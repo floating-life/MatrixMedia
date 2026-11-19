@@ -29,6 +29,7 @@ const path = require("path");
 // 先加载纯函数模块与 pushRecords（在 mock electron 之前），验证不强依赖 electron
 const {
   normalizeTitle,
+  buildTitleIndex,
   normalizeUrl,
   isManagementUrl,
   makeWorkKey,
@@ -65,9 +66,20 @@ function captureWarn(fn) {
   );
   assert.strictEqual(normalizeTitle("红烧肉教程 #美食 #家常菜"), "红烧肉教程");
   assert.strictEqual(normalizeTitle("红烧肉教程 #美食[话题]# #家常菜[话题]#"), "红烧肉教程");
+  assert.strictEqual(normalizeTitle("标题 #话题"), "标题");
   assert.strictEqual(normalizeTitle("零基础学 C# #编程"), "零基础学 C#");
+  assert.strictEqual(normalizeTitle("C#入门"), "C#入门");
+  assert.strictEqual(normalizeTitle("C#进阶"), "C#进阶");
+  assert.strictEqual(normalizeTitle("C#入门 #编程"), "C#入门");
+  assert.strictEqual(normalizeTitle("标题#紧贴非话题"), "标题#紧贴非话题");
   assert.strictEqual(normalizeTitle("#开箱 新品评测 #数码"), "#开箱 新品评测");
   assert.strictEqual(normalizeTitle("#纯标签1 #纯标签2"), "");
+  // 坏对象 / 数组 / 布尔不崩且视为空串，number 可转串
+  assert.strictEqual(normalizeTitle({ toString: null }), "");
+  assert.strictEqual(normalizeTitle(["a", "b"]), "");
+  assert.strictEqual(normalizeTitle(true), "");
+  assert.strictEqual(normalizeTitle(2026), "2026");
+  assert.strictEqual(normalizeUrl({ toString: null }), "");
 
   // normalizeUrl：保留 path 与标识作品的 query 参数，去除 fragment、尾斜杠与常见追踪参数
   assert.strictEqual(
@@ -1193,4 +1205,576 @@ function captureWarn(fn) {
   }
 }
 
-console.log("\n全部通过：跨平台作品关联与内容级汇总行");
+/* ---------- 9. 精修回归：状态+直链、重发去直链、C#词内#、截止日过滤与预计算 link、跨组去重、坏对象、缺 works.json ---------- */
+{
+  // 9a. 显式非 success 状态（即使带有效直链）一律排除；仅缺 publishStatus 的历史记录凭有效直链纳入
+  const nonSuccessStatuses = [
+    "scheduled", "publishing", "failed", "fail", "draft", "drafting",
+    "abnormal", "skipped", "expired", "login_required",
+  ];
+  const statusRecords = nonSuccessStatuses.map((st, i) => ({
+    pt: "抖音",
+    group: "G1",
+    title: `非成功_${st}`,
+    filePath: `D:\\status\\${st}.mp4`,
+    publishStatus: st,
+    videoLink: `https://www.douyin.com/video/800${i}`,
+    date: "2026-11-10",
+  }));
+  // 缺 publishStatus 但 republishCount > 0 → 其 videoLink 不作直链证据，不得纳入
+  statusRecords.push({
+    pt: "抖音",
+    group: "G1",
+    title: "无状态重发记录",
+    filePath: "D:\\status\\legacy_repub.mp4",
+    republishCount: 1,
+    videoLink: "https://www.douyin.com/video/8888",
+    date: "2026-11-10",
+  });
+  // 缺 publishStatus 且未重发 + 有效直链 → 历史记录纳入
+  statusRecords.push({
+    pt: "抖音",
+    group: "G1",
+    title: "无状态历史直链",
+    filePath: "D:\\status\\legacy_ok.mp4",
+    videoLink: "https://www.douyin.com/video/8999",
+    date: "2026-11-10",
+  });
+  const statusContents = buildContentIndex(statusRecords);
+  assert.strictEqual(statusContents.length, 1, "所有显式非 success（含 scheduled 带直链）与无状态重发记录必须排除");
+  assert.strictEqual(statusContents[0].contentKey, "file:d:/status/legacy_ok.mp4");
+
+  // 9b. 重发记录（republishCount > 0 且 publishStatus === "success"）：videoLink 不作直链证据，仅走唯一标题规则
+  const repubContents = buildContentIndex([
+    {
+      pt: "抖音",
+      group: "G1",
+      title: "重发新标题",
+      filePath: "D:\\repub\\new_video.mp4",
+      publishStatus: "success",
+      republishCount: 1,
+      videoLink: "https://www.douyin.com/video/old1", // 重发残留旧链
+      date: "2026-11-10",
+    },
+  ]);
+  assert.strictEqual(repubContents.length, 1);
+  assert.strictEqual(repubContents[0].targets[0].videoLink, "", "重发记录的 videoLink 必须清空，不作为直链证据");
+  const repubLink = linkWorks({
+    contents: repubContents,
+    accounts: [
+      {
+        group: "G1",
+        platform: "抖音",
+        works: [
+          { workId: "old1", title: "旧素材标题", url: "https://www.douyin.com/video/old1" },
+          { workId: "new2", title: "重发新标题", url: "https://www.douyin.com/video/new2" },
+        ],
+      },
+    ],
+  });
+  assert.deepStrictEqual(repubLink.get("G1|抖音|old1"), { contentKey: null, matchedBy: null }, "重发残留旧链不得匹配旧作品");
+  assert.deepStrictEqual(
+    repubLink.get("G1|抖音|new2"),
+    { contentKey: "file:d:/repub/new_video.mp4", matchedBy: "title" },
+    "重发记录仅凭唯一标题匹配新作品"
+  );
+  // 重发记录若标题不唯一 → 全部留空
+  const repubAmbiguousLink = linkWorks({
+    contents: repubContents,
+    accounts: [
+      {
+        group: "G1",
+        platform: "抖音",
+        works: [
+          { workId: "old1", title: "重发新标题", url: "https://www.douyin.com/video/old1" },
+          { workId: "new2", title: "重发新标题", url: "https://www.douyin.com/video/new2" },
+        ],
+      },
+    ],
+  });
+  assert.deepStrictEqual(repubAmbiguousLink.get("G1|抖音|old1"), { contentKey: null, matchedBy: null });
+  assert.deepStrictEqual(repubAmbiguousLink.get("G1|抖音|new2"), { contentKey: null, matchedBy: null });
+
+  // 9c. C#入门 / C#进阶 词内 # 保留，绝不混淆关联
+  const csharpContents = buildContentIndex([
+    {
+      pt: "抖音",
+      group: "教程组",
+      title: "C#进阶",
+      filePath: "D:\\code\\part2.mp4",
+      publishStatus: "success",
+      date: "2026-11-10",
+    },
+  ]);
+  const csharpAccounts = [
+    {
+      group: "教程组",
+      platform: "抖音",
+      works: [
+        { workId: "cs1", title: "C#入门", url: "https://www.douyin.com/video/cs1", publishTime: Date.parse("2026-11-10T01:00:00Z") },
+      ],
+    },
+  ];
+  const csharpLink = linkWorks({ contents: csharpContents, accounts: csharpAccounts });
+  assert.deepStrictEqual(csharpLink.get("教程组|抖音|cs1"), { contentKey: null, matchedBy: null }, "C#入门 不得匹配 C#进阶");
+  const csharpRows = buildContentSummaryRows({
+    contents: csharpContents,
+    accounts: csharpAccounts,
+    worksDaily: { "教程组|抖音": { cs1: { "2026-11-10": { play: 100 } } } },
+  });
+  assert.strictEqual(csharpRows.length, 2);
+  assert.strictEqual(csharpRows.find((r) => r.contentKey === "file:d:/code/part2.mp4").totalPlay, null);
+  assert.strictEqual(csharpRows.find((r) => r.contentKey === "unlinked:抖音:cs1").totalPlay, 100);
+
+  // 9d. 截止日：排除未来 target、未来 work，并对传入的预计算 link 作同样过滤
+  const cutoffContents = buildContentIndex([
+    // 11-20 才实发的定时任务，标题与 11-08 旧作品相同
+    {
+      pt: "抖音",
+      group: "G1",
+      title: "每周复盘",
+      filePath: "D:\\sched\\future_ep.mp4",
+      scheduledTask: true,
+      publishStatus: "success",
+      date: "2026-11-10",
+      lastPublishAt: Date.parse("2026-11-20T04:00:00Z"),
+    },
+    // 多平台内容：快手 11-10 已发、抖音 11-20 才发（同标题撞 11-08 另一旧作品）
+    {
+      pt: "快手",
+      group: "G1",
+      title: "跨日多平台",
+      filePath: "D:\\sched\\multi_day.mp4",
+      publishStatus: "success",
+      videoLink: "https://www.kuaishou.com/short-video/ks10",
+      date: "2026-11-10",
+    },
+    {
+      pt: "抖音",
+      group: "G1",
+      title: "旧视频乙",
+      filePath: "D:\\sched\\multi_day.mp4",
+      publishStatus: "success",
+      date: "2026-11-20",
+    },
+    // 11-10 已发目标（用于验证未来 publishTime 的 work 被排除）
+    {
+      pt: "小红书",
+      group: "G1",
+      title: "未来作品测试",
+      filePath: "D:\\sched\\past_target.mp4",
+      publishStatus: "success",
+      videoLink: "https://www.xiaohongshu.com/explore/f99",
+      date: "2026-11-10",
+    },
+  ]);
+  const cutoffAccounts = [
+    {
+      group: "G1",
+      platform: "抖音",
+      works: [
+        { workId: "old08", title: "每周复盘", url: "https://www.douyin.com/video/old08", publishTime: Date.parse("2026-11-08T04:00:00Z") },
+        { workId: "old08b", title: "旧视频乙", url: "https://www.douyin.com/video/old08b", publishTime: Date.parse("2026-11-08T05:00:00Z") },
+      ],
+    },
+    {
+      group: "G1",
+      platform: "快手",
+      works: [
+        { workId: "ks10", title: "跨日多平台", url: "https://www.kuaishou.com/short-video/ks10", publishTime: Date.parse("2026-11-10T04:00:00Z") },
+      ],
+    },
+    {
+      group: "G1",
+      platform: "小红书",
+      works: [
+        { workId: "f99", title: "未来作品测试", url: "https://www.xiaohongshu.com/explore/f99", publishTime: Date.parse("2026-11-20T04:00:00Z") },
+      ],
+    },
+  ];
+  const cutoffDaily = {
+    "G1|抖音": {
+      old08: { "2026-11-10": { play: 100 } },
+      old08b: { "2026-11-10": { play: 200 } },
+    },
+    "G1|快手": {
+      ks10: { "2026-11-10": { play: 300 } },
+    },
+    "G1|小红书": {
+      f99: { "2026-11-10": { play: 999 } },
+    },
+  };
+  // 无截止日预计算 link 会把 old08 / old08b / f99 都关联上
+  const precomputedFullLink = linkWorks({ contents: cutoffContents, accounts: cutoffAccounts });
+  assert.strictEqual(precomputedFullLink.get("G1|抖音|old08").contentKey, "file:d:/sched/future_ep.mp4");
+  assert.strictEqual(precomputedFullLink.get("G1|抖音|old08b").contentKey, "file:d:/sched/multi_day.mp4");
+  assert.strictEqual(precomputedFullLink.get("G1|小红书|f99").contentKey, "file:d:/sched/past_target.mp4");
+
+  // 带截止日 linkWorks：排除 11-20 的 target 与 11-20 的 work
+  const linkAsOf11 = linkWorks({ contents: cutoffContents, accounts: cutoffAccounts, date: "2026-11-11" });
+  assert.deepStrictEqual(linkAsOf11.get("G1|抖音|old08"), { contentKey: null, matchedBy: null });
+  assert.deepStrictEqual(linkAsOf11.get("G1|抖音|old08b"), { contentKey: null, matchedBy: null });
+  assert.deepStrictEqual(linkAsOf11.get("G1|小红书|f99"), { contentKey: null, matchedBy: null });
+  assert.strictEqual(linkAsOf11.get("G1|快手|ks10").contentKey, "file:d:/sched/multi_day.mp4");
+
+  // buildContentSummaryRows 无论是否传预计算 link，截至 11-11 行为必须一致
+  for (const maybeLink of [undefined, precomputedFullLink]) {
+    const rowsAsOf11 = buildContentSummaryRows({
+      contents: cutoffContents,
+      accounts: cutoffAccounts,
+      link: maybeLink,
+      worksDaily: cutoffDaily,
+      date: "2026-11-11",
+    });
+    assert.strictEqual(
+      rowsAsOf11.find((r) => r.contentKey === "file:d:/sched/future_ep.mp4"),
+      undefined,
+      "11-20 才发布的内容不得出现在 11-11 汇总中"
+    );
+    const old08Row = rowsAsOf11.find((r) => r.contentKey === "unlinked:抖音:old08");
+    assert.ok(old08Row, "被排除未来关联的旧作品应作为未关联行保留");
+    assert.strictEqual(old08Row.totalPlay, 100);
+
+    const multiDayRow = rowsAsOf11.find((r) => r.contentKey === "file:d:/sched/multi_day.mp4");
+    assert.ok(multiDayRow);
+    assert.strictEqual(multiDayRow.totalPlay, 300, "11-20 抖音 target 的关联必须失效，只计 11-10 快手 300");
+    assert.strictEqual(multiDayRow.platformCount, 1);
+    const old08bRow = rowsAsOf11.find((r) => r.contentKey === "unlinked:抖音:old08b");
+    assert.ok(old08bRow);
+    assert.strictEqual(old08bRow.totalPlay, 200);
+
+    const pastTargetRow = rowsAsOf11.find((r) => r.contentKey === "file:d:/sched/past_target.mp4");
+    assert.ok(pastTargetRow);
+    assert.strictEqual(pastTargetRow.totalPlay, null, "publishTime > date 的未来 work 必须排除，不得计入");
+    assert.strictEqual(
+      rowsAsOf11.find((r) => r.contentKey === "unlinked:小红书:f99"),
+      undefined,
+      "publishTime > date 的未来 work 不得生成未关联行"
+    );
+  }
+
+  // 9e. 跨组同作品（platform|workId 相同）只计一次：取 ≤date 最近快照，归入按分组名排序首个分组
+  const crossGroupContents = buildContentIndex([
+    {
+      pt: "抖音",
+      group: "组B",
+      title: "跨组共享作品",
+      filePath: "D:\\shared\\clip.mp4",
+      publishStatus: "success",
+      videoLink: "https://www.douyin.com/video/shared1",
+      date: "2026-11-10",
+    },
+    {
+      pt: "抖音",
+      group: "组A",
+      title: "跨组共享作品",
+      filePath: "D:\\shared\\clip.mp4",
+      publishStatus: "success",
+      videoLink: "https://www.douyin.com/video/shared1",
+      date: "2026-11-10",
+    },
+    {
+      pt: "抖音",
+      group: "组B",
+      title: "组B独有作品",
+      filePath: "D:\\shared\\clip.mp4",
+      publishStatus: "success",
+      videoLink: "https://www.douyin.com/video/onlyB",
+      date: "2026-11-10",
+    },
+  ]);
+  // 故意把 组B 放在 组A 前面，验证仍按分组名排序归入 组A
+  const crossGroupAccounts = [
+    {
+      group: "组B",
+      platform: "抖音",
+      works: [
+        { workId: "shared1", title: "跨组共享作品", url: "https://www.douyin.com/video/shared1", publishTime: Date.parse("2026-11-10T04:00:00Z") },
+        { workId: "onlyB", title: "组B独有作品", url: "https://www.douyin.com/video/onlyB", publishTime: Date.parse("2026-11-10T05:00:00Z") },
+        { workId: "unlinkedDup", title: "跨组未关联", url: "https://www.douyin.com/video/udup", publishTime: Date.parse("2026-11-10T06:00:00Z") },
+      ],
+    },
+    {
+      group: "组A",
+      platform: "抖音",
+      works: [
+        { workId: "shared1", title: "跨组共享作品", url: "https://www.douyin.com/video/shared1", publishTime: Date.parse("2026-11-10T04:00:00Z") },
+        { workId: "unlinkedDup", title: "跨组未关联", url: "https://www.douyin.com/video/udup", publishTime: Date.parse("2026-11-10T06:00:00Z") },
+      ],
+    },
+  ];
+  const crossGroupDaily = {
+    "组A|抖音": {
+      shared1: { "2026-11-10": { play: 100 }, "2026-11-15": { play: 500 } },
+      unlinkedDup: { "2026-11-10": { play: 60 } },
+    },
+    "组B|抖音": {
+      shared1: { "2026-11-11": { play: 150 } },
+      onlyB: { "2026-11-10": { play: 40 } },
+      unlinkedDup: { "2026-11-10": { play: 60 } },
+    },
+  };
+  const cgRows = buildContentSummaryRows({
+    contents: crossGroupContents,
+    accounts: crossGroupAccounts,
+    worksDaily: crossGroupDaily,
+    date: "2026-11-11",
+  });
+  const cgClip = cgRows.find((r) => r.contentKey === "file:d:/shared/clip.mp4");
+  assert.ok(cgClip);
+  assert.strictEqual(cgClip.platformCount, 1);
+  assert.strictEqual(cgClip.totalPlay, 190, "shared1 取 ≤11-11 最近快照 150，加上 onlyB 40 = 190，不重复计数");
+  assert.deepStrictEqual(cgClip.perPlatform["抖音|组A"].workIds, ["shared1"]);
+  assert.strictEqual(cgClip.perPlatform["抖音|组A"].play, 150);
+  assert.deepStrictEqual(cgClip.perPlatform["抖音|组B"].workIds, ["onlyB"], "组B 中不得重复计入 shared1");
+  assert.strictEqual(cgClip.perPlatform["抖音|组B"].play, 40);
+
+  // 未关联作品跨组重复时也只生成 1 行，归入 组A
+  const udupRows = cgRows.filter((r) => r.contentKey === "unlinked:抖音:unlinkedDup");
+  assert.strictEqual(udupRows.length, 1);
+  assert.strictEqual(udupRows[0].totalPlay, 60);
+  assert.deepStrictEqual(Object.keys(udupRows[0].perPlatform), ["抖音|组A"]);
+
+  // 9f. 坏 title / 文本对象不崩（buildContentIndex / linkWorks / buildContentSummaryRows / readPushRecords）
+  const badObj = { toString: null };
+  const badContents = buildContentIndex([
+    {
+      id: badObj,
+      pt: "抖音",
+      group: badObj,
+      phone: badObj,
+      title: badObj,
+      bt: ["bad"],
+      textOtherName: null,
+      bookName: true,
+      selectedFile: badObj,
+      filePath: "D:\\bad\\safe.mp4",
+      videoLink: badObj,
+      publishStatus: "success",
+      date: "2026-11-10",
+    },
+  ]);
+  assert.strictEqual(badContents.length, 1);
+  assert.strictEqual(badContents[0].displayTitle, "safe.mp4");
+  const badAccounts = [
+    {
+      group: "G1",
+      platform: "抖音",
+      works: [
+        { workId: "bw1", title: badObj, url: badObj, publishTime: badObj },
+        { workId: badObj, title: "无效ID" },
+      ],
+    },
+  ];
+  const badRows = buildContentSummaryRows({
+    contents: badContents,
+    accounts: badAccounts,
+    worksDaily: { "G1|抖音": { bw1: { "2026-11-10": { play: 12 } } } },
+  });
+  assert.strictEqual(badRows.find((r) => r.contentKey === "unlinked:抖音:bw1").title, "(无标题)");
+
+  // readPushRecords 读取含坏对象 JSON 文件不崩且文本字段置空
+  const badTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-bad-text-test-"));
+  try {
+    fs.writeFileSync(
+      path.join(badTmpDir, "2026-11-10.json"),
+      JSON.stringify([
+        {
+          id: 1001,
+          pt: "抖音",
+          group: "G1",
+          title: { toString: null },
+          bt: ["arr"],
+          textOtherName: null,
+          videoLink: { toString: null },
+          publishStatus: "success",
+        },
+      ]),
+      "utf8"
+    );
+    const badDiskRecs = readPushRecords({ dir: badTmpDir });
+    assert.strictEqual(badDiskRecs.length, 1);
+    assert.strictEqual(badDiskRecs[0].id, "1001");
+    assert.strictEqual(badDiskRecs[0].title, "");
+    assert.strictEqual(badDiskRecs[0].bt, "");
+    assert.strictEqual(badDiskRecs[0].textOtherName, "");
+    assert.strictEqual(badDiskRecs[0].videoLink, "");
+    assert.strictEqual(buildContentIndex(badDiskRecs).length, 1);
+  } finally {
+    fs.rmSync(badTmpDir, { recursive: true, force: true });
+  }
+
+  // 9g. works.json 缺失（或为空）时，worksDaily 中有快照的作品 ID 仍作为未关联行保留
+  const missingMetaRows = buildContentSummaryRows({
+    contents: [],
+    accounts: [{ group: "G1", platform: "抖音", works: [] }],
+    worksDaily: {
+      "G1|抖音": {
+        ghost1: { "2026-11-10": { play: 100, like: 5 } },
+      },
+      "孤儿组|快手": {
+        ghost2: { "2026-11-10": { play: 77 } },
+      },
+    },
+    date: "2026-11-10",
+  });
+  assert.strictEqual(missingMetaRows.length, 2);
+  const g1 = missingMetaRows.find((r) => r.contentKey === "unlinked:抖音:ghost1");
+  assert.ok(g1);
+  assert.strictEqual(g1.title, "(已删除或未匹配)");
+  assert.strictEqual(g1.totalPlay, 100);
+  assert.strictEqual(g1.totalLike, 5);
+  assert.strictEqual(g1.firstPublishDate, "");
+  assert.strictEqual(g1.firstPublishDateSource, "work");
+  assert.deepStrictEqual(g1.perPlatform["抖音|G1"].workIds, ["ghost1"]);
+
+  const g2 = missingMetaRows.find((r) => r.contentKey === "unlinked:快手:ghost2");
+  assert.ok(g2);
+  assert.strictEqual(g2.title, "(已删除或未匹配)");
+  assert.strictEqual(g2.totalPlay, 77);
+  assert.deepStrictEqual(g2.perPlatform["快手|孤儿组"].workIds, ["ghost2"]);
+
+  // 截止日早于快照日时不泄漏
+  assert.strictEqual(
+    buildContentSummaryRows({
+      contents: [],
+      accounts: [{ group: "G1", platform: "抖音", works: [] }],
+      worksDaily: { "G1|抖音": { ghost1: { "2026-11-10": { play: 100 } } } },
+      date: "2026-11-09",
+    }).length,
+    0
+  );
+
+  // 9h. buildTitleIndex 纯函数单测
+  const titleIdx = buildTitleIndex([
+    { workId: "u1", title: "唯一作品", url: "https://www.douyin.com/video/u1" },
+    { workId: "d1", title: "同名作品", url: "https://www.douyin.com/video/d1" },
+    { workId: "d2", title: "同名作品 #热门", url: "https://www.douyin.com/video/d2" },
+    { workId: "c1", title: "C#入门", url: "https://www.douyin.com/video/c1" },
+    { workId: "c2", title: "C#进阶", url: "https://www.douyin.com/video/c2" },
+    { workId: "bad", title: { toString: null }, url: "" },
+  ]);
+  assert.strictEqual(titleIdx.get("唯一作品").ambiguous, false);
+  assert.strictEqual(titleIdx.get("唯一作品").work.workId, "u1");
+  assert.deepStrictEqual(titleIdx.get("同名作品"), { work: null, ambiguous: true });
+  assert.strictEqual(titleIdx.get("C#入门").work.workId, "c1");
+  assert.strictEqual(titleIdx.get("C#进阶").work.workId, "c2");
+  console.log("✓ 精修回归：状态/重发/C#词内#/截止日预计算link/跨组去重/坏对象/缺失works.json/buildTitleIndex 正确");
+}
+
+/* ---------- 10. stats:match-works IPC：同名两作品返回 { found: false, ambiguous: true } ---------- */
+async function testMatchWorksIpcAmbiguity() {
+  const electronId = require.resolve("electron");
+  const collectorId = require.resolve("../src/main/services/dataStats/collector.js");
+  const storeId = require.resolve("../src/main/services/dataStats/store.js");
+  const indexId = require.resolve("../src/main/services/dataStats/index.js");
+
+  const prevCache = {
+    electron: require.cache[electronId],
+    collector: require.cache[collectorId],
+    store: require.cache[storeId],
+    index: require.cache[indexId],
+  };
+  const origSetTimeout = global.setTimeout;
+  const handlers = new Map();
+
+  require.cache[electronId] = {
+    id: electronId,
+    filename: electronId,
+    loaded: true,
+    exports: {
+      ipcMain: { handle: (channel, fn) => handlers.set(channel, fn) },
+    },
+  };
+  require.cache[collectorId] = {
+    id: collectorId,
+    filename: collectorId,
+    loaded: true,
+    exports: {
+      collectAccount: async () => ({
+        overview: {},
+        fansHistory: [],
+        works: [
+          { workId: "w_dup_1", title: "每日打卡", url: "https://www.douyin.com/video/dup1" },
+          { workId: "w_dup_2", title: "每日打卡 #日常", url: "https://www.douyin.com/video/dup2" },
+          { workId: "w_uniq", title: "唯一教程", url: "https://www.douyin.com/video/uniq" },
+          { workId: "w_cs1", title: "C#入门", url: "https://www.douyin.com/video/cs1" },
+          { workId: "w_cs2", title: "C#进阶", url: "https://www.douyin.com/video/cs2" },
+        ],
+      }),
+    },
+  };
+  require.cache[storeId] = {
+    id: storeId,
+    filename: storeId,
+    loaded: true,
+    exports: {
+      mergeDaily: () => {},
+      mergeWorks: () => {},
+      writeMeta: () => {},
+      readAccount: () => ({}),
+      readOverview: () => ({}),
+      readCollectLogs: () => [],
+      appendCollectLog: () => {},
+    },
+  };
+  delete require.cache[indexId];
+  global.setTimeout = (fn) => {
+    fn();
+    return 0;
+  };
+
+  try {
+    const { registerDataStatsIpc } = require("../src/main/services/dataStats/index.js");
+    registerDataStatsIpc();
+    const matchHandler = handlers.get("stats:match-works");
+    assert.strictEqual(typeof matchHandler, "function");
+
+    const res = await matchHandler(null, {
+      tasks: [
+        { key: "t_dup", group: "G1", platform: "抖音", partition: "persist:G1抖音", title: "每日打卡" },
+        { key: "t_uniq", group: "G1", platform: "抖音", partition: "persist:G1抖音", title: "唯一教程 #干货" },
+        { key: "t_cs", group: "G1", platform: "抖音", partition: "persist:G1抖音", title: "C#进阶" },
+        { key: "t_miss", group: "G1", platform: "抖音", partition: "persist:G1抖音", title: "不存在的标题" },
+      ],
+    });
+    assert.deepStrictEqual(res.errors, []);
+    assert.deepStrictEqual(
+      res.matches.t_dup,
+      { found: false, ambiguous: true },
+      "同名两作品时「获取状态」必须返回 { found: false, ambiguous: true }，不得写错链"
+    );
+    assert.deepStrictEqual(res.matches.t_uniq, {
+      found: true,
+      url: "https://www.douyin.com/video/uniq",
+      workId: "w_uniq",
+    });
+    assert.deepStrictEqual(res.matches.t_cs, {
+      found: true,
+      url: "https://www.douyin.com/video/cs2",
+      workId: "w_cs2",
+    });
+    assert.deepStrictEqual(res.matches.t_miss, { found: false });
+    console.log("✓ stats:match-works IPC：同名两作品返回 ambiguous、唯一作品正常命中");
+  } finally {
+    global.setTimeout = origSetTimeout;
+    for (const [key, id] of [
+      ["electron", electronId],
+      ["collector", collectorId],
+      ["store", storeId],
+      ["index", indexId],
+    ]) {
+      if (prevCache[key]) require.cache[id] = prevCache[key];
+      else delete require.cache[id];
+    }
+  }
+}
+
+testMatchWorksIpcAmbiguity()
+  .then(() => {
+    console.log("\n全部通过：跨平台作品关联与内容级汇总行");
+  })
+  .catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });

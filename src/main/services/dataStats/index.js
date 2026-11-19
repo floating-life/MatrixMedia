@@ -13,6 +13,7 @@
 const { ipcMain } = require("electron");
 const { collectAccount } = require("./collector");
 const store = require("./store");
+const { normalizeTitle, buildTitleIndex } = require("./contentLink");
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -148,9 +149,6 @@ function registerDataStatsIpc() {
       groupsMap.get(gk).tasks.push(t);
     }
 
-    const normalizeTitle = (s) =>
-      String(s || "").replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
-
     for (const { partition, platform, group, tasks: groupTasks } of groupsMap.values()) {
       try {
         const data = await collectAccount({ partition, platform });
@@ -162,16 +160,21 @@ function registerDataStatsIpc() {
           lastError: "",
           workCount: data.works.length,
         });
-        const byTitle = new Map();
-        for (const w of data.works || []) {
-          const key = normalizeTitle(w.title);
-          if (key && !byTitle.has(key)) byTitle.set(key, w);
-        }
+        const byTitle = buildTitleIndex(data.works);
         for (const t of groupTasks) {
-          const hit = byTitle.get(normalizeTitle(t.title));
-          matches[t.key] = hit
-            ? { found: true, url: hit.url || "", workId: hit.workId }
-            : { found: false };
+          const key = normalizeTitle(t.title);
+          const entry = key ? byTitle.get(key) : null;
+          if (entry && entry.ambiguous) {
+            matches[t.key] = { found: false, ambiguous: true };
+          } else if (entry && entry.work) {
+            matches[t.key] = {
+              found: true,
+              url: entry.work.url || "",
+              workId: entry.work.workId,
+            };
+          } else {
+            matches[t.key] = { found: false };
+          }
         }
       } catch (err) {
         const message = (err && err.message) || String(err);

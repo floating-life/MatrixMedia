@@ -12,6 +12,31 @@ const path = require("path");
 
 const DATE_FILE_RE = /^(\d{4}-\d{2}-\d{2})\.json$/;
 
+const TEXT_FIELDS = [
+  "id",
+  "pt",
+  "group",
+  "phone",
+  "textType",
+  "publishStatus",
+  "title",
+  "bt",
+  "textOtherName",
+  "bookName",
+  "shortTitle",
+  "bt2Filled",
+  "selectedFile",
+  "filePath",
+  "videoLink",
+];
+
+/** 文本字段类型校验：仅接受 string 或有限 number，对象/数组/null 等视为空串，绝不调用 toString */
+function toSafeText(v) {
+  if (typeof v === "string") return v;
+  if (typeof v === "number" && Number.isFinite(v)) return String(v);
+  return "";
+}
+
 function isValidYmd(dateStr) {
   if (typeof dateStr !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
     return false;
@@ -115,10 +140,16 @@ function readPushRecords(options) {
     }
     for (const item of parsed) {
       if (!item || typeof item !== "object" || Array.isArray(item)) continue;
-      records.push({
+      const sanitized = {
         ...item,
         date: f.date,
-      });
+      };
+      for (const field of TEXT_FIELDS) {
+        if (Object.prototype.hasOwnProperty.call(item, field)) {
+          sanitized[field] = toSafeText(item[field]);
+        }
+      }
+      records.push(sanitized);
     }
   }
 
