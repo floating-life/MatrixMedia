@@ -1696,7 +1696,7 @@ async function testMatchWorksIpcAmbiguity() {
         fansHistory: [],
         works: [
           { workId: "w_dup_1", title: "每日打卡", url: "https://www.douyin.com/video/dup1" },
-          { workId: "w_dup_2", title: "每日打卡 #日常", url: "https://www.douyin.com/video/dup2" },
+          { workId: "w_dup_2", title: " 每日打卡\u200B", url: "https://www.douyin.com/video/dup2" },
           { workId: "w_uniq", title: "唯一教程", url: "https://www.douyin.com/video/uniq" },
           { workId: "w_cs1", title: "C#入门", url: "https://www.douyin.com/video/cs1" },
           { workId: "w_cs2", title: "C#进阶", url: "https://www.douyin.com/video/cs2" },
@@ -1733,7 +1733,7 @@ async function testMatchWorksIpcAmbiguity() {
     const res = await matchHandler(null, {
       tasks: [
         { key: "t_dup", group: "G1", platform: "抖音", partition: "persist:G1抖音", title: "每日打卡" },
-        { key: "t_uniq", group: "G1", platform: "抖音", partition: "persist:G1抖音", title: "唯一教程 #干货" },
+        { key: "t_uniq", group: "G1", platform: "抖音", partition: "persist:G1抖音", title: "唯一教程" },
         { key: "t_cs", group: "G1", platform: "抖音", partition: "persist:G1抖音", title: "C#进阶" },
         { key: "t_miss", group: "G1", platform: "抖音", partition: "persist:G1抖音", title: "不存在的标题" },
       ],
@@ -1768,6 +1768,43 @@ async function testMatchWorksIpcAmbiguity() {
       else delete require.cache[id];
     }
   }
+}
+
+
+/* ---------- Claude 精修回归（S2 第 3 轮评审） ---------- */
+{
+  const CL = require("../src/main/services/dataStats/contentLink.js");
+  // 尾部 # 仅限小红书 [话题] 格式
+  assert.notStrictEqual(CL.normalizeTitle("版本更新 #2025#"), CL.normalizeTitle("版本更新 #2026#"));
+  assert.strictEqual(CL.normalizeTitle("红烧肉 #美食[话题]#"), "红烧肉");
+  // 「获取状态」精确键：不剥话题
+  assert.notStrictEqual(CL.normalizeStatusTitle("每日打卡"), CL.normalizeStatusTitle("每日打卡 #日常"));
+  // 状态字段存在但非 success（空串/数组清洗后为空串）→ 排除，即使有直链
+  const base = { pt: "抖音", group: "G", title: "t", filePath: "D:/v/a.mp4", date: "2026-11-10",
+    videoLink: "https://www.douyin.com/video/1" };
+  assert.strictEqual(CL.buildContentIndex([{ ...base, publishStatus: "" }]).length, 0);
+  assert.strictEqual(CL.buildContentIndex([{ ...base }]).length, 1, "缺状态字段的历史记录可凭直链纳入");
+  // 成功重发：recordDate 取更晚的 lastPublishAt
+  const idx = CL.buildContentIndex([{ ...base, publishStatus: "success", republishCount: 1,
+    lastPublishAt: Date.parse("2026-11-20T04:00:00Z") }]);
+  assert.strictEqual(idx[0].targets[0].recordDate, "2026-11-20");
+  // 跨组冲突：同一作品在两组分别关联到不同内容 → 作未关联行，且只计一次
+  const contents = CL.buildContentIndex([
+    { pt: "抖音", group: "A", title: "甲", filePath: "D:/v/jia.mp4", date: "2026-11-01", publishStatus: "success" },
+    { pt: "抖音", group: "B", title: "乙", filePath: "D:/v/yi.mp4", date: "2026-11-01", publishStatus: "success",
+      videoLink: "https://www.douyin.com/video/77" },
+  ]);
+  const w = (title) => ({ workId: "77", title, url: "https://www.douyin.com/video/77", publishTime: Date.parse("2026-11-01T04:00:00Z") });
+  const rows = CL.buildContentSummaryRows({
+    contents,
+    accounts: [{ group: "A", platform: "抖音", works: [w("甲")] }, { group: "B", platform: "抖音", works: [w("乙")] }],
+    worksDaily: { "A|抖音": { "77": { "2026-11-02": { play: 150 } } }, "B|抖音": { "77": { "2026-11-02": { play: 150 } } } },
+    date: "2026-11-02",
+  });
+  const withPlay = rows.filter((r) => r.totalPlay != null);
+  assert.strictEqual(withPlay.length, 1, "同一作品只计一次");
+  assert.ok(String(withPlay[0].contentKey).startsWith("unlinked:"), "证据冲突应作未关联行");
+  console.log("✓ Claude 精修回归：尾部#、精确状态键、状态字段存在、重发日期、跨组冲突");
 }
 
 testMatchWorksIpcAmbiguity()

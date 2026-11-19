@@ -13,7 +13,7 @@
 const { ipcMain } = require("electron");
 const { collectAccount } = require("./collector");
 const store = require("./store");
-const { normalizeTitle, buildTitleIndex } = require("./contentLink");
+const { normalizeStatusTitle, buildTitleIndex } = require("./contentLink");
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -160,9 +160,9 @@ function registerDataStatsIpc() {
           lastError: "",
           workCount: data.works.length,
         });
-        const byTitle = buildTitleIndex(data.works);
+        const byTitle = buildTitleIndex(data.works, normalizeStatusTitle);
         for (const t of groupTasks) {
-          const key = normalizeTitle(t.title);
+          const key = normalizeStatusTitle(t.title);
           const entry = key ? byTitle.get(key) : null;
           if (entry && entry.ambiguous) {
             matches[t.key] = { found: false, ambiguous: true };

@@ -109,25 +109,32 @@ function normalizeTitle(s) {
     .replace(/\s+/g, " ")
     .trim();
   while (out) {
-    // 仅剥离尾部、且 # 前为字符串开头或空白的话题标签（保留 C#入门 等词内 #）
-    const next = out.replace(/(?:^|\s)#[^\s#]+#?$/, "").trim();
+    // 仅剥离尾部、且 # 前为字符串开头或空白的话题标签（保留 C#入门 等词内 #）；
+    // 结尾 # 只在小红书 `#xx[话题]#` 格式下允许，避免把 `#2025#` 这类编号剥掉
+    const next = out.replace(/(?:^|\s)#(?:[^\s#]+\[话题\]#|[^\s#]+)$/, "").trim();
     if (next === out) break;
     out = next;
   }
   return out;
 }
 
+/** 「获取状态」用的精确标题键：仅去零宽字符与首尾空白（与原入口一致，不剥话题/标点） */
+function normalizeStatusTitle(s) {
+  return toSafeString(s).replace(ZERO_WIDTH_RE, "").trim();
+}
+
 /**
  * 按归一标题构建作品索引（供「获取状态」等入口复用）：
  * - 同一归一标题仅对应 1 个作品 → `{ work, ambiguous: false }`
  * - 同一归一标题对应 ≥2 个作品 → `{ work: null, ambiguous: true }`
+ * normalize 可替换：「获取状态」用 normalizeStatusTitle（仅去零宽与首尾空白，保持该入口原有精确匹配语义）
  */
-function buildTitleIndex(works) {
+function buildTitleIndex(works, normalize = normalizeTitle) {
   const byTitle = new Map();
   if (!Array.isArray(works)) return byTitle;
   for (const w of works) {
     if (!isPlainObject(w)) continue;
-    const key = normalizeTitle(w.title);
+    const key = normalize(w.title);
     if (!key) continue;
     const prev = byTitle.get(key);
     if (!prev) {
@@ -207,15 +214,15 @@ function makeWorkKey(group, platform, workId) {
 }
 
 function extractRecordDate(rec, status) {
-  if (rec.scheduledTask === true && status === "success") {
+  const baseDate = typeof rec.date === "string" && isValidDateStr(rec.date.trim())
+    ? rec.date.trim()
+    : "";
+  // 发布成功（含定时任务、换文件重发）时以最后一次发布日期为准：晚于登记日才采用
+  if (status === "success") {
     const doneDate = toUtc8DateStr(rec.lastPublishAt);
-    if (doneDate) return doneDate;
+    if (doneDate && (!baseDate || doneDate > baseDate)) return doneDate;
   }
-  if (typeof rec.date === "string") {
-    const s = rec.date.trim();
-    if (isValidDateStr(s)) return s;
-  }
-  return toUtc8DateStr(rec.lastPublishAt) || toUtc8DateStr(rec.createTime);
+  return baseDate || toUtc8DateStr(rec.lastPublishAt) || toUtc8DateStr(rec.createTime);
 }
 
 function collectMatchTitles(values) {
@@ -245,16 +252,12 @@ function buildContentIndex(pushRecords) {
     if (!isPlainObject(rec)) continue;
     if (toSafeTrimmed(rec.textType).toLowerCase() === "article") continue;
 
+    // 字段存在（含空串、数组等异常值）即只接受 success；仅字段缺失的历史记录可凭直链兜底
+    const hasStatusField = Object.prototype.hasOwnProperty.call(rec, "publishStatus") &&
+      rec.publishStatus !== undefined;
     const rawStatus = rec.publishStatus;
-    if (
-      rawStatus !== undefined &&
-      rawStatus !== null &&
-      typeof rawStatus !== "string" &&
-      (typeof rawStatus !== "number" || !Number.isFinite(rawStatus))
-    ) {
-      continue;
-    }
-    const status = toSafeTrimmed(rawStatus).toLowerCase();
+    const status = typeof rawStatus === "string" ? rawStatus.trim().toLowerCase() : "";
+    if (hasStatusField && status !== "success") continue;
     const rawVideoLink = toSafeTrimmed(rec.videoLink);
     const validLink = normalizeDirectUrl(rawVideoLink);
     const republishCount = normalizeMetric(rec.republishCount);
@@ -264,11 +267,7 @@ function buildContentIndex(pushRecords) {
       (republishCount === null && attemptCount !== null && attemptCount > 1);
     const directVideoLink = !isRepublished && validLink ? rawVideoLink : "";
 
-    if (status) {
-      if (status !== "success") continue;
-    } else if (!directVideoLink) {
-      continue;
-    }
+    if (!hasStatusField && !directVideoLink) continue;
 
     const platform = toSafeTrimmed(rec.pt);
     const group = toSafeTrimmed(rec.group) || toSafeString(rec.phone).split("-")[0].trim();
@@ -505,30 +504,6 @@ function resolveWorkSnapshotAsOf(workId, accWorksDaily, cutoffDate) {
   return { date: bestDate, metrics };
 }
 
-function isPrecomputedLinkValidAsOf(linkedKey, linkEntry, group, platform, work, cutoffDate, contentByKey) {
-  if (!cutoffDate) return true;
-  const meta = contentByKey.get(linkedKey);
-  if (!meta) return true;
-  if (!meta.eligible) return false;
-  if (!meta.hasTargets) return true;
-
-  const gpTargets = meta.eligibleTargetsByGp.get(`${group.trim()}|${platform.trim()}`);
-  if (!gpTargets || !gpTargets.length) return false;
-
-  const matchedBy = toSafeTrimmed(linkEntry && linkEntry.matchedBy);
-  const wNormUrl = normalizeDirectUrl(work.url);
-  const wNormTitle = normalizeTitle(work.title);
-  if (matchedBy === "link") {
-    return gpTargets.some((t) => t.normUrl && t.normUrl === wNormUrl);
-  }
-  if (matchedBy === "title") {
-    return gpTargets.some(
-      (t) => (!t.normUrl || t.normUrl === wNormUrl) && wNormTitle && t.matchTitles.includes(wNormTitle)
-    );
-  }
-  return true;
-}
-
 function addWorkToBucket(bucket, platform, group, workId, rawUrl, metrics) {
   const workUrl = toSafeTrimmed(rawUrl);
   const pgKey = `${platform}|${group}`;
@@ -567,7 +542,7 @@ function pickMinValidPubMs(obsList) {
 
 /**
  * 构建跨平台内容级汇总行（截至 date，默认最新快照日）。
- * - link：Map<`group|platform|workId`, { contentKey, matchedBy }>（可省）
+ * - link：已忽略（保留参数兼容），关联总按截止日用 linkWorks 重算
  * - worksDaily：`{ "group|platform": readWorksDaily(group, platform) }`
  * - 按 `platform|workId` 跨组去重：只取一份 ≤date 的最近快照，归入按分组名排序的第一个分组
  * - worksDaily 中出现但 works.json 缺失的作品 ID 保留为未关联行（title "(已删除或未匹配)"）
@@ -577,10 +552,9 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date } 
   if (!ok) return [];
 
   const accountList = Array.isArray(accounts) ? accounts : [];
-  const isPrecomputedLink = link instanceof Map;
-  const resolvedLink = isPrecomputedLink
-    ? link
-    : linkWorks({ contents, accounts: accountList, date: cutoffDate });
+  // 关联总是按同一截止日重算（忽略传入的 link）：预计算关联可能基于不同截止日，复用会绕过唯一性校验
+  void link;
+  const resolvedLink = linkWorks({ contents, accounts: accountList, date: cutoffDate });
   const dailyByGp = isPlainObject(worksDaily) ? worksDaily : null;
 
   const contentByKey = new Map();
@@ -680,12 +654,7 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date } 
       }
 
       const linkEntry = resolvedLink.get(workKey);
-      let linkedKey = linkEntry ? toSafeString(linkEntry.contentKey) || null : null;
-      if (linkedKey && isPrecomputedLink && cutoffDate) {
-        if (!isPrecomputedLinkValidAsOf(linkedKey, linkEntry, group, platform, w, cutoffDate, contentByKey)) {
-          linkedKey = null;
-        }
-      }
+      const linkedKey = linkEntry ? toSafeString(linkEntry.contentKey) || null : null;
 
       const snap = resolveWorkSnapshotAsOf(workId, accWorksDaily, cutoffDate);
       pushToMap(obsByPw, pwKey, {
@@ -743,8 +712,10 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date } 
     obsList.sort((a, b) => (a.group < b.group ? -1 : a.group > b.group ? 1 : 0));
 
     const { platform, workId } = obsList[0];
-    const linkedObs = obsList.filter((o) => o.linkedKey != null);
+    let linkedObs = obsList.filter((o) => o.linkedKey != null);
     const bestSnap = pickLatestSnapshot(obsList);
+    // 同一平台作品在不同分组关联到不同内容：证据冲突无法裁决，整体作未关联行
+    if (new Set(linkedObs.map((o) => o.linkedKey)).size > 1) linkedObs = [];
 
     if (linkedObs.length > 0) {
       const linkedKey = linkedObs[0].linkedKey;
@@ -836,6 +807,7 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date } 
 module.exports = {
   normalizeTitle,
   buildTitleIndex,
+  normalizeStatusTitle,
   normalizeUrl,
   isManagementUrl,
   makeWorkKey,
