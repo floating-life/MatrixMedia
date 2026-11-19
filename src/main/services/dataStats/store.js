@@ -2,9 +2,10 @@
 
 /**
  * 数据统计本地存储（userData/data-stats/<分组>/<平台>/）：
- *   daily.json  每日总量快照 { "YYYY-MM-DD": { fans, plays, likes, comments, favorites, shares } }
- *   works.json  作品列表 + 发布增长封闭记录
- *   meta.json   { lastCollectAt, lastError, workCount }
+ *   daily.json       每日总量快照 { "YYYY-MM-DD": { fans, plays, likes, comments, favorites, shares } }
+ *   works.json       作品列表 + 发布增长封闭记录
+ *   works-daily.json 作品每日累计值快照 { "<workId>": { "YYYY-MM-DD": { play, like, comment, share, favorite, fansDelta } } }
+ *   meta.json        { lastCollectAt, lastError, workCount }
  *
  * 日趋势口径：所有平台统一为「当日总量快照」；抖音/视频号额外回填粉丝历史（只补缺日期）。
  */
@@ -153,7 +154,68 @@ function mergeWorks(group, platform, newWorks, now = Date.now()) {
   // 展示按发布时间倒序
   data.works.sort((a, b) => (b.publishTime || 0) - (a.publishTime || 0));
   writeWorks(group, platform, data);
+  recordWorksDaily(group, platform, sorted, now);
   return data;
+}
+
+/* ---------------- works-daily（作品日快照） ---------------- */
+
+function readWorksDaily(group, platform) {
+  const data = readJson(path.join(accountDir(group, platform), "works-daily.json"), {});
+  return data && typeof data === "object" && !Array.isArray(data) ? data : {};
+}
+
+function writeWorksDaily(group, platform, daily) {
+  writeJson(path.join(accountDir(group, platform), "works-daily.json"), daily);
+}
+
+function pickWorkDailyStats(w) {
+  const out = {};
+  for (const k of WORK_STAT_KEYS) {
+    const raw = w[k];
+    if (raw == null || raw === "" || typeof raw === "boolean") {
+      out[k] = null;
+    } else {
+      const v = Number(raw);
+      out[k] = Number.isFinite(v) ? v : null;
+    }
+  }
+  return out;
+}
+
+/**
+ * 写入作品当日累计快照（日期按 UTC+8；同日多次采集覆盖为最后一次）。
+ * 写入失败只打警告，不得影响主流程（mergeWorks）。
+ */
+function recordWorksDaily(group, platform, works, now = Date.now()) {
+  if (!works || !works.length) return;
+  try {
+    const daily = readWorksDaily(group, platform);
+    const today = todayStr(now);
+    let updated = false;
+    for (const w of works) {
+      if (!w || !w.workId) continue;
+      const id = String(w.workId);
+      if (
+        !Object.prototype.hasOwnProperty.call(daily, id) ||
+        !daily[id] ||
+        typeof daily[id] !== "object" ||
+        Array.isArray(daily[id])
+      ) {
+        daily[id] = {};
+      }
+      daily[id][today] = pickWorkDailyStats(w);
+      updated = true;
+    }
+    if (updated) {
+      writeWorksDaily(group, platform, daily);
+    }
+  } catch (err) {
+    console.warn(
+      `[dataStats] 写入 works-daily.json 失败 (${group}/${platform}):`,
+      (err && err.message) || err
+    );
+  }
 }
 
 /* ---------------- meta ---------------- */
@@ -239,10 +301,12 @@ function readOverview() {
 
 module.exports = {
   METRIC_KEYS,
+  WORK_STAT_KEYS,
   mergeDaily,
   mergeWorks,
   readDaily,
   readWorks,
+  readWorksDaily,
   readAccount,
   readOverview,
   listAccounts,
