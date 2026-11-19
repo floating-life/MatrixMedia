@@ -201,7 +201,7 @@ function registerDataStatsIpc() {
    * - auto-run.json 已含 today → 立即返回 { status: "already-ran", date: today }
    * - collecting 中 → 返回 { status: "busy" }，不写入任何内容
    * - 否则同步置位 collecting=true，执行采集（复用 collectAccounts，trigger:"auto"），
-   *   结束（无论成功/部分失败/取消/异常）后原子追加 today 到 runs（写失败仅 warn）并复位 collecting
+   *   开跑前原子追加 today 到 runs（写失败返回 store-failed、不采集），结束后复位 collecting
    */
   ipcMain.handle("stats:auto-run", async (event, args) => {
     const today = getTodayStr();
@@ -227,6 +227,14 @@ function registerDataStatsIpc() {
     if (!accounts.length) {
       return { status: "empty", date: today, results: [] };
     }
+    // 开跑前先落盘「今天已自动跑」：中途退出/重启不会同日重采；落盘失败则不采集（下一轮再试）
+    try {
+      store.appendAutoRun(today);
+    } catch (err) {
+      console.warn("[dataStats] 写入 auto-run.json 失败，本轮不自动采集:", (err && err.message) || err);
+      return { status: "store-failed" };
+    }
+    autoRanInMemory.add(today);
     collecting = true;
     cancelled = false;
     try {
@@ -241,15 +249,6 @@ function registerDataStatsIpc() {
         cancelled: Boolean(out.cancelled),
       };
     } finally {
-      autoRanInMemory.add(today);
-      try {
-        store.appendAutoRun(today);
-      } catch (err) {
-        console.warn(
-          "[dataStats] 写入 auto-run.json 失败:",
-          (err && err.message) || err
-        );
-      }
       collecting = false;
     }
   });
