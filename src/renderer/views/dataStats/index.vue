@@ -11,8 +11,8 @@
           class="export-date-picker"
           value-format="yyyy-MM-dd"
           range-separator="至"
-          start-placeholder="开始日期"
-          end-placeholder="结束日期"
+          start-placeholder="默认近30天"
+          end-placeholder="默认最新日"
           :editable="false"
         />
         <el-button
@@ -212,11 +212,11 @@
                         <div v-if="p.workKey" class="work-row-actions">
                           <template v-if="!isRowUnlinked(row)">
                             <el-button
-                              v-if="p.matchedBy === 'fuzzy'"
+                              v-if="canConfirmWork(row, p)"
                               type="text"
                               size="mini"
                               :disabled="mutatingLink"
-                              @click="confirmSingleWork(p, row.contentKey)"
+                              @click="confirmSingleWork(p, row.contentKey, row)"
                             >
                               确认
                             </el-button>
@@ -616,8 +616,7 @@ import {
   updateSettings as updateAutoCollectSettings,
 } from "@/utils/statsScheduler";
 
-const DAY_MS = 86400000;
-const UNSTABLE_RECORD_KEY_RE = /^record:[^:]*:(?:.*:)?pos:\d+$/;
+const UNSTABLE_RECORD_KEY_RE = /^record:(?:.*:)?pos:\d+$/;
 const PLATFORM_ORDER = [
   "抖音",
   "视频号",
@@ -627,16 +626,6 @@ const PLATFORM_ORDER = [
   "百家号",
   "头条",
 ];
-
-function formatLocalYmd(ms) {
-  const d = new Date(ms);
-  const pad = (n) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-}
-
-function defaultExportRange(now = Date.now()) {
-  return [formatLocalYmd(now - 29 * DAY_MS), formatLocalYmd(now)];
-}
 
 function compareNullableMetric(a, b, key) {
   const av = a && a[key];
@@ -656,7 +645,8 @@ export default {
       overview: { daily: {}, accounts: [] },
       syncing: false,
       exporting: false,
-      exportRange: defaultExportRange(),
+      // 未手动调整导出区间时保持为空，由后端共享默认截止日（作品快照最新日）与近 30 天口径决定
+      exportRange: null,
       contentSummaryRows: [],
       contentSummaryDate: "",
       loadingSummary: false,
@@ -697,9 +687,7 @@ export default {
       return [...byPt.values()];
     },
     fuzzySummaryRows() {
-      return this.contentSummaryRows.filter(
-        (r) => !this.isRowUnlinked(r) && (r.matchMethod === "fuzzy" || r.hasFuzzy)
-      );
+      return this.contentSummaryRows.filter((r) => this.canConfirmRow(r));
     },
     displayedSummaryRows() {
       if (this.summaryFilter === "fuzzy") return this.fuzzySummaryRows;
@@ -725,10 +713,7 @@ export default {
     reassignTargetRows() {
       const kw = String(this.reassignKeyword || "").trim().toLowerCase();
       return this.contentSummaryRows.filter((r) => {
-        if (this.isRowUnlinked(r)) return false;
-        if (r.canAssignTarget === false || UNSTABLE_RECORD_KEY_RE.test(String(r.contentKey || ""))) {
-          return false;
-        }
+        if (!this.isRowAssignableTarget(r)) return false;
         if (this.reassignCurrentKey && r.contentKey === this.reassignCurrentKey) {
           return false;
         }
@@ -890,12 +875,18 @@ export default {
       if (item.matchedBy === "manual-detach") return { label: "已拆出", type: "warning" };
       return null;
     },
-    canConfirmRow(row) {
+    isRowAssignableTarget(row) {
       if (!row || this.isRowUnlinked(row)) return false;
-      if (row.canAssignTarget === false || UNSTABLE_RECORD_KEY_RE.test(String(row.contentKey || ""))) {
-        return false;
-      }
+      if (row.canAssignTarget === false) return false;
+      return !UNSTABLE_RECORD_KEY_RE.test(String(row.contentKey || ""));
+    },
+    canConfirmRow(row) {
+      if (!this.isRowAssignableTarget(row)) return false;
       return row.matchMethod === "fuzzy" || Boolean(row.hasFuzzy);
+    },
+    canConfirmWork(row, workItem) {
+      if (!workItem || workItem.matchedBy !== "fuzzy") return false;
+      return this.isRowAssignableTarget(row);
     },
     perPlatformList(row) {
       const map = (row && row.perPlatform) || {};
@@ -939,7 +930,7 @@ export default {
           out.push({
             ...cell,
             workId: fallbackId,
-            workKey: fallbackId ? `${cell.group}|${cell.platform}|${fallbackId}` : "",
+            workKey: fallbackId ? `${cell.platform}|${fallbackId}` : "",
             title: (row && row.title) || "(无标题)",
             url: Array.isArray(cell.urls) && cell.urls[0] ? cell.urls[0] : "",
             matchedBy: null,
@@ -1044,20 +1035,11 @@ export default {
     },
     async clearWorkOverride(workItem) {
       if (this.mutatingLink || !workItem || !workItem.workKey) return;
-      const keys =
-        Array.isArray(workItem.overrideWorkKeys) && workItem.overrideWorkKeys.length > 0
-          ? workItem.overrideWorkKeys
-          : [workItem.workKey];
       this.mutatingLink = true;
       try {
-        const res =
-          keys.length > 1
-            ? await ipcRenderer.invoke("stats:apply-link-overrides", {
-                ops: keys.map((workKey) => ({ action: "clear", workKey })),
-              })
-            : await ipcRenderer.invoke("stats:clear-link-override", {
-                workKey: keys[0],
-              });
+        const res = await ipcRenderer.invoke("stats:clear-link-override", {
+          workKey: workItem.workKey,
+        });
         if (!res || !res.ok) {
           this.$message.error((res && res.error) || "恢复自动关联失败");
           return;
@@ -1070,8 +1052,10 @@ export default {
         this.mutatingLink = false;
       }
     },
-    async confirmSingleWork(workItem, contentKey) {
+    async confirmSingleWork(workItem, contentKey, row) {
       if (this.mutatingLink || !workItem || !workItem.workKey || !contentKey) return;
+      if (row && !this.isRowAssignableTarget(row)) return;
+      if (UNSTABLE_RECORD_KEY_RE.test(String(contentKey))) return;
       this.mutatingLink = true;
       try {
         const res = await ipcRenderer.invoke("stats:set-link-override", {
@@ -1092,7 +1076,7 @@ export default {
       }
     },
     async confirmFuzzyRow(row) {
-      if (this.mutatingLink || !row || !row.contentKey) return;
+      if (this.mutatingLink || !row || !row.contentKey || !this.isRowAssignableTarget(row)) return;
       const works = this.perPlatformWorkList(row);
       const isAutoCluster =
         typeof row.contentKey === "string" && row.contentKey.startsWith("auto:");

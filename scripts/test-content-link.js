@@ -314,11 +314,16 @@ function captureWarn(fn) {
   assert.ok(contents.find((c) => c.contentKey === "file:d:/美食/final.mp4"));
   assert.ok(contents.find((c) => c.contentKey === "file:d:/旅行/final.mp4"));
 
-  // 无完整路径各自独立为 record:<日期>:<id或序号>
-  assert.ok(contents.find((c) => c.contentKey === "record:2026-11-12:rec-a"));
-  assert.ok(contents.find((c) => c.contentKey === "record:2026-11-12:rec-b"));
-  const noFileContents = contents.filter((c) => c.contentKey.startsWith("record:2026-11-13:"));
+  // 无完整路径：有不可变记录 id 生成 record:id:<id>（不含发布日期）；无 id 各自独立为 record:pos:<idx>（不可手工引用）
+  const recA = contents.find((c) => c.contentKey === "record:id:rec-a");
+  const recB = contents.find((c) => c.contentKey === "record:id:rec-b");
+  assert.ok(recA && recA.assignable === true);
+  assert.ok(recB && recB.assignable === true);
+  const noFileContents = contents.filter(
+    (c) => c.contentKey.startsWith("record:pos:") && c.firstPublishDate === "2026-11-13"
+  );
   assert.strictEqual(noFileContents.length, 2, "无文件名同标题两条记录绝不按标题合并");
+  assert.ok(noFileContents.every((c) => c.assignable === false), "无 id 无完整路径记录不可手工引用");
 
   // 历史有效直链确认纳入
   assert.ok(contents.find((c) => c.contentKey === "file:d:/历史/old.mp4"));
@@ -2742,75 +2747,440 @@ async function testMatchWorksIpcAmbiguity() {
     console.log("✓ S6-fix#12: 话题归一（先闭合后单#、紧贴英文/正文、保留 C#/F# 词内#）通过");
   }
 
-  // S6-fix#13: record: 键改用稳定身份哈希（删第一条不转移关联）与无法稳定旧位置键禁手工 assign
+  // S6-fix#13 + S6-r3#4: record: 键只由不可变身份生成（record:id:<id> 不含发布日期；无 id 无完整路径禁止手工引用 canAssignTarget=false）
   {
-    const legacyRecsTwo = [
-      { pt: "抖音", group: "G1", title: "旧无ID视频甲", date: "2026-11-10", publishStatus: "success" },
-      { pt: "抖音", group: "G1", title: "旧无ID视频乙", date: "2026-11-10", publishStatus: "success" },
-    ];
-    const idxTwo = buildContentIndex(legacyRecsTwo);
-    assert.strictEqual(idxTwo.length, 2);
-    const keyFirst = idxTwo.find((c) => c.displayTitle === "旧无ID视频甲").contentKey;
-    const keySecond = idxTwo.find((c) => c.displayTitle === "旧无ID视频乙").contentKey;
-    assert.ok(keyFirst.startsWith("record:2026-11-10:h_"), `无 id 记录应生成稳定哈希键: ${keyFirst}`);
-    assert.ok(keySecond.startsWith("record:2026-11-10:h_"));
-    assert.notStrictEqual(keyFirst, keySecond);
-
-    // 删掉第一条记录后，第二条记录的键保持不变，原指向第一条的手工 assign 绝不转移给第二条
-    const idxOnlySecond = buildContentIndex([legacyRecsTwo[1]]);
-    assert.strictEqual(idxOnlySecond[0].contentKey, keySecond);
-    const afterDeleteLink = linkWorks({
-      contents: idxOnlySecond,
+    // 4a. 有不可变 id 的记录跨日重发（lastPublishAt 变化）键不变，手工覆盖继续生效
+    const idRecDay1 = {
+      id: "immut_rec_1",
+      pt: "视频号",
+      group: "G1",
+      title: "跨日重发记录测试",
+      selectedFile: "clip.mp4",
+      date: "2026-11-10",
+      lastPublishAt: Date.parse("2026-11-10T04:00:00Z"),
+      publishStatus: "success",
+    };
+    const idRecDay2 = {
+      ...idRecDay1,
+      republishCount: 1,
+      lastPublishAt: Date.parse("2026-11-15T04:00:00Z"),
+    };
+    const idxDay1 = buildContentIndex([idRecDay1]);
+    const idxDay2 = buildContentIndex([idRecDay2]);
+    assert.strictEqual(idxDay1[0].contentKey, "record:id:immut_rec_1", "S6-r3#4: 有 id 记录键不得包含发布日期");
+    assert.strictEqual(idxDay1[0].assignable, true);
+    assert.strictEqual(idxDay2[0].contentKey, idxDay1[0].contentKey, "S6-r3#4: 跨日重发后 record: 键必须保持不变");
+    assert.strictEqual(idxDay2[0].firstPublishDate, "2026-11-15");
+    const keepOverrideAfterRepub = linkWorks({
+      contents: idxDay2,
       accounts: [
         {
           group: "G1",
           platform: "抖音",
-          works: [{ workId: "w_old", title: "完全无关的新标题", publishTime: Date.parse("2026-11-10T04:00:00Z") }],
+          works: [{ workId: "w_immut", title: "手工指定到跨日重发记录", publishTime: Date.parse("2026-11-10T04:00:00Z") }],
         },
       ],
       overrides: {
-        "G1|抖音|w_old": { action: "assign", contentKey: keyFirst },
+        "抖音|w_immut": { action: "assign", contentKey: idxDay1[0].contentKey },
       },
     });
     assert.deepStrictEqual(
-      afterDeleteLink.get("G1|抖音|w_old"),
-      { contentKey: null, matchedBy: null },
-      "S6-fix#13: 删除第一条旧记录后，第二条不得继承其键，手工关联不得转移"
+      keepOverrideAfterRepub.get("G1|抖音|w_immut"),
+      { contentKey: "record:id:immut_rec_1", matchedBy: "manual" },
+      "S6-r3#4: 跨日重发后既有手工关联必须继续生效"
     );
 
-    // 完全相同字段碰撞或无身份空壳记录 -> 退化为 :pos:N 且 assignable=false，不允许手工 assign
-    const collided = buildContentIndex([
-      { pt: "抖音", group: "G1", title: "完全重复记录", date: "2026-11-10", publishStatus: "success" },
-      { pt: "抖音", group: "G1", title: "完全重复记录", date: "2026-11-10", publishStatus: "success" },
-    ]);
-    assert.strictEqual(collided.length, 2);
-    assert.strictEqual(collided[0].assignable, false);
-    assert.strictEqual(isUnstableRecordKey(collided[0].contentKey), true);
-    const unstableAssignLink = linkWorks({
-      contents: collided,
+    // 4b. Review #4 复现：两条无 id 仅相对文件名 clip.mp4 + 不同 shortTitle 的视频号旧记录均不可手工引用，删第一条绝不转移关联
+    const sphLegacyA = {
+      pt: "视频号",
+      group: "G1",
+      date: "2026-11-18",
+      publishStatus: "success",
+      selectedFile: "clip.mp4",
+      shortTitle: "家庭咖啡磨豆器入门",
+    };
+    const sphLegacyB = {
+      ...sphLegacyA,
+      shortTitle: "家常红烧肉完整教程",
+    };
+    const onlyA = buildContentIndex([sphLegacyA]);
+    const onlyB = buildContentIndex([sphLegacyB]);
+    const bothAB = buildContentIndex([sphLegacyA, sphLegacyB]);
+    assert.strictEqual(onlyA[0].assignable, false, "S6-r3#4: 仅相对文件名+shortTitle 无 id 记录不得允许手工引用");
+    assert.strictEqual(isUnstableRecordKey(onlyA[0].contentKey), true);
+    assert.strictEqual(onlyB[0].assignable, false);
+    assert.ok(bothAB.every((c) => c.assignable === false && isUnstableRecordKey(c.contentKey)));
+    const transferLink = linkWorks({
+      contents: onlyB,
       accounts: [
         {
           group: "G1",
           platform: "抖音",
-          works: [{ workId: "w_pos", title: "待手工绑定作品", publishTime: Date.parse("2026-11-10T04:00:00Z") }],
+          works: [{ workId: "w_legacy_ref", title: "家庭咖啡磨豆器入门", publishTime: Date.parse("2026-11-18T04:00:00Z") }],
         },
       ],
       overrides: {
-        "G1|抖音|w_pos": { action: "assign", contentKey: collided[0].contentKey },
+        "抖音|w_legacy_ref": { action: "assign", contentKey: onlyA[0].contentKey },
       },
     });
     assert.deepStrictEqual(
-      unstableAssignLink.get("G1|抖音|w_pos"),
+      transferLink.get("G1|抖音|w_legacy_ref"),
       { contentKey: null, matchedBy: null },
-      "S6-fix#13: 不稳定旧位置键不允许被手工 assign"
+      "S6-r3#4: 无不可变身份记录禁止手工引用，删除第一条后绝不得将旧覆盖转移给第二条"
     );
     const unstableSummary = buildContentSummaryRows({
-      contents: collided,
+      contents: bothAB,
       accounts: [],
       worksDaily: {},
     });
-    assert.ok(unstableSummary.every((r) => r.canAssignTarget === false));
-    console.log("✓ S6-fix#13: record: 稳定哈希身份与不稳定位置键禁 assign 通过");
+    assert.ok(unstableSummary.every((r) => r.canAssignTarget === false), "S6-r3#4: 汇总行 canAssignTarget 必须为 false");
+
+    // 4c. 重复 id 碰撞同样退化为不可手工引用
+    const dupId = buildContentIndex([
+      { id: "dup_id_1", pt: "抖音", group: "G1", title: "重复ID甲", date: "2026-11-10", publishStatus: "success" },
+      { id: "dup_id_1", pt: "抖音", group: "G1", title: "重复ID乙", date: "2026-11-10", publishStatus: "success" },
+    ]);
+    assert.strictEqual(dupId.length, 2);
+    assert.ok(dupId.every((c) => c.assignable === false && isUnstableRecordKey(c.contentKey)));
+    console.log("✓ S6-r3#4: record: 不可变身份(record:id:<id>不含日期、跨日重发不换键、无id旧记录禁手工引用) 通过");
+  }
+
+  /* ---------- 13. S6-r3 第二轮评审返修回归：#3 / #6 / #7 / #8 ---------- */
+  // S6-r3#3: 集数冲突以目标/作品全部标题别名里任一明确集数先拒绝再评分（短标题不可绕过）
+  {
+    const day = "2026-11-10";
+    const pubTs = Date.parse(`${day}T04:00:00Z`);
+
+    // 3a. Review #3 精确复现（小桶路径）：视频号主标题第1集 + 短标题无集数 vs 唯一作品第2集 → 拒绝不误合
+    const sphEpRec = {
+      id: "sph-ep1",
+      pt: "视频号",
+      group: "G1",
+      publishStatus: "success",
+      filePath: "/v/hsr_ep1.mp4",
+      title: "家庭红烧肉完整教程第1集",
+      shortTitle: "家庭红烧肉完整教程",
+      date: day,
+    };
+    const smallRes = linkWorks({
+      contents: buildContentIndex([sphEpRec]),
+      accounts: [
+        {
+          group: "G1",
+          platform: "视频号",
+          works: [{ workId: "w_ep2", title: "家庭红烧肉完整教程第2集", publishTime: pubTs }],
+        },
+      ],
+    });
+    assert.deepStrictEqual(
+      smallRes.get("G1|视频号|w_ep2"),
+      { contentKey: null, matchedBy: null },
+      "S6-r3#3(testS6r3EpisodeConflictAcrossAliases): 视频号短标题不得绕过主标题第1集与作品第2集的集数冲突检查"
+    );
+
+    // 同记录遇第1集作品应正常命中
+    const matchEp1Res = linkWorks({
+      contents: buildContentIndex([sphEpRec]),
+      accounts: [
+        {
+          group: "G1",
+          platform: "视频号",
+          works: [{ workId: "w_ep1", title: "家庭红烧肉完整教程第1集完整精讲", publishTime: pubTs }],
+        },
+      ],
+    });
+    assert.strictEqual(matchEp1Res.get("G1|视频号|w_ep1").contentKey, "file:/v/hsr_ep1.mp4");
+    assert.strictEqual(matchEp1Res.get("G1|视频号|w_ep1").matchedBy, "fuzzy");
+
+    // 3b. 主标题极短（仅「第1集」，core<4 被 preparedCores 过滤）+ 短标题无集数 vs 第2集作品 → 仍须先拒绝
+    const shortMainRec = {
+      id: "sph-short-ep1",
+      pt: "视频号",
+      group: "G1",
+      publishStatus: "success",
+      filePath: "/v/short_main_ep1.mp4",
+      title: "第1集",
+      shortTitle: "家庭红烧肉完整教程",
+      date: day,
+    };
+    const shortMainRes = linkWorks({
+      contents: buildContentIndex([shortMainRec]),
+      accounts: [
+        {
+          group: "G1",
+          platform: "视频号",
+          works: [{ workId: "w_ep2_b", title: "家庭红烧肉完整教程第2集", publishTime: pubTs }],
+        },
+      ],
+    });
+    assert.deepStrictEqual(
+      shortMainRes.get("G1|视频号|w_ep2_b"),
+      { contentKey: null, matchedBy: null },
+      "S6-r3#3: 即便主标题核心长度<4，其明确集数仍须拒绝第2集作品"
+    );
+
+    // 3c. 大桶（>32 alias 倒排路径）同样拒绝短标题绕过
+    const fillerRecs = [sphEpRec];
+    for (let i = 0; i < 40; i++) {
+      fillerRecs.push({
+        id: `filler-${i}`,
+        pt: "视频号",
+        group: "G1",
+        publishStatus: "success",
+        filePath: `/v/filler_${i}.mp4`,
+        title: `无关填充视频主题编号${String(i).padStart(3, "0")}分享`,
+        date: day,
+      });
+    }
+    const largeRes = linkWorks({
+      contents: buildContentIndex(fillerRecs),
+      accounts: [
+        {
+          group: "G1",
+          platform: "视频号",
+          works: [{ workId: "w_ep2_big", title: "家庭红烧肉完整教程第2集", publishTime: pubTs }],
+        },
+      ],
+    });
+    assert.deepStrictEqual(
+      largeRes.get("G1|视频号|w_ep2_big"),
+      { contentKey: null, matchedBy: null },
+      "S6-r3#3: 大桶倒排路径同样必须先按目标全部别名集数拒绝冲突"
+    );
+
+    // 3d. 作品侧同理：作品主标题无集数、短标题/别名含第2集 → 遇第1集目标(③)与另一平台第1集作品(④)均拒绝
+    const workSideStep3 = linkWorks({
+      contents: buildContentIndex([
+        {
+          id: "t-ep1",
+          pt: "抖音",
+          group: "G1",
+          publishStatus: "success",
+          filePath: "/v/work_side_ep1.mp4",
+          title: "家庭红烧肉完整教程第1集",
+          date: day,
+        },
+      ]),
+      accounts: [
+        {
+          group: "G1",
+          platform: "抖音",
+          works: [
+            {
+              workId: "w_alias_ep2",
+              title: "家庭红烧肉完整教程",
+              shortTitle: "家庭红烧肉完整教程第2集",
+              publishTime: pubTs,
+            },
+          ],
+        },
+      ],
+    });
+    assert.deepStrictEqual(
+      workSideStep3.get("G1|抖音|w_alias_ep2"),
+      { contentKey: null, matchedBy: null },
+      "S6-r3#3: 作品侧短标题明确集数第2集必须拒绝第1集发布目标"
+    );
+
+    const workSideStep4 = linkWorks({
+      contents: [],
+      accounts: [
+        {
+          group: "G1",
+          platform: "抖音",
+          works: [
+            {
+              workId: "w4_a",
+              title: "家庭红烧肉完整教程",
+              shortTitle: "家庭红烧肉完整教程第2集",
+              publishTime: pubTs,
+            },
+          ],
+        },
+        {
+          group: "G1",
+          platform: "快手",
+          works: [
+            {
+              workId: "w4_b",
+              title: "家庭红烧肉完整教程第1集",
+              publishTime: pubTs,
+            },
+          ],
+        },
+      ],
+    });
+    assert.deepStrictEqual(
+      workSideStep4.get("G1|抖音|w4_a"),
+      { contentKey: null, matchedBy: null },
+      "S6-r3#3: ④ 跨平台聚类作品侧短标题集数第2集必须拒绝第1集作品"
+    );
+    console.log("✓ S6-r3#3: 目标与作品全部标题别名集数冲突先拒绝再评分通过");
+  }
+
+  // S6-r3#6: 话题归一先按闭合话题边界剥离（#…# 优先于词内 C#），再保护话题外 C#/F#
+  {
+    assert.strictEqual(extractCoreTitle("零基础教程#C#第1集"), "零基础教程第1集");
+    assert.strictEqual(extractCoreTitle("零基础教程#C#第2集"), "零基础教程第2集");
+    assert.strictEqual(
+      computeTitleSimilarity("零基础教程#C#第1集", "零基础教程#C#第2集"),
+      0,
+      "S6-r3#6(testS6r3ClosedTopicPrecedence): #C# 闭合话题结束符不得被词内 C# 抢占吞掉第1集/第2集"
+    );
+    assert.strictEqual(extractCoreTitle("学C#入门"), "学c#入门", "S6-r3#6: 话题外 学C#入门 必须保留 C#");
+    assert.strictEqual(extractCoreTitle("学F#入门"), "学f#入门", "S6-r3#6: 话题外 学F#入门 必须保留 F#");
+    assert.strictEqual(extractCoreTitle("C#教程#C#第1集"), "c#教程第1集");
+    assert.strictEqual(extractCoreTitle("C#和F#对比教程"), "c#和f#对比教程");
+
+    const topicCluster = linkWorks({
+      contents: [],
+      accounts: [
+        {
+          group: "G1",
+          platform: "抖音",
+          works: [{ workId: "tc1", title: "零基础教程#C#第1集", publishTime: Date.parse("2026-11-10T04:00:00Z") }],
+        },
+        {
+          group: "G1",
+          platform: "快手",
+          works: [{ workId: "tc2", title: "零基础教程#C#第2集", publishTime: Date.parse("2026-11-10T05:00:00Z") }],
+        },
+      ],
+    });
+    assert.deepStrictEqual(
+      topicCluster.get("G1|抖音|tc1"),
+      { contentKey: null, matchedBy: null },
+      "S6-r3#6: 零基础教程#C#第1集 vs 第2集 跨平台不得误合"
+    );
+    assert.deepStrictEqual(topicCluster.get("G1|快手|tc2"), { contentKey: null, matchedBy: null });
+    console.log("✓ S6-r3#6: 闭合话题边界优先于词内 C# 保护、话题外保留 C#/F# 通过");
+  }
+
+  // S6-r3#7: 二元组键无精度损失（Float64Array），「李家族谱甲」vs「𦝎家族谱乙」= 0.50 且不误合
+  {
+    const simCjkExt = computeTitleSimilarity("李家族谱甲", "𦝎家族谱乙");
+    assert.strictEqual(
+      simCjkExt,
+      0.5,
+      `S6-r3#7(testS6r3LosslessBigramKey): 「李家族谱甲」vs「𦝎家族谱乙」Dice 必须精确为 0.50，实测 ${simCjkExt}`
+    );
+    const extCluster = linkWorks({
+      contents: [],
+      accounts: [
+        {
+          group: "G1",
+          platform: "抖音",
+          works: [{ workId: "ext1", title: "李家族谱甲", publishTime: Date.parse("2026-11-10T04:00:00Z") }],
+        },
+        {
+          group: "G1",
+          platform: "快手",
+          works: [{ workId: "ext2", title: "𦝎家族谱乙", publishTime: Date.parse("2026-11-10T05:00:00Z") }],
+        },
+      ],
+    });
+    assert.deepStrictEqual(
+      extCluster.get("G1|抖音|ext1"),
+      { contentKey: null, matchedBy: null },
+      "S6-r3#7: 两平台同日仅有「李家族谱甲」与「𦝎家族谱乙」(Dice=0.50<0.60) 不得误合"
+    );
+    assert.deepStrictEqual(extCluster.get("G1|快手|ext2"), { contentKey: null, matchedBy: null });
+    console.log("✓ S6-r3#7: 二元组键 Float64 无损编码（「李家族谱甲」vs「𦝎家族谱乙」=0.50）通过");
+  }
+
+  // S6-r3#8: assign 不得改变其他作品的自动归属（auto 簇成员被 assign 走后，剩余成员保留原 auto 键与 fuzzy 标记）
+  {
+    const dayTs8 = Date.parse("2026-11-10T04:00:00Z");
+    const targetContent = buildContentIndex([
+      {
+        id: "t-other",
+        pt: "抖音",
+        group: "G1",
+        title: "完全独立的目标素材视频",
+        filePath: "/v/other_target.mp4",
+        publishStatus: "success",
+        date: "2026-11-10",
+      },
+    ]);
+
+    // 8a. 2 成员 auto 簇：抖音改合并到 file: 后，快手保留原 auto 键与 fuzzy 标记，汇总显示单平台
+    const pairAccounts = [
+      {
+        group: "G1",
+        platform: "抖音",
+        works: [{ workId: "a8_dy", title: "周末阳台种菜新手避坑完整指南", publishTime: dayTs8 }],
+      },
+      {
+        group: "G1",
+        platform: "快手",
+        works: [{ workId: "a8_ks", title: "周末阳台种菜新手避坑完整指南", publishTime: dayTs8 }],
+      },
+    ];
+    const basePair = linkWorks({ contents: targetContent, accounts: pairAccounts });
+    const pairAutoKey = basePair.get("G1|抖音|a8_dy").contentKey;
+    const ksBaseScore = basePair.get("G1|快手|a8_ks").score;
+    assert.ok(pairAutoKey && pairAutoKey.startsWith("auto:"));
+    assert.strictEqual(basePair.get("G1|快手|a8_ks").contentKey, pairAutoKey);
+
+    const afterAssignOne = linkWorks({
+      contents: targetContent,
+      accounts: pairAccounts,
+      overrides: {
+        "抖音|a8_dy": { action: "assign", contentKey: "file:/v/other_target.mp4" },
+      },
+    });
+    assert.deepStrictEqual(afterAssignOne.get("G1|抖音|a8_dy"), {
+      contentKey: "file:/v/other_target.mp4",
+      matchedBy: "manual",
+    });
+    assert.deepStrictEqual(
+      afterAssignOne.get("G1|快手|a8_ks"),
+      { contentKey: pairAutoKey, matchedBy: "fuzzy", score: ksBaseScore },
+      "S6-r3#8(testS6r3AssignPreservesPeerAutoCluster): 把抖音成员 assign 走后，快手成员必须保留原 auto 键与 fuzzy 标记"
+    );
+
+    const pairSummary = buildContentSummaryRows({
+      contents: targetContent,
+      accounts: pairAccounts,
+      worksDaily: {
+        "G1|抖音": { a8_dy: { "2026-11-12": { play: 100 } } },
+        "G1|快手": { a8_ks: { "2026-11-12": { play: 250 } } },
+      },
+      overrides: {
+        "抖音|a8_dy": { action: "assign", contentKey: "file:/v/other_target.mp4" },
+      },
+    });
+    const remainingAutoRow = pairSummary.find((r) => r.contentKey === pairAutoKey);
+    assert.ok(remainingAutoRow, "S6-r3#8: 汇总中仅剩 1 成员的 auto 簇行应保留");
+    assert.strictEqual(remainingAutoRow.platformCount, 1, "剩余 1 成员时汇总显示为单平台");
+    assert.strictEqual(remainingAutoRow.matchMethod, "fuzzy");
+    assert.strictEqual(remainingAutoRow.hasFuzzy, true);
+    assert.strictEqual(remainingAutoRow.totalPlay, 250);
+
+    // 8b. 3 成员 auto 簇：抖音改合并走后，剩余 2 成员（快手+小红书）保留原 auto 键与 fuzzy 标记
+    const tripleAccounts = [
+      ...pairAccounts,
+      {
+        group: "G1",
+        platform: "小红书",
+        works: [{ workId: "a8_xhs", title: "周末阳台种菜新手避坑完整指南", publishTime: dayTs8 }],
+      },
+    ];
+    const baseTriple = linkWorks({ contents: targetContent, accounts: tripleAccounts });
+    const tripleAutoKey = baseTriple.get("G1|抖音|a8_dy").contentKey;
+    assert.ok(tripleAutoKey && tripleAutoKey.startsWith("auto:"));
+    const afterAssignTriple = linkWorks({
+      contents: targetContent,
+      accounts: tripleAccounts,
+      overrides: {
+        "抖音|a8_dy": { action: "assign", contentKey: "file:/v/other_target.mp4" },
+      },
+    });
+    assert.strictEqual(afterAssignTriple.get("G1|快手|a8_ks").contentKey, tripleAutoKey);
+    assert.strictEqual(afterAssignTriple.get("G1|快手|a8_ks").matchedBy, "fuzzy");
+    assert.strictEqual(afterAssignTriple.get("G1|小红书|a8_xhs").contentKey, tripleAutoKey);
+    assert.strictEqual(afterAssignTriple.get("G1|小红书|a8_xhs").matchedBy, "fuzzy");
+    console.log("✓ S6-r3#8: assign 不改变其他作品自动归属（剩余 ≥2 或仅剩 1 条均保留原 auto 键与 fuzzy 标记）通过");
   }
 
   // S6-fix#7: 性能基准（常规 2000×2000 + 评审密集 63 字前缀 × 3 别名 + ④ 3 平台各 2000 条）

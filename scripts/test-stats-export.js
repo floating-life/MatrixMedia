@@ -2096,8 +2096,8 @@ async function main() {
             },
           },
           overrides: {
-            "S6组|抖音|S6_DY_MAN": { action: "assign", contentKey: "manual:s6merge" },
-            "S6组|快手|S6_KS_MAN": { action: "assign", contentKey: "manual:s6merge" },
+            "抖音|S6_DY_MAN": { action: "assign", contentKey: "manual:s6merge" },
+            "快手|S6_KS_MAN": { action: "assign", contentKey: "manual:s6merge" },
           },
         }),
       };
@@ -2216,7 +2216,7 @@ async function main() {
           updatedAt: dayTs("2026-11-18"),
           contents: {},
           overrides: {
-            "A组|抖音|A_W1": { action: "assign", contentKey: "file:/videos/b_shared_target.mp4" },
+            "抖音|A_W1": { action: "assign", contentKey: "file:/videos/b_shared_target.mp4" },
           },
         }),
       };
@@ -2305,7 +2305,128 @@ async function main() {
         4,
         `S6-fix#7: 单次导出内对同一数据集+cutoff 应仅跑 1 次 linkWorks（预期读 title 4 次，实际 ${titleReadCount} 次）`
       );
-      console.log("✓ S6-fix#10(跨组手工引用先解析后裁剪+共享默认截止日) & S6-fix#7(同次导出单次匹配复用) 通过");
+      // S6-r3#10(testS6r3DefaultExportCutoffVsExplicitTo):
+      // 未传 from/to 时用共享默认截止日 11-18（排除 11-19 新目标）；显式传手动调整区间 to=11-19 时才纳入 11-19 目标
+      const explicitRangeWb = buildStatsWorkbookData(
+        { from: "2026-11-01", to: "2026-11-19", now: dayTs("2026-11-20") },
+        crossRefDeps
+      );
+      assert.strictEqual(explicitRangeWb.to, "2026-11-19");
+      assert.strictEqual(
+        explicitRangeWb.sheets["作品跨平台汇总"].slice(1).some((r) => r[0] === "file:/videos/only_on_19.mp4"),
+        true,
+        "S6-r3#10: 手动指定 to=2026-11-19 时应纳入 19 日发布目标"
+      );
+
+      // S6-r3#1(testS6r3ExportCrossGroupWorkIdentity):
+      // 同一作品跨 A/B 两组观测时：全量按作品身份 platform|workId 裁决一次，日明细/全量汇总/GUI/单组导出必须完全一致
+      const crossWorkIdDeps = {
+        listAccounts: () => [
+          { group: "A组", platform: "抖音" },
+          { group: "B组", platform: "抖音" },
+        ],
+        readWorks: () => ({
+          works: [
+            {
+              workId: "SHARED_1",
+              title: "跨组共享已拆出作品",
+              url: "https://www.douyin.com/video/shared1",
+              publishTime: dayTs("2026-11-18"),
+            },
+            {
+              workId: "CONF_1",
+              title: "跨组归属冲突作品",
+              url: "https://www.douyin.com/video/conf1",
+              publishTime: dayTs("2026-11-18"),
+            },
+          ],
+        }),
+        readWorksDaily: (group) =>
+          group === "A组"
+            ? {
+                SHARED_1: { "2026-11-18": { play: 100 } },
+                CONF_1: { "2026-11-18": { play: 200 } },
+              }
+            : {
+                SHARED_1: { "2026-11-18": { play: 100 } },
+                CONF_1: { "2026-11-18": { play: 200 } },
+              },
+        readDaily: () => ({}),
+        readPushRecords: () => [
+          {
+            id: "sh-a",
+            pt: "抖音",
+            group: "A组",
+            publishStatus: "success",
+            title: "跨组共享已拆出作品",
+            filePath: "/videos/shared_1.mp4",
+            videoLink: "https://www.douyin.com/video/shared1",
+            lastPublishAt: dayTs("2026-11-18"),
+          },
+          {
+            id: "sh-b",
+            pt: "抖音",
+            group: "B组",
+            publishStatus: "success",
+            title: "跨组共享已拆出作品",
+            filePath: "/videos/shared_1.mp4",
+            videoLink: "https://www.douyin.com/video/shared1",
+            lastPublishAt: dayTs("2026-11-18"),
+          },
+          {
+            id: "cf-a",
+            pt: "抖音",
+            group: "A组",
+            publishStatus: "success",
+            title: "冲突素材甲",
+            filePath: "/videos/conf_a.mp4",
+            videoLink: "https://www.douyin.com/video/conf1",
+            lastPublishAt: dayTs("2026-11-18"),
+          },
+          {
+            id: "cf-b",
+            pt: "抖音",
+            group: "B组",
+            publishStatus: "success",
+            title: "冲突素材乙",
+            filePath: "/videos/conf_b.mp4",
+            videoLink: "https://www.douyin.com/video/conf1",
+            lastPublishAt: dayTs("2026-11-18"),
+          },
+        ],
+        readLinkOverrides: () => ({
+          version: 1,
+          updatedAt: dayTs("2026-11-18"),
+          contents: {},
+          overrides: {
+            "抖音|SHARED_1": { action: "detach" },
+          },
+        }),
+      };
+
+      const cwGui = buildContentSummaryData({}, crossWorkIdDeps);
+      const cwFullWb = buildStatsWorkbookData({ now: dayTs("2026-11-18") }, crossWorkIdDeps);
+      const cwOnlyBWb = buildStatsWorkbookData({ groups: ["B组"], now: dayTs("2026-11-18") }, crossWorkIdDeps);
+
+      assert.ok(cwGui.rows.find((r) => r.contentKey === "unlinked:抖音:SHARED_1"));
+      assert.ok(cwGui.rows.find((r) => r.contentKey === "unlinked:抖音:CONF_1"));
+      const cwFullDaily = cwFullWb.sheets["作品日明细"].slice(1);
+      assert.strictEqual(cwFullDaily.length, 4);
+      assert.ok(
+        cwFullDaily.every((r) => r[3] === null && r[4] === null),
+        "S6-r3#1: 全量日明细中拆出作品与跨组冲突作品在两组观测下均必须为空归属"
+      );
+      const cwOnlyBDaily = cwOnlyBWb.sheets["作品日明细"].slice(1);
+      assert.strictEqual(cwOnlyBDaily.length, 2);
+      assert.ok(
+        cwOnlyBDaily.every((r) => r[3] === null && r[4] === null),
+        "S6-r3#1: 只导 B 组日明细复用全量按作品身份裁决结果，拆出与冲突作品均须保持未关联"
+      );
+      const cwOnlyBSum = cwOnlyBWb.sheets["作品跨平台汇总"].slice(1);
+      assert.ok(cwOnlyBSum.find((r) => r[0] === "unlinked:抖音:SHARED_1"));
+      assert.ok(cwOnlyBSum.find((r) => r[0] === "unlinked:抖音:CONF_1"));
+
+      console.log("✓ S6-fix#10(跨组手工引用先解析后裁剪+共享默认截止日) & S6-fix#7(同次导出单次匹配复用) & S6-r3#1/#10 通过");
     }
 
     // 恢复 require.cache

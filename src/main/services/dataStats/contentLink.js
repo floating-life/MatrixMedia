@@ -55,16 +55,18 @@ const FUZZY_THRESHOLDS = Object.freeze({
 });
 
 const KEYCAP_EMOJI_RE = /[#*0-9]\uFE0F?\u20E3/g;
-// 保护词内 #（如 C#、F#、J#、Q#，以及后接空白/标点/音调词的乐理音名 D#、G#、A# 等）
-const WORD_INTERNAL_HASH_RE =
-  /(?<![A-Za-z0-9])(?:([CcFfJjQq])#(?!\[话题\]#)|([A-Ga-g])#(?=$|[\s.,!?;:)\]}\-/]|大调|小调|和弦|调|音|major|minor|m(?![A-Za-z])))/g;
+// 话题外词内 # 保护（如 C#、F#、J#、Q#，以及后接空白/标点/音调词的乐理音名 D#、G#、A# 等）；
+// 扫描时闭合话题（#…[话题]#、#…#）优先于词内 #，避免 #C# 的结束符被词内规则抢占
+const WORD_INTERNAL_HASH_STICKY_RE =
+  /(?:([CcFfJjQq])#(?!\[话题\]#)|([A-Ga-g])#(?=$|[\s.,!?;:)\]}\-/]|大调|小调|和弦|调|音|major|minor|m(?![A-Za-z])))/y;
 const HASH_PLACEHOLDER = "\u0000";
-const XHS_TOPIC_RE = /#[^\s#]+\[话题\]#/g;
-const WRAPPED_TOPIC_RE = /#[^\s#]+#/g;
-const SINGLE_TOPIC_RE = /#[^\s#]+/g;
+const XHS_TOPIC_STICKY_RE = /#[^\s#]+\[话题\]#/y;
+const WRAPPED_TOPIC_STICKY_RE = /#[^\s#]+#/y;
+const SINGLE_TOPIC_STICKY_RE = /#[^\s#]+/y;
+const ASCII_ALNUM_RE = /[A-Za-z0-9]/;
 const EXT_PICTOGRAPHIC_RE = /\p{Extended_Pictographic}/gu;
 const NON_LETTER_NUM_OR_PH_RE = /[^\p{L}\p{N}\u0000]/gu;
-const UNSTABLE_RECORD_KEY_RE = /^record:[^:]*:(?:.*:)?pos:\d+$/;
+const UNSTABLE_RECORD_KEY_RE = /^record:(?:.*:)?pos:\d+$/;
 const DAY_BUCKET_INDEX_THRESHOLD = 32;
 
 const ZH_DIGIT_MAP = {
@@ -179,45 +181,84 @@ function normalizeStatusTitle(s) {
   return toSafeString(s).replace(ZERO_WIDTH_RE, "").trim();
 }
 
-function protectWordInternalHash(text) {
-  return text.replace(WORD_INTERNAL_HASH_RE, (_, g1, g2) => `${g1 || g2}${HASH_PLACEHOLDER}`);
+/**
+ * 单遍从左到右剥离话题并保护话题外词内 #：
+ * - 遇到 # 时优先按完整闭合话题（#xx[话题]#、#xx#）边界剥离，确保 #C# 的结束符不被词内 C# 抢占；
+ *   其次剥离单 #xx（遇到空白或下一个 # 截止，不吞后续正文）
+ * - 仅对话题外、且前一个字符非 ASCII 字母数字的 C#/F#/J#/Q#/乐理音名 D# 等保护为占位符
+ */
+function stripTopicsAndProtectHash(s) {
+  const normalized = normalizeTitle(s);
+  if (!normalized) return "";
+  const text = normalized.replace(/\u0000/g, "").replace(KEYCAP_EMOJI_RE, "");
+  let out = "";
+  let i = 0;
+  const len = text.length;
+  while (i < len) {
+    const ch = text[i];
+    if (ch === "#") {
+      XHS_TOPIC_STICKY_RE.lastIndex = i;
+      let m = XHS_TOPIC_STICKY_RE.exec(text);
+      if (m) {
+        out += " ";
+        i += m[0].length;
+        continue;
+      }
+      WRAPPED_TOPIC_STICKY_RE.lastIndex = i;
+      m = WRAPPED_TOPIC_STICKY_RE.exec(text);
+      if (m) {
+        out += " ";
+        i += m[0].length;
+        continue;
+      }
+      SINGLE_TOPIC_STICKY_RE.lastIndex = i;
+      m = SINGLE_TOPIC_STICKY_RE.exec(text);
+      if (m) {
+        out += " ";
+        i += m[0].length;
+        continue;
+      }
+      out += ch;
+      i++;
+      continue;
+    }
+    if (i + 1 < len && text[i + 1] === "#") {
+      if (i === 0 || !ASCII_ALNUM_RE.test(text[i - 1])) {
+        WORD_INTERNAL_HASH_STICKY_RE.lastIndex = i;
+        const m = WORD_INTERNAL_HASH_STICKY_RE.exec(text);
+        if (m) {
+          out += `${m[1] || m[2]}${HASH_PLACEHOLDER}`;
+          i += 2;
+          continue;
+        }
+      }
+    }
+    out += ch;
+    i++;
+  }
+  return out;
 }
 
 /**
  * 模糊匹配用话题剥离（保留括号、标点与空白，供集数解析与核心标题提取共用）：
- * 1. 先去键帽 emoji 并保护 C#/F# 等词内 #
- * 2. 先剥完整闭合话题（#xx[话题]#、#xx#）
- * 3. 再剥单 #xx（遇到空白或下一个 # 截止，不吞后续正文）
- * 4. 还原词内 #
+ * 1. 先按闭合话题边界（#xx[话题]#、#xx#）剥离，再剥单 #xx
+ * 2. 对话题外文本保护并还原 C#/F# 等词内 #
  */
 function stripTopicsForFuzzy(s) {
-  const normalized = normalizeTitle(s);
-  if (!normalized) return "";
-  return protectWordInternalHash(
-    normalized.replace(/\u0000/g, "").replace(KEYCAP_EMOJI_RE, "")
-  )
-    .replace(XHS_TOPIC_RE, " ")
-    .replace(WRAPPED_TOPIC_RE, " ")
-    .replace(SINGLE_TOPIC_RE, " ")
-    .replace(/\u0000/g, "#")
-    .replace(/\s+/g, " ")
-    .trim();
+  const stripped = stripTopicsAndProtectHash(s);
+  if (!stripped) return "";
+  return stripped.replace(/\u0000/g, "#").replace(/\s+/g, " ").trim();
 }
 
 /**
  * 提取模糊匹配核心标题：
- * normalizeTitle 后先剥完整闭合话题（#xx[话题]#、#xx#）再剥单 #xx，
- * 保留 C#/F# 等词内 #，再去 emoji、标点与空白，并转小写。
+ * normalizeTitle 后先按闭合话题边界剥离、再剥单 #xx，同时对话题外文本保留 C#/F# 等词内 #，
+ * 再去 emoji、标点与空白，并转小写。
  */
 function extractCoreTitle(s) {
-  const normalized = normalizeTitle(s);
-  if (!normalized) return "";
-  return protectWordInternalHash(
-    normalized.replace(/\u0000/g, "").replace(KEYCAP_EMOJI_RE, "")
-  )
-    .replace(XHS_TOPIC_RE, " ")
-    .replace(WRAPPED_TOPIC_RE, " ")
-    .replace(SINGLE_TOPIC_RE, " ")
+  const stripped = stripTopicsAndProtectHash(s);
+  if (!stripped) return "";
+  return stripped
     .replace(EXT_PICTOGRAPHIC_RE, "")
     .replace(NON_LETTER_NUM_OR_PH_RE, "")
     .replace(/\u0000/g, "#")
@@ -281,17 +322,9 @@ const SECTION_BRACKET_RE = /[(\[]\s*(上|中|下)\s*(?:集|篇|部|卷|期|半�
 const SECTION_UNIT_RE = /(上|中|下)(?:集|篇|部|卷|半场|半部)/g;
 const SECTION_TAIL_RE = /(?:[\s\-_|·:/])(上|中|下)(?=$|[\s\-_|·:/)])/g;
 
-/**
- * 提取标题中的系列序号标记（季/集期话课部/EP/Part/(N)/上中下）。
- * 无法提取返回 null；否则返回规范化字符串签名 `{ seasonKey, episodeKey, sectionKey }`。
- */
-function extractSeriesMarkers(rawTitle) {
+function collectSeriesSets(rawTitle, seasons, episodes, sections) {
   const clean = stripTopicsForFuzzy(rawTitle);
-  if (!clean) return null;
-
-  const seasons = new Set();
-  const episodes = new Set();
-  const sections = new Set();
+  if (!clean) return;
   let m;
 
   SEASON_ZH_RE.lastIndex = 0;
@@ -348,7 +381,9 @@ function extractSeriesMarkers(rawTitle) {
   while ((m = SECTION_TAIL_RE.exec(clean)) !== null) {
     sections.add(m[1]);
   }
+}
 
+function formatSeriesSets(seasons, episodes, sections) {
   if (seasons.size === 0 && episodes.size === 0 && sections.size === 0) {
     return null;
   }
@@ -364,6 +399,34 @@ function extractSeriesMarkers(rawTitle) {
   };
 }
 
+/**
+ * 提取标题中的系列序号标记（季/集期话课部/EP/Part/(N)/上中下）。
+ * 无法提取返回 null；否则返回规范化字符串签名 `{ seasonKey, episodeKey, sectionKey }`。
+ */
+function extractSeriesMarkers(rawTitle) {
+  const seasons = new Set();
+  const episodes = new Set();
+  const sections = new Set();
+  collectSeriesSets(rawTitle, seasons, episodes, sections);
+  return formatSeriesSets(seasons, episodes, sections);
+}
+
+/**
+ * 汇总多条标题别名（如主标题+短标题等）中全部明确系列序号标记，
+ * 供目标侧与作品侧在打分前统一拒绝集数冲突（防止无集数短标题绕过主标题集数冲突检查）。
+ */
+function extractSeriesMarkersFromTitles(titles) {
+  const seasons = new Set();
+  const episodes = new Set();
+  const sections = new Set();
+  const list = Array.isArray(titles) ? titles : [titles];
+  for (const t of list) {
+    if (t == null || t === "") continue;
+    collectSeriesSets(t, seasons, episodes, sections);
+  }
+  return formatSeriesSets(seasons, episodes, sections);
+}
+
 function hasConflictingSeries(sa, sb) {
   if (!sa || !sb) return false;
   if (sa.seasonKey && sb.seasonKey && sa.seasonKey !== sb.seasonKey) return true;
@@ -373,6 +436,7 @@ function hasConflictingSeries(sa, sb) {
 }
 
 const EMPTY_INT32 = new Int32Array(0);
+const EMPTY_FLOAT64 = new Float64Array(0);
 
 function prepareCore(rawTitle) {
   const core = extractCoreTitle(rawTitle);
@@ -382,8 +446,8 @@ function prepareCore(rawTitle) {
       len: 0,
       eligible: false,
       series: null,
-      bigrams: EMPTY_INT32,
-      uniqueBigrams: EMPTY_INT32,
+      bigrams: EMPTY_FLOAT64,
+      uniqueBigrams: EMPTY_FLOAT64,
       uniqueCounts: EMPTY_INT32,
     };
   }
@@ -395,13 +459,14 @@ function prepareCore(rawTitle) {
       len,
       eligible: false,
       series: null,
-      bigrams: EMPTY_INT32,
-      uniqueBigrams: EMPTY_INT32,
+      bigrams: EMPTY_FLOAT64,
+      uniqueBigrams: EMPTY_FLOAT64,
       uniqueCounts: EMPTY_INT32,
     };
   }
   const bgLen = len - 1;
-  const bigrams = new Int32Array(bgLen);
+  // cp1 * 0x110000 + cp2 最大约 1.24e12（41 bit），用 Float64Array 保留 53 bit 完整整数精度，避免 Int32 截断碰撞
+  const bigrams = new Float64Array(bgLen);
   for (let i = 0; i < bgLen; i++) {
     bigrams[i] = chars[i].codePointAt(0) * 0x110000 + chars[i + 1].codePointAt(0);
   }
@@ -411,7 +476,7 @@ function prepareCore(rawTitle) {
   for (let i = 0; i < bgLen; i++) {
     if (i === 0 || bigrams[i] !== bigrams[i - 1]) uniqueCount++;
   }
-  const uniqueBigrams = new Int32Array(uniqueCount);
+  const uniqueBigrams = new Float64Array(uniqueCount);
   const uniqueCounts = new Int32Array(uniqueCount);
   let uIdx = -1;
   for (let i = 0; i < bgLen; i++) {
@@ -529,6 +594,19 @@ function isUnstableRecordKey(key) {
   return typeof key === "string" && UNSTABLE_RECORD_KEY_RE.test(key);
 }
 
+/** 作品身份键：`platform|workId`（不含 group，同一账号挂多分组共享同一作品身份） */
+function makeWorkIdentityKey(platform, workId) {
+  return `${toSafeString(platform)}|${toSafeString(workId)}`;
+}
+
+/** 校验合法的作品身份键 `platform|workId`（恰含一个 `|` 且两端均非空） */
+function isValidWorkIdentityKey(key) {
+  if (typeof key !== "string" || !key) return false;
+  const sep = key.indexOf("|");
+  if (sep <= 0 || sep >= key.length - 1) return false;
+  return key.indexOf("|", sep + 1) === -1;
+}
+
 /**
  * 基于簇内排序后的成员身份（platform|workId，不含 group）计算确定性 auto:<hash>。
  * 同一组作品在多个分组重复出现时生成同一键，避免跨组去重判冲突。
@@ -544,7 +622,7 @@ function computeAutoClusterKey(sortedMemberKeys) {
 
 /**
  * 清洗手工矫正配置，兼容传入 `{ version, updatedAt, contents?, overrides }` 或直接传入 overrides 字典。
- * 返回 `{ overrides: Map<workKey, entry>, contents: Map<contentKey, { title, createdAt }> }`。
+ * overrides 键为作品身份 `platform|workId`；返回 `{ overrides: Map<pwKey, entry>, contents: Map<contentKey, { title, createdAt }> }`。
  */
 function normalizeOverridesDoc(raw) {
   const overrides = new Map();
@@ -553,18 +631,18 @@ function normalizeOverridesDoc(raw) {
   const isDoc =
     hasOwn(raw, "overrides") && isPlainObject(raw.overrides) && typeof raw.action !== "string";
   const source = isDoc ? raw.overrides : raw;
-  for (const workKey of Object.keys(source)) {
-    if (!workKey) continue;
-    const desc = Object.getOwnPropertyDescriptor(source, workKey);
+  for (const pwKey of Object.keys(source)) {
+    if (!isValidWorkIdentityKey(pwKey)) continue;
+    const desc = Object.getOwnPropertyDescriptor(source, pwKey);
     const entry = desc ? desc.value : null;
     if (!isPlainObject(entry)) continue;
     const action = typeof entry.action === "string" ? entry.action.trim() : "";
     if (action === "detach") {
-      overrides.set(workKey, { action: "detach" });
+      overrides.set(pwKey, { action: "detach" });
     } else if (action === "assign") {
       const contentKey = typeof entry.contentKey === "string" ? entry.contentKey.trim() : "";
       if (contentKey && !contentKey.startsWith("unlinked:")) {
-        overrides.set(workKey, { action: "assign", contentKey });
+        overrides.set(pwKey, { action: "assign", contentKey });
       }
     }
   }
@@ -603,6 +681,7 @@ function buildPreparedCores(titles) {
  * - 小桶（alias 数 ≤ 32）直接扫描，避免建索引开销
  * - 大桶对高频 bigram（超过半数 alias 恰好出现 1 次）采用补集倒排，
  *   将密集共享前缀场景从 O(L·M) 降为 O(L + M)，且数学结果 100% 精确等价。
+ * - 每条 item 携带汇总自全部标题别名的 `series`，在评分前先按整条 item 拒绝集数冲突。
  */
 function buildDayBucketedIndex(items) {
   const grouped = new Map();
@@ -610,18 +689,20 @@ function buildDayBucketedIndex(items) {
     const it = items[i];
     const cores = it.cores;
     if (!cores || cores.length === 0) continue;
-    pushToMap(grouped, it.dayNum, { itemIdx: it.itemIdx, cores });
+    pushToMap(grouped, it.dayNum, { itemIdx: it.itemIdx, cores, series: it.series || null });
   }
 
   const bucketsByDay = new Map();
   for (const [dayNum, dayItems] of grouped.entries()) {
     const itemCount = dayItems.length;
     const itemIndices = new Int32Array(itemCount);
+    const itemSeries = new Array(itemCount);
     const aliasCoreList = [];
     const aliasLocalTiList = [];
 
     for (let li = 0; li < itemCount; li++) {
       itemIndices[li] = dayItems[li].itemIdx;
+      itemSeries[li] = dayItems[li].series;
       const cores = dayItems[li].cores;
       for (let ci = 0; ci < cores.length; ci++) {
         aliasCoreList.push(cores[ci]);
@@ -705,6 +786,7 @@ function buildDayBucketedIndex(items) {
       dayNum,
       itemCount,
       itemIndices,
+      itemSeries,
       aliasCount,
       aliasCores: aliasCoreList,
       aliasLocalTi,
@@ -724,9 +806,10 @@ function buildDayBucketedIndex(items) {
   return bucketsByDay;
 }
 
-/** 在单个日桶内为 queryCore 评分并回调所有相似度 > 0 的 (itemIdx, sim) */
-function scoreDayBucket(bucket, queryCore, onHit) {
-  const { itemCount, itemIndices, aliasCount, aliasCores, aliasLocalTi } = bucket;
+/** 在单个日桶内为 queryCore 评分并回调所有相似度 > 0 的 (itemIdx, sim)；评分前先按整条 item 别名集数拒绝冲突 */
+function scoreDayBucket(bucket, queryCore, querySeries, onHit) {
+  const { itemIndices, itemSeries, aliasCount, aliasCores, aliasLocalTi } = bucket;
+  const effectiveQuerySeries = querySeries || queryCore.series;
   let stamp = ++bucket.stamp;
   if (stamp >= 0x7fffffff) {
     bucket.aliasStamp.fill(0);
@@ -742,9 +825,12 @@ function scoreDayBucket(bucket, queryCore, onHit) {
 
   if (!bucket.invIndex) {
     for (let ai = 0; ai < aliasCount; ai++) {
+      const li = aliasLocalTi[ai];
+      if (effectiveQuerySeries && itemSeries[li] && hasConflictingSeries(effectiveQuerySeries, itemSeries[li])) {
+        continue;
+      }
       const sim = computePreparedSimilarity(queryCore, aliasCores[ai]);
       if (sim <= 0) continue;
-      const li = aliasLocalTi[ai];
       if (itemStamp[li] !== stamp) {
         itemStamp[li] = stamp;
         itemMaxSim[li] = sim;
@@ -832,7 +918,7 @@ function scoreDayBucket(bucket, queryCore, onHit) {
   const qLen = queryCore.len;
   const qBgLen = queryCore.bigrams.length;
   const qCore = queryCore.core;
-  const qSeries = queryCore.series;
+  const qSeries = effectiveQuerySeries;
   const aliasLen = bucket.aliasLen;
   const aliasBigramLen = bucket.aliasBigramLen;
 
@@ -840,8 +926,10 @@ function scoreDayBucket(bucket, queryCore, onHit) {
     for (let ai = 0; ai < aliasCount; ai++) {
       const ov = baseOverlap + (aliasStamp[ai] === stamp ? aliasOverlap[ai] : 0);
       if (ov <= 0) continue;
+      const li = aliasLocalTi[ai];
+      const targetSeries = itemSeries[li] || aliasCores[ai].series;
+      if (qSeries && targetSeries && hasConflictingSeries(qSeries, targetSeries)) continue;
       const ac = aliasCores[ai];
-      if (qSeries && ac.series && hasConflictingSeries(qSeries, ac.series)) continue;
 
       const aLen = aliasLen[ai];
       const aBgLen = aliasBigramLen[ai];
@@ -861,7 +949,6 @@ function scoreDayBucket(bucket, queryCore, onHit) {
           sim = (2 * ov) / (qBgLen + aBgLen);
         }
       }
-      const li = aliasLocalTi[ai];
       if (itemStamp[li] !== stamp) {
         itemStamp[li] = stamp;
         itemMaxSim[li] = sim;
@@ -875,8 +962,10 @@ function scoreDayBucket(bucket, queryCore, onHit) {
       const ai = touchedAliases[k];
       const ov = aliasOverlap[ai];
       if (ov <= 0) continue;
+      const li = aliasLocalTi[ai];
+      const targetSeries = itemSeries[li] || aliasCores[ai].series;
+      if (qSeries && targetSeries && hasConflictingSeries(qSeries, targetSeries)) continue;
       const ac = aliasCores[ai];
-      if (qSeries && ac.series && hasConflictingSeries(qSeries, ac.series)) continue;
 
       const aLen = aliasLen[ai];
       const aBgLen = aliasBigramLen[ai];
@@ -896,7 +985,6 @@ function scoreDayBucket(bucket, queryCore, onHit) {
           sim = (2 * ov) / (qBgLen + aBgLen);
         }
       }
-      const li = aliasLocalTi[ai];
       if (itemStamp[li] !== stamp) {
         itemStamp[li] = stamp;
         itemMaxSim[li] = sim;
@@ -939,7 +1027,12 @@ function matchFuzzyGroupTargets(freeWorks, freeTargets, result, matchedWorks, oc
   for (let ti = 0; ti < freeTargets.length; ti++) {
     const t = freeTargets[ti];
     if (t.preparedCores && t.preparedCores.length > 0) {
-      targetItems.push({ itemIdx: ti, dayNum: t.dayNum, cores: t.preparedCores });
+      targetItems.push({
+        itemIdx: ti,
+        dayNum: t.dayNum,
+        cores: t.preparedCores,
+        series: t.series || null,
+      });
     }
   }
   if (!targetItems.length) return;
@@ -962,10 +1055,12 @@ function matchFuzzyGroupTargets(freeWorks, freeTargets, result, matchedWorks, oc
   const coreSigCounts = new Map();
   const workCoreSigs = new Array(wCount);
   for (let wi = 0; wi < wCount; wi++) {
-    const wp = freeWorks[wi].preparedCore;
+    const w = freeWorks[wi];
+    const wp = w.preparedCore;
     if (!wp || !wp.eligible) continue;
-    const sig = wp.series
-      ? `${wp.core}\0${wp.series.seasonKey}|${wp.series.episodeKey}|${wp.series.sectionKey}`
+    const ws = w.series || wp.series;
+    const sig = ws
+      ? `${wp.core}\0${ws.seasonKey}|${ws.episodeKey}|${ws.sectionKey}`
       : wp.core;
     workCoreSigs[wi] = sig;
     coreSigCounts.set(sig, (coreSigCounts.get(sig) || 0) + 1);
@@ -978,6 +1073,7 @@ function matchFuzzyGroupTargets(freeWorks, freeTargets, result, matchedWorks, oc
     const w = freeWorks[wi];
     const wp = w.preparedCore;
     if (!wp || !wp.eligible) continue;
+    const ws = w.series || wp.series;
 
     collectWindowBuckets(bucketsByDay, w.dayNum, windowBuckets);
     if (!windowBuckets.length) continue;
@@ -1027,14 +1123,14 @@ function matchFuzzyGroupTargets(freeWorks, freeTargets, result, matchedWorks, oc
       };
 
       if (!shouldCache) {
-        scoreDayBucket(bucket, wp, applyHit);
+        scoreDayBucket(bucket, wp, ws, applyHit);
       } else {
         const cacheKey = `${bucket.dayNum === null ? "null" : bucket.dayNum}\0${coreSig}`;
         let cachedHits = bucketScoreCache.get(cacheKey);
         if (!cachedHits) {
           const hitIndices = [];
           const hitSims = [];
-          scoreDayBucket(bucket, wp, (ti, sim) => {
+          scoreDayBucket(bucket, wp, ws, (ti, sim) => {
             hitIndices.push(ti);
             hitSims.push(sim);
             applyHit(ti, sim);
@@ -1159,7 +1255,12 @@ function clusterUnlinkedAcrossPlatforms(unlinkedWorks, result) {
       const pk = pairKey(a, b);
       let s = pairSimCache.get(pk);
       if (s === undefined) {
-        s = computePreparedSimilarity(nodes[a].preparedCore, nodes[b].preparedCore);
+        const sa = nodes[a].series || nodes[a].preparedCore.series;
+        const sb = nodes[b].series || nodes[b].preparedCore.series;
+        s =
+          sa && sb && hasConflictingSeries(sa, sb)
+            ? 0
+            : computePreparedSimilarity(nodes[a].preparedCore, nodes[b].preparedCore);
         pairSimCache.set(pk, s);
       }
       return s;
@@ -1263,7 +1364,12 @@ function findCrossPlatformPairEdges(listA, listB, nodeIdxByWorkKey, edgesOut) {
   for (let bi = 0; bi < listB.length; bi++) {
     const p = listB[bi].preparedCore;
     if (p && p.eligible) {
-      bItems.push({ itemIdx: bi, dayNum: listB[bi].dayNum, cores: [p] });
+      bItems.push({
+        itemIdx: bi,
+        dayNum: listB[bi].dayNum,
+        cores: [p],
+        series: listB[bi].series || p.series || null,
+      });
     }
   }
   if (!bItems.length) return;
@@ -1284,10 +1390,12 @@ function findCrossPlatformPairEdges(listA, listB, nodeIdxByWorkKey, edgesOut) {
   const coreSigCounts = new Map();
   const aCoreSigs = new Array(aCount);
   for (let ai = 0; ai < aCount; ai++) {
-    const pa = listA[ai].preparedCore;
+    const wa = listA[ai];
+    const pa = wa.preparedCore;
     if (!pa || !pa.eligible) continue;
-    const sig = pa.series
-      ? `${pa.core}\0${pa.series.seasonKey}|${pa.series.episodeKey}|${pa.series.sectionKey}`
+    const sa = wa.series || pa.series;
+    const sig = sa
+      ? `${pa.core}\0${sa.seasonKey}|${sa.episodeKey}|${sa.sectionKey}`
       : pa.core;
     aCoreSigs[ai] = sig;
     coreSigCounts.set(sig, (coreSigCounts.get(sig) || 0) + 1);
@@ -1300,6 +1408,7 @@ function findCrossPlatformPairEdges(listA, listB, nodeIdxByWorkKey, edgesOut) {
     const wa = listA[ai];
     const pa = wa.preparedCore;
     if (!pa || !pa.eligible) continue;
+    const sa = wa.series || pa.series;
 
     collectWindowBuckets(bucketsByDay, wa.dayNum, windowBuckets);
     if (!windowBuckets.length) continue;
@@ -1344,14 +1453,14 @@ function findCrossPlatformPairEdges(listA, listB, nodeIdxByWorkKey, edgesOut) {
       };
 
       if (!shouldCache) {
-        scoreDayBucket(bucket, pa, applyHit);
+        scoreDayBucket(bucket, pa, sa, applyHit);
       } else {
         const cacheKey = `${bucket.dayNum === null ? "null" : bucket.dayNum}\0${coreSig}`;
         let cachedHits = bucketScoreCache.get(cacheKey);
         if (!cachedHits) {
           const hitIndices = [];
           const hitSims = [];
-          scoreDayBucket(bucket, pa, (bi, sim) => {
+          scoreDayBucket(bucket, pa, sa, (bi, sim) => {
             hitIndices.push(bi);
             hitSims.push(sim);
             applyHit(bi, sim);
@@ -1512,9 +1621,10 @@ function collectMatchTitles(values) {
  * - publishStatus 存在且不是 success → 直接排除（即使有 videoLink）；
  *   仅 publishStatus 缺失的历史记录允许凭有效非管理页直链纳入；
  *   republishCount > 0 时其 videoLink 不作为直链证据（仅走唯一标题规则）
- * - 仅按完整路径归桶（小写、/ 分隔）；无完整路径优先用记录 id，其次用
- *   filePath/selectedFile + 平台 + 分组 + 发布时间 + 标题 + 链接 的稳定 sha256 哈希；
- *   无足够身份字段或同日指纹碰撞时退化为 `record:<日期>:...:pos:<idx>`（assignable=false，禁止手工 assign）
+ * - 仅按完整路径归桶（小写、/ 分隔，`file:<完整路径>`，assignable=true）；
+ *   无完整路径时仅允许用不可变记录 `id` 生成 `record:id:<id>`（不含发布日期，唯一 id 时 assignable=true）；
+ *   缺少完整路径与唯一记录 id（或 id 碰撞）的记录退化为位置键 `record:pos:<idx>` / `record:id:<id>:pos:<idx>`
+ *   （assignable=false，禁止手工 assign，防止删改记录导致手工关联漂移）
  * - 每条平台记录独立成 target，不再按文件+平台折叠
  */
 function buildContentIndex(pushRecords) {
@@ -1549,7 +1659,6 @@ function buildContentIndex(pushRecords) {
     const recordDate = extractRecordDate(rec, status);
     // 真实 pushData 完整路径在 filePath（LocalVideoPublish.vue:2095），兼容完整路径写入 selectedFile
     const fullPath = normalizeFullPath(rec.filePath) || normalizeFullPath(rec.selectedFile);
-    const rawFileHint = toSafeTrimmed(rec.filePath) || toSafeTrimmed(rec.selectedFile);
     const title = [rec.title, rec.bt, rec.textOtherName, rec.bookName]
       .map(toSafeTrimmed)
       .find(Boolean) || "";
@@ -1561,23 +1670,8 @@ function buildContentIndex(pushRecords) {
     if (!fullPath) {
       const recId = toSafeTrimmed(rec.id);
       if (recId) {
-        stableCandidateKey = `record:${recordDate || "unknown"}:${recId}`;
-      } else {
-        const exactPubTime = toSafeTrimmed(rec.lastPublishAt) || toSafeTrimmed(rec.createTime);
-        if (rawFileHint || title || rawVideoLink || exactPubTime) {
-          const fp = JSON.stringify([
-            rawFileHint.toLowerCase(),
-            platform,
-            group,
-            exactPubTime || recordDate,
-            title,
-            rawVideoLink,
-          ]);
-          const hash = crypto.createHash("sha256").update(fp).digest("hex").slice(0, 16);
-          stableCandidateKey = `record:${recordDate || "unknown"}:h_${hash}`;
-        }
-      }
-      if (stableCandidateKey) {
+        // 仅用不可变记录 id，不含发布日期，跨日重发不会换键
+        stableCandidateKey = `record:id:${recId}`;
         recordKeyCounts.set(stableCandidateKey, (recordKeyCounts.get(stableCandidateKey) || 0) + 1);
       }
     }
@@ -1614,7 +1708,7 @@ function buildContentIndex(pushRecords) {
       assignable = false;
       contentKey = item.stableCandidateKey
         ? `${item.stableCandidateKey}:pos:${item.idx}`
-        : `record:${item.recordDate || "unknown"}:pos:${item.idx}`;
+        : `record:pos:${item.idx}`;
     }
 
     let bucket = buckets.get(contentKey);
@@ -1685,17 +1779,44 @@ function parseCutoffDate(date) {
   return isValidDateStr(trimmed) ? { ok: true, cutoffDate: trimmed } : { ok: false, cutoffDate: "" };
 }
 
+const AUTO_MATCH_RANK = { link: 3, title: 2, fuzzy: 1 };
+
+function pickStrongestAutoEntry(autoEntries) {
+  let best = autoEntries[0].entry;
+  let bestRank = AUTO_MATCH_RANK[best.matchedBy] || 0;
+  let bestScore = typeof best.score === "number" && Number.isFinite(best.score) ? best.score : -1;
+  for (let i = 1; i < autoEntries.length; i++) {
+    const cur = autoEntries[i].entry;
+    const rank = AUTO_MATCH_RANK[cur.matchedBy] || 0;
+    const score = typeof cur.score === "number" && Number.isFinite(cur.score) ? cur.score : -1;
+    if (rank > bestRank || (rank === bestRank && score > bestScore + FUZZY_EPS)) {
+      best = cur;
+      bestRank = rank;
+      bestScore = score;
+    }
+  }
+  return best;
+}
+
+function getLinkResultMeta(link) {
+  return link instanceof Map ? LINK_RESULT_META.get(link) || null : null;
+}
+
 /**
  * 关联作品与内容，返回 Map<`group|platform|workId`, { contentKey, matchedBy, score? }>。
  * - 可选截止日 date：排除 recordDate > date 的 target 与有效 publishTime > date 的 work
- * - 可选 worksDaily：将截至 date 仅存在于 worksDaily 的作品也纳入 activeWorkKeys（仅接受手工覆盖）
- * - 可选手工矫正 overrides：只有 detach 在 ③④ 之前排除；①–④ 照常运行（含被 assign 的作品参与占位），
- *   最后套用 overrides（assign 指向不存在/不稳定 contentKey 或未写入 contents 表的 auto:/manual: 时忽略）
+ * - 可选 worksDaily：将截至 date 仅存在于 worksDaily 的作品也纳入作品身份归属（仅接受手工覆盖）
+ * - 可选手工矫正 overrides：按作品身份 `platform|workId` 存储；只有 detach 在 ③④ 之前按作品身份排除；
+ *   ①–④ 照常运行（含被 assign 的作品参与占位），随后在全量分组上按作品身份 `platform|workId` 做一次统一归属裁决
+ *   （同一作品挂在多分组时共用同一最终归属，日明细、跨平台汇总、GUI 完全一致），最后套用 overrides
+ *   （assign 指向不存在/不稳定 contentKey 或未写入 contents 表的 auto:/manual: 时忽略）。
+ * - auto 簇成员资格在自动阶段 ④ 确定：某成员被 assign 走后，不得改变其他作品的自动归属，
+ *   剩余成员无论 ≥2 还是仅剩 1 条均保留原 `auto:` 键与 `fuzzy` 标记（仅剩 1 条时在汇总中显示为单平台）。
  * ① 有效直链 1:1 唯一匹配（多对一/一对多全部留空且禁止标题兜底）；
  * ② 标题命中且同 group+platform 内唯一 work、唯一未被①占用的 target，且 target 无冲突直链；
- * ③ 模糊匹配（同 group+platform，排除占位/短标题及不同集数，标题 core 子串≥6=0.95 / 二元组 Dice，
- *    仅取 target 自身 recordDate/lastPublishAt，时间窗按 UTC+8 日历日相差 ≤2 天、缺时间门槛 +0.1，
- *    sim≥0.6、最佳比次佳高≥0.1、互为最佳）；
+ * ③ 模糊匹配（同 group+platform，先汇总目标与作品全部标题别名的明确集数并在评分前硬拒绝冲突，排除占位/短标题，
+ *    标题 core 子串≥6=0.95 / Float64 无损二元组 Dice，仅取 target 自身 recordDate/lastPublishAt，
+ *    时间窗按 UTC+8 日历日相差 ≤2 天、缺时间门槛 +0.1，sim≥0.6、最佳比次佳高≥0.1、互为最佳）；
  * ④ 无发布记录作品跨平台聚类（同 group 不同 platform，同规则互为最佳成边 + Kruskal 全对相容合并每平台最多 1 条，
  *    簇大小≥2，按不含 group 的 platform|workId 生成稳定 auto:<hash>）。
  */
@@ -1731,7 +1852,9 @@ function linkWorks({ contents, accounts, date, overrides, worksDaily } = {}) {
       if (cutoffDate && cutoffTargetDate && cutoffTargetDate > cutoffDate) continue;
       eligibleTargetCount++;
       const gpKey = `${toSafeTrimmed(t.group)}|${toSafeTrimmed(t.platform)}`;
-      const rawTitles = Array.isArray(t.matchTitles) ? t.matchTitles : [t.title];
+      const rawTitles = Array.isArray(t.matchTitles)
+        ? t.matchTitles
+        : [t.title, t.shortTitle].filter((v) => v != null && v !== "");
       const matchTitles = collectMatchTitles(rawTitles);
       pushToMap(targetsByGp, gpKey, {
         idx: targetSeq++,
@@ -1739,6 +1862,8 @@ function linkWorks({ contents, accounts, date, overrides, worksDaily } = {}) {
         normUrl: normalizeDirectUrl(t.videoLink),
         matchTitles,
         preparedCores: buildPreparedCores(rawTitles),
+        // 目标全部标题别名（主标题+短标题等）汇总的集数标记：评分前先拒绝集数冲突
+        series: extractSeriesMarkersFromTitles(rawTitles),
         // ③ 模糊匹配时间窗只看该 target 自身日期，缺则走缺时间门槛 +0.1
         dayNum: dateStrToDayNum(ownTargetDate),
       });
@@ -1752,9 +1877,28 @@ function linkWorks({ contents, accounts, date, overrides, worksDaily } = {}) {
     }
   }
 
+  // 若指定了截止日，先跨全量分组收集有效 publishTime > cutoffDate 的作品身份，避免跨组泄漏未来作品
+  const excludedFuturePwKeys = new Set();
+  if (cutoffDate) {
+    for (const acc of accounts) {
+      if (!isPlainObject(acc)) continue;
+      const rawPlatform = toSafeString(acc.platform);
+      for (const w of Array.isArray(acc.works) ? acc.works : []) {
+        if (!isPlainObject(w)) continue;
+        const workId = toSafeString(w.workId);
+        if (!workId) continue;
+        const pubMs = parseValidTimestampMs(w.publishTime);
+        const pubDate = pubMs !== null ? toUtc8DateStr(pubMs) : "";
+        if (pubDate && pubDate > cutoffDate) {
+          excludedFuturePwKeys.add(makeWorkIdentityKey(rawPlatform, workId));
+        }
+      }
+    }
+  }
+
   const worksByGp = new Map();
-  const activeWorkKeys = new Set();
-  const detachedWorkKeys = new Set();
+  const obsByPw = new Map();
+  const detachedPwKeys = new Set();
   const gpInfoByKey = new Map();
   let workSeq = 0;
 
@@ -1774,31 +1918,61 @@ function linkWorks({ contents, accounts, date, overrides, worksDaily } = {}) {
       const workKey = makeWorkKey(rawGroup, rawPlatform, workId);
       if (result.has(workKey)) continue;
       result.set(workKey, { contentKey: null, matchedBy: null });
+      const pwKey = makeWorkIdentityKey(rawPlatform, workId);
       const pubMs = parseValidTimestampMs(w.publishTime);
       const pubDate = pubMs !== null ? toUtc8DateStr(pubMs) : "";
-      if (cutoffDate && pubDate && pubDate > cutoffDate) continue;
-
-      activeWorkKeys.add(workKey);
-      const ov = overrideMap.get(workKey);
-      if (ov && ov.action === "detach") {
-        detachedWorkKeys.add(workKey);
+      if (cutoffDate && ((pubDate && pubDate > cutoffDate) || excludedFuturePwKeys.has(pwKey))) {
+        excludedFuturePwKeys.add(pwKey);
+        continue;
       }
+
+      const ov = overrideMap.get(pwKey);
+      if (ov && ov.action === "detach") {
+        detachedPwKeys.add(pwKey);
+      }
+
+      const normTitle = normalizeTitle(w.title);
+      const rawTitle = w.title;
+      const preparedCore = prepareCore(rawTitle);
+      const hasExtraWorkTitles =
+        (Array.isArray(w.matchTitles) && w.matchTitles.length > 0) ||
+        (w.shortTitle != null && w.shortTitle !== "");
+      const workSeries = hasExtraWorkTitles
+        ? extractSeriesMarkersFromTitles([
+            rawTitle,
+            ...(Array.isArray(w.matchTitles) ? w.matchTitles : []),
+            w.shortTitle,
+          ])
+        : preparedCore.series || extractSeriesMarkers(rawTitle);
+
+      pushToMap(obsByPw, pwKey, {
+        workKey,
+        pwKey,
+        group: rawGroup,
+        platform: rawPlatform,
+        workId,
+        title: toSafeString(rawTitle),
+        pubMs,
+        fromWorksJson: true,
+      });
 
       pushToMap(worksByGp, gpKey, {
         idx: workSeq++,
         workKey,
+        pwKey,
         memberKey: `${platformKey}|${workId}`,
         groupKey,
         platformKey,
-        normTitle: normalizeTitle(w.title),
-        preparedCore: prepareCore(w.title),
+        normTitle,
+        preparedCore,
+        series: workSeries,
         normUrl: normalizeDirectUrl(w.url),
         dayNum: dateStrToDayNum(pubDate),
       });
     }
   }
 
-  // 只存在于 works-daily（works.json 已删除/缺失）的作品也纳入 activeWorkKeys，仅接受手工覆盖，不参与自动匹配
+  // 只存在于 works-daily（works.json 已删除/缺失）的作品也纳入 obsByPw，接受跨组统一归属与手工覆盖
   if (dailyByGp) {
     for (const [rawGpKey, accWorksDaily] of Object.entries(dailyByGp)) {
       if (!isPlainObject(accWorksDaily)) continue;
@@ -1813,14 +1987,26 @@ function linkWorks({ contents, accounts, date, overrides, worksDaily } = {}) {
         if (!workId) continue;
         const workKey = makeWorkKey(group, platform, workId);
         if (result.has(workKey)) continue;
+        const pwKey = makeWorkIdentityKey(platform, workId);
+        if (excludedFuturePwKeys.has(pwKey)) continue;
         const snap = resolveWorkSnapshotAsOf(workId, accWorksDaily, cutoffDate);
         if (!snap) continue;
         result.set(workKey, { contentKey: null, matchedBy: null });
-        activeWorkKeys.add(workKey);
+        pushToMap(obsByPw, pwKey, {
+          workKey,
+          pwKey,
+          group,
+          platform,
+          workId,
+          title: DELETED_WORK_TITLE,
+          pubMs: null,
+          fromWorksJson: false,
+        });
       }
     }
   }
 
+  const rawAutoResult = new Map();
   const unlinkedForCluster = [];
 
   for (const [gpKey, gpWorks] of worksByGp.entries()) {
@@ -1843,7 +2029,7 @@ function linkWorks({ contents, accounts, date, overrides, worksDaily } = {}) {
         if (urlWorks.length === 1 && urlTargets.length === 1) {
           matchedWorks.add(urlWorks[0].idx);
           occupiedTargets.add(urlTargets[0].idx);
-          result.set(urlWorks[0].workKey, { contentKey: urlTargets[0].contentKey, matchedBy: "link" });
+          rawAutoResult.set(urlWorks[0].workKey, { contentKey: urlTargets[0].contentKey, matchedBy: "link" });
         } else {
           for (const w of urlWorks) blockedWorks.add(w.idx);
           for (const t of urlTargets) blockedTargets.add(t.idx);
@@ -1874,17 +2060,17 @@ function linkWorks({ contents, accounts, date, overrides, worksDaily } = {}) {
         if (pairs.length === 1) {
           matchedWorks.add(pairs[0].work.idx);
           occupiedTargets.add(pairs[0].target.idx);
-          result.set(pairs[0].work.workKey, { contentKey: pairs[0].target.contentKey, matchedBy: "title" });
+          rawAutoResult.set(pairs[0].work.workKey, { contentKey: pairs[0].target.contentKey, matchedBy: "title" });
         }
       }
 
-      // ③ 作品↔发布记录 target 模糊匹配（只排除已匹配/已阻断/manual-detach；被 assign 的作品照常参与占位）
+      // ③ 作品↔发布记录 target 模糊匹配（只排除已匹配/已阻断/按作品身份 manual-detach；被 assign 的作品照常参与占位）
       const freeWorks = [];
       for (const w of gpWorks) {
         if (
           matchedWorks.has(w.idx) ||
           blockedWorks.has(w.idx) ||
-          detachedWorkKeys.has(w.workKey)
+          detachedPwKeys.has(w.pwKey)
         ) {
           continue;
         }
@@ -1896,53 +2082,92 @@ function linkWorks({ contents, accounts, date, overrides, worksDaily } = {}) {
         freeTargets.push(t);
       }
 
-      matchFuzzyGroupTargets(freeWorks, freeTargets, result, matchedWorks, occupiedTargets);
+      matchFuzzyGroupTargets(freeWorks, freeTargets, rawAutoResult, matchedWorks, occupiedTargets);
     }
 
     for (const w of gpWorks) {
-      if (matchedWorks.has(w.idx) || detachedWorkKeys.has(w.workKey)) {
+      if (matchedWorks.has(w.idx) || detachedPwKeys.has(w.pwKey)) {
         continue;
       }
       unlinkedForCluster.push(w);
     }
   }
 
-  // ④ 无发布记录作品跨平台聚类（同 group，不同 platform）
-  clusterUnlinkedAcrossPlatforms(unlinkedForCluster, result);
+  // ④ 无发布记录作品跨平台聚类（同 group，不同 platform；簇成员资格在此阶段确定）
+  clusterUnlinkedAcrossPlatforms(unlinkedForCluster, rawAutoResult);
 
-  // 最后套用手工矫正 overrides（手工结果永远优先于自动结果；指向不存在或不稳定 contentKey 时忽略）
-  if (overrideMap.size > 0) {
-    const isValidAssignTarget = (contentKey) => {
-      if (isValidSyntheticContentKey(contentKey)) {
-        // auto:/manual: 合成内容必须在持久化 contents 表中存在才生效
-        return overrideContents.has(contentKey);
+  // ⑤ 在全量分组上按作品身份 platform|workId 做一次统一归属裁决，再套用按作品身份存储的手工覆盖。
+  //    注意：不清理因其他成员被 assign 走而仅剩 1 条的 auto:* 簇（assign 不得改变其他作品的自动归属）。
+  const isValidAssignTarget = (contentKey) => {
+    if (isValidSyntheticContentKey(contentKey)) {
+      // auto:/manual: 合成内容必须在持久化 contents 表中存在才生效
+      return overrideContents.has(contentKey);
+    }
+    return assignableContentKeys.has(contentKey);
+  };
+
+  const byWorkIdentity = new Map();
+  const syntheticObsByKey = new Map();
+
+  for (const [pwKey, obsList] of obsByPw.entries()) {
+    if (excludedFuturePwKeys.has(pwKey)) continue;
+    obsList.sort((a, b) => compareText(a.group, b.group));
+
+    const autoEntries = [];
+    for (const obs of obsList) {
+      const entry = rawAutoResult.get(obs.workKey);
+      if (entry && entry.contentKey) {
+        autoEntries.push({ obs, entry });
       }
-      return assignableContentKeys.has(contentKey);
-    };
+    }
 
-    for (const [workKey, ov] of overrideMap.entries()) {
-      if (!activeWorkKeys.has(workKey)) continue;
+    let resolved;
+    if (autoEntries.length > 0 && new Set(autoEntries.map((x) => x.entry.contentKey)).size === 1) {
+      const best = pickStrongestAutoEntry(autoEntries);
+      resolved =
+        best.matchedBy === "fuzzy" && typeof best.score === "number" && Number.isFinite(best.score)
+          ? { contentKey: best.contentKey, matchedBy: "fuzzy", score: best.score }
+          : { contentKey: best.contentKey, matchedBy: best.matchedBy };
+    } else {
+      resolved = { contentKey: null, matchedBy: null };
+    }
+
+    const ov = overrideMap.get(pwKey);
+    if (ov) {
       if (ov.action === "detach") {
-        result.set(workKey, { contentKey: null, matchedBy: "manual-detach" });
+        resolved = { contentKey: null, matchedBy: "manual-detach" };
       } else if (ov.action === "assign" && isValidAssignTarget(ov.contentKey)) {
-        result.set(workKey, { contentKey: ov.contentKey, matchedBy: "manual" });
+        resolved = { contentKey: ov.contentKey, matchedBy: "manual" };
       }
     }
 
-    // 清理因部分成员被移走/拆出而只剩 1 条纯 fuzzy 作品的孤儿 auto:* 簇（已确认 manual 成员保留）
-    const autoMembers = new Map();
-    for (const [workKey, entry] of result.entries()) {
-      if (entry && isValidAutoContentKey(entry.contentKey)) {
-        pushToMap(autoMembers, entry.contentKey, { workKey, entry });
+    byWorkIdentity.set(pwKey, resolved);
+    for (const obs of obsList) {
+      result.set(obs.workKey, { ...resolved });
+      if (resolved.contentKey && isValidSyntheticContentKey(resolved.contentKey)) {
+        pushToMap(syntheticObsByKey, resolved.contentKey, obs);
       }
     }
-    for (const members of autoMembers.values()) {
-      if (members.length < 2 && members.every((m) => m.entry.matchedBy === "fuzzy")) {
-        for (const m of members) {
-          result.set(m.workKey, { contentKey: null, matchedBy: null });
-        }
-      }
+  }
+
+  // 全量分组视角下的合成内容标题（供分组裁剪导出与校验上下文复用）
+  const syntheticTitlesByKey = new Map();
+  for (const [ck, list] of syntheticObsByKey.entries()) {
+    const persisted = overrideContents.get(ck);
+    if (persisted && persisted.title) {
+      syntheticTitlesByKey.set(ck, persisted.title);
+      continue;
     }
+    const sorted = [...list].sort((a, b) => {
+      const aHas = a.pubMs !== null;
+      const bHas = b.pubMs !== null;
+      if (aHas !== bHas) return aHas ? -1 : 1;
+      if (aHas && a.pubMs !== b.pubMs) return a.pubMs - b.pubMs;
+      const cp = compareText(a.pwKey, b.pwKey);
+      return cp !== 0 ? cp : compareText(a.workKey, b.workKey);
+    });
+    const chosen = sorted.find((o) => o.fromWorksJson && o.title) || sorted[0];
+    syntheticTitlesByKey.set(ck, (chosen && chosen.title) || "(无标题)");
   }
 
   LINK_RESULT_META.set(result, {
@@ -1951,6 +2176,10 @@ function linkWorks({ contents, accounts, date, overrides, worksDaily } = {}) {
     worksDaily: dailyByGp,
     cutoffDate,
     overrides,
+    byWorkIdentity,
+    rawAutoByWorkKey: rawAutoResult,
+    syntheticTitlesByKey,
+    excludedFuturePwKeys,
   });
   return result;
 }
@@ -2074,19 +2303,28 @@ function pickMinValidPubMs(obsList) {
 
 /**
  * 构建跨平台内容级汇总行（截至 date，默认最新快照日）。
- * - link：仅当由 linkWorks 针对同一数据集与 cutoffDate 产出时复用，否则按截止日重算
- * - overrides：可选手工矫正配置（与 linkWorks 口径一致）
+ * - link：仅当由 linkWorks 针对同一全量数据集与 cutoffDate 产出时复用，否则按截止日重算
+ * - overrides：可选手工矫正配置（按作品身份 `platform|workId`，与 linkWorks 口径一致）
+ * - groups：可选导出分组裁剪（Set 或数组）；归属已在全量分组上按作品身份裁决，此处仅按 groups 裁剪输出观测
  * - worksDaily：`{ "group|platform": readWorksDaily(group, platform) }`
  * - 按 `platform|workId` 跨组去重：只取一份 ≤date 的最近快照，归组列沿用按分组名排序的首个匹配分组
  * - worksDaily 中出现但 works.json 缺失的作品 ID 纳入手工覆盖范围，未关联时保留为未关联行（title "(已删除或未匹配)"）
  */
-function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, overrides } = {}) {
+function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, overrides, groups } = {}) {
   const { ok, cutoffDate } = parseCutoffDate(date);
   if (!ok) return [];
 
   const accountList = Array.isArray(accounts) ? accounts : [];
   const dailyByGp = isPlainObject(worksDaily) ? worksDaily : null;
   const { overrides: overrideMap, contents: overrideContents } = normalizeOverridesDoc(overrides);
+  const groupSet =
+    groups instanceof Set
+      ? groups.size > 0
+        ? groups
+        : null
+      : Array.isArray(groups) && groups.length > 0
+      ? new Set(groups.map((g) => String(g)))
+      : null;
 
   const cachedMeta = link instanceof Map ? LINK_RESULT_META.get(link) : null;
   const canReuseLink = Boolean(
@@ -2106,6 +2344,11 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, o
         date: cutoffDate,
         overrides,
       });
+  const linkMeta = LINK_RESULT_META.get(resolvedLink) || null;
+  const byWorkIdentity = linkMeta && linkMeta.byWorkIdentity ? linkMeta.byWorkIdentity : null;
+  const rawAutoByWorkKey = linkMeta && linkMeta.rawAutoByWorkKey ? linkMeta.rawAutoByWorkKey : null;
+  const metaSyntheticTitles =
+    linkMeta && linkMeta.syntheticTitlesByKey ? linkMeta.syntheticTitlesByKey : null;
 
   const contentByKey = new Map();
   const buckets = new Map();
@@ -2195,10 +2438,12 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, o
     }
   }
 
-  // 1. 收集 accounts[*].works 中的作品观测（排除有效 publishTime > cutoffDate 的作品）
+  // 1. 收集 accounts[*].works 中的作品观测（排除有效 publishTime > cutoffDate 的作品，按 groupSet 裁剪输出）
   const seenGpWorkKeys = new Set();
   const gpInfoByKey = new Map();
-  const excludedFuturePwKeys = new Set();
+  const excludedFuturePwKeys = new Set(
+    linkMeta && linkMeta.excludedFuturePwKeys ? linkMeta.excludedFuturePwKeys : []
+  );
   const obsByPw = new Map();
   const syntheticObsByContentKey = new Map();
 
@@ -2208,7 +2453,8 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, o
     const platform = toSafeString(acc.platform);
     const gpKey = `${group}|${platform}`;
     if (!gpInfoByKey.has(gpKey)) gpInfoByKey.set(gpKey, { group, platform });
-    const accWorksDaily = dailyByGp && hasOwn(dailyByGp, gpKey) ? dailyByGp[gpKey] : null;
+    const inGroupScope = !groupSet || groupSet.has(group);
+    const accWorksDaily = inGroupScope && dailyByGp && hasOwn(dailyByGp, gpKey) ? dailyByGp[gpKey] : null;
 
     for (const w of Array.isArray(acc.works) ? acc.works : []) {
       if (!isPlainObject(w)) continue;
@@ -2218,26 +2464,27 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, o
       if (seenGpWorkKeys.has(workKey)) continue;
       seenGpWorkKeys.add(workKey);
 
-      const pwKey = `${platform}|${workId}`;
+      const pwKey = makeWorkIdentityKey(platform, workId);
       const pubMs = parseValidTimestampMs(w.publishTime);
       const pubDate = pubMs !== null ? toUtc8DateStr(pubMs) : "";
       if (cutoffDate && pubDate && pubDate > cutoffDate) {
         excludedFuturePwKeys.add(pwKey);
         continue;
       }
+      if (!inGroupScope || excludedFuturePwKeys.has(pwKey)) continue;
 
-      const linkEntry = resolvedLink.get(workKey);
+      const linkEntry = (byWorkIdentity && byWorkIdentity.get(pwKey)) || resolvedLink.get(workKey);
       const linkedKey = linkEntry ? toSafeString(linkEntry.contentKey) || null : null;
       const matchedBy = linkEntry ? linkEntry.matchedBy || null : null;
       const score =
         linkEntry && matchedBy === "fuzzy" && typeof linkEntry.score === "number" && Number.isFinite(linkEntry.score)
           ? linkEntry.score
           : null;
-      const hasOverride = overrideMap.has(workKey);
 
       const snap = resolveWorkSnapshotAsOf(workId, accWorksDaily, cutoffDate);
       const obs = {
         workKey,
+        pwKey,
         group,
         platform,
         workId,
@@ -2248,7 +2495,6 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, o
         linkedKey,
         matchedBy,
         score,
-        hasOverride,
         snap,
         fromWorksJson: true,
       };
@@ -2270,22 +2516,28 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, o
         gpInfo = { group: gpKey.slice(0, sep), platform: gpKey.slice(sep + 1) };
       }
       const { group, platform } = gpInfo;
+      if (groupSet && !groupSet.has(group)) continue;
       for (const workId of Object.keys(accWorksDaily)) {
         if (!workId) continue;
         const workKey = makeWorkKey(group, platform, workId);
         if (seenGpWorkKeys.has(workKey)) continue;
         seenGpWorkKeys.add(workKey);
 
+        const pwKey = makeWorkIdentityKey(platform, workId);
+        if (excludedFuturePwKeys.has(pwKey)) continue;
         const snap = resolveWorkSnapshotAsOf(workId, accWorksDaily, cutoffDate);
         if (!snap) continue;
-        const linkEntry = resolvedLink.get(workKey);
+        const linkEntry = (byWorkIdentity && byWorkIdentity.get(pwKey)) || resolvedLink.get(workKey);
         const linkedKey = linkEntry ? toSafeString(linkEntry.contentKey) || null : null;
         const matchedBy = linkEntry ? linkEntry.matchedBy || null : null;
-        const hasOverride = overrideMap.has(workKey);
+        const score =
+          linkEntry && matchedBy === "fuzzy" && typeof linkEntry.score === "number" && Number.isFinite(linkEntry.score)
+            ? linkEntry.score
+            : null;
 
-        const pwKey = `${platform}|${workId}`;
         const obs = {
           workKey,
+          pwKey,
           group,
           platform,
           workId,
@@ -2295,8 +2547,7 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, o
           pubDate: "",
           linkedKey,
           matchedBy,
-          score: null,
-          hasOverride,
+          score,
           snap,
           fromWorksJson: false,
         };
@@ -2308,7 +2559,7 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, o
     }
   }
 
-  // 为 auto:* / manual:* 合成桶确定性地选取标题：优先持久化 contents 表标题，其次簇内最早发布作品标题
+  // 为 auto:* / manual:* 合成桶确定性地选取标题：优先持久化 contents 表标题，其次全量簇内最早发布作品标题
   const syntheticTitleByKey = new Map();
   for (const [ck, list] of syntheticObsByContentKey.entries()) {
     const persisted = overrideContents.get(ck);
@@ -2316,70 +2567,50 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, o
       syntheticTitleByKey.set(ck, persisted.title);
       continue;
     }
+    if (metaSyntheticTitles && metaSyntheticTitles.has(ck)) {
+      syntheticTitleByKey.set(ck, metaSyntheticTitles.get(ck));
+      continue;
+    }
     const sorted = [...list].sort((a, b) => {
       const aHas = a.pubMs !== null;
       const bHas = b.pubMs !== null;
       if (aHas !== bHas) return aHas ? -1 : 1;
       if (aHas && a.pubMs !== b.pubMs) return a.pubMs - b.pubMs;
-      return compareText(a.workKey, b.workKey);
+      return compareText(a.pwKey, b.pwKey);
     });
     const chosen = sorted.find((o) => o.fromWorksJson && o.title) || sorted[0];
     syntheticTitleByKey.set(ck, (chosen && chosen.title) || "(无标题)");
   }
 
-  // 3. 按 platform|workId 跨组去重：关联裁决、既有归组列与操作用 workKey 分离
+  // 3. 按作品身份 platform|workId 跨组去重（归属已由 linkWorks 在全量分组上按作品身份统一裁决）
   for (const [pwKey, obsList] of obsByPw.entries()) {
     if (excludedFuturePwKeys.has(pwKey)) continue;
     obsList.sort((a, b) => compareText(a.group, b.group));
 
     const { platform, workId } = obsList[0];
-    const manualAssignObs = obsList.filter((o) => o.matchedBy === "manual" && o.linkedKey != null);
-    const manualDetachObs = obsList.filter((o) => o.matchedBy === "manual-detach");
-    const overrideWorkKeys = obsList.filter((o) => o.hasOverride).map((o) => o.workKey);
-
-    let resolvedLinkedKey = null;
-    let resolvedMatchedBy = null;
-    let resolvedScore = null;
-    let actionObs = obsList[0];
-
-    if (manualAssignObs.length > 0) {
-      if (new Set(manualAssignObs.map((o) => o.linkedKey)).size === 1) {
-        resolvedLinkedKey = manualAssignObs[0].linkedKey;
-        resolvedMatchedBy = "manual";
-        resolvedScore = null;
-        actionObs = manualAssignObs[0];
-      } else {
-        // 多组手工指定指向不同内容：冲突，按未关联处理
-        actionObs = manualAssignObs[0];
-      }
-    } else if (manualDetachObs.length > 0) {
-      resolvedLinkedKey = null;
-      resolvedMatchedBy = "manual-detach";
-      actionObs = manualDetachObs[0];
-    } else {
-      const autoLinkedObs = obsList.filter((o) => o.linkedKey != null);
-      if (autoLinkedObs.length > 0 && new Set(autoLinkedObs.map((o) => o.linkedKey)).size === 1) {
-        resolvedLinkedKey = autoLinkedObs[0].linkedKey;
-        resolvedMatchedBy = autoLinkedObs[0].matchedBy;
-        resolvedScore = autoLinkedObs[0].score;
-        actionObs = autoLinkedObs[0];
-      }
-    }
-
+    const resolvedLinkedKey = obsList[0].linkedKey;
+    const resolvedMatchedBy = obsList[0].matchedBy;
+    const resolvedScore = obsList[0].score;
+    const hasOverride = overrideMap.has(pwKey);
     const bestSnap = pickLatestSnapshot(obsList);
 
     if (resolvedLinkedKey != null) {
-      // 既有归组列：在全部指向 resolvedLinkedKey 的观测（含自动与手工）中取按分组名排序的首组，
-      // 确保给 B 组手工指定同一键时不把原本归在 A 组的指标移到 B 组列
-      const sameContentObs = obsList.filter((o) => o.linkedKey === resolvedLinkedKey);
-      const primaryGroup = (sameContentObs[0] || actionObs).group;
+      // 既有归组列：若存在自动匹配到同一 contentKey 的观测则取按分组名排序的首组，否则取全观测首组
+      const sameRawAutoObs = rawAutoByWorkKey
+        ? obsList.filter((o) => {
+            const raw = rawAutoByWorkKey.get(o.workKey);
+            return raw && raw.contentKey === resolvedLinkedKey;
+          })
+        : [];
+      const primaryGroup = (sameRawAutoObs[0] || obsList[0]).group;
+      const preferredObs = sameRawAutoObs.length > 0 ? sameRawAutoObs : obsList;
       const bestTitle =
-        (sameContentObs.find((o) => o.fromWorksJson && o.title) ||
+        (preferredObs.find((o) => o.fromWorksJson && o.title) ||
           obsList.find((o) => o.fromWorksJson && o.title) ||
-          actionObs).title || "(无标题)";
+          obsList[0]).title || "(无标题)";
       const bestUrl =
-        (sameContentObs.find((o) => o.url) || obsList.find((o) => o.url) || {}).url || "";
-      const bestPubMs = pickMinValidPubMs(sameContentObs) ?? pickMinValidPubMs(obsList);
+        (preferredObs.find((o) => o.url) || obsList.find((o) => o.url) || {}).url || "";
+      const bestPubMs = pickMinValidPubMs(preferredObs) ?? pickMinValidPubMs(obsList);
 
       const bucketId = `linked:${resolvedLinkedKey}`;
       let bucket = buckets.get(bucketId);
@@ -2390,8 +2621,8 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, o
         const fallbackTitle =
           (persisted && persisted.title) ||
           syntheticTitleByKey.get(resolvedLinkedKey) ||
-          (sameContentObs.find((o) => o.fromWorksJson && o.title) || {}).title ||
-          (sameContentObs[0] && sameContentObs[0].title) ||
+          (preferredObs.find((o) => o.fromWorksJson && o.title) || {}).title ||
+          (obsList[0] && obsList[0].title) ||
           "";
         bucket = meta
           ? makeBucket(
@@ -2416,8 +2647,7 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, o
         addWorkToBucket(
           bucket,
           {
-            workKey: actionObs.workKey,
-            overrideWorkKeys,
+            workKey: pwKey,
             workId,
             group: primaryGroup,
             platform,
@@ -2426,7 +2656,7 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, o
             publishDate: bestPubMs !== null ? toUtc8DateStr(bestPubMs) : "",
             matchedBy: resolvedMatchedBy,
             score: resolvedScore,
-            hasOverride: overrideWorkKeys.length > 0,
+            hasOverride,
             ...bestSnap.metrics,
           },
           bestSnap.metrics
@@ -2454,8 +2684,7 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, o
       addWorkToBucket(
         bucket,
         {
-          workKey: actionObs.workKey,
-          overrideWorkKeys,
+          workKey: pwKey,
           workId,
           group: primaryGroup,
           platform,
@@ -2464,7 +2693,7 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, o
           publishDate: bestPubMs !== null ? toUtc8DateStr(bestPubMs) : "",
           matchedBy: resolvedMatchedBy === "manual-detach" ? "manual-detach" : null,
           score: null,
-          hasOverride: overrideWorkKeys.length > 0,
+          hasOverride,
           ...bestSnap.metrics,
         },
         bestSnap.metrics
@@ -2539,17 +2768,21 @@ module.exports = {
   extractCoreTitle,
   isPlaceholderTitle,
   extractSeriesMarkers,
+  extractSeriesMarkersFromTitles,
   hasConflictingSeries,
   isValidAutoContentKey,
   isValidManualContentKey,
   isValidSyntheticContentKey,
   isUnstableRecordKey,
+  isValidWorkIdentityKey,
   computeTitleSimilarity,
   buildTitleIndex,
   normalizeStatusTitle,
   normalizeUrl,
   isManagementUrl,
   makeWorkKey,
+  makeWorkIdentityKey,
+  getLinkResultMeta,
   buildContentIndex,
   linkWorks,
   buildContentSummaryRows,

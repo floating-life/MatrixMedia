@@ -110,41 +110,47 @@ async function main() {
       assert.deepStrictEqual(Object.keys(emptyDoc.overrides), []);
       assert.deepStrictEqual(emptyWarns, []);
 
-      // 1b. set / merge / clear 往返
-      const d1 = store.setLinkOverride("G1|抖音|w1", { action: "assign", contentKey: "file:/v/a.mp4" }, 1000);
+      // 1b. set / merge / clear 往返（按作品身份 platform|workId 存储）
+      const d1 = store.setLinkOverride("抖音|w1", { action: "assign", contentKey: "file:/v/a.mp4" }, 1000);
       assert.strictEqual(d1.version, 1);
       assert.strictEqual(d1.updatedAt, 1000);
-      assert.deepStrictEqual(d1.overrides["G1|抖音|w1"], { action: "assign", contentKey: "file:/v/a.mp4" });
+      assert.deepStrictEqual(d1.overrides["抖音|w1"], { action: "assign", contentKey: "file:/v/a.mp4" });
       assert.ok(fs.existsSync(overridesFile));
 
-      const d2 = store.setLinkOverride("G1|快手|w2", { action: "detach" }, 2000);
-      assert.deepStrictEqual(d2.overrides["G1|快手|w2"], { action: "detach" });
+      // 拒绝非法作品身份键（空、无分隔符、带分组前缀的 3 段键）
+      assert.throws(() => store.setLinkOverride("G1|抖音|w1", { action: "detach" }));
+      assert.throws(() => store.setLinkOverride("invalid", { action: "detach" }));
+      assert.throws(() => store.setLinkOverride("|w1", { action: "detach" }));
+      assert.throws(() => store.setLinkOverride("抖音|", { action: "detach" }));
 
-      const merged = store.mergeWorksOverride(["G1|抖音|u1", "G1|小红书|u2", "G1|抖音|u1"], 3000);
+      const d2 = store.setLinkOverride("快手|w2", { action: "detach" }, 2000);
+      assert.deepStrictEqual(d2.overrides["快手|w2"], { action: "detach" });
+
+      const merged = store.mergeWorksOverride(["抖音|u1", "小红书|u2", "抖音|u1"], 3000);
       assert.ok(merged.contentKey.startsWith("manual:"));
-      assert.deepStrictEqual(merged.workKeys, ["G1|抖音|u1", "G1|小红书|u2"]);
-      assert.deepStrictEqual(merged.doc.overrides["G1|抖音|u1"], {
+      assert.deepStrictEqual(merged.workKeys, ["抖音|u1", "小红书|u2"]);
+      assert.deepStrictEqual(merged.doc.overrides["抖音|u1"], {
         action: "assign",
         contentKey: merged.contentKey,
       });
-      assert.deepStrictEqual(merged.doc.overrides["G1|小红书|u2"], {
+      assert.deepStrictEqual(merged.doc.overrides["小红书|u2"], {
         action: "assign",
         contentKey: merged.contentKey,
       });
 
       // 少于 2 条不允许合并
-      assert.throws(() => store.mergeWorksOverride(["G1|抖音|only1"]));
-      assert.throws(() => store.mergeWorksOverride(["G1|抖音|dup", "G1|抖音|dup"]));
+      assert.throws(() => store.mergeWorksOverride(["抖音|only1"]));
+      assert.throws(() => store.mergeWorksOverride(["抖音|dup", "抖音|dup"]));
 
       // clear 清除单条
-      const d3 = store.clearLinkOverride("G1|快手|w2", 4000);
-      assert.strictEqual(d3.overrides["G1|快手|w2"], undefined);
-      assert.deepStrictEqual(d3.overrides["G1|抖音|w1"], { action: "assign", contentKey: "file:/v/a.mp4" });
+      const d3 = store.clearLinkOverride("快手|w2", 4000);
+      assert.strictEqual(d3.overrides["快手|w2"], undefined);
+      assert.deepStrictEqual(d3.overrides["抖音|w1"], { action: "assign", contentKey: "file:/v/a.mp4" });
 
       // 特殊 key（__proto__）不发生原型污染
-      store.setLinkOverride("G1|抖音|__proto__", { action: "detach" }, 4500);
+      store.setLinkOverride("抖音|__proto__", { action: "detach" }, 4500);
       const rereadProto = store.readLinkOverrides();
-      assert.deepStrictEqual(rereadProto.overrides["G1|抖音|__proto__"], { action: "detach" });
+      assert.deepStrictEqual(rereadProto.overrides["抖音|__proto__"], { action: "detach" });
       assert.strictEqual(({}).action, undefined);
 
       // 1c. 原子写失败（fsync ENOSPC）保留旧文件完整、无 .tmp 残留
@@ -156,7 +162,7 @@ async function main() {
         throw err;
       };
       try {
-        assert.throws(() => store.setLinkOverride("G1|抖音|fail", { action: "detach" }), /ENOSPC/);
+        assert.throws(() => store.setLinkOverride("抖音|fail", { action: "detach" }), /ENOSPC/);
       } finally {
         fs.fsyncSync = origFsync;
       }
@@ -173,11 +179,11 @@ async function main() {
         "[]",
         "null",
         '{"version":1,"updatedAt":1000,"overrides":[]}',
-        '{"version":2,"updatedAt":1000,"overrides":{"G1|抖音|a":{"action":"detach"}}}',
-        '{"version":"1","updatedAt":1000,"overrides":{"G1|抖音|a":{"action":"detach"}}}',
-        '{"version":1,"updatedAt":{"toString":null},"overrides":{"G1|抖音|a":{"action":"detach"}}}',
-        '{"version":1,"updatedAt":"1000","overrides":{"G1|抖音|a":{"action":"detach"}}}',
-        '{"version":1,"updatedAt":null,"overrides":{"G1|抖音|a":{"action":"detach"}}}',
+        '{"version":2,"updatedAt":1000,"overrides":{"抖音|a":{"action":"detach"}}}',
+        '{"version":"1","updatedAt":1000,"overrides":{"抖音|a":{"action":"detach"}}}',
+        '{"version":1,"updatedAt":{"toString":null},"overrides":{"抖音|a":{"action":"detach"}}}',
+        '{"version":1,"updatedAt":"1000","overrides":{"抖音|a":{"action":"detach"}}}',
+        '{"version":1,"updatedAt":null,"overrides":{"抖音|a":{"action":"detach"}}}',
         '{"version":1,"updatedAt":1000,"contents":[],"overrides":{}}',
       ]) {
         fs.writeFileSync(overridesFile, badContent, "utf8");
@@ -189,7 +195,7 @@ async function main() {
         assert.ok(warnings.some((w) => w.includes("link-overrides.json")), `损坏/非法内容 ${badContent} 应 warn`);
       }
 
-      // 条目结构不对的逐条丢弃，合法条目保留
+      // 条目结构不对（含旧 3 段 group|platform|workId 键）的逐条丢弃，合法条目保留
       fs.writeFileSync(
         overridesFile,
         JSON.stringify({
@@ -204,12 +210,13 @@ async function main() {
             "auto:bad_obj": null,
           },
           overrides: {
-            "G1|抖音|ok1": { action: "detach" },
-            "G1|抖音|ok2": { action: "assign", contentKey: "manual:good1" },
-            "G1|抖音|bad_action": { action: "unknown" },
-            "G1|抖音|bad_ck_obj": { action: "assign", contentKey: { toString: null } },
-            "G1|抖音|bad_ck_unlinked": { action: "assign", contentKey: "unlinked:抖音:1" },
-            "G1|抖音|bad_entry": "not-an-object",
+            "抖音|ok1": { action: "detach" },
+            "抖音|ok2": { action: "assign", contentKey: "manual:good1" },
+            "G1|抖音|legacy_group_key": { action: "detach" },
+            "抖音|bad_action": { action: "unknown" },
+            "抖音|bad_ck_obj": { action: "assign", contentKey: { toString: null } },
+            "抖音|bad_ck_unlinked": { action: "assign", contentKey: "unlinked:抖音:1" },
+            "抖音|bad_entry": "not-an-object",
           },
         }),
         "utf8"
@@ -218,7 +225,7 @@ async function main() {
       assert.deepStrictEqual(partialWarns, []);
       assert.strictEqual(partialRes.updatedAt, 5000);
       assert.deepStrictEqual(Object.keys(partialRes.contents).sort(), ["auto:good2", "manual:good1"]);
-      assert.deepStrictEqual(Object.keys(partialRes.overrides).sort(), ["G1|抖音|ok1", "G1|抖音|ok2"]);
+      assert.deepStrictEqual(Object.keys(partialRes.overrides).sort(), ["抖音|ok1", "抖音|ok2"]);
 
       fs.rmSync(overridesFile, { force: true });
       fs.mkdirSync(overridesFile);
@@ -288,8 +295,8 @@ async function main() {
         contents,
         accounts,
         overrides: {
-          "G1|抖音|dy_fuzzy": { action: "detach" },
-          "G1|抖音|dy_auto": { action: "detach" },
+          "抖音|dy_fuzzy": { action: "detach" },
+          "抖音|dy_auto": { action: "detach" },
         },
       });
       assert.deepStrictEqual(detachedLink.get("G1|抖音|dy_fuzzy"), {
@@ -311,8 +318,8 @@ async function main() {
         contents,
         accounts,
         overrides: {
-          "G1|抖音|dy_fuzzy": { action: "assign", contentKey: "file:d:/v/deleted_forever.mp4" },
-          "G1|抖音|dy_auto": { action: "assign", contentKey: "auto:0000000000000000" },
+          "抖音|dy_fuzzy": { action: "assign", contentKey: "file:d:/v/deleted_forever.mp4" },
+          "抖音|dy_auto": { action: "assign", contentKey: "auto:0000000000000000" },
         },
       });
       assert.strictEqual(
@@ -336,9 +343,9 @@ async function main() {
           updatedAt: 1000,
           contents: {},
           overrides: {
-            "G1|抖音|dy_free": { action: "assign", contentKey: "manual:never_created" },
-            "G1|抖音|dy_auto": { action: "assign", contentKey: "auto:1111222233334444" },
-            "G1|快手|ks_auto": { action: "assign", contentKey: "auto:1111222233334444" },
+            "抖音|dy_free": { action: "assign", contentKey: "manual:never_created" },
+            "抖音|dy_auto": { action: "assign", contentKey: "auto:1111222233334444" },
+            "快手|ks_auto": { action: "assign", contentKey: "auto:1111222233334444" },
           },
         },
       });
@@ -364,13 +371,13 @@ async function main() {
         },
         overrides: {
           // 把原本模糊配给 hsr 的作品改合并到 steak
-          "G1|抖音|dy_fuzzy": { action: "assign", contentKey: "file:d:/v/steak.mp4" },
+          "抖音|dy_fuzzy": { action: "assign", contentKey: "file:d:/v/steak.mp4" },
           // 把 auto 簇固化为 manual
-          "G1|抖音|dy_auto": { action: "assign", contentKey: autoKey },
-          "G1|快手|ks_auto": { action: "assign", contentKey: autoKey },
+          "抖音|dy_auto": { action: "assign", contentKey: autoKey },
+          "快手|ks_auto": { action: "assign", contentKey: autoKey },
           // 合并两个未关联作品为 manual:*
-          "G1|抖音|dy_free": { action: "assign", contentKey: "manual:custom001" },
-          "G1|快手|ks_free": { action: "assign", contentKey: "manual:custom001" },
+          "抖音|dy_free": { action: "assign", contentKey: "manual:custom001" },
+          "快手|ks_free": { action: "assign", contentKey: "manual:custom001" },
         },
       };
       const manualLink = linkWorks({ contents, accounts, overrides: manualOverrides });
@@ -403,8 +410,8 @@ async function main() {
           [autoKey]: { title: "周末户外露营必带十件实用装备清单", createdAt: 2500 },
         },
         overrides: {
-          "G1|抖音|dy_auto": { action: "assign", contentKey: autoKey },
-          "G1|快手|ks_auto": { action: "detach" },
+          "抖音|dy_auto": { action: "assign", contentKey: autoKey },
+          "快手|ks_auto": { action: "detach" },
         },
       };
       const partialConfirmLink = linkWorks({ contents, accounts, overrides: partialConfirmDetach });
@@ -493,7 +500,7 @@ async function main() {
           contents: s1Contents,
           accounts: s1Accounts,
           overrides: {
-            "G1|抖音|fit_exact": { action: "assign", contentKey: "file:d:/fit/core.mp4" },
+            "抖音|fit_exact": { action: "assign", contentKey: "file:d:/fit/core.mp4" },
           },
         });
         assert.deepStrictEqual(afterConfirm.get("G1|抖音|fit_exact"), {
@@ -573,12 +580,12 @@ async function main() {
           accounts: cgAccounts,
           worksDaily: cgDaily,
           overrides: {
-            "组B|抖音|cg1": { action: "assign", contentKey: "file:d:/cg/same.mp4" },
+            "抖音|cg1": { action: "assign", contentKey: "file:d:/cg/same.mp4" },
           },
         });
         assert.ok(
           afterManualBCg[0].perPlatform["抖音|组A"],
-          "S6-fix#5: 对 B 组观测手工 assign 同一 file: 键后，指标必须留在既有 抖音|组A 列"
+          "S6-fix#5: 手工 assign 同一 file: 键后，指标必须留在既有 抖音|组A 列"
         );
         assert.strictEqual(afterManualBCg[0].perPlatform["抖音|组A"].play, 180);
         assert.strictEqual(
@@ -589,8 +596,8 @@ async function main() {
         assert.strictEqual(afterManualBCg[0].matchMethod, "manual");
         assert.strictEqual(
           afterManualBCg[0].perPlatform["抖音|组A"].works[0].workKey,
-          "组B|抖音|cg1",
-          "操作用 workKey 应指向持有 override 的真实观测"
+          "抖音|cg1",
+          "S6-r3#1+2: 作品操作用 workKey 应为统一作品身份 platform|workId"
         );
       }
 
@@ -661,9 +668,10 @@ async function main() {
       assert.strictEqual((await clearOverride(localEv, { workKey: "" })).ok, false);
       assert.strictEqual((await applyOverrides(localEv, { ops: [] })).ok, false);
 
-      // 3c. 并发 Promise.all 串行写入不丢写（先准备合法 file: 目标，同时写 10 条不同 workKey）
+      // 3c. 并发 Promise.all 串行写入不丢写（准备合法 file: 目标与 10 条真实作品，同时写 10 条不同作品身份）
       const batchPushFile = path.join(pushDataDir, "2026-11-09.json");
       const batchRecs = [];
+      const batchWorks = [];
       for (let i = 0; i < 10; i++) {
         batchRecs.push({
           id: `batch_r_${i}`,
@@ -674,14 +682,21 @@ async function main() {
           filePath: `/videos/batch_${i}.mp4`,
           lastPublishAt: dayTs("2026-11-09"),
         });
+        batchWorks.push({
+          workId: `cw_${i}`,
+          title: `独立并发作品_${i}`,
+          publishTime: dayTs("2026-11-09"),
+          play: 10 + i,
+        });
       }
       fs.writeFileSync(batchPushFile, JSON.stringify(batchRecs), "utf8");
+      store.mergeWorks("并发组", "抖音", batchWorks, dayTs("2026-11-09"));
 
       const concurrentCalls = [];
       for (let i = 0; i < 10; i++) {
         concurrentCalls.push(
           setOverride(localEv, {
-            workKey: `并发组|抖音|cw_${i}`,
+            workKey: `抖音|cw_${i}`,
             action: "assign",
             contentKey: `file:/videos/batch_${i}.mp4`,
           })
@@ -693,7 +708,7 @@ async function main() {
       assert.strictEqual(afterConcurrent.ok, true);
       for (let i = 0; i < 10; i++) {
         assert.deepStrictEqual(
-          afterConcurrent.overrides[`并发组|抖音|cw_${i}`],
+          afterConcurrent.overrides[`抖音|cw_${i}`],
           { action: "assign", contentKey: `file:/videos/batch_${i}.mp4` },
           `并发写入第 ${i} 条不应丢失`
         );
@@ -702,6 +717,7 @@ async function main() {
       // 清理并发测试脏数据
       fs.rmSync(overridesFile, { force: true });
       fs.rmSync(batchPushFile, { force: true });
+      fs.rmSync(path.join(userDataDir, "data-stats", "并发组"), { recursive: true, force: true });
 
       // 3d. 端到端数据：准备 pushData + store 作品日快照，通过 IPC 做 assign/detach/merge/clear，验证界面汇总与 Excel 导出完全一致
       fs.writeFileSync(
@@ -997,7 +1013,317 @@ async function main() {
       assert.ok(dailyOnlyS2);
       assert.strictEqual(dailyOnlyS2[6], 333);
 
-      console.log("✓ IPC 安全/参数/并发串行写入 + S6-fix#4/#6/#13 端到端与导出一致性全通过");
+      // 3g. S6-r3#1 + #2 + #9 + #11 端到端回归测试
+      {
+        const r3PushFile = path.join(pushDataDir, "2026-11-12.json");
+        fs.writeFileSync(
+          r3PushFile,
+          JSON.stringify([
+            {
+              id: "r3-shared",
+              pt: "抖音",
+              group: "交叉组A",
+              publishStatus: "success",
+              title: "跨组共享作品拆出测试",
+              filePath: "/videos/r3_shared.mp4",
+              videoLink: "https://www.douyin.com/video/r3shared",
+              lastPublishAt: dayTs("2026-11-12"),
+            },
+            {
+              id: "r3-shared-b",
+              pt: "抖音",
+              group: "交叉组B",
+              publishStatus: "success",
+              title: "跨组共享作品拆出测试",
+              filePath: "/videos/r3_shared.mp4",
+              videoLink: "https://www.douyin.com/video/r3shared",
+              lastPublishAt: dayTs("2026-11-12"),
+            },
+            {
+              id: "r3-conf-a",
+              pt: "抖音",
+              group: "交叉组A",
+              publishStatus: "success",
+              title: "跨组冲突素材甲",
+              filePath: "/videos/r3_conf_a.mp4",
+              videoLink: "https://www.douyin.com/video/r3conf",
+              lastPublishAt: dayTs("2026-11-12"),
+            },
+            {
+              id: "r3-conf-b",
+              pt: "抖音",
+              group: "交叉组B",
+              publishStatus: "success",
+              title: "跨组冲突素材乙",
+              filePath: "/videos/r3_conf_b.mp4",
+              videoLink: "https://www.douyin.com/video/r3conf",
+              lastPublishAt: dayTs("2026-11-12"),
+            },
+          ]),
+          "utf8"
+        );
+
+        const sharedWork = {
+          workId: "W_R3_SHARED",
+          title: "跨组共享作品拆出测试",
+          url: "https://www.douyin.com/video/r3shared",
+          publishTime: dayTs("2026-11-12"),
+          play: 500,
+        };
+        const conflictWork = {
+          workId: "W_R3_CONF",
+          title: "跨组冲突作品",
+          url: "https://www.douyin.com/video/r3conf",
+          publishTime: dayTs("2026-11-12"),
+          play: 300,
+        };
+        const unlinkedPeer = {
+          workId: "W_R3_PEER",
+          title: "完全无关独立快手视频",
+          url: "https://www.kuaishou.com/short-video/r3peer",
+          publishTime: dayTs("2026-11-12"),
+          play: 200,
+        };
+
+        store.mergeWorks("交叉组A", "抖音", [sharedWork, conflictWork], dayTs("2026-11-12"));
+        store.mergeWorks(
+          "交叉组B",
+          "抖音",
+          [{ ...sharedWork, play: 520 }, { ...conflictWork, play: 310 }],
+          dayTs("2026-11-12")
+        );
+        store.mergeWorks("交叉组A", "快手", [unlinkedPeer], dayTs("2026-11-12"));
+
+        // S6-r3#1(testS6r3WorkIdentityDetachAcrossGroups):
+        // A/B 两组采到同一作品 W_R3_SHARED，点拆出后：GUI 汇总、全量 Excel 日明细(A+B)、单导 B 组日明细与汇总全部未关联
+        const detachShared = await setOverride(localEv, {
+          workKey: "交叉组A|抖音|W_R3_SHARED",
+          action: "detach",
+        });
+        assert.strictEqual(detachShared.ok, true);
+        assert.strictEqual(detachShared.workKey, "抖音|W_R3_SHARED", "S6-r3#1: 写入应归一为作品身份 platform|workId");
+
+        const ovOnDisk = await getOverrides(localEv);
+        assert.deepStrictEqual(ovOnDisk.overrides["抖音|W_R3_SHARED"], { action: "detach" });
+        assert.strictEqual(ovOnDisk.overrides["交叉组A|抖音|W_R3_SHARED"], undefined);
+
+        const guiAfterDetach = await getSummary(localEv, {});
+        assert.ok(
+          guiAfterDetach.rows.find((r) => r.contentKey === "unlinked:抖音:W_R3_SHARED"),
+          "S6-r3#1: GUI 汇总应显示未关联"
+        );
+        const fullWbAfterDetach = buildStatsWorkbookData({ to: "2026-11-12", now: dayTs("2026-11-12") });
+        const sharedDailyRows = fullWbAfterDetach.sheets["作品日明细"]
+          .slice(1)
+          .filter((r) => r[6] === "W_R3_SHARED");
+        assert.strictEqual(sharedDailyRows.length, 2, "全量日明细应包含 A、B 两组观测");
+        assert.ok(
+          sharedDailyRows.every((r) => r[3] === null && r[4] === null),
+          "S6-r3#1: 拆出后全量 Excel 日明细中 A、B 两组行内容ID与关联方式均必须为空"
+        );
+        const onlyBWbAfterDetach = buildStatsWorkbookData({
+          to: "2026-11-12",
+          groups: ["交叉组B"],
+          now: dayTs("2026-11-12"),
+        });
+        const onlyBS1 = onlyBWbAfterDetach.sheets["作品日明细"]
+          .slice(1)
+          .find((r) => r[6] === "W_R3_SHARED");
+        assert.strictEqual(onlyBS1[3], null, "S6-r3#1: 只导 B 组日明细中该作品必须保持未关联");
+        assert.ok(
+          onlyBWbAfterDetach.sheets["作品跨平台汇总"]
+            .slice(1)
+            .find((r) => r[0] === "unlinked:抖音:W_R3_SHARED"),
+          "S6-r3#1: 只导 B 组跨平台汇总中该作品必须保持未关联，不得恢复原素材关联"
+        );
+
+        // S6-r3#2(testS6r3CrossGroupAtomicOverrideAndVerify):
+        // 2a. 先用 A/B 观测键分别手工指定同一素材，再拆出 → 落盘仅 1 条作品身份，拆出后彻底脱离
+        const assignA = await setOverride(localEv, {
+          workKey: "交叉组A|抖音|W_R3_SHARED",
+          action: "assign",
+          contentKey: "file:/videos/r3_shared.mp4",
+        });
+        const assignB = await setOverride(localEv, {
+          workKey: "交叉组B|抖音|W_R3_SHARED",
+          action: "assign",
+          contentKey: "file:/videos/r3_shared.mp4",
+        });
+        assert.strictEqual(assignA.ok, true);
+        assert.strictEqual(assignB.ok, true);
+        const detachAfterBothAssign = await setOverride(localEv, {
+          workKey: "抖音|W_R3_SHARED",
+          action: "detach",
+        });
+        assert.strictEqual(detachAfterBothAssign.ok, true);
+        const guiAfterSecondDetach = await getSummary(localEv, {});
+        assert.ok(
+          guiAfterSecondDetach.rows.find((r) => r.contentKey === "unlinked:抖音:W_R3_SHARED"),
+          "S6-r3#2: A/B 两份观测先后 assign 后再点拆出，必须原子更新作品身份并彻底脱离原行"
+        );
+
+        // 2b. 跨组冲突作品 W_R3_CONF 与另一条未关联作品 W_R3_PEER 合并 → 成功且新行包含全部 2 条
+        const mergeConfRes = await applyOverrides(localEv, {
+          ops: [{ action: "merge", workKeys: ["交叉组A|抖音|W_R3_CONF", "交叉组A|快手|W_R3_PEER"] }],
+        });
+        assert.strictEqual(mergeConfRes.ok, true, "S6-r3#2: 跨组冲突未关联作品与另一条未关联作品合并应成功");
+        const guiAfterMergeConf = await getSummary(localEv, {});
+        const mergedConfRow = guiAfterMergeConf.rows.find((r) => r.contentKey === mergeConfRes.contentKey);
+        assert.ok(mergedConfRow, "S6-r3#2: 刷新后应存在新合并行");
+        assert.strictEqual(mergedConfRow.platformCount, 2, "S6-r3#2: 新合并行必须包含全部 2 条作品");
+        assert.strictEqual(mergedConfRow.totalPlay, 500, "S6-r3#2: 同日跨组观测去重后应为 300+200=500，不得双倍累加");
+
+        // 2c. 写入端校验失败（不存在的作品 / 同一作品在两组的两份观测试图自合并）拒绝且不写盘
+        const diskBeforeReject = fs.readFileSync(overridesFile, "utf8");
+        const missingWorkAssign = await setOverride(localEv, {
+          workKey: "抖音|NOT_EXIST_WORK",
+          action: "assign",
+          contentKey: "file:/videos/r3_shared.mp4",
+        });
+        assert.strictEqual(missingWorkAssign.ok, false, "S6-r3#2: 不存在作品的 assign 必须拒绝不写盘");
+        const selfMergeCrossGroup = await applyOverrides(localEv, {
+          ops: [{ action: "merge", workKeys: ["交叉组A|抖音|W_R3_SHARED", "交叉组B|抖音|W_R3_SHARED"] }],
+        });
+        assert.strictEqual(
+          selfMergeCrossGroup.ok,
+          false,
+          "S6-r3#2: 同一作品在两组的两份观测归一为 1 条作品，不得创建手工合并"
+        );
+        assert.strictEqual(
+          fs.readFileSync(overridesFile, "utf8"),
+          diskBeforeReject,
+          "S6-r3#2: 校验失败不得修改磁盘 link-overrides.json"
+        );
+
+        // S6-r3#9(testS6r3BatchOpsSequentialValidation):
+        // W_R3_SHARED 当前处于 detach 状态，但清除后会恢复自动关联到 r3_shared.mp4；
+        // 把 [clear, merge] 放进同一个 ops 必须按顺序在内存状态上校验并拒绝整批，磁盘不变！
+        const extraUnlinked = {
+          workId: "W_R3_UNL2",
+          title: "另一条完全独立的快手测试视频",
+          publishTime: dayTs("2026-11-12"),
+          play: 88,
+        };
+        store.mergeWorks("交叉组A", "快手", [extraUnlinked], dayTs("2026-11-12"));
+
+        const bytesBeforeSeq = fs.readFileSync(overridesFile, "utf8");
+        const clearThenMerge = await applyOverrides(localEv, {
+          ops: [
+            { action: "clear", workKey: "抖音|W_R3_SHARED" },
+            { action: "merge", workKeys: ["抖音|W_R3_SHARED", "快手|W_R3_UNL2"] },
+          ],
+        });
+        assert.strictEqual(
+          clearThenMerge.ok,
+          false,
+          "S6-r3#9(testS6r3BatchOpsSequentialValidation): 批量 clear 后该作品已恢复自动关联，紧随其后的 merge 必须拒绝"
+        );
+        assert.strictEqual(
+          fs.readFileSync(overridesFile, "utf8"),
+          bytesBeforeSeq,
+          "S6-r3#9: 批量校验失败不得写盘"
+        );
+
+        // 正向对照：先恢复自动关联，再在单批 ops 内 [detach, merge] 必须基于前一条 detach 后的状态通过并一次写盘
+        assert.strictEqual((await clearOverride(localEv, { workKey: "抖音|W_R3_SHARED" })).ok, true);
+        const detachThenMerge = await applyOverrides(localEv, {
+          ops: [
+            { action: "detach", workKey: "抖音|W_R3_SHARED" },
+            { action: "merge", workKeys: ["抖音|W_R3_SHARED", "快手|W_R3_UNL2"] },
+          ],
+        });
+        assert.strictEqual(
+          detachThenMerge.ok,
+          true,
+          "S6-r3#9: 单批 ops 内先 detach 再 merge 应基于前序状态通过并一次写盘"
+        );
+        assert.ok(detachThenMerge.contentKey && detachThenMerge.contentKey.startsWith("manual:"));
+        const afterSeqSum = await getSummary(localEv, {});
+        const seqMergedRow = afterSeqSum.rows.find((r) => r.contentKey === detachThenMerge.contentKey);
+        assert.ok(seqMergedRow && seqMergedRow.platformCount === 2);
+
+        // 联动对照：未持久化 auto 簇在同批先 detach 成员1 再 assign 成员2 到该 autoKey → 拒绝不写盘
+        store.mergeWorks(
+          "交叉组A",
+          "抖音",
+          [{ workId: "W_SEQ_AUTO_1", title: "批量顺序校验自动簇测试标题", publishTime: dayTs("2026-11-12"), play: 10 }],
+          dayTs("2026-11-12")
+        );
+        store.mergeWorks(
+          "交叉组A",
+          "快手",
+          [{ workId: "W_SEQ_AUTO_2", title: "批量顺序校验自动簇测试标题", publishTime: dayTs("2026-11-12"), play: 20 }],
+          dayTs("2026-11-12")
+        );
+        const seqAutoSum = await getSummary(localEv, {});
+        const seqAutoRow = seqAutoSum.rows.find(
+          (r) => typeof r.contentKey === "string" && r.contentKey.startsWith("auto:") && r.title === "批量顺序校验自动簇测试标题"
+        );
+        assert.ok(seqAutoRow);
+        const bytesBeforeAutoSeq = fs.readFileSync(overridesFile, "utf8");
+        const detachThenAssignGoneAuto = await applyOverrides(localEv, {
+          ops: [
+            { action: "detach", workKey: "抖音|W_SEQ_AUTO_1" },
+            { action: "assign", workKey: "快手|W_SEQ_AUTO_2", contentKey: seqAutoRow.contentKey },
+          ],
+        });
+        assert.strictEqual(
+          detachThenAssignGoneAuto.ok,
+          false,
+          "S6-r3#9: 批内前一条 detach 使未持久化 auto 簇失效，后一条 assign 到该 autoKey 必须拒绝"
+        );
+        assert.strictEqual(fs.readFileSync(overridesFile, "utf8"), bytesBeforeAutoSeq);
+
+        // S6-r3#11(testS6r3WriteValidationUsesCutoffReader):
+        // 多天 works-daily 夹具 + spy 断言写入校验路径绝不调用全量 store.readWorksDaily，而是复用 store.readWorksDailyLatestAsOf
+        for (let d = 1; d <= 15; d++) {
+          const ymd = `2026-10-${String(d).padStart(2, "0")}`;
+          store.mergeWorks("交叉组A", "抖音", [{ ...sharedWork, play: 100 + d }], dayTs(ymd));
+        }
+        let fullReadCount = 0;
+        let cutoffReadCount = 0;
+        const origFullRead = store.readWorksDaily;
+        const origCutoffRead = store.readWorksDailyLatestAsOf;
+        store.readWorksDaily = (...args) => {
+          fullReadCount++;
+          return origFullRead(...args);
+        };
+        store.readWorksDailyLatestAsOf = (...args) => {
+          cutoffReadCount++;
+          return origCutoffRead(...args);
+        };
+        try {
+          const spyClear = await clearOverride(localEv, { workKey: "抖音|W_R3_SHARED" });
+          assert.strictEqual(spyClear.ok, true);
+          const spyAssign = await setOverride(localEv, {
+            workKey: "抖音|W_R3_SHARED",
+            action: "assign",
+            contentKey: "file:/videos/r3_shared.mp4",
+          });
+          assert.strictEqual(spyAssign.ok, true);
+          const spyDetach = await setOverride(localEv, {
+            workKey: "抖音|W_R3_SHARED",
+            action: "detach",
+          });
+          assert.strictEqual(spyDetach.ok, true);
+          assert.strictEqual(
+            fullReadCount,
+            0,
+            `S6-r3#11(testS6r3WriteValidationUsesCutoffReader): 写入校验不得调用全量 store.readWorksDaily，实际调用 ${fullReadCount} 次`
+          );
+          assert.ok(
+            cutoffReadCount > 0,
+            "S6-r3#11: 写入校验应复用截至日读取路径 store.readWorksDailyLatestAsOf"
+          );
+        } finally {
+          store.readWorksDaily = origFullRead;
+          store.readWorksDailyLatestAsOf = origCutoffRead;
+        }
+
+        fs.rmSync(r3PushFile, { force: true });
+      }
+
+      console.log("✓ IPC 安全/参数/并发串行写入 + S6-fix#4/#6/#13 + S6-r3#1/#2/#9/#11 端到端与导出一致性全通过");
     }
 
     /* ---------- 4. dataStats/index.vue 模板编译与手工矫正交互方法校验 ---------- */
@@ -1110,12 +1436,13 @@ async function main() {
         await ctx.confirmFuzzyRow({
           contentKey: "auto:1234567890abcdef",
           matchMethod: "fuzzy",
+          canAssignTarget: true,
           perPlatform: {
             "抖音|G1": {
-              works: [{ workKey: "G1|抖音|w1", matchedBy: "fuzzy", score: 0.9 }],
+              works: [{ workKey: "抖音|w1", matchedBy: "fuzzy", score: 0.9 }],
             },
             "快手|G1": {
-              works: [{ workKey: "G1|快手|w2", matchedBy: "fuzzy", score: 0.9 }],
+              works: [{ workKey: "快手|w2", matchedBy: "fuzzy", score: 0.9 }],
             },
           },
         });
@@ -1133,17 +1460,39 @@ async function main() {
         );
 
         // S6-fix#4: 合并未关联作品也走 stats:apply-link-overrides
-        ctx.selectedUnlinkedWorks = [{ workKey: "G1|抖音|u1" }, { workKey: "G1|快手|u2" }];
+        ctx.selectedUnlinkedWorks = [{ workKey: "抖音|u1" }, { workKey: "快手|u2" }];
         await ctx.mergeSelectedUnlinked();
         const mergeApplyCall = invokeCalls.filter((c) => c.channel === "stats:apply-link-overrides")[1];
         assert.ok(mergeApplyCall);
         assert.strictEqual(mergeApplyCall.payload.ops[0].action, "merge");
-        assert.deepStrictEqual(mergeApplyCall.payload.ops[0].workKeys, ["G1|抖音|u1", "G1|快手|u2"]);
+        assert.deepStrictEqual(mergeApplyCall.payload.ops[0].workKeys, ["抖音|u1", "快手|u2"]);
 
-        // S6-fix#13: 前端合并弹窗过滤掉无法稳定的旧位置键（canAssignTarget=false 或 :pos:N）
+        // S6-fix#13 + S6-r3#12(testS6r3VueCanAssignTargetSharedConfirmAndFilter):
+        // 不可手工引用的旧位置记录(canAssignTarget=false)在汇总确认、展开明细确认、待确认筛选与合并目标弹窗中全部一致隐藏/过滤
+        const unstableFuzzyWork = { workKey: "视频号|u_pos_w", matchedBy: "fuzzy", score: 0.9 };
+        const stableFuzzyWork = { workKey: "抖音|u_ok_w", matchedBy: "fuzzy", score: 0.9 };
+        const unstableFuzzyRow = {
+          contentKey: "record:pos:0",
+          title: "不稳定旧位置记录",
+          isUnlinked: false,
+          canAssignTarget: false,
+          matchMethod: "fuzzy",
+          hasFuzzy: true,
+          perPlatform: { "视频号|G1": { works: [unstableFuzzyWork] } },
+        };
+        const stableFuzzyRow = {
+          contentKey: "file:/v/stable.mp4",
+          title: "稳定内容",
+          isUnlinked: false,
+          canAssignTarget: true,
+          matchMethod: "fuzzy",
+          hasFuzzy: true,
+          perPlatform: { "抖音|G1": { works: [stableFuzzyWork] } },
+        };
         ctx.contentSummaryRows = [
-          { contentKey: "file:/v/stable.mp4", title: "稳定内容", isUnlinked: false, canAssignTarget: true },
-          { contentKey: "record:2026-11-10:pos:0", title: "不稳定旧位置记录", isUnlinked: false, canAssignTarget: false },
+          stableFuzzyRow,
+          unstableFuzzyRow,
+          { contentKey: "record:2026-11-10:pos:0", title: "旧格式不稳定记录", isUnlinked: false, canAssignTarget: false, matchMethod: "fuzzy", hasFuzzy: true },
           { contentKey: "unlinked:抖音:u1", title: "未关联", isUnlinked: true, canAssignTarget: false },
         ];
         assert.deepStrictEqual(
@@ -1151,10 +1500,57 @@ async function main() {
           ["file:/v/stable.mp4"],
           "S6-fix#13: 不稳定旧位置键不得显示为合并弹窗可选目标"
         );
+        assert.strictEqual(ctx.canConfirmRow(stableFuzzyRow), true);
+        assert.strictEqual(ctx.canConfirmRow(unstableFuzzyRow), false, "S6-r3#12: 汇总行确认应尊重 canAssignTarget");
+        assert.strictEqual(ctx.canConfirmWork(stableFuzzyRow, stableFuzzyWork), true);
+        assert.strictEqual(
+          ctx.canConfirmWork(unstableFuzzyRow, unstableFuzzyWork),
+          false,
+          "S6-r3#12: 展开明细单条确认必须共用 canAssignTarget，禁止对不可手工引用记录显示确认"
+        );
+        assert.deepStrictEqual(
+          ctx.fuzzySummaryRows.map((r) => r.contentKey),
+          ["file:/v/stable.mp4"],
+          "S6-r3#12: 「仅模糊匹配（待确认）」筛选必须共用 canAssignTarget，排除不可确认的位置键行"
+        );
+        assert.ok(
+          sfc.template.content.includes("canConfirmWork(row, p)"),
+          "S6-r3#12: 模板展开明细确认按钮必须绑定 canConfirmWork(row, p)"
+        );
+        const invokeBeforeBlockedConfirm = invokeCalls.length;
+        await ctx.confirmSingleWork(unstableFuzzyWork, unstableFuzzyRow.contentKey, unstableFuzzyRow);
+        assert.strictEqual(
+          invokeCalls.length,
+          invokeBeforeBlockedConfirm,
+          "S6-r3#12: 对 canAssignTarget=false 行调用 confirmSingleWork 不得发 IPC"
+        );
+
+        // S6-r3#10(testS6r3VueDefaultExportRange):
+        // 未手动调整导出区间时不传 from/to（用后端共享默认截止日）；手动调整后才传
+        assert.strictEqual(ctx.exportRange, null, "S6-r3#10: 默认 exportRange 应为 null（不预设本地当天）");
+        await ctx.exportXlsx();
+        const defaultExportCall = invokeCalls.filter((c) => c.channel === "stats:export-xlsx").pop();
+        assert.deepStrictEqual(
+          defaultExportCall.payload,
+          {},
+          "S6-r3#10: 未手动调整导出区间时不得传 from/to，由后端共享默认截止日决定"
+        );
+        ctx.exportRange = ["2026-11-01", "2026-11-18"];
+        await ctx.exportXlsx();
+        const customExportCall = invokeCalls.filter((c) => c.channel === "stats:export-xlsx").pop();
+        assert.deepStrictEqual(
+          customExportCall.payload,
+          { from: "2026-11-01", to: "2026-11-18" },
+          "S6-r3#10: 手动调整导出区间后应传递 from/to"
+        );
+        ctx.exportRange = null;
+        await ctx.exportXlsx();
+        const clearedExportCall = invokeCalls.filter((c) => c.channel === "stats:export-xlsx").pop();
+        assert.deepStrictEqual(clearedExportCall.payload, {}, "S6-r3#10: 清空导出区间后恢复不传 from/to");
 
         // S6-fix#14: 合并弹窗重开清空表格当前行，再次点击同一高亮行可更新 reassignTargetKey 并提交
         const targetRow = ctx.contentSummaryRows[0];
-        ctx.openReassignDialog({ workKey: "G1|抖音|u1", platform: "抖音", group: "G1", title: "作品1" }, null);
+        ctx.openReassignDialog({ workKey: "抖音|u1", platform: "抖音", group: "G1", title: "作品1" }, null);
         mockReassignTable.simulateUserClickRow(targetRow);
         assert.strictEqual(ctx.reassignTargetKey, "file:/v/stable.mp4");
         assert.strictEqual(tableCurrentRow, targetRow);
@@ -1165,7 +1561,7 @@ async function main() {
         assert.strictEqual(tableCurrentRow, null, "S6-fix#14: 弹窗重置必须通过 setCurrentRow() 清空表格当前行");
         assert.ok(setCurrentRowCalls > 0);
 
-        ctx.openReassignDialog({ workKey: "G1|抖音|u1", platform: "抖音", group: "G1", title: "作品1" }, null);
+        ctx.openReassignDialog({ workKey: "抖音|u1", platform: "抖音", group: "G1", title: "作品1" }, null);
         // 即使表格意外仍停在 targetRow，行点击仍能正确选中并允许提交
         mockReassignTable.simulateUserClickRow(targetRow);
         assert.strictEqual(
@@ -1176,7 +1572,7 @@ async function main() {
 
         // 测试拆出失败时 $message.error 报错
         nextInvokeResult = { ok: false, error: "模拟写入失败" };
-        await ctx.detachWork({ workKey: "G1|抖音|w1" });
+        await ctx.detachWork({ workKey: "抖音|w1" });
         assert.ok(
           messages.some((x) => x.type === "error" && x.m.includes("模拟写入失败")),
           "操作失败时必须调用 $message.error 报错"
@@ -1186,7 +1582,7 @@ async function main() {
         delete require.cache[bundlePath];
       }
 
-      console.log("✓ dataStats/index.vue 模板编译、批量原子确认/合并(S6-fix#4)、过滤不稳定键(S6-fix#13)与重开弹窗选同行(S6-fix#14)通过");
+      console.log("✓ dataStats/index.vue 模板编译、批量原子确认/合并(S6-fix#4)、过滤不稳定键与共用canAssignTarget(S6-r3#12)、默认导出区间(S6-r3#10)与重开弹窗选同行(S6-fix#14)通过");
     }
   } finally {
     if (origElectronCache) require.cache[electronId] = origElectronCache;

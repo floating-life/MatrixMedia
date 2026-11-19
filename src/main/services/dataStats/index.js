@@ -31,6 +31,7 @@ const {
   isValidAutoContentKey,
   isValidManualContentKey,
   isUnstableRecordKey,
+  isValidWorkIdentityKey,
 } = require("./contentLink");
 const {
   validateExportDateRange,
@@ -145,101 +146,200 @@ function normalizeOverrideOps(rawOps) {
   return normalized;
 }
 
-function pickMergedWorksTitle(workKeys, workInfoByKey, explicitTitle) {
+function pickMergedWorksTitle(pwKeys, workInfoByPwKey, explicitTitle) {
   if (explicitTitle) return explicitTitle;
-  const list = workKeys
-    .map((wk) => workInfoByKey.get(wk))
+  const list = pwKeys
+    .map((pwKey) => workInfoByPwKey.get(pwKey))
     .filter(Boolean)
     .sort((a, b) => {
       const aHas = a.pubMs !== null;
       const bHas = b.pubMs !== null;
       if (aHas !== bHas) return aHas ? -1 : 1;
       if (aHas && a.pubMs !== b.pubMs) return a.pubMs - b.pubMs;
-      return a.workKey < b.workKey ? -1 : a.workKey > b.workKey ? 1 : 0;
+      return a.pwKey < b.pwKey ? -1 : a.pwKey > b.pwKey ? 1 : 0;
     });
   const chosen = list.find((o) => o.fromWorksJson && o.rawTitle) || list[0];
   return (chosen && chosen.title) || "(无标题)";
 }
 
+/**
+ * 将请求中的 workKey（规范作品身份 `platform|workId`，或兼容观测键 `group|platform|workId`）
+ * 归一解析为作品身份 `platform|workId`。
+ */
+function resolveOpWorkIdentity(rawKey, ctx, workingOverrides, allowMissing = false) {
+  if (typeof rawKey !== "string" || !rawKey) return null;
+  if (ctx.workInfoByPwKey.has(rawKey)) return rawKey;
+  if (ctx.pwKeyByObsWorkKey.has(rawKey)) return ctx.pwKeyByObsWorkKey.get(rawKey);
+  if (allowMissing) {
+    if (isValidWorkIdentityKey(rawKey)) return rawKey;
+    const firstPipe = rawKey.indexOf("|");
+    if (firstPipe > 0) {
+      const candidate = rawKey.slice(firstPipe + 1);
+      if (
+        isValidWorkIdentityKey(candidate) &&
+        Object.prototype.hasOwnProperty.call(workingOverrides, candidate)
+      ) {
+        return candidate;
+      }
+    }
+  }
+  return null;
+}
+
 function applyOverrideOpsSync(rawOps, exportDeps) {
   const ops = normalizeOverrideOps(rawOps);
   const current = store.readLinkOverrides();
-  const nextOverrides = cloneNoProtoMap(current.overrides);
-  const nextContents = cloneNoProtoMap(current.contents);
+  const workingDoc = {
+    version: current.version,
+    updatedAt: current.updatedAt,
+    contents: cloneNoProtoMap(current.contents),
+    overrides: cloneNoProtoMap(current.overrides),
+  };
 
-  const needsValidation = ops.some((o) => o.action === "assign" || o.action === "merge");
-  const ctx = needsValidation
-    ? resolveLinkValidationContext({ linkOverrides: current }, exportDeps || { store })
-    : null;
-  const pwLinkedKey = ctx ? new Map(ctx.pwLinkedKey) : null;
+  // 复用汇总的截至日读取路径（传 exportDeps 而非 { store }，走 store.readWorksDailyLatestAsOf 不加载全量历史）
+  const ctx = resolveLinkValidationContext({ linkOverrides: current }, exportDeps);
   const now = Date.now();
   const createdContentKeys = [];
+  const resolvedWorkKeys = [];
+  const expectedFinalByPwKey = new Map();
 
+  let state = null;
+  let stateDirty = true;
+  const ensureState = () => {
+    if (!state || stateDirty) {
+      state = ctx.evaluate(workingDoc);
+      stateDirty = false;
+    }
+    return state;
+  };
+
+  // 按顺序在内存状态上逐条应用并校验（后一条基于前一条应用后的状态）
   for (const op of ops) {
     if (op.action === "detach") {
-      nextOverrides[op.workKey] = { action: "detach" };
-      if (ctx) {
-        const info = ctx.workInfoByKey.get(op.workKey);
-        if (info) pwLinkedKey.set(info.pwKey, null);
+      const pwKey = resolveOpWorkIdentity(op.workKey, ctx, workingDoc.overrides, false);
+      if (!pwKey) {
+        throw new Error(`作品不存在或未纳入当前统计范围：${op.workKey}`);
       }
+      workingDoc.overrides[pwKey] = { action: "detach" };
+      stateDirty = true;
+      expectedFinalByPwKey.set(pwKey, { action: "detach" });
+      resolvedWorkKeys.push(pwKey);
     } else if (op.action === "clear") {
-      delete nextOverrides[op.workKey];
+      const pwKey = resolveOpWorkIdentity(op.workKey, ctx, workingDoc.overrides, true);
+      if (!pwKey) {
+        throw new Error(`无效的作品标识：${op.workKey}`);
+      }
+      delete workingDoc.overrides[pwKey];
+      stateDirty = true;
+      expectedFinalByPwKey.set(pwKey, { action: "clear" });
+      resolvedWorkKeys.push(pwKey);
     } else if (op.action === "assign") {
+      const pwKey = resolveOpWorkIdentity(op.workKey, ctx, workingDoc.overrides, false);
+      if (!pwKey) {
+        throw new Error(`作品不存在或未纳入当前统计范围：${op.workKey}`);
+      }
       const ck = op.contentKey;
       if (isUnstableRecordKey(ck) || ctx.unstableRecordKeys.has(ck)) {
         throw new Error("该记录缺少稳定标识，不能作为手工合并目标");
       }
       if (isValidAutoContentKey(ck)) {
-        if (!nextContents[ck]) {
-          const cluster = ctx.autoClusters.get(ck);
+        if (!workingDoc.contents[ck]) {
+          const curState = ensureState();
+          const cluster = curState.autoClusters.get(ck);
           if (!cluster) {
             throw new Error(`目标自动聚类内容不存在或已失效：${ck}`);
           }
-          nextContents[ck] = {
+          workingDoc.contents[ck] = {
             title: cluster.title || "(无标题)",
             createdAt: now,
           };
         }
       } else if (isValidManualContentKey(ck)) {
-        if (!nextContents[ck]) {
+        if (!workingDoc.contents[ck]) {
           throw new Error(`目标手工合并内容不存在：${ck}`);
         }
       } else if (!ctx.eligibleAssignableKeys.has(ck)) {
         throw new Error(`目标内容不存在或不可用：${ck}`);
       }
-      nextOverrides[op.workKey] = { action: "assign", contentKey: ck };
-      const info = ctx.workInfoByKey.get(op.workKey);
-      if (info) pwLinkedKey.set(info.pwKey, ck);
+      workingDoc.overrides[pwKey] = { action: "assign", contentKey: ck };
+      stateDirty = true;
+      expectedFinalByPwKey.set(pwKey, { action: "assign", contentKey: ck });
+      resolvedWorkKeys.push(pwKey);
     } else if (op.action === "merge") {
+      const curState = ensureState();
+      const uniquePwKeys = [];
+      const seenPw = new Set();
       for (const wk of op.workKeys) {
-        const info = ctx.workInfoByKey.get(wk);
-        if (!info) {
+        const pwKey = resolveOpWorkIdentity(wk, ctx, workingDoc.overrides, false);
+        if (!pwKey) {
           throw new Error(`待合并作品不存在或未纳入当前统计范围：${wk}`);
         }
-        if (pwLinkedKey.get(info.pwKey) != null) {
-          throw new Error(`待合并作品已关联其他内容，请刷新后重试：${wk}`);
+        if (seenPw.has(pwKey)) continue;
+        seenPw.add(pwKey);
+        uniquePwKeys.push(pwKey);
+      }
+      if (uniquePwKeys.length < 2) {
+        throw new Error("至少需要选择 2 条不同作品才能合并");
+      }
+      for (const pwKey of uniquePwKeys) {
+        const cur = curState.byWorkIdentity.get(pwKey);
+        if (cur && cur.contentKey != null) {
+          throw new Error(`待合并作品已关联其他内容，请刷新后重试：${pwKey}`);
         }
       }
       const contentKey = `manual:${crypto.randomBytes(8).toString("hex")}`;
-      const title = pickMergedWorksTitle(op.workKeys, ctx.workInfoByKey, op.title);
-      nextContents[contentKey] = { title, createdAt: now };
-      for (const wk of op.workKeys) {
-        nextOverrides[wk] = { action: "assign", contentKey };
-        const info = ctx.workInfoByKey.get(wk);
-        if (info) pwLinkedKey.set(info.pwKey, contentKey);
+      const title = pickMergedWorksTitle(uniquePwKeys, ctx.workInfoByPwKey, op.title);
+      workingDoc.contents[contentKey] = { title, createdAt: now };
+      for (const pwKey of uniquePwKeys) {
+        workingDoc.overrides[pwKey] = { action: "assign", contentKey };
+        expectedFinalByPwKey.set(pwKey, { action: "assign", contentKey });
       }
-      createdContentKeys.push({ contentKey, workKeys: op.workKeys, title });
+      stateDirty = true;
+      createdContentKeys.push({ contentKey, workKeys: uniquePwKeys, title });
+      resolvedWorkKeys.push(...uniquePwKeys);
+    }
+  }
+
+  // 写盘前按全量分组重新计算并校验最终归属与请求一致，不一致则不写盘并返回错误
+  const finalState = ensureState();
+  for (const [pwKey, expected] of expectedFinalByPwKey.entries()) {
+    const finalEntry = finalState.byWorkIdentity.get(pwKey) || null;
+    if (expected.action === "assign") {
+      if (
+        !finalEntry ||
+        finalEntry.contentKey !== expected.contentKey ||
+        finalEntry.matchedBy !== "manual"
+      ) {
+        throw new Error(`操作后作品最终归属与请求不一致：${pwKey}`);
+      }
+    } else if (expected.action === "detach") {
+      if (
+        !finalEntry ||
+        finalEntry.contentKey !== null ||
+        finalEntry.matchedBy !== "manual-detach"
+      ) {
+        throw new Error(`拆出后作品最终归属与请求不一致：${pwKey}`);
+      }
+    } else if (expected.action === "clear") {
+      if (
+        ctx.workInfoByPwKey.has(pwKey) &&
+        finalEntry &&
+        (finalEntry.matchedBy === "manual" || finalEntry.matchedBy === "manual-detach")
+      ) {
+        throw new Error(`恢复自动后作品仍残留手动覆盖：${pwKey}`);
+      }
     }
   }
 
   const doc = store.writeLinkOverrides(
-    { overrides: nextOverrides, contents: nextContents },
+    { overrides: workingDoc.overrides, contents: workingDoc.contents },
     now
   );
   return {
     doc,
     applied: ops.length,
     createdContentKeys,
+    resolvedWorkKeys,
   };
 }
 
@@ -569,7 +669,7 @@ function registerDataStatsIpc(options = {}) {
       );
       return {
         ok: true,
-        workKey,
+        workKey: res.resolvedWorkKeys[0] || workKey,
         override: entry,
         updatedAt: res.doc.updatedAt,
       };
@@ -639,7 +739,7 @@ function registerDataStatsIpc(options = {}) {
       );
       return {
         ok: true,
-        workKey,
+        workKey: res.resolvedWorkKeys[0] || workKey,
         updatedAt: res.doc.updatedAt,
       };
     } catch (err) {

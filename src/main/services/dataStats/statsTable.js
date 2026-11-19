@@ -100,7 +100,9 @@ function buildWorkDailyRows({ group, platform, works, worksDaily, from, to, link
     if (!dateMap || typeof dateMap !== "object" || Array.isArray(dateMap)) continue;
     const workId = String(rawWorkId);
     const linkInfo = hasLink
-      ? link.get(`${groupStr}|${platformStr}|${workId}`) || null
+      ? link.get(`${groupStr}|${platformStr}|${workId}`) ||
+        link.get(`${platformStr}|${workId}`) ||
+        null
       : null;
     const meta = workById.get(workId);
     const title = meta ? meta.title || "(无标题)" : DELETED_WORK_TITLE;

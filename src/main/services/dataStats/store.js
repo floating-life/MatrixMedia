@@ -376,6 +376,113 @@ function readWorksDaily(group, platform) {
 }
 
 /**
+ * 仅读取截至 cutoffDate 的每个作品最新一条快照（跳过 > cutoffDate 的日文件，内存保持 O(作品数)）。
+ * 与 readWorksDaily 保持同一口径：目录文件优先于旧单文件 works-daily.json。
+ * 返回 `{ worksDaily: { [workId]: { [bestDate]: stats } }, latestDate }`。
+ */
+function readWorksDailyLatestAsOf(group, platform, cutoffDate = "") {
+  const dir = worksDailyDir(group, platform);
+  const bestByWork = Object.create(null);
+  let latestDate = "";
+
+  let entries = null;
+  try {
+    entries = fs.readdirSync(dir);
+  } catch (err) {
+    if (!err || err.code !== "ENOENT") {
+      console.warn(
+        `[dataStats] 读取 works-daily 目录失败 (${dir}):`,
+        (err && err.message) || err
+      );
+    }
+  }
+
+  if (Array.isArray(entries) && entries.length > 0) {
+    const dayFiles = [];
+    for (const name of entries) {
+      const m = WORKS_DAILY_FILE_RE.exec(name);
+      if (!m) continue;
+      const date = m[1];
+      if (!isValidAutoRunDate(date)) continue;
+      if (cutoffDate && date > cutoffDate) continue;
+      dayFiles.push({ date, name });
+    }
+    // 倒序扫描：每个作品首次命中即为 <= cutoffDate 的最新快照
+    dayFiles.sort((a, b) => (a.date > b.date ? -1 : a.date < b.date ? 1 : 0));
+    for (const { date, name } of dayFiles) {
+      const file = path.join(dir, name);
+      let dayWorks;
+      try {
+        dayWorks = parseDayWorksFile(file);
+      } catch (err) {
+        console.warn(
+          `[dataStats] 读取作品日快照失败，已跳过 (${file}):`,
+          (err && err.message) || err
+        );
+        continue;
+      }
+      if (!dayWorks) continue;
+      for (const workId of Object.keys(dayWorks)) {
+        if (!bestByWork[workId]) {
+          bestByWork[workId] = { date, snap: dayWorks[workId] };
+          if (!latestDate || date > latestDate) latestDate = date;
+        }
+      }
+    }
+  }
+
+  // 兼容旧单文件 works-daily.json（目录同日优先，仅更晚日期可补缺）
+  const legacyFile = legacyWorksDailyFile(group, platform);
+  let legacyRaw = null;
+  try {
+    legacyRaw = fs.readFileSync(legacyFile, "utf8");
+  } catch (err) {
+    if (!err || err.code !== "ENOENT") {
+      console.warn(
+        `[dataStats] 读取旧 works-daily.json 失败 (${legacyFile}):`,
+        (err && err.message) || err
+      );
+    }
+  }
+  if (legacyRaw !== null) {
+    let parsed = null;
+    try {
+      parsed = JSON.parse(legacyRaw);
+    } catch (err) {
+      console.warn(
+        `[dataStats] 旧 works-daily.json JSON 损坏，已跳过 (${legacyFile}):`,
+        (err && err.message) || err
+      );
+    }
+    if (isPlainObject(parsed)) {
+      for (const workId of Object.keys(parsed)) {
+        const desc = Object.getOwnPropertyDescriptor(parsed, workId);
+        const dateMap = desc ? desc.value : null;
+        if (!isPlainObject(dateMap)) continue;
+        for (const d of Object.keys(dateMap)) {
+          if (!isValidAutoRunDate(d)) continue;
+          if (cutoffDate && d > cutoffDate) continue;
+          const snapDesc = Object.getOwnPropertyDescriptor(dateMap, d);
+          if (!snapDesc || !isPlainObject(snapDesc.value)) continue;
+          const prev = bestByWork[workId];
+          if (!prev || d > prev.date) {
+            bestByWork[workId] = { date: d, snap: pickWorkDailyStats(snapDesc.value) };
+            if (!latestDate || d > latestDate) latestDate = d;
+          }
+        }
+      }
+    }
+  }
+
+  const worksDaily = Object.create(null);
+  for (const workId of Object.keys(bestByWork)) {
+    const entry = bestByWork[workId];
+    worksDaily[workId] = { [entry.date]: entry.snap };
+  }
+  return { worksDaily, latestDate };
+}
+
+/**
  * 写入作品当日累计快照（UTC+8，只读写当天 YYYY-MM-DD.json，不加锁、不写非当天文件）。
  * 读当天文件（不存在/损坏视为空，损坏时 warn）→ 按 workId 合并 → 原子写；失败仅 warn，不影响 mergeWorks。
  */
@@ -542,6 +649,14 @@ function isSyntheticContentKey(key) {
   );
 }
 
+/** 校验作品身份键 `platform|workId`（恰含一个 `|` 且平台与作品 ID 均非空） */
+function isValidWorkIdentityKey(key) {
+  if (typeof key !== "string" || !key) return false;
+  const sep = key.indexOf("|");
+  if (sep <= 0 || sep >= key.length - 1) return false;
+  return key.indexOf("|", sep + 1) === -1;
+}
+
 function normalizeLinkContentEntry(entry) {
   if (!isPlainObject(entry)) return null;
   if (typeof entry.title !== "string") return null;
@@ -585,12 +700,12 @@ function normalizeLinkOverrideEntry(entry) {
 function normalizeLinkOverridesMap(rawMap) {
   const out = Object.create(null);
   if (!isPlainObject(rawMap)) return out;
-  for (const workKey of Object.keys(rawMap)) {
-    if (!workKey) continue;
-    const desc = Object.getOwnPropertyDescriptor(rawMap, workKey);
+  for (const pwKey of Object.keys(rawMap)) {
+    if (!isValidWorkIdentityKey(pwKey)) continue;
+    const desc = Object.getOwnPropertyDescriptor(rawMap, pwKey);
     const normalized = normalizeLinkOverrideEntry(desc ? desc.value : null);
     if (normalized) {
-      out[workKey] = normalized;
+      out[pwKey] = normalized;
     }
   }
   return out;
@@ -674,8 +789,8 @@ function writeLinkOverrides(docOrMap, now = Date.now()) {
 }
 
 function setLinkOverride(workKey, entry, now = Date.now(), contentMeta) {
-  if (typeof workKey !== "string" || !workKey) {
-    throw new Error("workKey 不能为空");
+  if (!isValidWorkIdentityKey(workKey)) {
+    throw new Error("workKey 必须为有效的作品身份 platform|workId");
   }
   const normalized = normalizeLinkOverrideEntry(entry);
   if (!normalized) {
@@ -705,8 +820,8 @@ function setLinkOverride(workKey, entry, now = Date.now(), contentMeta) {
 }
 
 function clearLinkOverride(workKey, now = Date.now()) {
-  if (typeof workKey !== "string" || !workKey) {
-    throw new Error("workKey 不能为空");
+  if (!isValidWorkIdentityKey(workKey)) {
+    throw new Error("workKey 必须为有效的作品身份 platform|workId");
   }
   const current = readLinkOverrides();
   delete current.overrides[workKey];
@@ -720,7 +835,7 @@ function mergeWorksOverride(workKeys, now = Date.now(), title = "") {
   const uniqueKeys = [];
   const seen = new Set();
   for (const k of workKeys) {
-    if (typeof k !== "string" || !k) continue;
+    if (!isValidWorkIdentityKey(k)) continue;
     if (seen.has(k)) continue;
     seen.add(k);
     uniqueKeys.push(k);
@@ -804,6 +919,7 @@ module.exports = {
   readDaily,
   readWorks,
   readWorksDaily,
+  readWorksDailyLatestAsOf,
   readAccount,
   readOverview,
   listAccounts,

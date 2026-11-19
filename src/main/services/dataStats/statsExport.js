@@ -21,12 +21,13 @@ const {
   isValidAutoContentKey,
   isUnstableRecordKey,
   makeWorkKey,
+  makeWorkIdentityKey,
+  getLinkResultMeta,
 } = require("./contentLink");
 
 const UTC8_MS = 8 * 3600e3;
 const DAY_MS = 86400000;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-const WORKS_DAILY_FILE_RE = /^(\d{4}-\d{2}-\d{2})\.json$/;
 const DEFAULT_RANGE_DAYS = 29; // 含起止日共 30 天
 const MAX_SHEET_ROWS = 200000;
 const ROW_LIMIT_EXCEEDED_CODE = "ROW_LIMIT_EXCEEDED";
@@ -286,6 +287,21 @@ function resolveIoDeps(options = {}, depsArg) {
         : storeApi && typeof storeApi.readWorksDaily === "function"
         ? (g, p) => storeApi.readWorksDaily(g, p)
         : (g, p) => getStore().readWorksDaily(g, p),
+    readWorksDailyLatestAsOf:
+      typeof injected.readWorksDailyLatestAsOf === "function"
+        ? injected.readWorksDailyLatestAsOf
+        : typeof injected.readWorksDaily === "function"
+        ? null
+        : storeApi
+        ? typeof storeApi.readWorksDailyLatestAsOf === "function"
+          ? (g, p, cutoff) => storeApi.readWorksDailyLatestAsOf(g, p, cutoff)
+          : null
+        : (g, p, cutoff) => {
+            const s = getStore();
+            return typeof s.readWorksDailyLatestAsOf === "function"
+              ? s.readWorksDailyLatestAsOf(g, p, cutoff)
+              : null;
+          },
     readDaily:
       typeof injected.readDaily === "function"
         ? injected.readDaily
@@ -325,197 +341,6 @@ function resolveRecordGroup(rec) {
   if (g) return g;
   const p = typeof rec.phone === "string" ? rec.phone : "";
   return p.split("-")[0].trim();
-}
-
-function safeSeg(name) {
-  return String(name || "未命名").replace(/[\\/:*?"<>|]/g, "_");
-}
-
-function pickWorkDailyStats(w) {
-  const out = {};
-  for (const k of WORK_STAT_KEYS) {
-    out[k] = hasOwn(w, k) ? normalizeMetric(w[k]) : null;
-  }
-  return out;
-}
-
-function parseDayWorksFile(file) {
-  let raw;
-  try {
-    raw = fs.readFileSync(file, "utf8");
-  } catch (err) {
-    if (err && err.code === "ENOENT") return null;
-    throw err;
-  }
-  let parsed;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (err) {
-    console.warn(`[dataStats] 作品日快照 JSON 损坏 (${file}):`, (err && err.message) || err);
-    return null;
-  }
-  if (!isPlainObject(parsed) || !isPlainObject(parsed.works)) {
-    console.warn(`[dataStats] 作品日快照结构无效 (${file})`);
-    return null;
-  }
-  const works = Object.create(null);
-  for (const workId of Object.keys(parsed.works)) {
-    const desc = Object.getOwnPropertyDescriptor(parsed.works, workId);
-    if (desc && isPlainObject(desc.value)) {
-      works[workId] = pickWorkDailyStats(desc.value);
-    }
-  }
-  return works;
-}
-
-function canUseCutoffFsReader(options, depsArg) {
-  const injected = isPlainObject(depsArg)
-    ? depsArg
-    : isPlainObject(options && options.deps)
-    ? options.deps
-    : null;
-  if (
-    injected &&
-    (typeof injected.readWorksDaily === "function" ||
-      (isPlainObject(injected.store) &&
-        typeof injected.store.readWorksDaily === "function"))
-  ) {
-    return false;
-  }
-  try {
-    const electron = require("electron");
-    if (!electron || !electron.app || typeof electron.app.getPath !== "function") {
-      return false;
-    }
-    const storeMod = require("./store");
-    if (
-      !storeMod ||
-      typeof storeMod.readWorksDaily !== "function" ||
-      typeof storeMod.mergeWorks !== "function" ||
-      typeof storeMod.todayStr !== "function"
-    ) {
-      return false;
-    }
-    // 若单测覆盖/包装了 store.readWorksDaily，回退走 io.readWorksDaily 以尊重 mock/spy
-    const fnSrc = Function.prototype.toString.call(storeMod.readWorksDaily);
-    if (!fnSrc.includes("mergeLegacyWorksDaily")) return false;
-    return true;
-  } catch (_) {
-    return false;
-  }
-}
-
-/**
- * 仅读取截至 cutoffDate 的每个作品最新一条快照（跳过 > cutoffDate 的日文件，内存保持 O(作品数)）。
- * 与 store.readWorksDaily 保持同一口径：目录文件优先于旧单文件 works-daily.json。
- */
-function readWorksDailyLatestAsOfFs(group, platform, cutoffDate) {
-  const { app } = require("electron");
-  const accDir = path.join(
-    app.getPath("userData"),
-    "data-stats",
-    safeSeg(group),
-    safeSeg(platform)
-  );
-  const dir = path.join(accDir, "works-daily");
-  const bestByWork = Object.create(null);
-  let latestDate = "";
-
-  let entries = null;
-  try {
-    entries = fs.readdirSync(dir);
-  } catch (err) {
-    if (!err || err.code !== "ENOENT") {
-      console.warn(
-        `[dataStats] 读取 works-daily 目录失败 (${dir}):`,
-        (err && err.message) || err
-      );
-    }
-  }
-
-  if (Array.isArray(entries) && entries.length > 0) {
-    const dayFiles = [];
-    for (const name of entries) {
-      const m = WORKS_DAILY_FILE_RE.exec(name);
-      if (!m) continue;
-      const date = m[1];
-      if (!isValidDateStr(date)) continue;
-      if (cutoffDate && date > cutoffDate) continue;
-      dayFiles.push({ date, name });
-    }
-    // 倒序扫描：每个作品首次命中即为 <= cutoffDate 的最新快照
-    dayFiles.sort((a, b) => (a.date > b.date ? -1 : a.date < b.date ? 1 : 0));
-    for (const { date, name } of dayFiles) {
-      const file = path.join(dir, name);
-      let dayWorks;
-      try {
-        dayWorks = parseDayWorksFile(file);
-      } catch (err) {
-        console.warn(
-          `[dataStats] 读取作品日快照失败，已跳过 (${file}):`,
-          (err && err.message) || err
-        );
-        continue;
-      }
-      if (!dayWorks) continue;
-      for (const workId of Object.keys(dayWorks)) {
-        if (!bestByWork[workId]) {
-          bestByWork[workId] = { date, snap: dayWorks[workId] };
-          if (!latestDate || date > latestDate) latestDate = date;
-        }
-      }
-    }
-  }
-
-  // 兼容旧单文件 works-daily.json（目录同日优先，仅更晚日期可补缺）
-  const legacyFile = path.join(accDir, "works-daily.json");
-  let legacyRaw = null;
-  try {
-    legacyRaw = fs.readFileSync(legacyFile, "utf8");
-  } catch (err) {
-    if (!err || err.code !== "ENOENT") {
-      console.warn(
-        `[dataStats] 读取旧 works-daily.json 失败 (${legacyFile}):`,
-        (err && err.message) || err
-      );
-    }
-  }
-  if (legacyRaw !== null) {
-    let parsed = null;
-    try {
-      parsed = JSON.parse(legacyRaw);
-    } catch (err) {
-      console.warn(
-        `[dataStats] 旧 works-daily.json JSON 损坏，已跳过 (${legacyFile}):`,
-        (err && err.message) || err
-      );
-    }
-    if (isPlainObject(parsed)) {
-      for (const workId of Object.keys(parsed)) {
-        const desc = Object.getOwnPropertyDescriptor(parsed, workId);
-        const dateMap = desc ? desc.value : null;
-        if (!isPlainObject(dateMap)) continue;
-        for (const d of Object.keys(dateMap)) {
-          if (!isValidDateStr(d)) continue;
-          if (cutoffDate && d > cutoffDate) continue;
-          const snapDesc = Object.getOwnPropertyDescriptor(dateMap, d);
-          if (!snapDesc || !isPlainObject(snapDesc.value)) continue;
-          const prev = bestByWork[workId];
-          if (!prev || d > prev.date) {
-            bestByWork[workId] = { date: d, snap: pickWorkDailyStats(snapDesc.value) };
-            if (!latestDate || d > latestDate) latestDate = d;
-          }
-        }
-      }
-    }
-  }
-
-  const worksDaily = Object.create(null);
-  for (const workId of Object.keys(bestByWork)) {
-    const entry = bestByWork[workId];
-    worksDaily[workId] = { [entry.date]: entry.snap };
-  }
-  return { worksDaily, latestDate };
 }
 
 function reduceWorksDailyAsOf(rawWorksDaily, cutoffDate) {
@@ -584,11 +409,18 @@ function resolveDefaultCutoffDate(accountsData, getFallbackDaily) {
 }
 
 /**
- * 在全量分组发布记录上解析完手工引用后，按输出分组集合裁剪跨平台汇总行：
- * 保留全部未关联作品行、本组有作品关联到的内容行（含跨组手工引用目标）以及本组自有发布记录行，
- * 裁掉纯属其他分组且未被本组任何作品引用的空内容行。
+ * 在全量分组上按作品身份裁决完归属后，按输出分组集合裁剪跨平台汇总行：
+ * 保留全部未关联作品行、输出分组有作品关联到的内容行（含跨组手工引用目标）以及输出分组自有发布记录行，
+ * 裁掉纯属其他分组且未被输出分组任何作品引用的空内容行。
  */
-function filterSummaryRowsByGroupScope(summaryRows, allContents, link, groupSet, cutoffDate) {
+function filterSummaryRowsByGroupScope(
+  summaryRows,
+  allContents,
+  link,
+  outputAccountsData,
+  groupSet,
+  cutoffDate
+) {
   if (!groupSet || groupSet.size === 0) return summaryRows;
 
   const ownContentKeys = new Set();
@@ -612,10 +444,22 @@ function filterSummaryRowsByGroupScope(summaryRows, allContents, link, groupSet,
   }
 
   const referencedKeys = new Set();
-  if (link instanceof Map) {
-    for (const entry of link.values()) {
-      if (entry && entry.contentKey) {
-        referencedKeys.add(entry.contentKey);
+  if (link instanceof Map && Array.isArray(outputAccountsData)) {
+    for (const acc of outputAccountsData) {
+      if (!isPlainObject(acc)) continue;
+      const group = acc.group == null ? "" : String(acc.group);
+      const platform = acc.platform == null ? "" : String(acc.platform);
+      for (const w of Array.isArray(acc.works) ? acc.works : []) {
+        if (!isPlainObject(w) || w.workId == null || w.workId === "") continue;
+        const entry = link.get(makeWorkKey(group, platform, String(w.workId)));
+        if (entry && entry.contentKey) referencedKeys.add(entry.contentKey);
+      }
+      if (isPlainObject(acc.worksDaily)) {
+        for (const workId of Object.keys(acc.worksDaily)) {
+          if (!workId) continue;
+          const entry = link.get(makeWorkKey(group, platform, workId));
+          if (entry && entry.contentKey) referencedKeys.add(entry.contentKey);
+        }
       }
     }
   }
@@ -638,14 +482,14 @@ function loadRawDataset(options = {}, depsArg) {
       : null;
 
   const rawAccounts = io.listAccounts() || [];
-  const accountsData = [];
-  const worksDailyByGp = Object.create(null);
+  const allAccountsData = [];
+  const allWorksDailyByGp = Object.create(null);
 
   for (const acc of rawAccounts) {
     if (!isPlainObject(acc)) continue;
     const group = acc.group == null ? "" : String(acc.group);
     const platform = acc.platform == null ? "" : String(acc.platform);
-    if (groupSet && !groupSet.has(group)) continue;
+    const inOutputScope = !groupSet || groupSet.has(group);
 
     const worksDoc = io.readWorks(group, platform);
     const works =
@@ -656,29 +500,36 @@ function loadRawDataset(options = {}, depsArg) {
         : [];
     const rawWorksDaily = io.readWorksDaily(group, platform);
     const worksDaily = isPlainObject(rawWorksDaily) ? rawWorksDaily : Object.create(null);
-    const rawDaily = io.readDaily(group, platform);
+    const rawDaily = inOutputScope ? io.readDaily(group, platform) : {};
     const daily = isPlainObject(rawDaily) ? rawDaily : {};
 
-    accountsData.push({ group, platform, works, worksDaily, daily });
-    worksDailyByGp[`${group}|${platform}`] = worksDaily;
+    allAccountsData.push({ group, platform, works, worksDaily, daily });
+    allWorksDailyByGp[`${group}|${platform}`] = worksDaily;
   }
 
-  accountsData.sort((a, b) => {
+  allAccountsData.sort((a, b) => {
     const pc = comparePlatform(a.platform, b.platform);
     if (pc !== 0) return pc;
     return compareText(a.group, b.group);
   });
 
-  // 保留全量发布记录用于解析跨组手工引用，输出阶段再按 groupSet 裁剪
+  const outputAccountsData = groupSet
+    ? allAccountsData.filter((a) => groupSet.has(a.group))
+    : allAccountsData;
+
+  // 保留全量分组账号与发布记录用于全量作品身份归属裁决，输出阶段再按 groupSet 裁剪
   const allPushRecords = io.readPushRecords() || [];
-  const latestDataDate = resolveDefaultCutoffDate(accountsData);
+  const latestDataDate = resolveDefaultCutoffDate(allAccountsData, (g, p) => io.readDaily(g, p));
   const linkOverrides = io.readLinkOverrides();
 
   return {
     io,
     groupSet,
-    accountsData,
-    worksDailyByGp,
+    allAccountsData,
+    allWorksDailyByGp,
+    outputAccountsData,
+    accountsData: outputAccountsData,
+    worksDailyByGp: allWorksDailyByGp,
     allPushRecords,
     pushRecords: allPushRecords,
     linkOverrides,
@@ -687,9 +538,10 @@ function loadRawDataset(options = {}, depsArg) {
 }
 
 /**
- * 仅加载「作品跨平台汇总」截至 cutoffDate 所需数据：
+ * 仅加载「作品跨平台汇总」及写入校验截至 cutoffDate 所需数据：
  * - 不读取 daily.json（仅当所有作品快照均为空且未指定 date 时才兜底查最新快照日）
- * - works-daily 仅保留每作品 <= cutoffDate 的最新一条快照（真实存储跳过 > cutoffDate 文件）
+ * - 复用 store.readWorksDailyLatestAsOf 仅保留每作品 <= cutoffDate 的最新一条快照（不全量加载历史快照）
+ * - 加载全量分组供作品身份归属裁决，输出阶段再按 groupSet 裁剪
  */
 function loadSummaryDataset(options = {}, depsArg, explicitCutoffDate = "") {
   const io = resolveIoDeps(options, depsArg);
@@ -699,15 +551,13 @@ function loadSummaryDataset(options = {}, depsArg, explicitCutoffDate = "") {
       : null;
 
   const rawAccounts = io.listAccounts() || [];
-  const accountsData = [];
-  const worksDailyByGp = Object.create(null);
-  const useFastFs = canUseCutoffFsReader(options, depsArg);
+  const allAccountsData = [];
+  const allWorksDailyByGp = Object.create(null);
 
   for (const acc of rawAccounts) {
     if (!isPlainObject(acc)) continue;
     const group = acc.group == null ? "" : String(acc.group);
     const platform = acc.platform == null ? "" : String(acc.platform);
-    if (groupSet && !groupSet.has(group)) continue;
 
     const worksDoc = io.readWorks(group, platform);
     const works =
@@ -717,32 +567,43 @@ function loadSummaryDataset(options = {}, depsArg, explicitCutoffDate = "") {
         ? worksDoc
         : [];
 
-    const res = useFastFs
-      ? readWorksDailyLatestAsOfFs(group, platform, explicitCutoffDate)
-      : reduceWorksDailyAsOf(io.readWorksDaily(group, platform), explicitCutoffDate);
+    let res = null;
+    if (typeof io.readWorksDailyLatestAsOf === "function") {
+      res = io.readWorksDailyLatestAsOf(group, platform, explicitCutoffDate);
+    }
+    if (!res) {
+      res = reduceWorksDailyAsOf(io.readWorksDaily(group, platform), explicitCutoffDate);
+    }
 
-    accountsData.push({ group, platform, works, worksDaily: res.worksDaily, daily: {} });
-    worksDailyByGp[`${group}|${platform}`] = res.worksDaily;
+    allAccountsData.push({ group, platform, works, worksDaily: res.worksDaily, daily: {} });
+    allWorksDailyByGp[`${group}|${platform}`] = res.worksDaily;
   }
 
-  accountsData.sort((a, b) => {
+  allAccountsData.sort((a, b) => {
     const pc = comparePlatform(a.platform, b.platform);
     if (pc !== 0) return pc;
     return compareText(a.group, b.group);
   });
 
-  // 保留全量发布记录用于解析跨组手工引用，输出阶段再按 groupSet 裁剪
+  const outputAccountsData = groupSet
+    ? allAccountsData.filter((a) => groupSet.has(a.group))
+    : allAccountsData;
+
+  // 保留全量分组账号与发布记录用于全量作品身份归属裁决，输出阶段再按 groupSet 裁剪
   const allPushRecords = io.readPushRecords() || [];
   const latestDataDate = explicitCutoffDate
     ? ""
-    : resolveDefaultCutoffDate(accountsData, (g, p) => io.readDaily(g, p));
+    : resolveDefaultCutoffDate(allAccountsData, (g, p) => io.readDaily(g, p));
   const linkOverrides = io.readLinkOverrides();
 
   return {
     io,
     groupSet,
-    accountsData,
-    worksDailyByGp,
+    allAccountsData,
+    allWorksDailyByGp,
+    outputAccountsData,
+    accountsData: outputAccountsData,
+    worksDailyByGp: allWorksDailyByGp,
     allPushRecords,
     pushRecords: allPushRecords,
     linkOverrides,
@@ -873,24 +734,26 @@ function buildContentSummaryData(options = {}, depsArg) {
   const contents = buildContentIndex(dataset.allPushRecords);
   const link = linkWorks({
     contents,
-    accounts: dataset.accountsData,
-    worksDaily: dataset.worksDailyByGp,
+    accounts: dataset.allAccountsData,
+    worksDaily: dataset.allWorksDailyByGp,
     date: cutoffDate || undefined,
     overrides: dataset.linkOverrides,
   });
   let rows = buildContentSummaryRows({
     contents,
-    accounts: dataset.accountsData,
+    accounts: dataset.allAccountsData,
     link,
-    worksDaily: dataset.worksDailyByGp,
+    worksDaily: dataset.allWorksDailyByGp,
     date: cutoffDate || undefined,
     overrides: dataset.linkOverrides,
+    groups: dataset.groupSet,
   });
   if (dataset.groupSet) {
     rows = filterSummaryRowsByGroupScope(
       rows,
       contents,
       link,
+      dataset.outputAccountsData,
       dataset.groupSet,
       cutoffDate
     );
@@ -901,7 +764,7 @@ function buildContentSummaryData(options = {}, depsArg) {
     rows,
     date: cutoffDate,
     counts: {
-      accounts: dataset.accountsData.length,
+      accounts: dataset.outputAccountsData.length,
       works: workCounts.works,
       contents: rows.length,
       unlinkedWorks: workCounts.unlinkedWorks,
@@ -928,9 +791,9 @@ function parseRawTimestampMs(raw) {
 
 /**
  * 构建手工矫正写入校验上下文（供 dataStats/index.js 串行写入队列使用）：
- * - 基于全量分组与当前 overrides 单次运行匹配与汇总
- * - 输出可分配的 file:/record: 目标集合、不稳定位置键集合、当前自动 auto: 簇表、
- *   现存作品信息（含仅存在于 works-daily 的作品）以及各 platform|workId 的当前关联状态。
+ * - 复用 loadSummaryDataset 截至日读取路径（调用 store.readWorksDailyLatestAsOf，不全量加载历史快照）
+ * - 按全量分组构建可分配目标集合、不稳定位置键集合、作品身份索引 `workInfoByPwKey` 与观测映射 `pwKeyByObsWorkKey`
+ * - 提供纯内存 `evaluate(overridesDoc)`，支持批量 ops 逐条状态演进校验与写前最终归属一致校验
  */
 function resolveLinkValidationContext(options = {}, depsArg) {
   const opts = isPlainObject(options) ? { ...options, groups: undefined } : {};
@@ -938,21 +801,6 @@ function resolveLinkValidationContext(options = {}, depsArg) {
   const dataset = loadSummaryDataset(opts, depsArg, dateStr);
   const cutoffDate = dateStr || dataset.latestDataDate || "";
   const contents = buildContentIndex(dataset.allPushRecords);
-  const link = linkWorks({
-    contents,
-    accounts: dataset.accountsData,
-    worksDaily: dataset.worksDailyByGp,
-    date: cutoffDate || undefined,
-    overrides: dataset.linkOverrides,
-  });
-  const rows = buildContentSummaryRows({
-    contents,
-    accounts: dataset.accountsData,
-    link,
-    worksDaily: dataset.worksDailyByGp,
-    date: cutoffDate || undefined,
-    overrides: dataset.linkOverrides,
-  });
 
   const eligibleAssignableKeys = new Set();
   const unstableRecordKeys = new Set();
@@ -982,20 +830,57 @@ function resolveLinkValidationContext(options = {}, depsArg) {
     }
   }
 
-  const autoClusters = new Map();
-  for (const row of rows) {
-    if (row && !row.isUnlinked && isValidAutoContentKey(row.contentKey)) {
-      autoClusters.set(row.contentKey, { title: row.title || "(无标题)" });
+  // 先扫描未来发布作品身份（与 linkWorks / buildContentSummaryRows 保持一致）
+  const excludedFuturePwKeys = new Set();
+  if (cutoffDate) {
+    for (const acc of dataset.allAccountsData) {
+      const platform = acc.platform;
+      for (const w of Array.isArray(acc.works) ? acc.works : []) {
+        if (!isPlainObject(w)) continue;
+        const workId = w.workId == null ? "" : String(w.workId);
+        if (!workId) continue;
+        const pubMs = parseRawTimestampMs(w.publishTime);
+        const pubDate = pubMs !== null ? formatUtc8Date(pubMs) : "";
+        if (pubDate && pubDate > cutoffDate) {
+          excludedFuturePwKeys.add(makeWorkIdentityKey(platform, workId));
+        }
+      }
     }
   }
 
-  const workInfoByKey = new Map();
-  const obsByPw = new Map();
+  const workInfoByPwKey = new Map();
+  const pwKeyByObsWorkKey = new Map();
   const seenWorkKeys = new Set();
   const gpInfoByKey = new Map();
-  const autoObsByKey = new Map();
 
-  for (const acc of dataset.accountsData) {
+  const mergePwInfo = (pwKey, obs) => {
+    const prev = workInfoByPwKey.get(pwKey);
+    if (!prev) {
+      workInfoByPwKey.set(pwKey, {
+        pwKey,
+        platform: obs.platform,
+        workId: obs.workId,
+        title: obs.title,
+        rawTitle: obs.rawTitle,
+        pubMs: obs.pubMs,
+        fromWorksJson: obs.fromWorksJson,
+      });
+      return;
+    }
+    if (obs.fromWorksJson && !prev.fromWorksJson) {
+      prev.fromWorksJson = true;
+      prev.title = obs.title;
+      prev.rawTitle = obs.rawTitle;
+    } else if (obs.fromWorksJson && !prev.rawTitle && obs.rawTitle) {
+      prev.title = obs.title;
+      prev.rawTitle = obs.rawTitle;
+    }
+    if (obs.pubMs !== null && (prev.pubMs === null || obs.pubMs < prev.pubMs)) {
+      prev.pubMs = obs.pubMs;
+    }
+  };
+
+  for (const acc of dataset.allAccountsData) {
     const group = acc.group;
     const platform = acc.platform;
     const gpKey = `${group}|${platform}`;
@@ -1008,40 +893,29 @@ function resolveLinkValidationContext(options = {}, depsArg) {
       if (seenWorkKeys.has(workKey)) continue;
       seenWorkKeys.add(workKey);
 
+      const pwKey = makeWorkIdentityKey(platform, workId);
       const pubMs = parseRawTimestampMs(w.publishTime);
       const pubDate = pubMs !== null ? formatUtc8Date(pubMs) : "";
-      if (cutoffDate && pubDate && pubDate > cutoffDate) continue;
+      if (cutoffDate && ((pubDate && pubDate > cutoffDate) || excludedFuturePwKeys.has(pwKey))) {
+        excludedFuturePwKeys.add(pwKey);
+        continue;
+      }
 
-      const pwKey = `${platform}|${workId}`;
-      const entry = link.get(workKey) || null;
-      const linkedKey = entry && entry.contentKey ? entry.contentKey : null;
-      const matchedBy = entry && entry.matchedBy ? entry.matchedBy : null;
       const title = typeof w.title === "string" ? w.title : "";
-      const info = {
-        workKey,
-        pwKey,
-        group,
+      pwKeyByObsWorkKey.set(workKey, pwKey);
+      mergePwInfo(pwKey, {
         platform,
         workId,
         title: title || "(无标题)",
         rawTitle: title,
         pubMs,
-        linkedKey,
-        matchedBy,
         fromWorksJson: true,
-      };
-      workInfoByKey.set(workKey, info);
-      if (!obsByPw.has(pwKey)) obsByPw.set(pwKey, []);
-      obsByPw.get(pwKey).push(info);
-      if (linkedKey && isValidAutoContentKey(linkedKey) && !autoClusters.has(linkedKey)) {
-        if (!autoObsByKey.has(linkedKey)) autoObsByKey.set(linkedKey, []);
-        autoObsByKey.get(linkedKey).push(info);
-      }
+      });
     }
   }
 
   // 补齐仅存在于 works-daily 的作品（works.json 中已删除/缺失）
-  for (const [gpKey, accWorksDaily] of Object.entries(dataset.worksDailyByGp)) {
+  for (const [gpKey, accWorksDaily] of Object.entries(dataset.allWorksDailyByGp)) {
     if (!isPlainObject(accWorksDaily)) continue;
     let gpInfo = gpInfoByKey.get(gpKey);
     if (!gpInfo) {
@@ -1054,6 +928,8 @@ function resolveLinkValidationContext(options = {}, depsArg) {
       if (!workId) continue;
       const workKey = makeWorkKey(group, platform, workId);
       if (seenWorkKeys.has(workKey)) continue;
+      const pwKey = makeWorkIdentityKey(platform, workId);
+      if (excludedFuturePwKeys.has(pwKey)) continue;
       const dateMap = accWorksDaily[workId];
       if (!isPlainObject(dateMap)) continue;
       let hasSnap = false;
@@ -1066,64 +942,49 @@ function resolveLinkValidationContext(options = {}, depsArg) {
       if (!hasSnap) continue;
       seenWorkKeys.add(workKey);
 
-      const pwKey = `${platform}|${workId}`;
-      const entry = link.get(workKey) || null;
-      const linkedKey = entry && entry.contentKey ? entry.contentKey : null;
-      const matchedBy = entry && entry.matchedBy ? entry.matchedBy : null;
-      const info = {
-        workKey,
-        pwKey,
-        group,
+      pwKeyByObsWorkKey.set(workKey, pwKey);
+      mergePwInfo(pwKey, {
         platform,
         workId,
         title: DELETED_WORK_TITLE,
         rawTitle: "",
         pubMs: null,
-        linkedKey,
-        matchedBy,
         fromWorksJson: false,
-      };
-      workInfoByKey.set(workKey, info);
-      if (!obsByPw.has(pwKey)) obsByPw.set(pwKey, []);
-      obsByPw.get(pwKey).push(info);
+      });
     }
   }
 
-  for (const [ck, list] of autoObsByKey.entries()) {
-    const sorted = [...list].sort((a, b) => {
-      const aHas = a.pubMs !== null;
-      const bHas = b.pubMs !== null;
-      if (aHas !== bHas) return aHas ? -1 : 1;
-      if (aHas && a.pubMs !== b.pubMs) return a.pubMs - b.pubMs;
-      return compareText(a.workKey, b.workKey);
+  const evaluate = (overridesDoc) => {
+    const link = linkWorks({
+      contents,
+      accounts: dataset.allAccountsData,
+      worksDaily: dataset.allWorksDailyByGp,
+      date: cutoffDate || undefined,
+      overrides: overridesDoc,
     });
-    const chosen = sorted.find((o) => o.fromWorksJson && o.rawTitle) || sorted[0];
-    autoClusters.set(ck, { title: (chosen && chosen.title) || "(无标题)" });
-  }
-
-  const pwLinkedKey = new Map();
-  for (const [pwKey, list] of obsByPw.entries()) {
-    const manualAssign = list.filter((o) => o.matchedBy === "manual" && o.linkedKey != null);
-    const manualDetach = list.filter((o) => o.matchedBy === "manual-detach");
-    if (manualAssign.length > 0) {
-      const uniq = new Set(manualAssign.map((o) => o.linkedKey));
-      pwLinkedKey.set(pwKey, uniq.size === 1 ? manualAssign[0].linkedKey : null);
-    } else if (manualDetach.length > 0) {
-      pwLinkedKey.set(pwKey, null);
-    } else {
-      const autoLinked = list.filter((o) => o.linkedKey != null);
-      const uniq = new Set(autoLinked.map((o) => o.linkedKey));
-      pwLinkedKey.set(pwKey, uniq.size === 1 ? autoLinked[0].linkedKey : null);
+    const meta = getLinkResultMeta(link);
+    const byWorkIdentity =
+      meta && meta.byWorkIdentity ? meta.byWorkIdentity : new Map();
+    const syntheticTitles =
+      meta && meta.syntheticTitlesByKey ? meta.syntheticTitlesByKey : new Map();
+    const autoClusters = new Map();
+    for (const entry of byWorkIdentity.values()) {
+      if (entry && isValidAutoContentKey(entry.contentKey) && !autoClusters.has(entry.contentKey)) {
+        autoClusters.set(entry.contentKey, {
+          title: syntheticTitles.get(entry.contentKey) || "(无标题)",
+        });
+      }
     }
-  }
+    return { link, byWorkIdentity, autoClusters };
+  };
 
   return {
     cutoffDate,
     eligibleAssignableKeys,
     unstableRecordKeys,
-    autoClusters,
-    workInfoByKey,
-    pwLinkedKey,
+    workInfoByPwKey,
+    pwKeyByObsWorkKey,
+    evaluate,
   };
 }
 
@@ -1471,7 +1332,7 @@ function buildSchemaSheet(dynamicSchemaEntries) {
       "作品日明细",
       "内容ID",
       "contentKey",
-      "跨平台关联后的内容唯一键（file:<完整路径>、record:<日期>:<id>、auto:<哈希> 或 manual:<id>）；未关联作品为空单元格。",
+      "跨平台关联后的内容唯一键（file:<完整路径>、record:id:<id>、auto:<哈希> 或 manual:<id>）；未关联作品为空单元格。",
     ],
     [
       "作品日明细",
@@ -1593,7 +1454,7 @@ function buildSchemaSheet(dynamicSchemaEntries) {
       "作品跨平台汇总",
       "内容ID",
       "contentKey",
-      "内容唯一键（file:<路径> / record:<日期>:<id> / auto:<哈希> / manual:<id>）；未关联作品各自独立成行，键为 unlinked:<平台>:<作品ID>。",
+      "内容唯一键（file:<路径> / record:id:<id> / auto:<哈希> / manual:<id>）；未关联作品各自独立成行，键为 unlinked:<平台>:<作品ID>。",
     ],
     [
       "作品跨平台汇总",
@@ -1868,7 +1729,7 @@ function buildStatsWorkbookData(options = {}, deps) {
 
   // 构建前先计数「作品日明细」与「账号日快照」行数，超限直接拒绝，避免无谓排序与高内存占用
   const estWorkDailyRows = countWorkDailyRows(
-    dataset.accountsData,
+    dataset.outputAccountsData,
     resolvedFrom,
     resolvedTo
   );
@@ -1876,7 +1737,7 @@ function buildStatsWorkbookData(options = {}, deps) {
     throw createRowLimitError(estWorkDailyRows, maxRows, "作品日明细");
   }
   const estAccountDailyRows = countAccountDailyRows(
-    dataset.accountsData,
+    dataset.outputAccountsData,
     resolvedFrom,
     resolvedTo
   );
@@ -1884,28 +1745,30 @@ function buildStatsWorkbookData(options = {}, deps) {
     throw createRowLimitError(estAccountDailyRows, maxRows, "账号日快照");
   }
 
-  // 先在全量发布记录上解析手工引用，且单次匹配同时供作品日明细与跨平台汇总复用
+  // 在全量分组上按作品身份做一次归属裁决，日明细与跨平台汇总共用该结果，之后再按导出分组裁剪
   const allContents = buildContentIndex(dataset.allPushRecords);
   const link = linkWorks({
     contents: allContents,
-    accounts: dataset.accountsData,
-    worksDaily: dataset.worksDailyByGp,
+    accounts: dataset.allAccountsData,
+    worksDaily: dataset.allWorksDailyByGp,
     date: resolvedTo,
     overrides: dataset.linkOverrides,
   });
   let summaryRows = buildContentSummaryRows({
     contents: allContents,
-    accounts: dataset.accountsData,
+    accounts: dataset.allAccountsData,
     link,
-    worksDaily: dataset.worksDailyByGp,
+    worksDaily: dataset.allWorksDailyByGp,
     date: resolvedTo,
     overrides: dataset.linkOverrides,
+    groups: dataset.groupSet,
   });
   if (dataset.groupSet) {
     summaryRows = filterSummaryRowsByGroupScope(
       summaryRows,
       allContents,
       link,
+      dataset.outputAccountsData,
       dataset.groupSet,
       resolvedTo
     );
@@ -1915,7 +1778,7 @@ function buildStatsWorkbookData(options = {}, deps) {
   }
 
   const workDaily = buildWorkDailySheet(
-    dataset.accountsData,
+    dataset.outputAccountsData,
     link,
     resolvedFrom,
     resolvedTo
@@ -1923,7 +1786,7 @@ function buildStatsWorkbookData(options = {}, deps) {
   const contentSummary = buildContentSummarySheet(summaryRows);
   const platformDaily = buildPlatformDailySheet(workDaily.rows);
   const accountDaily = buildAccountDailySheet(
-    dataset.accountsData,
+    dataset.outputAccountsData,
     resolvedFrom,
     resolvedTo
   );
@@ -1931,7 +1794,7 @@ function buildStatsWorkbookData(options = {}, deps) {
 
   const workCounts = computeWorkCountsFromSummaryRows(summaryRows);
   const counts = {
-    accounts: dataset.accountsData.length,
+    accounts: dataset.outputAccountsData.length,
     works: workCounts.works,
     contents: summaryRows.length,
     unlinkedWorks: workCounts.unlinkedWorks,
