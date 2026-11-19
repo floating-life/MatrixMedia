@@ -1195,6 +1195,20 @@ async function main() {
           trigger: "manual",
         });
         assert.strictEqual(afterDiskErr.results[0].success, true);
+        // 持久化失败后同日再次自动触发：内存兜底返回 already-ran，不得再采集（防每分钟重采）
+        {
+          const before = collectedBatches.length;
+          await withMockDateNow(
+            () => cnTime(2026, 11, 26, 10, 1, 0),
+            async () => {
+              const again = await autoRunHandler(fakeEvent, {
+                accounts: [{ group: "DiskG2", platform: "抖音", partition: "persist:DiskG2-抖音" }],
+              });
+              assert.strictEqual(again.status, "already-ran");
+            }
+          );
+          assert.strictEqual(collectedBatches.length, before, "写盘失败后同日不得再次自动采集");
+        }
 
         collectorImpl = origImpl;
         console.log("✓ 采集中途抛错/异常逃逸/取消/写盘失败：runs 行为与 collecting 复位均正确");

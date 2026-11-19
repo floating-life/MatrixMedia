@@ -24,6 +24,8 @@ const VALID_TRIGGERS = new Set(["auto", "manual"]);
 let collecting = false;
 let cancelled = false;
 let collectedToday = { date: "", partitions: new Set() };
+// auto-run.json 读写失败时的兜底：本进程内已自动跑过的日期（防止持久化失败导致每分钟重采）
+const autoRanInMemory = new Set();
 
 function getTodayStr(now = Date.now()) {
   if (typeof store.todayStr === "function") {
@@ -194,8 +196,19 @@ function registerDataStatsIpc() {
    */
   ipcMain.handle("stats:auto-run", async (event, args) => {
     const today = getTodayStr();
-    const runs = store.readAutoRuns();
+    if (autoRanInMemory.has(today)) {
+      return { status: "already-ran", date: today };
+    }
+    let runs = [];
+    try {
+      runs = store.readAutoRuns();
+    } catch (err) {
+      // 读失败不冒险开跑：当作忙，下一轮再试
+      console.warn("[dataStats] 读取 auto-run.json 失败:", (err && err.message) || err);
+      return { status: "busy" };
+    }
     if (runs.includes(today)) {
+      autoRanInMemory.add(today);
       return { status: "already-ran", date: today };
     }
     if (collecting) {
@@ -219,6 +232,7 @@ function registerDataStatsIpc() {
         cancelled: Boolean(out.cancelled),
       };
     } finally {
+      autoRanInMemory.add(today);
       try {
         store.appendAutoRun(today);
       } catch (err) {
