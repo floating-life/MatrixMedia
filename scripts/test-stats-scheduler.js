@@ -993,8 +993,9 @@ async function main() {
                 winB.start();
                 const pA = winA.tick();
                 const resB1 = await winB.tick();
-                assert.deepStrictEqual(resB1, { ran: false, reason: "busy" });
-                assert.strictEqual(store.readAutoRuns().includes("2026-11-22"), false);
+                // 日期在开跑前已落盘：A 采集期间 B 直接得到 already-ran
+                assert.deepStrictEqual(resB1, { ran: false, reason: "already-ran", date: "2026-11-22" });
+                assert.strictEqual(store.readAutoRuns().includes("2026-11-22"), true);
 
                 gate3.resolve();
                 const resA = await pA;
@@ -1003,13 +1004,9 @@ async function main() {
                 assert.strictEqual(notifiesA.length, 1);
                 assert.strictEqual(notifiesB.length, 0);
 
-                // 下一分钟 B 重试：主进程返回 already-ran，不重采、不通知
+                // 下一分钟 B：本地已标记当天完成，不再调用主进程
                 const resB2 = await winB.tick();
-                assert.deepStrictEqual(resB2, {
-                  ran: false,
-                  reason: "already-ran",
-                  date: "2026-11-22",
-                });
+                assert.deepStrictEqual(resB2, { ran: false, reason: "not-due" });
                 assert.strictEqual(collectedBatches.length - startLen, 1);
                 assert.strictEqual(notifiesB.length, 0);
                 winA.stop();
@@ -1171,12 +1168,13 @@ async function main() {
           await withMockDateNow(
             () => cnTime(2026, 11, 26, 10, 0, 0),
             async () => {
+              const beforeBatches = collectedBatches.length;
               const res = await autoRunHandler(fakeEvent, {
                 accounts: [{ group: "DiskG", platform: "抖音", partition: "persist:DiskG-抖音" }],
               });
-              assert.strictEqual(res.status, "done");
-              assert.strictEqual(res.date, "2026-11-26");
-              assert.strictEqual(res.results[0].success, true);
+              // 开跑前落盘失败 → 不采集
+              assert.strictEqual(res.status, "store-failed");
+              assert.strictEqual(collectedBatches.length, beforeBatches, "落盘失败不得采集");
             }
           );
         } finally {
@@ -1195,19 +1193,23 @@ async function main() {
           trigger: "manual",
         });
         assert.strictEqual(afterDiskErr.results[0].success, true);
-        // 持久化失败后同日再次自动触发：内存兜底返回 already-ran，不得再采集（防每分钟重采）
+        // 磁盘恢复后下一轮：正常落盘并采集一次；同日再触发 already-ran，不重采
         {
           const before = collectedBatches.length;
           await withMockDateNow(
             () => cnTime(2026, 11, 26, 10, 1, 0),
             async () => {
-              const again = await autoRunHandler(fakeEvent, {
+              const ok = await autoRunHandler(fakeEvent, {
                 accounts: [{ group: "DiskG2", platform: "抖音", partition: "persist:DiskG2-抖音" }],
+              });
+              assert.strictEqual(ok.status, "done");
+              const again = await autoRunHandler(fakeEvent, {
+                accounts: [{ group: "DiskG3", platform: "抖音", partition: "persist:DiskG3-抖音" }],
               });
               assert.strictEqual(again.status, "already-ran");
             }
           );
-          assert.strictEqual(collectedBatches.length, before, "写盘失败后同日不得再次自动采集");
+          assert.strictEqual(collectedBatches.length, before + 1, "同日只自动采集一次");
         }
 
         collectorImpl = origImpl;
