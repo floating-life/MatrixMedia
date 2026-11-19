@@ -113,9 +113,10 @@ export default {
     },
     async syncThis() {
       if (this.syncing) return;
-      const accounts = buildCollectAccounts(
-        (g, p) => g === this.groupName && p === this.platform
-      );
+      const accounts =
+        buildCollectAccounts(
+          (g, p) => g === this.groupName && p === this.platform
+        ) || [];
       if (!accounts.length) {
         this.$message.warning("该账号不存在或不参与统计");
         return;

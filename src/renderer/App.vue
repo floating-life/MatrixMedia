@@ -12,26 +12,37 @@
 <script setup>
 import { getCurrentInstance, onMounted, onBeforeUnmount } from "vue";
 import CHeader from "./components/title";
-import statsScheduler from "@/utils/statsScheduler";
+import statsScheduler, { isMainWindowLocation } from "@/utils/statsScheduler";
 
 const instance = getCurrentInstance();
+let schedulerStarted = false;
 
 onMounted(() => {
-  statsScheduler.start({
-    notify: (options) => {
-      if (
-        instance &&
-        instance.proxy &&
-        typeof instance.proxy.$notify === "function"
-      ) {
-        instance.proxy.$notify(options);
-      }
-    },
-  });
+  if (
+    typeof window !== "undefined" &&
+    !window.opener &&
+    isMainWindowLocation(window.location)
+  ) {
+    schedulerStarted = true;
+    statsScheduler.start({
+      notify: (options) => {
+        if (
+          instance &&
+          instance.proxy &&
+          typeof instance.proxy.$notify === "function"
+        ) {
+          instance.proxy.$notify(options);
+        }
+      },
+    });
+  }
 });
 
 onBeforeUnmount(() => {
-  statsScheduler.stop();
+  if (schedulerStarted) {
+    schedulerStarted = false;
+    statsScheduler.stop();
+  }
 });
 </script>
 

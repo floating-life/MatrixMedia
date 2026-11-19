@@ -125,6 +125,8 @@ export default {
           ? "采集中…"
           : p.status === "success"
           ? "✓"
+          : p.status === "skipped"
+          ? "已跳过"
           : "✗ " + (p.error || "")
       }`;
     });
@@ -148,10 +150,16 @@ export default {
   },
   methods: {
     onAutoCollectChange() {
-      this.autoCollect = updateAutoCollectSettings({
+      const res = updateAutoCollectSettings({
         enabled: this.autoCollect.enabled,
         time: this.autoCollect.time,
       });
+      this.autoCollect = res.settings;
+      if (!res.ok) {
+        this.$message.error(
+          `保存自动采集设置失败${res.error ? "：" + res.error : ""}`
+        );
+      }
     },
     async refresh() {
       this.overview = await getOverviewStats();
@@ -162,7 +170,7 @@ export default {
     },
     async syncAll() {
       if (this.syncing) return;
-      const accounts = buildCollectAccounts();
+      const accounts = buildCollectAccounts() || [];
       if (!accounts.length) {
         this.$message.warning("没有可统计的账号，请先在「媒体平台管理」添加并登录");
         return;

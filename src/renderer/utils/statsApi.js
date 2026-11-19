@@ -12,21 +12,36 @@ const STATS_EXCLUDED = new Set(["番茄视频", "掘金"]);
 
 /**
  * 从 localStorage 账号树组装可采集账号列表。
+ * 解析失败或结构异常时返回 null（区别于确认无账号的空数组 []）。
  * @param {(group: string, platform: string) => boolean} [filter] 可选过滤（如只采集某分组某平台）
- * @returns [{ group, platform, partition }]
+ * @returns {Array<{ group: string, platform: string, partition: string, accountKey: string }> | null}
  */
 export function buildCollectAccounts(filter) {
-  let tree = {};
+  let raw;
   try {
-    tree = JSON.parse(localStorage.getItem("accountTree") || "{}");
+    raw = localStorage.getItem("accountTree");
   } catch (e) {
+    return null;
+  }
+  if (raw === null || raw === undefined || raw === "") {
     return [];
+  }
+  let tree;
+  try {
+    tree = JSON.parse(raw);
+  } catch (e) {
+    return null;
+  }
+  if (!tree || typeof tree !== "object" || Array.isArray(tree)) {
+    return null;
   }
   const accounts = [];
   const seenPartitions = new Set();
   for (const [group, node] of Object.entries(tree)) {
     const children = (node && node.children) || [];
+    if (!Array.isArray(children)) continue;
     for (const child of children) {
+      if (!child || typeof child !== "object") continue;
       const pt = (child.meta && child.meta.pt) || child.path;
       if (!pt || STATS_EXCLUDED.has(pt)) continue;
       if (filter && !filter(group, pt)) continue;

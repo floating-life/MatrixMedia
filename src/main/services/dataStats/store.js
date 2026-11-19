@@ -444,6 +444,75 @@ function readCollectLogs() {
   return readJson(collectLogFile(), []);
 }
 
+/* ---------------- auto-run（每日自动采集认领记录） ---------------- */
+
+const MAX_AUTO_RUN_DATES = 14;
+
+function autoRunFile() {
+  return path.join(baseDir(), "auto-run.json");
+}
+
+function isValidAutoRunDate(str) {
+  if (typeof str !== "string" || !WORKS_DAILY_DATE_RE.test(str)) return false;
+  const [year, month, day] = str.split("-").map(Number);
+  const dt = new Date(Date.UTC(year, month - 1, day));
+  return (
+    dt.getUTCFullYear() === year &&
+    dt.getUTCMonth() === month - 1 &&
+    dt.getUTCDate() === day
+  );
+}
+
+function normalizeAutoRuns(list) {
+  if (!Array.isArray(list)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const item of list) {
+    if (!isValidAutoRunDate(item)) continue;
+    if (seen.has(item)) continue;
+    seen.add(item);
+    out.push(item);
+  }
+  return out.slice(-MAX_AUTO_RUN_DATES);
+}
+
+/**
+ * 读取 <userData>/data-stats/auto-run.json 中的已运行日期列表。
+ * 不存在返回 []；JSON 损坏或结构无效告警并返回 []；读 I/O 错误上抛由调用方处理。
+ */
+function readAutoRuns() {
+  const file = autoRunFile();
+  let raw;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch (err) {
+    if (err && err.code === "ENOENT") return [];
+    throw err;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    console.warn(`[dataStats] auto-run.json JSON 损坏 (${file}):`, (err && err.message) || err);
+    return [];
+  }
+  if (!isPlainObject(parsed) || !Array.isArray(parsed.runs)) {
+    console.warn(`[dataStats] auto-run.json 结构无效 (${file})`);
+    return [];
+  }
+  return normalizeAutoRuns(parsed.runs);
+}
+
+/**
+ * 原子写入 <userData>/data-stats/auto-run.json（复用 S1 同款原子写，仅保留最近 14 个日期）。
+ * 写入失败直接抛错，保留旧文件完整。
+ */
+function writeAutoRuns(runs) {
+  const normalized = normalizeAutoRuns(runs);
+  writeWorksDailyAtomic(autoRunFile(), { runs: normalized });
+  return normalized;
+}
+
 /* ---------------- 读取与聚合 ---------------- */
 
 /** 单账号完整数据（平台页用） */
@@ -512,5 +581,8 @@ module.exports = {
   writeMeta,
   appendCollectLog,
   readCollectLogs,
+  MAX_AUTO_RUN_DATES,
+  readAutoRuns,
+  writeAutoRuns,
   todayStr,
 };

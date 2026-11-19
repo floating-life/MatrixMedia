@@ -1,11 +1,15 @@
 /**
  * 每日定时自动采集调度器（渲染层）：
  * - 设置保存在 localStorage "statsAutoCollect"：{ enabled, time, lastRunDate }
+ *   其中 lastRunDate 仅作界面展示与快速跳过，「每天只跑一次」的权威判定在主进程
+ *   stats:auto-claim（<userData>/data-stats/auto-run.json，UTC+8）
  * - 每 60s 用 setInterval 轮询一次（避免长 setTimeout 在系统睡眠/唤醒后漂移）
- * - 启动后前 2 分钟不触发（给用户先手动操作和登录窗口初始化留出时间）
- * - 本地日期 today !== lastRunDate 且当前时间 >= time 时触发（含关机/睡眠错过补跑）
- * - 先置 lastRunDate = today 再发起采集，防止失败后每分钟重试轰炸平台；
- *   仅当主进程返回「已有采集任务进行中」时还原 lastRunDate 下周期重试，当天最多重试 6 次（计数存内存）
+ * - 启动后前 2 分钟用单调时钟（performance.now）拦截，不受系统校时/回拨影响
+ * - 本地时间 >= time 且未快速跳过时，先读取账号树（解析失败返回 null → 不认领继续轮询；
+ *   确认为空数组 [] → 仍向主进程认领记录当天已跑）
+ * - 主进程 stats:auto-claim 成功后发起 stats:collect(trigger:"auto")；
+ *   若认领返回 busy，或认领后采集 IPC 返回 busy（此时调 stats:auto-release 释放本次认领），
+ *   则下周期重试，当天最多重试 6 次（计数存内存）
  */
 
 export const STORAGE_KEY = "statsAutoCollect";
@@ -22,6 +26,12 @@ export const DEFAULT_SETTINGS = Object.freeze({
 
 const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
 const DATE_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+const MAIN_ROUTE_PREFIXES = [
+  "/data-stats",
+  "/video-manager",
+  "/project-detail",
+  "/accountManager",
+];
 
 const settingsListeners = new Set();
 const runCompleteListeners = new Set();
@@ -82,20 +92,52 @@ export function isBusyError(res) {
 }
 
 /**
+ * 判断当前渲染器的 location 是否为主窗口页面（排除登录窗、加载窗及 open-win 子窗口）。
+ */
+export function isMainWindowLocation(
+  loc = typeof window !== "undefined" ? window.location : null
+) {
+  if (!loc || typeof loc !== "object") return false;
+  const protocol = String(loc.protocol || "");
+  const hostname = String(loc.hostname || "");
+  const pathname = String(loc.pathname || "");
+  const hash = String(loc.hash || "");
+
+  if (protocol === "file:") {
+    if (!/(?:^|\/)index\.html$/i.test(pathname)) return false;
+  } else if (protocol === "http:" || protocol === "https:") {
+    if (
+      hostname !== "localhost" &&
+      hostname !== "127.0.0.1" &&
+      hostname !== "[::1]"
+    ) {
+      return false;
+    }
+    if (pathname !== "/" && !/\/index\.html$/i.test(pathname)) return false;
+  } else {
+    return false;
+  }
+
+  const rawHash = hash.replace(/^#/, "").split("?")[0];
+  if (!rawHash || rawHash === "/") return true;
+  return MAIN_ROUTE_PREFIXES.some(
+    (prefix) => rawHash === prefix || rawHash.startsWith(`${prefix}/`)
+  );
+}
+
+/**
  * 纯函数：判断当前时刻是否应触发每日自动采集。
+ * 注意：不含依赖 Date 的启动延迟闸门（启动延迟由调度器用单调时钟独立判定）；
+ * settings.lastRunDate 仅作快速跳过与展示，权威判定在主进程 stats:auto-claim。
  * @param {object} params
  * @param {Date|number} params.now 当前时刻
  * @param {object} [params.settings] 采集设置（自动归一化，坏数据回落默认）
- * @param {Date|number} [params.startedAt] 调度器启动时刻（未满 startupDelayMs 不跑）
- * @param {number} [params.startupDelayMs=120000] 启动延迟毫秒数
  * @param {{ date: string, count: number }|null} [params.busyState] 当日「进行中」重试状态
  * @param {number} [params.maxBusyRetries=6] 当日最多重试次数（首次尝试 + 最多 6 次重试）
  */
 export function shouldRun({
   now,
   settings,
-  startedAt,
-  startupDelayMs = STARTUP_DELAY_MS,
   busyState = null,
   maxBusyRetries = MAX_BUSY_RETRIES,
 } = {}) {
@@ -105,17 +147,6 @@ export function shouldRun({
 
   const cfg = normalizeSettings(settings);
   if (!cfg.enabled) return false;
-
-  if (startedAt !== undefined && startedAt !== null) {
-    const startMs =
-      startedAt instanceof Date ? startedAt.getTime() : Number(startedAt);
-    if (!Number.isFinite(startMs)) return false;
-    const delay =
-      Number.isFinite(startupDelayMs) && startupDelayMs >= 0
-        ? startupDelayMs
-        : STARTUP_DELAY_MS;
-    if (nowMs - startMs < delay) return false;
-  }
 
   const today = formatLocalDate(nowDate);
   if (!today || cfg.lastRunDate === today) return false;
@@ -148,13 +179,22 @@ export function buildNotifyPayload(res) {
     };
   }
   const results = Array.isArray(res && res.results) ? res.results : [];
-  const successCount = results.filter((item) => item && item.success).length;
-  const failCount = results.length - successCount;
+  const skippedCount = results.filter((item) => item && item.skipped).length;
+  const successCount = results.filter(
+    (item) => item && item.success && !item.skipped
+  ).length;
+  const failCount = results.filter(
+    (item) => !item || (!item.success && !item.skipped)
+  ).length;
+  const countText =
+    skippedCount > 0
+      ? `成功 ${successCount} / 跳过 ${skippedCount} / 失败 ${failCount}`
+      : `成功 ${successCount} / 失败 ${failCount}`;
 
   if (res && res.cancelled) {
     return {
       title: "每日自动采集已取消",
-      message: `成功 ${successCount} / 失败 ${failCount}，详情请查看「拉取记录」`,
+      message: `${countText}，详情请查看「拉取记录」`,
       type: "info",
       duration: 6000,
     };
@@ -162,15 +202,15 @@ export function buildNotifyPayload(res) {
   if (failCount > 0) {
     return {
       title: "每日自动采集完成",
-      message: `成功 ${successCount} / 失败 ${failCount}，详情请查看「拉取记录」`,
+      message: `${countText}，详情请查看「拉取记录」`,
       type: "warning",
       duration: 6000,
     };
   }
   return {
     title: "每日自动采集完成",
-    message: `成功 ${successCount} / 失败 0`,
-    type: results.length > 0 ? "success" : "info",
+    message: countText,
+    type: successCount > 0 ? "success" : "info",
     duration: 6000,
   };
 }
@@ -181,6 +221,17 @@ function getDefaultStorage() {
   } catch (_) {
     return null;
   }
+}
+
+function defaultMonotonicNow() {
+  if (
+    typeof performance !== "undefined" &&
+    performance &&
+    typeof performance.now === "function"
+  ) {
+    return performance.now();
+  }
+  return Date.now();
 }
 
 function emitSettingsChange(settings) {
@@ -228,19 +279,33 @@ export function loadSettings(storage = getDefaultStorage()) {
   }
 }
 
+/**
+ * 保存配置到 localStorage。
+ * 返回 { ok: true, settings } 或 { ok: false, settings: 当前有效配置, error }，
+ * 写入失败时不触发设置变更广播，由调用方提示错误并回滚 UI。
+ */
 export function saveSettings(settings, storage = getDefaultStorage()) {
   const normalized = normalizeSettings(settings);
-  if (storage && typeof storage.setItem === "function") {
-    try {
-      storage.setItem(STORAGE_KEY, JSON.stringify(normalized));
-    } catch (_) {
-      /* 忽略 localStorage 不可写 / 配额满异常 */
-    }
+  if (!storage || typeof storage.setItem !== "function") {
+    return {
+      ok: false,
+      settings: loadSettings(storage),
+      error: "本地存储不可用",
+    };
+  }
+  try {
+    storage.setItem(STORAGE_KEY, JSON.stringify(normalized));
+  } catch (err) {
+    return {
+      ok: false,
+      settings: loadSettings(storage),
+      error: (err && err.message) || "保存失败",
+    };
   }
   if (storage === getDefaultStorage()) {
     emitSettingsChange(normalized);
   }
-  return normalized;
+  return { ok: true, settings: normalized };
 }
 
 export function updateSettings(patch, storage = getDefaultStorage()) {
@@ -261,6 +326,22 @@ function defaultGetAccounts() {
   return buildCollectAccounts();
 }
 
+function defaultAutoClaim() {
+  const { ipcRenderer } = require("electron");
+  if (ipcRenderer && typeof ipcRenderer.invoke === "function") {
+    return ipcRenderer.invoke("stats:auto-claim");
+  }
+  return Promise.resolve({ ok: false, reason: "ipc-unavailable" });
+}
+
+function defaultAutoRelease(date) {
+  const { ipcRenderer } = require("electron");
+  if (ipcRenderer && typeof ipcRenderer.invoke === "function") {
+    return ipcRenderer.invoke("stats:auto-release", { date });
+  }
+  return Promise.resolve({ ok: false, reason: "ipc-unavailable" });
+}
+
 function defaultCollect(accounts) {
   const { ipcRenderer } = require("electron");
   if (ipcRenderer && typeof ipcRenderer.invoke === "function") {
@@ -275,9 +356,12 @@ export function createStatsScheduler(options = {}) {
   const {
     storage,
     getAccounts = defaultGetAccounts,
+    autoClaim = defaultAutoClaim,
+    autoRelease = defaultAutoRelease,
     collect = defaultCollect,
     notify = () => {},
     now = () => Date.now(),
+    monotonicNow = defaultMonotonicNow,
     setIntervalFn = setInterval,
     clearIntervalFn = clearInterval,
     checkIntervalMs = CHECK_INTERVAL_MS,
@@ -288,16 +372,36 @@ export function createStatsScheduler(options = {}) {
   } = options;
 
   let timer = null;
-  let startedAt = null;
+  let startedAtMono = null;
   let running = false;
   let stopped = true;
   let busyState = { date: "", count: 0 };
-  // localStorage 不可写时的内存兜底日期，避免每分钟重复触发采集
-  let fallbackRunDate = "";
+
+  function recordBusy(today) {
+    const nextCount = busyState.date === today ? busyState.count + 1 : 1;
+    busyState = { date: today, count: nextCount };
+    return {
+      ran: false,
+      busy: true,
+      retryCount: nextCount,
+      exhausted: nextCount > maxBusyRetries,
+    };
+  }
 
   async function tick() {
     if (stopped || running) {
       return { ran: false, reason: stopped ? "stopped" : "in-flight" };
+    }
+
+    // 启动延迟改用单调时钟（performance.now），不受系统校时/回拨影响
+    const delay =
+      Number.isFinite(startupDelayMs) && startupDelayMs >= 0
+        ? startupDelayMs
+        : STARTUP_DELAY_MS;
+    const elapsedMono =
+      startedAtMono === null ? -1 : monotonicNow() - startedAtMono;
+    if (!Number.isFinite(elapsedMono) || elapsedMono < delay) {
+      return { ran: false, reason: "startup-delay" };
     }
 
     const currentNow = now();
@@ -311,17 +415,10 @@ export function createStatsScheduler(options = {}) {
     }
 
     const settings = loadSettings(storage);
-    const effectiveSettings =
-      fallbackRunDate === today && settings.lastRunDate !== today
-        ? { ...settings, lastRunDate: today }
-        : settings;
-
     if (
       !shouldRun({
         now: currentNow,
-        settings: effectiveSettings,
-        startedAt,
-        startupDelayMs,
+        settings,
         busyState,
         maxBusyRetries,
       })
@@ -329,29 +426,60 @@ export function createStatsScheduler(options = {}) {
       return { ran: false, reason: "not-due" };
     }
 
-    const prevLastRunDate = settings.lastRunDate;
-    const prevFallbackRunDate = fallbackRunDate;
     running = true;
 
     try {
-      // 先置 lastRunDate = today，防止失败后每分钟重试轰炸平台
-      updateSettings({ lastRunDate: today }, storage);
-      if (loadSettings(storage).lastRunDate !== today) {
-        fallbackRunDate = today;
-      }
-
-      let accounts = [];
+      // 账号树解析失败返回 null → 不认领，继续轮询；
+      // 确认为空数组 [] 才视为「无账号」，并走主进程 auto-claim 记录当天已跑
+      let accounts = null;
       try {
         const list = getAccounts();
-        accounts = Array.isArray(list) ? list : [];
+        accounts = Array.isArray(list) ? list : null;
       } catch (_) {
-        accounts = [];
+        accounts = null;
+      }
+      if (accounts === null) {
+        return { ran: false, reason: "accounts-unavailable" };
       }
 
-      // 无账号则直接记为已跑，不调用 IPC、不弹窗
+      // 主进程权威认领今日自动采集配额（UTC+8，单线程防多窗口与回拨重跑）
+      let claimRes;
+      try {
+        claimRes = await autoClaim();
+      } catch (err) {
+        return {
+          ran: false,
+          reason: "claim-failed",
+          error: (err && err.message) || String(err),
+        };
+      }
+
+      if (!claimRes || !claimRes.ok) {
+        const reason = (claimRes && claimRes.reason) || "claim-failed";
+        if (reason === "already-ran") {
+          busyState = { date: "", count: 0 };
+          // localStorage.lastRunDate 仅作展示与快速跳过，避免覆盖更新的日期
+          if (!settings.lastRunDate || settings.lastRunDate < today) {
+            updateSettings({ lastRunDate: today }, storage);
+          }
+          return { ran: false, reason: "already-ran" };
+        }
+        if (reason === "busy") {
+          return recordBusy(today);
+        }
+        // store-failed 等：不采集，避免无持久化保障时重复轰炸平台
+        return { ran: false, reason };
+      }
+
+      const claimedDate = isValidDateStr(claimRes.date)
+        ? claimRes.date
+        : today;
+
+      // 确认为空数组：主进程已通过 auto-claim 记录当天已跑，不调 collect、不弹窗
       if (!accounts.length) {
+        updateSettings({ lastRunDate: claimedDate }, storage);
         busyState = { date: "", count: 0 };
-        return { ran: true, skippedEmpty: true };
+        return { ran: true, skippedEmpty: true, date: claimedDate };
       }
 
       let res;
@@ -359,6 +487,7 @@ export function createStatsScheduler(options = {}) {
         res = await collect(accounts);
       } catch (err) {
         const message = (err && err.message) || String(err) || "采集异常";
+        updateSettings({ lastRunDate: claimedDate }, storage);
         if (!stopped && typeof notify === "function") {
           try {
             notify({
@@ -381,25 +510,20 @@ export function createStatsScheduler(options = {}) {
             emitRunComplete({ results: [], error: message });
           }
         }
-        return { ran: true, error: message };
+        return { ran: true, error: message, date: claimedDate };
       }
 
       if (isBusyError(res)) {
-        const nextCount = busyState.date === today ? busyState.count + 1 : 1;
-        busyState = { date: today, count: nextCount };
-        fallbackRunDate = prevFallbackRunDate;
-        const latest = loadSettings(storage);
-        if (latest.lastRunDate === today) {
-          updateSettings({ lastRunDate: prevLastRunDate }, storage);
+        // 仅本次认领后采集 IPC 返回 busy 时，同步释放本次认领日期
+        try {
+          await autoRelease(claimedDate);
+        } catch (_) {
+          /* 释放失败不阻塞状态复位 */
         }
-        return {
-          ran: false,
-          busy: true,
-          retryCount: nextCount,
-          exhausted: nextCount > maxBusyRetries,
-        };
+        return recordBusy(today);
       }
 
+      updateSettings({ lastRunDate: claimedDate }, storage);
       busyState = { date: "", count: 0 };
 
       const payload = buildNotifyPayload(res);
@@ -420,7 +544,7 @@ export function createStatsScheduler(options = {}) {
           emitRunComplete(res);
         }
       }
-      return { ran: true, result: res };
+      return { ran: true, result: res, date: claimedDate };
     } finally {
       running = false;
     }
@@ -429,7 +553,7 @@ export function createStatsScheduler(options = {}) {
   function start() {
     if (timer !== null) return;
     stopped = false;
-    startedAt = now();
+    startedAtMono = monotonicNow();
     timer = setIntervalFn(() => {
       tick();
     }, checkIntervalMs);
@@ -447,7 +571,7 @@ export function createStatsScheduler(options = {}) {
     return {
       running,
       stopped,
-      startedAt,
+      startedAtMono,
       busyState: { ...busyState },
     };
   }
@@ -488,6 +612,7 @@ export default {
   BUSY_ERROR_TEXT,
   formatLocalDate,
   normalizeSettings,
+  isMainWindowLocation,
   shouldRun,
   isBusyError,
   buildNotifyPayload,
