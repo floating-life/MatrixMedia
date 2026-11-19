@@ -15,7 +15,6 @@ const path = require("path");
 const xlsx = require("xlsx");
 const { WORK_STAT_KEYS, normalizeMetric, buildWorkDailyRows } = require("./statsTable");
 const {
-  makeWorkKey,
   buildContentIndex,
   linkWorks,
   buildContentSummaryRows,
@@ -24,7 +23,10 @@ const {
 const UTC8_MS = 8 * 3600e3;
 const DAY_MS = 86400000;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const WORKS_DAILY_FILE_RE = /^(\d{4}-\d{2}-\d{2})\.json$/;
 const DEFAULT_RANGE_DAYS = 29; // 含起止日共 30 天
+const MAX_SHEET_ROWS = 200000;
+const ROW_LIMIT_EXCEEDED_CODE = "ROW_LIMIT_EXCEEDED";
 
 const SHEET_NAMES = [
   "作品日明细",
@@ -301,6 +303,226 @@ function resolveRecordGroup(rec) {
   return p.split("-")[0].trim();
 }
 
+function safeSeg(name) {
+  return String(name || "未命名").replace(/[\\/:*?"<>|]/g, "_");
+}
+
+function pickWorkDailyStats(w) {
+  const out = {};
+  for (const k of WORK_STAT_KEYS) {
+    out[k] = hasOwn(w, k) ? normalizeMetric(w[k]) : null;
+  }
+  return out;
+}
+
+function parseDayWorksFile(file) {
+  let raw;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch (err) {
+    if (err && err.code === "ENOENT") return null;
+    throw err;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    console.warn(`[dataStats] 作品日快照 JSON 损坏 (${file}):`, (err && err.message) || err);
+    return null;
+  }
+  if (!isPlainObject(parsed) || !isPlainObject(parsed.works)) {
+    console.warn(`[dataStats] 作品日快照结构无效 (${file})`);
+    return null;
+  }
+  const works = Object.create(null);
+  for (const workId of Object.keys(parsed.works)) {
+    const desc = Object.getOwnPropertyDescriptor(parsed.works, workId);
+    if (desc && isPlainObject(desc.value)) {
+      works[workId] = pickWorkDailyStats(desc.value);
+    }
+  }
+  return works;
+}
+
+function canUseCutoffFsReader(options, depsArg) {
+  const injected = isPlainObject(depsArg)
+    ? depsArg
+    : isPlainObject(options && options.deps)
+    ? options.deps
+    : null;
+  if (
+    injected &&
+    (typeof injected.readWorksDaily === "function" ||
+      (isPlainObject(injected.store) &&
+        typeof injected.store.readWorksDaily === "function"))
+  ) {
+    return false;
+  }
+  try {
+    const electron = require("electron");
+    if (!electron || !electron.app || typeof electron.app.getPath !== "function") {
+      return false;
+    }
+    const storeMod = require("./store");
+    if (
+      !storeMod ||
+      typeof storeMod.readWorksDaily !== "function" ||
+      typeof storeMod.mergeWorks !== "function" ||
+      typeof storeMod.todayStr !== "function"
+    ) {
+      return false;
+    }
+    // 若单测覆盖/包装了 store.readWorksDaily，回退走 io.readWorksDaily 以尊重 mock/spy
+    const fnSrc = Function.prototype.toString.call(storeMod.readWorksDaily);
+    if (!fnSrc.includes("mergeLegacyWorksDaily")) return false;
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
+ * 仅读取截至 cutoffDate 的每个作品最新一条快照（跳过 > cutoffDate 的日文件，内存保持 O(作品数)）。
+ * 与 store.readWorksDaily 保持同一口径：目录文件优先于旧单文件 works-daily.json。
+ */
+function readWorksDailyLatestAsOfFs(group, platform, cutoffDate) {
+  const { app } = require("electron");
+  const accDir = path.join(
+    app.getPath("userData"),
+    "data-stats",
+    safeSeg(group),
+    safeSeg(platform)
+  );
+  const dir = path.join(accDir, "works-daily");
+  const bestByWork = Object.create(null);
+  let latestDate = "";
+
+  let entries = null;
+  try {
+    entries = fs.readdirSync(dir);
+  } catch (err) {
+    if (!err || err.code !== "ENOENT") {
+      console.warn(
+        `[dataStats] 读取 works-daily 目录失败 (${dir}):`,
+        (err && err.message) || err
+      );
+    }
+  }
+
+  if (Array.isArray(entries) && entries.length > 0) {
+    const dayFiles = [];
+    for (const name of entries) {
+      const m = WORKS_DAILY_FILE_RE.exec(name);
+      if (!m) continue;
+      const date = m[1];
+      if (!isValidDateStr(date)) continue;
+      if (cutoffDate && date > cutoffDate) continue;
+      dayFiles.push({ date, name });
+    }
+    // 倒序扫描：每个作品首次命中即为 <= cutoffDate 的最新快照
+    dayFiles.sort((a, b) => (a.date > b.date ? -1 : a.date < b.date ? 1 : 0));
+    for (const { date, name } of dayFiles) {
+      const file = path.join(dir, name);
+      let dayWorks;
+      try {
+        dayWorks = parseDayWorksFile(file);
+      } catch (err) {
+        console.warn(
+          `[dataStats] 读取作品日快照失败，已跳过 (${file}):`,
+          (err && err.message) || err
+        );
+        continue;
+      }
+      if (!dayWorks) continue;
+      for (const workId of Object.keys(dayWorks)) {
+        if (!bestByWork[workId]) {
+          bestByWork[workId] = { date, snap: dayWorks[workId] };
+          if (!latestDate || date > latestDate) latestDate = date;
+        }
+      }
+    }
+  }
+
+  // 兼容旧单文件 works-daily.json（目录同日优先，仅更晚日期可补缺）
+  const legacyFile = path.join(accDir, "works-daily.json");
+  let legacyRaw = null;
+  try {
+    legacyRaw = fs.readFileSync(legacyFile, "utf8");
+  } catch (err) {
+    if (!err || err.code !== "ENOENT") {
+      console.warn(
+        `[dataStats] 读取旧 works-daily.json 失败 (${legacyFile}):`,
+        (err && err.message) || err
+      );
+    }
+  }
+  if (legacyRaw !== null) {
+    let parsed = null;
+    try {
+      parsed = JSON.parse(legacyRaw);
+    } catch (err) {
+      console.warn(
+        `[dataStats] 旧 works-daily.json JSON 损坏，已跳过 (${legacyFile}):`,
+        (err && err.message) || err
+      );
+    }
+    if (isPlainObject(parsed)) {
+      for (const workId of Object.keys(parsed)) {
+        const desc = Object.getOwnPropertyDescriptor(parsed, workId);
+        const dateMap = desc ? desc.value : null;
+        if (!isPlainObject(dateMap)) continue;
+        for (const d of Object.keys(dateMap)) {
+          if (!isValidDateStr(d)) continue;
+          if (cutoffDate && d > cutoffDate) continue;
+          const snapDesc = Object.getOwnPropertyDescriptor(dateMap, d);
+          if (!snapDesc || !isPlainObject(snapDesc.value)) continue;
+          const prev = bestByWork[workId];
+          if (!prev || d > prev.date) {
+            bestByWork[workId] = { date: d, snap: pickWorkDailyStats(snapDesc.value) };
+            if (!latestDate || d > latestDate) latestDate = d;
+          }
+        }
+      }
+    }
+  }
+
+  const worksDaily = Object.create(null);
+  for (const workId of Object.keys(bestByWork)) {
+    const entry = bestByWork[workId];
+    worksDaily[workId] = { [entry.date]: entry.snap };
+  }
+  return { worksDaily, latestDate };
+}
+
+function reduceWorksDailyAsOf(rawWorksDaily, cutoffDate) {
+  const worksDaily = Object.create(null);
+  let latestDate = "";
+  if (!isPlainObject(rawWorksDaily)) return { worksDaily, latestDate };
+  for (const workId of Object.keys(rawWorksDaily)) {
+    const desc = Object.getOwnPropertyDescriptor(rawWorksDaily, workId);
+    const dateMap = desc ? desc.value : null;
+    if (!isPlainObject(dateMap)) continue;
+    let bestDate = "";
+    let bestSnap = null;
+    for (const d of Object.keys(dateMap)) {
+      if (!isValidDateStr(d)) continue;
+      if (cutoffDate && d > cutoffDate) continue;
+      const snapDesc = Object.getOwnPropertyDescriptor(dateMap, d);
+      const snap = snapDesc ? snapDesc.value : null;
+      if (!isPlainObject(snap)) continue;
+      if (!bestDate || d > bestDate) {
+        bestDate = d;
+        bestSnap = snap;
+      }
+    }
+    if (bestSnap) {
+      worksDaily[workId] = { [bestDate]: bestSnap };
+      if (!latestDate || bestDate > latestDate) latestDate = bestDate;
+    }
+  }
+  return { worksDaily, latestDate };
+}
+
 function loadRawDataset(options = {}, depsArg) {
   const io = resolveIoDeps(options, depsArg);
   const groupSet =
@@ -356,6 +578,82 @@ function loadRawDataset(options = {}, depsArg) {
   };
 }
 
+/**
+ * 仅加载「作品跨平台汇总」截至 cutoffDate 所需数据：
+ * - 不读取 daily.json（仅当所有作品快照均为空且未指定 date 时才兜底查最新快照日）
+ * - works-daily 仅保留每作品 <= cutoffDate 的最新一条快照（真实存储跳过 > cutoffDate 文件）
+ */
+function loadSummaryDataset(options = {}, depsArg, explicitCutoffDate = "") {
+  const io = resolveIoDeps(options, depsArg);
+  const groupSet =
+    Array.isArray(options.groups) && options.groups.length > 0
+      ? new Set(options.groups.map((g) => String(g)))
+      : null;
+
+  const rawAccounts = io.listAccounts() || [];
+  const accountsData = [];
+  const worksDailyByGp = Object.create(null);
+  let latestWorksDate = "";
+  const useFastFs = canUseCutoffFsReader(options, depsArg);
+
+  for (const acc of rawAccounts) {
+    if (!isPlainObject(acc)) continue;
+    const group = acc.group == null ? "" : String(acc.group);
+    const platform = acc.platform == null ? "" : String(acc.platform);
+    if (groupSet && !groupSet.has(group)) continue;
+
+    const worksDoc = io.readWorks(group, platform);
+    const works =
+      worksDoc && Array.isArray(worksDoc.works)
+        ? worksDoc.works
+        : Array.isArray(worksDoc)
+        ? worksDoc
+        : [];
+
+    const res = useFastFs
+      ? readWorksDailyLatestAsOfFs(group, platform, explicitCutoffDate)
+      : reduceWorksDailyAsOf(io.readWorksDaily(group, platform), explicitCutoffDate);
+
+    if (res.latestDate && (!latestWorksDate || res.latestDate > latestWorksDate)) {
+      latestWorksDate = res.latestDate;
+    }
+
+    accountsData.push({ group, platform, works, worksDaily: res.worksDaily, daily: {} });
+    worksDailyByGp[`${group}|${platform}`] = res.worksDaily;
+  }
+
+  accountsData.sort((a, b) => {
+    const pc = comparePlatform(a.platform, b.platform);
+    if (pc !== 0) return pc;
+    return compareText(a.group, b.group);
+  });
+
+  const rawPushRecords = io.readPushRecords() || [];
+  const filteredPushRecords = groupSet
+    ? rawPushRecords.filter((rec) => groupSet.has(resolveRecordGroup(rec)))
+    : rawPushRecords;
+
+  let latestDataDate = latestWorksDate;
+  if (!explicitCutoffDate && !latestDataDate) {
+    for (const acc of accountsData) {
+      const rawDaily = io.readDaily(acc.group, acc.platform);
+      if (!isPlainObject(rawDaily)) continue;
+      for (const [d, snap] of Object.entries(rawDaily)) {
+        if (!isPlainObject(snap) || !isValidDateStr(d)) continue;
+        if (!latestDataDate || d > latestDataDate) latestDataDate = d;
+      }
+    }
+  }
+
+  return {
+    io,
+    accountsData,
+    worksDailyByGp,
+    pushRecords: filteredPushRecords,
+    latestDataDate,
+  };
+}
+
 function findLatestDataDate(accountsData) {
   let latest = "";
   for (const acc of accountsData) {
@@ -374,49 +672,81 @@ function findLatestDataDate(accountsData) {
   return latest;
 }
 
-function computeWorkCountsAsOf(accountsData, link, cutoffDate) {
-  const workLinkedMap = new Map();
-
-  for (const acc of accountsData) {
-    for (const w of acc.works) {
-      if (!isPlainObject(w)) continue;
-      const workId = w.workId == null ? "" : String(w.workId);
-      if (!workId) continue;
-      const pubDate = rawTimestampToUtc8Date(w.publishTime);
-      if (cutoffDate && pubDate && pubDate > cutoffDate) continue;
-      const workKey = makeWorkKey(acc.group, acc.platform, workId);
-      const entry = link.get(workKey);
-      const linked = Boolean(entry && entry.contentKey != null && entry.contentKey !== "");
-      if (!workLinkedMap.has(workKey)) {
-        workLinkedMap.set(workKey, linked);
-      }
-    }
-    for (const [workId, dateMap] of Object.entries(acc.worksDaily)) {
-      if (!workId || !isPlainObject(dateMap)) continue;
-      let hasSnapAsOf = false;
-      for (const [d, snap] of Object.entries(dateMap)) {
-        if (!isPlainObject(snap) || !isValidDateStr(d)) continue;
-        if (!cutoffDate || d <= cutoffDate) {
-          hasSnapAsOf = true;
-          break;
-        }
-      }
-      if (!hasSnapAsOf) continue;
-      const workKey = makeWorkKey(acc.group, acc.platform, workId);
-      if (!workLinkedMap.has(workKey)) {
-        workLinkedMap.set(workKey, false);
-      }
-    }
-  }
-
+/**
+ * 沿用跨平台汇总（buildContentSummaryRows）的去重与关联口径统计作品数与未关联作品数：
+ * - buildContentSummaryRows 已按 platform|workId 跨组去重并处理冲突与未来作品过滤
+ * - 每个已纳入汇总的作品仅出现在某一行的 perPlatform[*].workIds 中一次
+ * - contentKey 以 "unlinked:" 开头的行即为未关联作品
+ */
+function computeWorkCountsFromSummaryRows(summaryRows) {
+  let works = 0;
   let unlinkedWorks = 0;
-  for (const linked of workLinkedMap.values()) {
-    if (!linked) unlinkedWorks++;
+  for (const row of Array.isArray(summaryRows) ? summaryRows : []) {
+    if (!isPlainObject(row) || !isPlainObject(row.perPlatform)) continue;
+    const isUnlinked =
+      typeof row.contentKey === "string" && row.contentKey.startsWith("unlinked:");
+    let rowWorkCount = 0;
+    for (const cell of Object.values(row.perPlatform)) {
+      if (cell && Array.isArray(cell.workIds)) {
+        rowWorkCount += cell.workIds.length;
+      }
+    }
+    works += rowWorkCount;
+    if (isUnlinked) unlinkedWorks += rowWorkCount;
   }
-  return {
-    works: workLinkedMap.size,
-    unlinkedWorks,
-  };
+  return { works, unlinkedWorks };
+}
+
+function countWorkDailyRows(accountsData, from, to) {
+  let count = 0;
+  for (const acc of Array.isArray(accountsData) ? accountsData : []) {
+    if (!isPlainObject(acc) || !isPlainObject(acc.worksDaily)) continue;
+    for (const workId of Object.keys(acc.worksDaily)) {
+      const desc = Object.getOwnPropertyDescriptor(acc.worksDaily, workId);
+      const dateMap = desc ? desc.value : null;
+      if (!isPlainObject(dateMap)) continue;
+      for (const d of Object.keys(dateMap)) {
+        if (!isValidDateStr(d)) continue;
+        if (from && d < from) continue;
+        if (to && d > to) continue;
+        const snapDesc = Object.getOwnPropertyDescriptor(dateMap, d);
+        if (!snapDesc || !isPlainObject(snapDesc.value)) continue;
+        count += 1;
+      }
+    }
+  }
+  return count;
+}
+
+function countAccountDailyRows(accountsData, from, to) {
+  let count = 0;
+  for (const acc of Array.isArray(accountsData) ? accountsData : []) {
+    if (!isPlainObject(acc) || !isPlainObject(acc.daily)) continue;
+    for (const [d, snap] of Object.entries(acc.daily)) {
+      if (!isPlainObject(snap) || !isValidDateStr(d)) continue;
+      if (from && d < from) continue;
+      if (to && d > to) continue;
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function resolveMaxRows(raw) {
+  if (raw === undefined || raw === null) return MAX_SHEET_ROWS;
+  if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) {
+    return Math.floor(raw);
+  }
+  throw new Error(`maxRows 需为正整数：${raw}`);
+}
+
+function createRowLimitError(rowCount, maxRows, sheetName) {
+  const err = new Error(`数据量过大（${rowCount} 行），请缩小日期范围后再导出`);
+  err.code = ROW_LIMIT_EXCEEDED_CODE;
+  err.rowCount = rowCount;
+  err.maxRows = maxRows;
+  if (sheetName) err.sheetName = sheetName;
+  return err;
 }
 
 function validateOptionalDate(value, label) {
@@ -432,34 +762,47 @@ function validateOptionalDate(value, label) {
   return trimmed;
 }
 
+function validateExportDateRange(from, to) {
+  const validFrom = validateOptionalDate(from, "from");
+  const validTo = validateOptionalDate(to, "to");
+  if (validFrom && validTo && validFrom > validTo) {
+    throw new Error(`开始日期不能晚于结束日期（${validFrom} > ${validTo}）`);
+  }
+  return { from: validFrom, to: validTo };
+}
+
+function buildDefaultExportFileName(from, to, now = Date.now()) {
+  const today = formatUtc8Date(now);
+  let resolvedTo = to || today;
+  if (!to && from && resolvedTo < from) {
+    resolvedTo = from;
+  }
+  const resolvedFrom = from || shiftDateStr(resolvedTo, -DEFAULT_RANGE_DAYS);
+  return `MatrixMedia-作品数据-${resolvedFrom}_${resolvedTo}.xlsx`;
+}
+
 /**
  * 构建跨平台内容汇总数据（供 GUI「作品汇总」tab / IPC stats:get-content-summary 复用）。
+ * - 仅读取截止日所需快照（不读全量历史，不排序作品日明细）
+ * - 先解析统一 cutoffDate（参数 date，缺省=最新快照日），同一个 cutoff 用于关联、汇总、计数和页面回执
  */
 function buildContentSummaryData(options = {}, depsArg) {
-  const dateStr = validateOptionalDate(options.date, "date");
-  const dataset = loadRawDataset(options, depsArg);
+  const opts = isPlainObject(options) ? options : {};
+  const dateStr = validateOptionalDate(opts.date, "date");
+  const dataset = loadSummaryDataset(opts, depsArg, dateStr);
+  const cutoffDate = dateStr || dataset.latestDataDate || "";
   const contents = buildContentIndex(dataset.pushRecords);
-  const cutoffDate = dateStr || "";
-  const link = linkWorks({
-    contents,
-    accounts: dataset.accountsData,
-    date: cutoffDate || undefined,
-  });
   const rows = buildContentSummaryRows({
     contents,
     accounts: dataset.accountsData,
     worksDaily: dataset.worksDailyByGp,
     date: cutoffDate || undefined,
   });
-  const workCounts = computeWorkCountsAsOf(
-    dataset.accountsData,
-    link,
-    cutoffDate
-  );
+  const workCounts = computeWorkCountsFromSummaryRows(rows);
 
   return {
     rows,
-    date: dateStr || dataset.latestDataDate || "",
+    date: cutoffDate,
     counts: {
       accounts: dataset.accountsData.length,
       works: workCounts.works,
@@ -627,37 +970,58 @@ function buildContentSummarySheet(summaryRows) {
   return { aoa, dynamicSchemaEntries };
 }
 
-/** Sheet 3: 平台日汇总（由作品日明细按 日期+平台 求和，null 不计；全 null 为空） */
+/**
+ * Sheet 3: 平台日汇总（由作品日明细按「日期+平台+作品ID」去重后按 日期+平台 求和；
+ * 同一作品多分组只取按分组名排序第一组的一份观测，null 不计，全 null 为空）
+ */
 function buildPlatformDailySheet(workDailyRows) {
   const buckets = new Map();
 
   for (const r of workDailyRows) {
-    const key = `${r.date}|${r.platform}`;
-    let agg = buckets.get(key);
-    if (!agg) {
-      agg = {
+    const key = `${r.date}\0${r.platform}`;
+    let bucket = buckets.get(key);
+    if (!bucket) {
+      bucket = {
         date: r.date,
         platform: r.platform,
-        workCount: 0,
-        sums: Object.create(null),
+        byWorkId: new Map(),
       };
-      for (const dk of WORK_DELTA_KEYS) agg.sums[dk] = null;
-      buckets.set(key, agg);
+      buckets.set(key, bucket);
     }
 
-    const hasCumulativeData = WORK_STAT_KEYS.some((k) => r[k] !== null);
-    if (hasCumulativeData) agg.workCount += 1;
-
-    for (const dk of WORK_DELTA_KEYS) {
-      const val = r[dk];
-      if (typeof val === "number" && Number.isFinite(val)) {
-        const next = agg.sums[dk] === null ? val : agg.sums[dk] + val;
-        agg.sums[dk] = next === 0 ? 0 : next;
-      }
+    const workId = r.workId == null ? "" : String(r.workId);
+    const existing = bucket.byWorkId.get(workId);
+    if (!existing || compareText(String(r.group || ""), String(existing.group || "")) < 0) {
+      bucket.byWorkId.set(workId, r);
     }
   }
 
-  const rows = [...buckets.values()].sort((a, b) => {
+  const rows = [];
+  for (const bucket of buckets.values()) {
+    const agg = {
+      date: bucket.date,
+      platform: bucket.platform,
+      workCount: 0,
+      sums: Object.create(null),
+    };
+    for (const dk of WORK_DELTA_KEYS) agg.sums[dk] = null;
+
+    for (const obs of bucket.byWorkId.values()) {
+      const hasCumulativeData = WORK_STAT_KEYS.some((k) => obs[k] !== null);
+      if (hasCumulativeData) agg.workCount += 1;
+
+      for (const dk of WORK_DELTA_KEYS) {
+        const val = obs[dk];
+        if (typeof val === "number" && Number.isFinite(val)) {
+          const next = agg.sums[dk] === null ? val : agg.sums[dk] + val;
+          agg.sums[dk] = next === 0 ? 0 : next;
+        }
+      }
+    }
+    rows.push(agg);
+  }
+
+  rows.sort((a, b) => {
     if (a.date !== b.date) return compareText(a.date, b.date);
     return comparePlatform(a.platform, b.platform);
   });
@@ -753,7 +1117,7 @@ function buildAccountDailySheet(accountsData, from, to) {
   return { aoa, rows };
 }
 
-/** Sheet 5: 字段说明（每个 sheet 每列一行） */
+/** Sheet 5: 字段说明（每个 sheet 每列一行，仅列出实际生成的列） */
 function buildSchemaSheet(dynamicSchemaEntries) {
   const entries = [
     // 1. 作品日明细
@@ -761,7 +1125,7 @@ function buildSchemaSheet(dynamicSchemaEntries) {
       "作品日明细",
       "日期",
       "date",
-      "快照采集日期（YYYY-MM-DD，UTC+8）。平台数据通常为 T+1 口径（如抖音当天数据不可查，次日更新）。",
+      "本地快照采集日期（YYYY-MM-DD，UTC+8），非平台自然日。平台数据本身存在 T+1 延迟（如抖音当天数据不可查，次日更新），采集值为采集时平台已开放的最新累计值。",
     ],
     [
       "作品日明细",
@@ -773,7 +1137,7 @@ function buildSchemaSheet(dynamicSchemaEntries) {
       "作品日明细",
       "分组",
       "group",
-      "账号分组名。已知问题：同组同平台挂多个账号时，本地统计按「分组/平台」合并存储，无法拆分到单账号。",
+      "账号分组名。本表保留分组明细不去重，同一账号挂多个分组时会出现重复行；另同组同平台挂多个账号时，本地统计按「分组/平台」合并存储，无法拆分到单账号。",
     ],
     [
       "作品日明细",
@@ -815,37 +1179,37 @@ function buildSchemaSheet(dynamicSchemaEntries) {
       "作品日明细",
       "播放",
       "play",
-      "截至当日的累计播放量（累计值，非日增）。缺失为空单元格而非 0。已知问题：部分平台适配器可能把缺失指标写成 0，导致「掉 0 再回升」假波动。",
+      "截至采集日的累计播放/阅读量（累计值，非日增；7 平台均有）。缺失为空单元格而非 0。已知问题：部分平台适配器可能把缺失指标写成 0，导致「掉 0 再回升」假波动。",
     ],
     [
       "作品日明细",
       "点赞",
       "like",
-      "截至当日的累计点赞数（累计值，非日增）；缺失为空不是 0。",
+      "截至采集日的累计点赞/推荐数（累计值，非日增；7 平台均有）；缺失为空不是 0。",
     ],
     [
       "作品日明细",
       "评论",
       "comment",
-      "截至当日的累计评论数（累计值，非日增）；缺失为空不是 0。",
+      "截至采集日的累计评论数（累计值，非日增；7 平台均有）；缺失为空不是 0。",
     ],
     [
       "作品日明细",
       "分享",
       "share",
-      "截至当日的累计分享数（累计值）。平台缺项为空不是 0（快手无分享）。",
+      "截至采集日的累计分享/转发数（累计值）。平台缺项为空不是 0（快手、头条无分享；抖音、视频号、哔哩哔哩、百家号、小红书有分享）。",
     ],
     [
       "作品日明细",
       "收藏",
       "favorite",
-      "截至当日的累计收藏数（累计值）。平台缺项为空不是 0（快手无收藏/分享、抖音无收藏、头条无收藏）。",
+      "截至采集日的累计收藏数（累计值）。平台缺项为空不是 0（仅快手无收藏；抖音含 favorite_count、头条含 repinCount，与视频号/哔哩哔哩/百家号/小红书均有收藏）。",
     ],
     [
       "作品日明细",
       "涨粉",
       "fansDelta",
-      "截至当日该作品带来的累计涨粉数（累计值）。平台缺项为空不是 0（仅抖音/视频号有单作品涨粉，B站无单视频涨粉）。",
+      "截至采集日该作品带来的累计涨粉数（累计值）。平台缺项为空不是 0（仅抖音、视频号有单作品涨粉；哔哩哔哩、百家号、头条、快手、小红书无单作品涨粉）。",
     ],
     [
       "作品日明细",
@@ -869,19 +1233,19 @@ function buildSchemaSheet(dynamicSchemaEntries) {
       "作品日明细",
       "分享日增",
       "shareDelta",
-      "分享日增量=与该作品上一次有记录日期的差；断档天数 > 0 时日增跨多天；平台缺项（快手无分享）为空不是 0。",
+      "分享日增量=与该作品上一次有记录日期的差；断档天数 > 0 时日增跨多天；平台缺项（快手、头条无分享）为空不是 0。",
     ],
     [
       "作品日明细",
       "收藏日增",
       "favoriteDelta",
-      "收藏日增量=与该作品上一次有记录日期的差；断档天数 > 0 时日增跨多天；平台缺项（快手/抖音/头条无收藏）为空不是 0。",
+      "收藏日增量=与该作品上一次有记录日期的差；断档天数 > 0 时日增跨多天；平台缺项（仅快手无收藏；抖音、头条等均有收藏）为空不是 0。",
     ],
     [
       "作品日明细",
       "涨粉日增",
       "fansDeltaDelta",
-      "涨粉日增量=与该作品上一次有记录日期的差；断档天数 > 0 时日增跨多天；仅抖音/视频号有涨粉，B站无单视频涨粉，缺项为空不是 0。",
+      "涨粉日增量=与该作品上一次有记录日期的差；断档天数 > 0 时日增跨多天；仅抖音、视频号有单作品涨粉，哔哩哔哩/百家号/头条/快手/小红书无单作品涨粉，缺项为空不是 0。",
     ],
     [
       "作品日明细",
@@ -943,33 +1307,27 @@ function buildSchemaSheet(dynamicSchemaEntries) {
       "作品跨平台汇总",
       "总分享",
       "totalShare",
-      "截至结束日期（to）各平台最新累计分享数之和（累计值；快手无分享为空不是 0，全空则为空）。",
+      "截至结束日期（to）各平台最新累计分享数之和（累计值；快手、头条无分享为空不是 0，全空则为空）。",
     ],
     [
       "作品跨平台汇总",
       "总收藏",
       "totalFavorite",
-      "截至结束日期（to）各平台最新累计收藏数之和（累计值；快手/抖音/头条无收藏为空不是 0，全空则为空）。",
+      "截至结束日期（to）各平台最新累计收藏数之和（累计值；仅快手无收藏为空不是 0，抖音/头条等均有收藏，全空则为空）。",
     ],
     [
       "作品跨平台汇总",
       "总涨粉",
       "totalFansDelta",
-      "截至结束日期（to）各平台最新累计涨粉数之和（累计值；仅抖音/视频号有涨粉，B站无单视频涨粉，缺项为空不是 0）。",
+      "截至结束日期（to）各平台最新累计涨粉数之和（累计值；仅抖音、视频号有单作品涨粉，哔哩哔哩/百家号/头条/快手/小红书无单作品涨粉，缺项为空不是 0）。",
     ],
   ];
 
-  if (dynamicSchemaEntries && dynamicSchemaEntries.length > 0) {
+  // 仅列出本次导出实际生成的动态列
+  if (Array.isArray(dynamicSchemaEntries) && dynamicSchemaEntries.length > 0) {
     for (const d of dynamicSchemaEntries) {
       entries.push(["作品跨平台汇总", d.col, d.key, d.desc]);
     }
-  } else {
-    entries.push([
-      "作品跨平台汇总",
-      "<平台>·<分组>·播放/点赞/评论",
-      "perPlatform.<platform|group>.play|like|comment",
-      "动态列：每个出现过的「平台|分组」各占播放/点赞/评论 3 列（截至结束日期 to 的累计值）。",
-    ]);
   }
 
   entries.push(
@@ -985,50 +1343,50 @@ function buildSchemaSheet(dynamicSchemaEntries) {
       "平台日汇总",
       "日期",
       "date",
-      "统计日期（YYYY-MM-DD，UTC+8）。数据 T+1（抖音当天不可查）。",
+      "本地快照采集日期（YYYY-MM-DD，UTC+8），非平台自然日。平台数据本身存在 T+1 延迟（如抖音当天不可查）。",
     ],
     ["平台日汇总", "平台", "platform", "平台中文名。"],
     [
       "平台日汇总",
       "有数据作品数",
       "workCount",
-      "当日该平台在「作品日明细」中至少有一项非空累计指标的作品条数。",
+      "当日该平台按「日期+平台+作品ID」去重后（同一作品跨多分组只取按分组名排序第一组的一份观测），至少有一项非空累计指标的作品数。",
     ],
     [
       "平台日汇总",
       "播放日增合计",
       "playDeltaSum",
-      "由「作品日明细」按日期+平台对播放日增求和（日增口径；空值不计，全空则为空单元格）。",
+      "由「作品日明细」按「日期+平台+作品ID」去重（多分组取分组名排序第一组）后对播放日增求和（日增口径；空值不计，全空则为空单元格）。",
     ],
     [
       "平台日汇总",
       "点赞日增合计",
       "likeDeltaSum",
-      "由「作品日明细」按日期+平台对点赞日增求和（日增口径；空值不计，全空则为空单元格）。",
+      "由「作品日明细」按「日期+平台+作品ID」去重（多分组取分组名排序第一组）后对点赞日增求和（日增口径；空值不计，全空则为空单元格）。",
     ],
     [
       "平台日汇总",
       "评论日增合计",
       "commentDeltaSum",
-      "由「作品日明细」按日期+平台对评论日增求和（日增口径；空值不计，全空则为空单元格）。",
+      "由「作品日明细」按「日期+平台+作品ID」去重（多分组取分组名排序第一组）后对评论日增求和（日增口径；空值不计，全空则为空单元格）。",
     ],
     [
       "平台日汇总",
       "分享日增合计",
       "shareDeltaSum",
-      "由「作品日明细」按日期+平台对分享日增求和（空值不计，全空则为空；快手无分享为空不是 0）。",
+      "由「作品日明细」按「日期+平台+作品ID」去重后对分享日增求和（空值不计，全空则为空；快手、头条无分享为空不是 0）。",
     ],
     [
       "平台日汇总",
       "收藏日增合计",
       "favoriteDeltaSum",
-      "由「作品日明细」按日期+平台对收藏日增求和（空值不计，全空则为空；快手/抖音/头条无收藏为空不是 0）。",
+      "由「作品日明细」按「日期+平台+作品ID」去重后对收藏日增求和（空值不计，全空则为空；仅快手无收藏为空不是 0，抖音/头条等均有收藏）。",
     ],
     [
       "平台日汇总",
       "涨粉日增合计",
       "fansDeltaDeltaSum",
-      "由「作品日明细」按日期+平台对涨粉日增求和（空值不计，全空则为空；仅抖音/视频号有涨粉，B站无单视频涨粉）。",
+      "由「作品日明细」按「日期+平台+作品ID」去重后对涨粉日增求和（空值不计，全空则为空；仅抖音、视频号有单作品涨粉，哔哩哔哩/百家号/头条/快手/小红书无单作品涨粉）。",
     ],
 
     // 4. 账号日快照
@@ -1036,7 +1394,7 @@ function buildSchemaSheet(dynamicSchemaEntries) {
       "账号日快照",
       "日期",
       "date",
-      "账号日快照日期（YYYY-MM-DD，UTC+8，含抖音/视频号历史粉丝回填日期；数据 T+1）。",
+      "正常采集日为本地采集日期（YYYY-MM-DD，UTC+8；平台数据本身存在 T+1 延迟，如抖音当天不可查）。另：抖音（近 30 天 fansHistory）与视频号（fansHistory）会写入平台历史回填日，该类日期为平台历史自然日，仅回填粉丝数，其余指标为空。",
     ],
     ["账号日快照", "平台", "platform", "平台中文名。"],
     [
@@ -1049,39 +1407,49 @@ function buildSchemaSheet(dynamicSchemaEntries) {
       "账号日快照",
       "粉丝",
       "fans",
-      "当日账号累计粉丝总数（累计值，来自 daily.json）。",
+      "当日账号累计粉丝总数（累计值，来自 daily.json；7 平台均有；抖音/视频号历史回填日数据来自平台 fansHistory）。",
     ],
     [
       "账号日快照",
       "总播放",
       "plays",
-      "当日账号累计总播放量（累计值；仅粉丝历史回填日为空；已知问题：部分适配器可能把缺失写成 0 导致假波动）。",
+      "当日账号累计总播放/阅读量（累计值；7 平台当日采集均有；抖音/视频号仅粉丝历史回填日为空；已知问题：部分适配器可能把缺失写成 0 导致假波动）。",
     ],
-    ["账号日快照", "总点赞", "likes", "当日账号累计总点赞数（累计值）。"],
-    ["账号日快照", "总评论", "comments", "当日账号累计总评论数（累计值）。"],
+    [
+      "账号日快照",
+      "总点赞",
+      "likes",
+      "当日账号累计总点赞数（累计值；7 平台当日采集均有；历史粉丝回填日为空）。",
+    ],
+    [
+      "账号日快照",
+      "总评论",
+      "comments",
+      "当日账号累计总评论数（累计值；7 平台当日采集均有；历史粉丝回填日为空）。",
+    ],
     [
       "账号日快照",
       "总收藏",
       "favorites",
-      "当日账号累计总收藏数（累计值；快手/抖音/头条无收藏为空不是 0）。",
+      "当日账号累计总收藏数（累计值；仅快手无收藏为空不是 0，抖音/头条等均有收藏；历史粉丝回填日为空）。",
     ],
     [
       "账号日快照",
       "总分享",
       "shares",
-      "当日账号累计总分享数（累计值；快手无分享为空不是 0）。",
+      "当日账号累计总分享数（累计值；快手、头条无分享为空不是 0；历史粉丝回填日为空）。",
     ],
     [
       "账号日快照",
       "粉丝日增",
       "fansDelta",
-      "当日粉丝数 − 该账号上一有粉丝记录日的粉丝数（日增口径；断档跨天时为多天合计变化）。",
+      "当日粉丝数 − 该账号上一有粉丝记录日的粉丝数（日增口径，含平台历史粉丝回填日；断档跨天时为多天合计变化）。",
     ],
     [
       "账号日快照",
       "播放日增",
       "playsDelta",
-      "当日总播放 − 该账号上一有播放记录日的总播放（日增口径；断档跨天时为多天合计变化）。",
+      "当日总播放 − 该账号上一有播放记录日的总播放（日增口径，跳过仅粉丝历史回填日；断档跨天时为多天合计变化）。",
     ],
 
     // 5. 字段说明
@@ -1101,7 +1469,7 @@ function buildSchemaSheet(dynamicSchemaEntries) {
       "导出信息",
       "值",
       "value",
-      "本次导出的元信息取值（导出时间、日期范围、应用版本及账号/作品/内容/未关联计数）。",
+      "本次导出的元信息取值（导出时间、日期范围、应用版本及账号/作品/内容/未关联计数；作品数与未关联作品数沿用作品跨平台汇总的去重与关联口径）。",
     ]
   );
 
@@ -1134,6 +1502,7 @@ function buildMetaSheet({ exportedAt, from, to, appVersion, counts }) {
  * @param {string} [options.from]       起始日期 YYYY-MM-DD（含），默认 to 往前 29 天
  * @param {string} [options.to]         截止日期 YYYY-MM-DD（含），默认最新有数据日
  * @param {string[]} [options.groups]   可选，仅导出指定分组
+ * @param {number} [options.maxRows]    可选，单 sheet 数据行上限（默认 200000）
  * @param {number|Date} [options.now]   可选，注入导出时间
  * @param {string} [options.appVersion] 可选，注入应用版本
  * @param {string} [options.pushDataDir] 可选，注入 pushData 目录
@@ -1141,11 +1510,11 @@ function buildMetaSheet({ exportedAt, from, to, appVersion, counts }) {
  */
 function buildStatsWorkbookData(options = {}, deps) {
   const opts = isPlainObject(options) ? options : {};
-  const explicitFrom = validateOptionalDate(opts.from, "from");
-  const explicitTo = validateOptionalDate(opts.to, "to");
-  if (explicitFrom && explicitTo && explicitFrom > explicitTo) {
-    throw new Error(`开始日期不能晚于结束日期（${explicitFrom} > ${explicitTo}）`);
-  }
+  const { from: explicitFrom, to: explicitTo } = validateExportDateRange(
+    opts.from,
+    opts.to
+  );
+  const maxRows = resolveMaxRows(opts.maxRows);
 
   const dataset = loadRawDataset(opts, deps);
   const nowVal = dataset.io.now !== undefined ? dataset.io.now : Date.now();
@@ -1156,6 +1525,24 @@ function buildStatsWorkbookData(options = {}, deps) {
     resolvedTo = explicitFrom;
   }
   const resolvedFrom = explicitFrom || shiftDateStr(resolvedTo, -DEFAULT_RANGE_DAYS);
+
+  // 构建前先计数「作品日明细」与「账号日快照」行数，超限直接拒绝，避免无谓排序与高内存占用
+  const estWorkDailyRows = countWorkDailyRows(
+    dataset.accountsData,
+    resolvedFrom,
+    resolvedTo
+  );
+  if (estWorkDailyRows > maxRows) {
+    throw createRowLimitError(estWorkDailyRows, maxRows, "作品日明细");
+  }
+  const estAccountDailyRows = countAccountDailyRows(
+    dataset.accountsData,
+    resolvedFrom,
+    resolvedTo
+  );
+  if (estAccountDailyRows > maxRows) {
+    throw createRowLimitError(estAccountDailyRows, maxRows, "账号日快照");
+  }
 
   const contents = buildContentIndex(dataset.pushRecords);
   const link = linkWorks({
@@ -1169,6 +1556,9 @@ function buildStatsWorkbookData(options = {}, deps) {
     worksDaily: dataset.worksDailyByGp,
     date: resolvedTo,
   });
+  if (summaryRows.length > maxRows) {
+    throw createRowLimitError(summaryRows.length, maxRows, "作品跨平台汇总");
+  }
 
   const workDaily = buildWorkDailySheet(
     dataset.accountsData,
@@ -1185,7 +1575,7 @@ function buildStatsWorkbookData(options = {}, deps) {
   );
   const schemaAoa = buildSchemaSheet(contentSummary.dynamicSchemaEntries);
 
-  const workCounts = computeWorkCountsAsOf(dataset.accountsData, link, resolvedTo);
+  const workCounts = computeWorkCountsFromSummaryRows(summaryRows);
   const counts = {
     accounts: dataset.accountsData.length,
     works: workCounts.works,
@@ -1206,20 +1596,30 @@ function buildStatsWorkbookData(options = {}, deps) {
     counts,
   });
 
+  const sheets = {
+    作品日明细: workDaily.aoa,
+    作品跨平台汇总: contentSummary.aoa,
+    平台日汇总: platformDaily.aoa,
+    账号日快照: accountDaily.aoa,
+    字段说明: schemaAoa,
+    导出信息: metaAoa,
+  };
+
+  for (const name of SHEET_NAMES) {
+    const aoa = sheets[name];
+    const dataRows = Array.isArray(aoa) && aoa.length > 0 ? aoa.length - 1 : 0;
+    if (dataRows > maxRows) {
+      throw createRowLimitError(dataRows, maxRows, name);
+    }
+  }
+
   return {
     from: resolvedFrom,
     to: resolvedTo,
     exportedAt,
     appVersion,
     sheetOrder: [...SHEET_NAMES],
-    sheets: {
-      作品日明细: workDaily.aoa,
-      作品跨平台汇总: contentSummary.aoa,
-      平台日汇总: platformDaily.aoa,
-      账号日快照: accountDaily.aoa,
-      字段说明: schemaAoa,
-      导出信息: metaAoa,
-    },
+    sheets,
     counts,
   };
 }
@@ -1258,20 +1658,31 @@ function computeColWidths(aoa, maxWidth = 48) {
 /**
  * 将 buildStatsWorkbookData 产出写入 .xlsx 文件。
  * 不合并单元格、无公式、保留数值为数字类型、空值为空单元格。
+ * 原样使用 filePath（不做 trim），并在写盘前校验任一 sheet 行数不超上限。
  */
-function writeStatsXlsx(data, filePath) {
+function writeStatsXlsx(data, filePath, options = {}) {
   if (!data || !isPlainObject(data.sheets)) {
     throw new Error("无效的工作簿数据");
   }
   if (typeof filePath !== "string" || !filePath.trim()) {
     throw new Error("导出路径不能为空");
   }
-  const resolvedPath = path.resolve(filePath.trim());
-  const wb = xlsx.utils.book_new();
+  const maxRows = resolveMaxRows(options && options.maxRows);
   const order =
     Array.isArray(data.sheetOrder) && data.sheetOrder.length
       ? data.sheetOrder
       : SHEET_NAMES;
+
+  for (const name of order) {
+    const aoa = Array.isArray(data.sheets[name]) ? data.sheets[name] : [];
+    const dataRows = aoa.length > 0 ? aoa.length - 1 : 0;
+    if (dataRows > maxRows) {
+      throw createRowLimitError(dataRows, maxRows, name);
+    }
+  }
+
+  const resolvedPath = path.resolve(filePath);
+  const wb = xlsx.utils.book_new();
 
   for (const name of order) {
     const aoa = Array.isArray(data.sheets[name]) ? data.sheets[name] : [];
@@ -1289,6 +1700,8 @@ function writeStatsXlsx(data, filePath) {
 
 module.exports = {
   SHEET_NAMES,
+  MAX_SHEET_ROWS,
+  ROW_LIMIT_EXCEEDED_CODE,
   WORK_DAILY_HEADERS,
   SUMMARY_BASE_HEADERS,
   PLATFORM_DAILY_HEADERS,
@@ -1298,6 +1711,10 @@ module.exports = {
   isValidDateStr,
   sanitizeTextCell,
   sanitizeNumberCell,
+  validateExportDateRange,
+  buildDefaultExportFileName,
+  countWorkDailyRows,
+  computeWorkCountsFromSummaryRows,
   buildContentSummaryData,
   buildStatsWorkbookData,
   writeStatsXlsx,

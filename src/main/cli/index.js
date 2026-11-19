@@ -577,8 +577,16 @@ async function runBatchDirPublish(v, cfg) {
  */
 export async function runCliMain(argv = process.argv) {
   const sub = getCliSubArgv(argv);
-  // CLI 链路同样先做账号记录「分组新模型」一次性迁移（幂等）
-  ensureAccountRecordsMigrated();
+  // CLI 链路同样先做账号记录「分组新模型」一次性迁移（幂等），诊断日志路由到 stderr 不污染 stdout
+  {
+    const origLog = console.log;
+    console.log = (...args) => console.error(...args);
+    try {
+      ensureAccountRecordsMigrated();
+    } finally {
+      console.log = origLog;
+    }
+  }
   if (!sub || sub.length === 0) {
     console.error(
       "用法: <应用> cli <publish|publish-article|login|accounts|history|stats|stats-sync|stats-work|stats-export|comments|comments-reply|comments-probe> ..."
@@ -1033,6 +1041,9 @@ export async function runCliMain(argv = process.argv) {
   if (Object.prototype.hasOwnProperty.call(STATS_CMDS, cmd)) {
     const parsed = parseStatsArgs(sub.slice(1), STATS_CMDS[cmd]);
     if (!parsed.ok) {
+      if (cmd === "stats-export") {
+        console.log(JSON.stringify({ success: false, error: parsed.error }, null, 2));
+      }
       console.error(parsed.error);
       return 2;
     }
@@ -1043,6 +1054,15 @@ export async function runCliMain(argv = process.argv) {
     try {
       return await runStatsCli(parsed.value);
     } catch (e) {
+      if (cmd === "stats-export") {
+        console.log(
+          JSON.stringify(
+            { success: false, error: (e && e.message) || String(e) },
+            null,
+            2
+          )
+        );
+      }
       console.error(e);
       return 1;
     }

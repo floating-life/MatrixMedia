@@ -18,20 +18,40 @@ function print(data) {
   console.log(JSON.stringify(data, null, 2));
 }
 
-export async function runStatsCli({ action, platform, phone, title, out, from, to }) {
+export async function runStatsCli({
+  action,
+  platform,
+  phone,
+  title,
+  out,
+  from,
+  to,
+  maxRows,
+  deps,
+}) {
   if (action === "export") {
-    const trimmedOut = String(out || "").trim();
-    if (!trimmedOut) {
+    const rawOut = typeof out === "string" ? out : "";
+    if (!rawOut.trim()) {
       print({ success: false, error: "缺少 --out <路径.xlsx>" });
       return 2;
     }
-    const outPath = path.resolve(trimmedOut);
+    if (!/\.xlsx$/i.test(rawOut)) {
+      print({ success: false, error: `--out 必须以 .xlsx 结尾：${rawOut}` });
+      return 2;
+    }
+    const outPath = path.resolve(rawOut);
     try {
-      const data = statsExport.buildStatsWorkbookData({
+      const buildOpts = {
         from: from || undefined,
         to: to || undefined,
-      });
-      statsExport.writeStatsXlsx(data, outPath);
+      };
+      if (maxRows !== undefined) buildOpts.maxRows = maxRows;
+      const data = statsExport.buildStatsWorkbookData(buildOpts, deps);
+      statsExport.writeStatsXlsx(
+        data,
+        outPath,
+        maxRows !== undefined ? { maxRows } : undefined
+      );
       print({
         success: true,
         out: outPath,
@@ -42,6 +62,8 @@ export async function runStatsCli({ action, platform, phone, title, out, from, t
       return 0;
     } catch (err) {
       const message = (err && err.message) || String(err);
+      const exitCode =
+        err && err.code === statsExport.ROW_LIMIT_EXCEEDED_CODE ? 3 : 1;
       print({
         success: false,
         out: outPath,
@@ -49,7 +71,7 @@ export async function runStatsCli({ action, platform, phone, title, out, from, t
         to: to || null,
         error: message,
       });
-      return 1;
+      return exitCode;
     }
   }
 

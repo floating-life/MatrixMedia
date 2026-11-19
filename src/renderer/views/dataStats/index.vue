@@ -63,27 +63,25 @@
     </div>
     <el-tabs v-model="activeTab" class="stats-tabs">
       <el-tab-pane label="账号总览" name="overview">
-        <template v-if="activeTab === 'overview'">
-          <stats-overview :rows="rows" />
-          <div class="platform-card">
-            <div class="card-head">
-              <span class="card-title">平台数据分布</span>
-              <span class="card-tip">番茄视频、掘金不参与统计</span>
-            </div>
-            <platform-bar-chart v-if="platformRows.length" :rows="platformRows" />
-            <div v-else class="card-empty">暂无数据，点击右上角「同步全部数据」</div>
+        <stats-overview :rows="rows" />
+        <div class="platform-card">
+          <div class="card-head">
+            <span class="card-title">平台数据分布</span>
+            <span class="card-tip">番茄视频、掘金不参与统计</span>
           </div>
-          <div class="platform-card">
-            <div class="card-head">
-              <span class="card-title">分组统计</span>
-              <span class="card-tip">点击行进入对应账号统计页</span>
-            </div>
-            <group-stats-table :accounts="accounts" />
+          <platform-bar-chart v-if="platformRows.length" :rows="platformRows" />
+          <div v-else class="card-empty">暂无数据，点击右上角「同步全部数据」</div>
+        </div>
+        <div class="platform-card">
+          <div class="card-head">
+            <span class="card-title">分组统计</span>
+            <span class="card-tip">点击行进入对应账号统计页</span>
           </div>
-        </template>
+          <group-stats-table :accounts="accounts" />
+        </div>
       </el-tab-pane>
-      <el-tab-pane label="作品汇总" name="works">
-        <div v-if="activeTab === 'works'" class="platform-card works-summary-card">
+      <el-tab-pane label="作品汇总" name="works" lazy>
+        <div class="platform-card works-summary-card">
           <div class="card-head">
             <span class="card-title">作品跨平台汇总</span>
             <span class="card-tip">

@@ -226,11 +226,11 @@ electron . cli publish-article -p juejin --phone 13800138000 -t "文章标题" -
 | `cli stats -p <平台> --phone <分组>` | 读取本地快照中的账号粉丝数据 |
 | `cli stats-sync -p <平台> --phone <分组>` | 主动采集该账号最新数据并写入本地快照 |
 | `cli stats-work -p <平台> --phone <分组> --title <标题>` | 按完整标题查询某个视频的发布数据（含发布时间） |
-| `cli stats-export --out <路径.xlsx> [--from YYYY-MM-DD] [--to YYYY-MM-DD]` | 将作品日明细、跨平台汇总、平台日汇总与账号日快照导出为 Excel（默认截至最新有数据日的近 30 天，输出 JSON `{ success, out, from, to, counts }`） |
+| `cli stats-export --out <路径.xlsx> [--from YYYY-MM-DD] [--to YYYY-MM-DD]` | 将作品日明细、跨平台汇总、平台日汇总与账号日快照导出为 Excel（`--out` 须以 `.xlsx` 结尾；默认截至最新有数据日的近 30 天；单表超过 200,000 行拒绝导出并返回退出码 `3`；stdout 仅输出一份 JSON `{ success, out, from, to, counts }`，启动诊断日志输出到 stderr） |
 
 - 平台参数支持短码：`dy` `sph` `blbl` `bjh` `tt` `ks` `xhs` 或中文名
 - `--phone` 为分组名（与 GUI「媒体平台管理」中的分组一致）
-- 输出 JSON（含 `success` 字段）；`stats-sync` 需该分组此平台已在 GUI 登录
+- 输出 JSON（含 `success` 字段）；`stats-sync` 需该分组此平台已在 GUI 登录；`stats-export` 退出码：`0` 成功 / `1` 异常 / `2` 参数错误 / `3` 业务失败（如数据量超限）
 - 数据存于 `<userData>/data-stats/<分组>/<平台>/`，与 GUI「账号数据」页共享
 
 示例：

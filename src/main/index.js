@@ -215,16 +215,30 @@ process.on("uncaughtException", (err) => {
 
 async function startApplication() {
   try {
-    await initializeElectronRuntime({ app, pie });
+    // CLI 模式下 [startup] 等诊断日志写到 stderr，避免污染命令的 stdout JSON 输出（不影响 GUI）
+    const startupLogger = cliMode
+      ? { log: (...args) => console.error(...args) }
+      : console;
+    await initializeElectronRuntime({ app, pie, logger: startupLogger });
     // 账号记录「分组新模型」一次性迁移（幂等，失败自动回退历史规则）
-    ensureAccountRecordsMigrated();
+    if (cliMode) {
+      const origLog = console.log;
+      console.log = (...args) => console.error(...args);
+      try {
+        ensureAccountRecordsMigrated();
+      } finally {
+        console.log = origLog;
+      }
+    } else {
+      ensureAccountRecordsMigrated();
+    }
     // 匿名使用统计（best-effort，不阻塞启动）
     reportUsageTelemetry(app, cliMode ? "cli" : "gui").catch(() => {});
     if (cliMode) {
-      console.log("[startup] CLI 参数已识别，开始执行命令");
+      startupLogger.log("[startup] CLI 参数已识别，开始执行命令");
       const code = await runCliMain(process.argv);
       const exitCode = typeof code === "number" ? code : 0;
-      console.log(`[startup] CLI 执行结束，退出码=${exitCode}`);
+      startupLogger.log(`[startup] CLI 执行结束，退出码=${exitCode}`);
       app.exit(exitCode);
       return;
     }

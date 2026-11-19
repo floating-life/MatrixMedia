@@ -38,11 +38,13 @@ function parseStatsExportArgs(args) {
     if (a === "--out" || a === "-o") {
       const v = readValue(args, i, a);
       if (!v.ok) return v;
-      out.out = String(v.value).trim();
+      const val = String(v.value);
+      if (!val.trim()) return { ok: false, error: "--out 需要一个非空路径" };
+      out.out = val;
       i = v.next;
     } else if (typeof a === "string" && a.startsWith("--out=")) {
-      const val = a.slice("--out=".length).trim();
-      if (!val) return { ok: false, error: "--out 需要一个非空路径" };
+      const val = a.slice("--out=".length);
+      if (!val.trim()) return { ok: false, error: "--out 需要一个非空路径" };
       out.out = val;
     } else if (a === "--from") {
       const v = readValue(args, i, a);
@@ -74,6 +76,9 @@ function parseStatsExportArgs(args) {
 
   if (!out.out) {
     return { ok: false, error: "缺少 --out <路径.xlsx>" };
+  }
+  if (!/\.xlsx$/i.test(out.out)) {
+    return { ok: false, error: `--out 必须以 .xlsx 结尾：${out.out}` };
   }
   if (out.from !== null && !isValidYmd(out.from)) {
     return { ok: false, error: `--from 不是合法日期（需 YYYY-MM-DD）：${out.from}` };
@@ -145,13 +150,13 @@ export function statsHelpText(cmd) {
 将本地作品日明细、跨平台汇总、平台日汇总与账号日快照导出为 Excel（.xlsx）
 
 选项:
-  -o, --out <路径>      输出 .xlsx 文件路径（必填）
+  -o, --out <路径>      输出 .xlsx 文件路径（必填，须以 .xlsx 结尾）
       --from <日期>     起始日期（含），YYYY-MM-DD，默认结束日期往前 29 天
       --to <日期>       结束日期（含），YYYY-MM-DD，默认最新有数据日期
       --json            以 JSON 输出（默认即 JSON，便于脚本消费）
   -h, --help            显示本帮助
 
-退出码: 0 成功, 1 异常, 2 参数错误
+退出码: 0 成功, 1 异常, 2 参数错误, 3 业务失败（如单表超过 200000 行）
 
 示例:
   matrixmedia cli stats-export --out ./stats.xlsx

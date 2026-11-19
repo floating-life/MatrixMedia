@@ -21,6 +21,8 @@ const { collectAccount } = require("./collector");
 const store = require("./store");
 const { normalizeStatusTitle, buildTitleIndex } = require("./contentLink");
 const {
+  validateExportDateRange,
+  buildDefaultExportFileName,
   buildContentSummaryData,
   buildStatsWorkbookData,
   writeStatsXlsx,
@@ -177,7 +179,28 @@ async function collectAccounts(accounts, sender, options = {}) {
   return { results, cancelled };
 }
 
-function registerDataStatsIpc() {
+function isLocalFrameEvent(event) {
+  try {
+    const frame = new URL(
+      String((event && event.senderFrame && event.senderFrame.url) || "")
+    );
+    return (
+      (frame.protocol === "file:" && !frame.hostname) ||
+      (["http:", "https:"].includes(frame.protocol) &&
+        ["localhost", "127.0.0.1"].includes(frame.hostname))
+    );
+  } catch (_) {
+    return false;
+  }
+}
+
+function registerDataStatsIpc(options = {}) {
+  const exportMaxRows =
+    options && options.exportMaxRows !== undefined ? options.exportMaxRows : undefined;
+  const exportDeps =
+    options && options.exportDeps && typeof options.exportDeps === "object"
+      ? options.exportDeps
+      : undefined;
   ipcMain.handle("stats:collect", async (event, args) => {
     if (collecting) {
       return { results: [], error: "已有采集任务进行中" };
@@ -271,13 +294,16 @@ function registerDataStatsIpc() {
     return store.readCollectLogs();
   });
 
-  ipcMain.handle("stats:get-content-summary", async (_event, args) => {
+  ipcMain.handle("stats:get-content-summary", async (event, args) => {
     try {
+      if (!isLocalFrameEvent(event)) {
+        return { rows: [], date: "", error: "不允许外部页面读取作品汇总" };
+      }
       if (args != null && (typeof args !== "object" || Array.isArray(args))) {
         return { rows: [], date: "", error: "查询参数无效" };
       }
       const date = args && args.date !== undefined ? args.date : undefined;
-      return buildContentSummaryData({ date });
+      return buildContentSummaryData({ date }, exportDeps);
     } catch (err) {
       return {
         rows: [],
@@ -289,24 +315,19 @@ function registerDataStatsIpc() {
 
   ipcMain.handle("stats:export-xlsx", async (event, args = {}) => {
     try {
-      let localFrame = false;
-      try {
-        const frame = new URL(
-          String((event && event.senderFrame && event.senderFrame.url) || "")
-        );
-        localFrame =
-          (frame.protocol === "file:" && !frame.hostname) ||
-          (["http:", "https:"].includes(frame.protocol) &&
-            ["localhost", "127.0.0.1"].includes(frame.hostname));
-      } catch (_) {
-        localFrame = false;
-      }
-      if (!localFrame) {
+      if (!isLocalFrameEvent(event)) {
         return { ok: false, message: "不允许外部页面导出数据" };
       }
       if (args != null && (typeof args !== "object" || Array.isArray(args))) {
         return { ok: false, message: "导出参数无效" };
       }
+      const payload = args || {};
+      // 纯参数校验（不读任何数据）：日期非法或 from > to 直接拒绝，不弹保存框
+      const { from: validFrom, to: validTo } = validateExportDateRange(
+        payload.from,
+        payload.to
+      );
+
       const { BrowserWindow, dialog, app } = electron;
       const win =
         BrowserWindow && typeof BrowserWindow.fromWebContents === "function"
@@ -314,14 +335,8 @@ function registerDataStatsIpc() {
           : null;
       if (!win) return { ok: false, message: "窗口已关闭" };
 
-      const payload = args || {};
-      const data = buildStatsWorkbookData({
-        from: payload.from,
-        to: payload.to,
-        groups: payload.groups,
-      });
-
-      const defaultName = `MatrixMedia-作品数据-${data.from}_${data.to}.xlsx`;
+      // 先弹保存对话框，用户取消则不读任何数据
+      const defaultName = buildDefaultExportFileName(validFrom, validTo);
       const result = await dialog.showSaveDialog(win, {
         title: "导出作品数据 Excel",
         defaultPath: path.join(app.getPath("documents"), defaultName),
@@ -330,7 +345,21 @@ function registerDataStatsIpc() {
       if (result.canceled || !result.filePath) {
         return { ok: false, canceled: true };
       }
-      writeStatsXlsx(data, result.filePath);
+
+      const buildOpts = {
+        from: validFrom || undefined,
+        to: validTo || undefined,
+        groups: payload.groups,
+      };
+      if (exportMaxRows !== undefined) buildOpts.maxRows = exportMaxRows;
+
+      const data = buildStatsWorkbookData(buildOpts, exportDeps);
+      // 原样使用对话框返回路径（不做 trim）
+      writeStatsXlsx(
+        data,
+        result.filePath,
+        exportMaxRows !== undefined ? { maxRows: exportMaxRows } : undefined
+      );
       return {
         ok: true,
         filePath: result.filePath,
