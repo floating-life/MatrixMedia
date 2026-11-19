@@ -61,6 +61,19 @@ function normalizeMetric(v) {
   return null;
 }
 
+/** 按 `group|platform|workId` 从 link（Map 或普通对象）读取关联信息 */
+function lookupWorkLink(link, workKey) {
+  if (link instanceof Map) {
+    return link.get(workKey) || null;
+  }
+  if (link && typeof link === "object" && !Array.isArray(link)) {
+    return Object.prototype.hasOwnProperty.call(link, workKey)
+      ? link[workKey]
+      : null;
+  }
+  return null;
+}
+
 /**
  * 构建单个「分组 × 平台」的作品日快照长表行。
  *
@@ -71,9 +84,10 @@ function normalizeMetric(v) {
  * @param {object} [params.worksDaily]         作品日快照对象（works-daily.json）
  * @param {string} [params.from]               起始日期 YYYY-MM-DD（含），可省
  * @param {string} [params.to]                 截止日期 YYYY-MM-DD（含），可省
+ * @param {Map|object} [params.link]           可选，linkWorks 返回的关联表；传入时行增加 contentKey / matchedBy
  * @returns {Array<object>}
  */
-function buildWorkDailyRows({ group, platform, works, worksDaily, from, to } = {}) {
+function buildWorkDailyRows({ group, platform, works, worksDaily, from, to, link } = {}) {
   if (!worksDaily || typeof worksDaily !== "object" || Array.isArray(worksDaily)) {
     return [];
   }
@@ -82,6 +96,7 @@ function buildWorkDailyRows({ group, platform, works, worksDaily, from, to } = {
   const platformStr = platform == null ? "" : String(platform);
   const fromStr = typeof from === "string" && from.trim() ? from.trim() : "";
   const toStr = typeof to === "string" && to.trim() ? to.trim() : "";
+  const hasLink = link != null;
 
   const workById = new Map();
   if (Array.isArray(works)) {
@@ -97,6 +112,9 @@ function buildWorkDailyRows({ group, platform, works, worksDaily, from, to } = {
   for (const [rawWorkId, dateMap] of Object.entries(worksDaily)) {
     if (!dateMap || typeof dateMap !== "object" || Array.isArray(dateMap)) continue;
     const workId = String(rawWorkId);
+    const linkInfo = hasLink
+      ? lookupWorkLink(link, `${groupStr}|${platformStr}|${workId}`)
+      : null;
     const meta = workById.get(workId);
     const title = meta ? meta.title || "(无标题)" : DELETED_WORK_TITLE;
     const url = meta ? meta.url || "" : "";
@@ -143,30 +161,38 @@ function buildWorkDailyRows({ group, platform, works, worksDaily, from, to } = {
       if (fromStr && point.date < fromStr) continue;
       if (toStr && point.date > toStr) continue;
 
+      const row = {
+        date: point.date,
+        group: groupStr,
+        platform: platformStr,
+        workId,
+        title,
+        url,
+        publishTime,
+        play: values.play,
+        like: values.like,
+        comment: values.comment,
+        share: values.share,
+        favorite: values.favorite,
+        fansDelta: values.fansDelta,
+        playDelta: deltas.playDelta,
+        likeDelta: deltas.likeDelta,
+        commentDelta: deltas.commentDelta,
+        shareDelta: deltas.shareDelta,
+        favoriteDelta: deltas.favoriteDelta,
+        fansDeltaDelta: deltas.fansDeltaDelta,
+        gapDays,
+      };
+      if (hasLink) {
+        row.contentKey =
+          linkInfo && linkInfo.contentKey != null ? linkInfo.contentKey : null;
+        row.matchedBy =
+          linkInfo && linkInfo.matchedBy != null ? linkInfo.matchedBy : null;
+      }
+
       entries.push({
         publishTimeMs,
-        row: {
-          date: point.date,
-          group: groupStr,
-          platform: platformStr,
-          workId,
-          title,
-          url,
-          publishTime,
-          play: values.play,
-          like: values.like,
-          comment: values.comment,
-          share: values.share,
-          favorite: values.favorite,
-          fansDelta: values.fansDelta,
-          playDelta: deltas.playDelta,
-          likeDelta: deltas.likeDelta,
-          commentDelta: deltas.commentDelta,
-          shareDelta: deltas.shareDelta,
-          favoriteDelta: deltas.favoriteDelta,
-          fansDeltaDelta: deltas.fansDeltaDelta,
-          gapDays,
-        },
+        row,
       });
     }
   }
