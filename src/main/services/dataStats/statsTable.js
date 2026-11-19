@@ -61,19 +61,6 @@ function normalizeMetric(v) {
   return null;
 }
 
-/** 按 `group|platform|workId` 从 link（Map 或普通对象）读取关联信息 */
-function lookupWorkLink(link, workKey) {
-  if (link instanceof Map) {
-    return link.get(workKey) || null;
-  }
-  if (link && typeof link === "object" && !Array.isArray(link)) {
-    return Object.prototype.hasOwnProperty.call(link, workKey)
-      ? link[workKey]
-      : null;
-  }
-  return null;
-}
-
 /**
  * 构建单个「分组 × 平台」的作品日快照长表行。
  *
@@ -84,7 +71,7 @@ function lookupWorkLink(link, workKey) {
  * @param {object} [params.worksDaily]         作品日快照对象（works-daily.json）
  * @param {string} [params.from]               起始日期 YYYY-MM-DD（含），可省
  * @param {string} [params.to]                 截止日期 YYYY-MM-DD（含），可省
- * @param {Map|object} [params.link]           可选，linkWorks 返回的关联表；传入时行增加 contentKey / matchedBy
+ * @param {Map} [params.link]                  可选，linkWorks 返回的 Map；传入时行增加 contentKey / matchedBy
  * @returns {Array<object>}
  */
 function buildWorkDailyRows({ group, platform, works, worksDaily, from, to, link } = {}) {
@@ -96,7 +83,7 @@ function buildWorkDailyRows({ group, platform, works, worksDaily, from, to, link
   const platformStr = platform == null ? "" : String(platform);
   const fromStr = typeof from === "string" && from.trim() ? from.trim() : "";
   const toStr = typeof to === "string" && to.trim() ? to.trim() : "";
-  const hasLink = link != null;
+  const hasLink = link instanceof Map;
 
   const workById = new Map();
   if (Array.isArray(works)) {
@@ -113,7 +100,7 @@ function buildWorkDailyRows({ group, platform, works, worksDaily, from, to, link
     if (!dateMap || typeof dateMap !== "object" || Array.isArray(dateMap)) continue;
     const workId = String(rawWorkId);
     const linkInfo = hasLink
-      ? lookupWorkLink(link, `${groupStr}|${platformStr}|${workId}`)
+      ? link.get(`${groupStr}|${platformStr}|${workId}`) || null
       : null;
     const meta = workById.get(workId);
     const title = meta ? meta.title || "(无标题)" : DELETED_WORK_TITLE;

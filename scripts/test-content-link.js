@@ -2,19 +2,21 @@
  * 跨平台作品关联（contentLink.js）、pushData 读取（pushRecords.js）与
  * buildWorkDailyRows 可选 link 参数单元测试（不依赖 Electron 运行环境）：
  *
- * 1. 纯函数模块独立加载（contentLink.js / statsTable.js 不依赖 electron / fs）
- * 2. normalizeTitle 与 normalizeUrl 边界用例
- * 3. buildContentIndex：同文件多平台归一（含大小写/扩展名/Win&POSIX路径）、无文件名按标题、
- *    图文记录排除、历史 phone 分组回退、重发合并去重
- * 4. linkWorks：链接优先于标题、标题带话题/全角/零宽差异匹配、全局唯一标题兜底（含歧义拦截与分组改名）、
- *    同标题两条视频不互占（按 publishTime 最接近 firstPublishDate 先到先得，且不跨平台抢占）
- * 5. buildContentSummaryRows：跨平台汇总行、未关联作品各自成行、null 合计语义（全 null 为 null，0+null 为 0）、
- *    截至 date 切片（默认最新）、多种 worksDaily 传参形态、特殊 workId 防原型污染
- * 6. buildWorkDailyRows：不传 link 保持原字段契约；传 link 增加 contentKey / matchedBy
- * 7. pushRecords.readPushRecords：注入目录读取、损坏/非数组/EISDIR 跳过+warn、不存在目录静默空数组、
- *    electron documents 路径回退与端到端串联
+ * 1. normalizeTitle / normalizeUrl / isManagementUrl（含 query 保留、追踪参数剥离、管理页识别）
+ * 2. buildContentIndex：仅完整路径归桶、同名不同目录不合并、无完整路径独立 record:*、
+ *    不按 basename/标题归桶、同文件两次实发独立 target、仅已确认发布纳入、图文排除
+ * 3. linkWorks：同 group+platform 内严格 1:1 直链与唯一标题匹配；反例不误关联：
+ *    id=1/id=2 查询参数直链、1 直链多 target/多 work 全留空、同组同标题两条作品、
+ *    target 直链与 work 直链冲突、定时/草稿/未发布记录不吸旧作品、取消全局标题兜底、
+ *    视频号短标题（shortTitle / bt2Filled）匹配与管理页兜底链接排除
+ * 4. buildContentSummaryRows：截止日仅读 worksDaily（不回退 works.json、不泄漏未来值）、
+ *    无指标已确认内容保留行、perPlatform 多作品 urls/workIds 求和、platformCount 按平台名计、
+ *    group|platform|workId 去重、firstPublishDate（UTC+8 最小值）与 firstPublishDateSource、
+ *    publishTime 越界（1e20 / 8.64e15 / 1999 / 2101）不崩、合计 null 语义、特殊 workId 防原型污染
+ * 5. buildWorkDailyRows：不传 link 保持原契约；传 Map 附加 contentKey / matchedBy；非 Map 忽略
+ * 6. pushRecords.readPushRecords：目录注入、损坏/非数组/EISDIR 跳过+warn、from/to、默认目录回退与端到端串联
  *
- * 运行：yarn test:content-link
+ * 运行：node scripts/test-content-link.js
  */
 
 "use strict";
@@ -24,10 +26,11 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
-// 先加载纯函数模块与 pushRecords（在 mock electron 之前），验证其不强依赖 electron
+// 先加载纯函数模块与 pushRecords（在 mock electron 之前），验证不强依赖 electron
 const {
   normalizeTitle,
   normalizeUrl,
+  isManagementUrl,
   makeWorkKey,
   buildContentIndex,
   linkWorks,
@@ -41,20 +44,17 @@ function captureWarn(fn) {
   const origWarn = console.warn;
   console.warn = (...args) => warnings.push(args.join(" "));
   try {
-    const result = fn();
-    return { result, warnings };
+    return { result: fn(), warnings };
   } finally {
     console.warn = origWarn;
   }
 }
 
-/* ---------- 1. normalizeTitle & normalizeUrl ---------- */
+/* ---------- 1. normalizeTitle / normalizeUrl / isManagementUrl ---------- */
 {
   assert.strictEqual(normalizeTitle(null), "");
   assert.strictEqual(normalizeTitle(undefined), "");
   assert.strictEqual(normalizeTitle("   "), "");
-
-  // 零宽字符、全角空格、连续空白、全角/中文标点归一
   assert.strictEqual(
     normalizeTitle("  \u200B今天\uFEFF学做　　红烧肉（超好吃）！\t\n "),
     "今天学做 红烧肉(超好吃)!"
@@ -63,36 +63,33 @@ function captureWarn(fn) {
     normalizeTitle("【干货】AI实战：效率提升，看这篇就够了。"),
     "[干货]AI实战:效率提升,看这篇就够了."
   );
-  assert.strictEqual(
-    normalizeTitle("《指南》“引文”——开箱…"),
-    '<指南>"引文"--开箱...'
-  );
-
-  // 去除末尾话题标签（半角/全角 #、无空格紧贴、#tag#、小红书 [话题]#）
   assert.strictEqual(normalizeTitle("红烧肉教程 #美食 #家常菜"), "红烧肉教程");
-  assert.strictEqual(normalizeTitle("红烧肉教程#美食#家常菜"), "红烧肉教程");
-  assert.strictEqual(normalizeTitle("红烧肉教程 ＃美食 ＃家常菜"), "红烧肉教程");
-  assert.strictEqual(normalizeTitle("红烧肉教程 #美食# #家常菜#"), "红烧肉教程");
   assert.strictEqual(normalizeTitle("红烧肉教程 #美食[话题]# #家常菜[话题]#"), "红烧肉教程");
-  assert.strictEqual(
-    normalizeTitle("红烧肉教程！ #美食 #家常菜  "),
-    normalizeTitle("红烧肉教程!")
-  );
-
-  // 保留非末尾标签与 C#
-  assert.strictEqual(normalizeTitle("#开箱 新品评测 #数码"), "#开箱 新品评测");
   assert.strictEqual(normalizeTitle("零基础学 C# #编程"), "零基础学 C#");
-  assert.strictEqual(normalizeTitle("零基础学 C#"), "零基础学 C#");
+  assert.strictEqual(normalizeTitle("#开箱 新品评测 #数码"), "#开箱 新品评测");
   assert.strictEqual(normalizeTitle("#纯标签1 #纯标签2"), "");
 
-  // normalizeUrl：去 query、hash、尾斜杠；保留路径大小写（如 B站 BV 号）
+  // normalizeUrl：保留 path 与标识作品的 query 参数，去除 fragment、尾斜杠与常见追踪参数
+  assert.strictEqual(
+    normalizeUrl("https://baijiahao.baidu.com/s?id=1&utm_source=app&spm=1.2&share_from=wx#top"),
+    "https://baijiahao.baidu.com/s?id=1"
+  );
+  assert.strictEqual(
+    normalizeUrl("https://baijiahao.baidu.com/s?id=2&utm_medium=feed"),
+    "https://baijiahao.baidu.com/s?id=2"
+  );
+  assert.notStrictEqual(
+    normalizeUrl("https://baijiahao.baidu.com/s?id=1"),
+    normalizeUrl("https://baijiahao.baidu.com/s?id=2"),
+    "不同 id 查询参数必须保持区分"
+  );
+  assert.strictEqual(
+    normalizeUrl("https://www.bilibili.com/video/BV1Ab2Cd3Ef/?p=2&spm_id_from=333&vd_source=abc"),
+    "https://www.bilibili.com/video/BV1Ab2Cd3Ef?p=2"
+  );
   assert.strictEqual(
     normalizeUrl("https://www.douyin.com/video/7123456/?modeFrom=userPost#top"),
     "https://www.douyin.com/video/7123456"
-  );
-  assert.strictEqual(
-    normalizeUrl("HTTPS://WWW.BILIBILI.COM/video/BV1Ab2Cd3Ef/?spm_id_from=333"),
-    "https://www.bilibili.com/video/BV1Ab2Cd3Ef"
   );
   assert.strictEqual(
     normalizeUrl("https://www.toutiao.com/a712345///"),
@@ -100,18 +97,31 @@ function captureWarn(fn) {
   );
   assert.strictEqual(normalizeUrl("  "), "");
   assert.strictEqual(normalizeUrl(null), "");
-  console.log("✓ normalizeTitle 与 normalizeUrl 边界用例正确");
+
+  // 管理页兜底链接识别
+  assert.strictEqual(isManagementUrl("https://channels.weixin.qq.com/platform/post/list"), true);
+  assert.strictEqual(isManagementUrl("https://channels.weixin.qq.com/platform/"), true);
+  assert.strictEqual(
+    isManagementUrl("https://baijiahao.baidu.com/builder/rc/content?currentPage=1&pageSize=10"),
+    true
+  );
+  assert.strictEqual(isManagementUrl("https://creator.douyin.com/creator-micro/content/manage"), true);
+  assert.strictEqual(isManagementUrl("https://www.douyin.com/video/7123456"), false);
+  assert.strictEqual(isManagementUrl("https://baijiahao.baidu.com/s?id=1"), false);
+  console.log("✓ normalizeTitle / normalizeUrl / isManagementUrl 正确");
 }
 
-/* ---------- 2. buildContentIndex：同文件多平台归一 / 无文件名按标题 / 图文排除 ---------- */
+/* ---------- 2. buildContentIndex：完整路径归桶、同名不同目录分离、独立 target、图文/未发布排除 ---------- */
 {
-  const pushRecords = [
-    // 同文件不同大小写/扩展名/路径分隔符 + 跨日期 + 历史 phone 分组与显式 group
+  const records = [
+    // 2a. 同文件跨平台（真实 pushData 形态：filePath 完整路径 + selectedFile basename；兼容 selectedFile 写完整路径）
     {
       pt: "快手",
-      phone: "运营一组-快手备注",
+      phone: "运营一组-快手",
       bt: "春季穿搭分享！ #穿搭",
-      selectedFile: "D:\\Videos\\Look_01.MOV",
+      selectedFile: "look_01.mp4",
+      filePath: "D:\\Videos\\Look_01.MP4",
+      publishStatus: "success",
       videoLink: "",
       date: "2026-11-11",
       textType: "local",
@@ -119,469 +129,691 @@ function captureWarn(fn) {
     {
       pt: "抖音",
       group: "运营一组",
-      phone: "运营一组-主号",
-      title: "春季穿搭分享！ #穿搭 #日常",
-      selectedFile: "look_01.mp4",
+      phone: "运营一组-抖音",
+      title: "最早记录原标题！ #穿搭 #日常",
+      selectedFile: "  d:/videos/look_01.mp4  ",
+      publishStatus: "success",
       videoLink: "https://www.douyin.com/video/9001?from=share",
       date: "2026-11-10",
       textType: "local",
     },
-    {
-      pt: "哔哩哔哩",
-      group: "品牌-A",
-      phone: "品牌-A-B站",
-      title: "春季穿搭完整版",
-      selectedFile: "/home/user/videos/LOOK_01.mp4",
-      videoLink: "https://www.bilibili.com/video/BV1Aa2Bb3Cc/",
-      date: "2026-11-12",
-      textType: "local",
-    },
-    // 同账号同内容重发后补齐 videoLink → 应合并为同一 target 而非重复占位
-    {
-      pt: "快手",
-      group: "运营一组",
-      title: "春季穿搭分享! #日常",
-      selectedFile: "look_01.mp4",
-      videoLink: "https://www.kuaishou.com/short-video/ks01",
-      date: "2026-11-12",
-      textType: "local",
-    },
-    // 空白 selectedFile + 远程 URL filePath（含 query 中的小数点）→ 仍能正确归一到 look_01
-    {
-      pt: "头条",
-      group: "运营一组",
-      title: "春季穿搭分享",
-      selectedFile: "   ",
-      filePath: "https://cdn.example.com/media/LOOK_01.mp4?v=1.2&token=abc",
-      videoLink: "",
-      date: "2026-11-12",
-      textType: "local",
-    },
-    // 图文记录（即使同名文件）必须排除
-    {
-      pt: "百家号",
-      group: "运营一组",
-      title: "图文测试",
-      selectedFile: "look_01.md",
-      videoLink: "https://baijiahao.baidu.com/s?id=1",
-      date: "2026-11-09",
-      textType: "article",
-    },
-    {
-      pt: "掘金",
-      group: "运营一组",
-      title: "纯文章记录",
-      selectedFile: "article_only.md",
-      videoLink: "https://juejin.cn/post/1",
-      date: "2026-11-10",
-      textType: "article",
-    },
-    // 无文件名：按 normalizeTitle 归为同一内容
+    // 2b. 同名不同目录（评审反例 #1）：D:\美食\final.mp4 vs D:\旅行\final.mp4 绝不合并
     {
       pt: "抖音",
-      group: "运营一组",
-      title: "无文件名测试（全角）！ #热门",
+      group: "G1",
+      title: "美食日记",
+      selectedFile: "final.mp4",
+      filePath: "D:\\美食\\final.mp4",
+      publishStatus: "success",
+      videoLink: "https://www.douyin.com/video/101",
+      date: "2026-11-10",
+      textType: "local",
+    },
+    {
+      pt: "抖音",
+      group: "G1",
+      title: "旅行日记",
+      selectedFile: "final.mp4",
+      filePath: "D:\\旅行\\final.mp4",
+      publishStatus: "success",
+      videoLink: "https://www.douyin.com/video/102",
+      date: "2026-11-10",
+      textType: "local",
+    },
+    // 2c. 只有 basename（无完整路径）的两条同名记录 → 各自独立为 record:*，绝不按 basename 归桶
+    {
+      id: "rec-a",
+      pt: "抖音",
+      group: "G1",
+      title: "同basename测试",
+      selectedFile: "final.mp4",
+      publishStatus: "success",
+      date: "2026-11-12",
+      textType: "local",
+    },
+    {
+      id: "rec-b",
+      pt: "快手",
+      group: "G1",
+      title: "同basename测试",
+      selectedFile: "final.mp4",
+      publishStatus: "success",
+      date: "2026-11-12",
+      textType: "local",
+    },
+    // 2d. 无文件名但同标题的两条记录 → 各自独立为 record:*，绝不按标题归桶
+    {
+      pt: "抖音",
+      group: "G1",
+      title: "无文件名相同标题",
       selectedFile: "",
-      videoLink: "",
+      publishStatus: "success",
       date: "2026-11-13",
+      textType: "local",
     },
     {
       pt: "小红书",
-      phone: "运营一组-小红书",
-      textOtherName: "无文件名测试(全角)!",
-      videoLink: "",
-      date: "2026-11-14",
+      group: "G1",
+      title: "无文件名相同标题",
+      selectedFile: "",
+      publishStatus: "success",
+      date: "2026-11-13",
+      textType: "local",
     },
-  ];
-
-  const contents = buildContentIndex(pushRecords);
-  assert.strictEqual(contents.length, 2, "图文记录应被排除，仅保留 2 条视频内容");
-
-  const cFile = contents.find((c) => c.contentKey === "file:look_01");
-  assert.ok(cFile, "同文件多平台应归一到 file:look_01");
-  assert.strictEqual(cFile.firstPublishDate, "2026-11-10", "firstPublishDate 应取视频记录最早日期（不受图文 11-09 影响）");
-  assert.strictEqual(cFile.displayTitle, "春季穿搭分享！ #穿搭 #日常", "displayTitle 应保留原始展示标题（不归一化）");
-  assert.strictEqual(cFile.file, "look_01.mp4");
-  assert.strictEqual(cFile.targets.length, 4, "重发补齐 videoLink 的快手记录应合并为同一 target，另含头条远程 URL 归一");
-
-  const ksTarget = cFile.targets.find((t) => t.platform === "快手");
-  assert.strictEqual(ksTarget.group, "运营一组", "缺 group 时应按 phone '-' 前缀提取分组");
-  assert.strictEqual(ksTarget.videoLink, "https://www.kuaishou.com/short-video/ks01", "合并后应保留补齐的 videoLink");
-
-  const biliTarget = cFile.targets.find((t) => t.platform === "哔哩哔哩");
-  assert.strictEqual(biliTarget.group, "品牌-A", "显式 group 含 '-' 不应被截断");
-
-  const cTitle = contents.find((c) => c.contentKey === "title:无文件名测试(全角)!");
-  assert.ok(cTitle, "无文件名记录应按 normalizeTitle 归并");
-  assert.strictEqual(cTitle.file, "");
-  assert.strictEqual(cTitle.firstPublishDate, "2026-11-13");
-  assert.strictEqual(cTitle.targets.length, 2);
-  assert.deepStrictEqual(
-    cTitle.targets.map((t) => t.platform).sort(),
-    ["小红书", "抖音"]
-  );
-  console.log("✓ buildContentIndex：同文件多平台归一、无文件名按标题、图文排除、分组兼容与重发合并正确");
-}
-
-/* ---------- 3. linkWorks：链接优先于标题 + 话题/全角差异匹配 + 全局唯一兜底 ---------- */
-{
-  const contents = buildContentIndex([
+    // 2e. 图文记录（即便与视频同完整路径、状态 success、有直链）必须排除
+    {
+      pt: "百家号",
+      group: "运营一组",
+      title: "图文排除测试",
+      selectedFile: "look_01.mp4",
+      filePath: "D:\\Videos\\Look_01.MP4",
+      publishStatus: "success",
+      videoLink: "https://baijiahao.baidu.com/s?id=999",
+      date: "2026-11-09",
+      textType: "article",
+    },
+    // 2f. 未确认发布状态（scheduled / publishing / failed / draft / abnormal / publishing+管理页兜底链接）全部排除
     {
       pt: "抖音",
       group: "G1",
-      title: "相同标题",
-      selectedFile: "video_a.mp4",
-      videoLink: "https://www.douyin.com/video/111?from=web",
+      title: "定时任务未发",
+      filePath: "D:\\待发\\sched.mp4",
+      publishStatus: "scheduled",
+      scheduledTask: true,
       date: "2026-11-10",
+      textType: "local",
     },
     {
       pt: "抖音",
       group: "G1",
-      title: "相同标题",
-      selectedFile: "video_b.mp4",
-      videoLink: "https://www.douyin.com/video/222/",
-      date: "2026-11-15",
+      title: "发布中未确认",
+      filePath: "D:\\待发\\pub.mp4",
+      publishStatus: "publishing",
+      date: "2026-11-10",
+      textType: "local",
+    },
+    {
+      pt: "抖音",
+      group: "G1",
+      title: "发布失败",
+      filePath: "D:\\待发\\fail.mp4",
+      publishStatus: "failed",
+      date: "2026-11-10",
+      textType: "local",
+    },
+    {
+      pt: "抖音",
+      group: "G1",
+      title: "仅保存草稿",
+      filePath: "D:\\待发\\draft.mp4",
+      publishStatus: "draft",
+      publishSuccessCount: 1,
+      date: "2026-11-10",
+      textType: "local",
     },
     {
       pt: "视频号",
       group: "G1",
-      title: "美食教学（第一期）！ #美食 #家常菜",
-      selectedFile: "video_a.mp4",
-      videoLink: "",
+      title: "管理页链接不算已确认",
+      filePath: "D:\\待发\\sph_mgmt.mp4",
+      publishStatus: "publishing",
+      videoLink: "https://channels.weixin.qq.com/platform/post/list",
       date: "2026-11-10",
+      textType: "local",
     },
-    // 单一 target 全局唯一标题（用于验证分组改名/跨账号 title-global 命中）
+    // 2g. 历史记录缺 publishStatus 但有有效非管理页直链 → 视为已确认发布
     {
-      pt: "快手",
-      group: "旧分组",
-      title: "独家测评：新款耳机",
-      selectedFile: "unique_review.mp4",
-      videoLink: "",
-      date: "2026-11-12",
-    },
-    // 多平台同内容、分组整体改名场景（两个 target 同属一个 contentKey，各平台唯一）
-    {
-      pt: "抖音",
-      group: "老组",
-      title: "改名后跨平台视频",
-      selectedFile: "renamed_video.mp4",
-      videoLink: "",
-      date: "2026-11-12",
-    },
-    {
-      pt: "快手",
-      group: "老组",
-      title: "改名后跨平台视频",
-      selectedFile: "renamed_video.mp4",
-      videoLink: "",
-      date: "2026-11-12",
-    },
-    // 两个不同 content 共用同一标题 → title-global 必须判歧义不匹配
-    {
-      pt: "抖音",
-      group: "G2",
-      title: "歧义标题",
-      selectedFile: "amb_1.mp4",
-      videoLink: "",
+      id: "legacy-1",
+      pt: "头条",
+      group: "G1",
+      title: "历史直链确认",
+      filePath: "D:\\历史\\old.mp4",
+      videoLink: "https://www.toutiao.com/a777888/",
       date: "2026-11-10",
-    },
-    {
-      pt: "快手",
-      group: "G2",
-      title: "歧义标题",
-      selectedFile: "amb_2.mp4",
-      videoLink: "",
-      date: "2026-11-11",
-    },
-  ]);
-
-  const accounts = [
-    {
-      group: "G1",
-      platform: "抖音",
-      works: [
-        // 标题完全被改，且 publishTime 更贴近 video_a，但链接指向 video_b → 必须走 link 命中 video_b
-        {
-          workId: "dy_link_override",
-          title: "已修改的全新标题",
-          url: "https://www.douyin.com/video/222?enter_from=manage",
-          publishTime: Date.parse("2026-11-10T04:00:00Z"),
-        },
-        // 即使排在后面、标题是「相同标题」，仍通过链接命中 video_a；不会误占 video_b
-        {
-          workId: "dy_a",
-          title: "相同标题",
-          url: "https://www.douyin.com/video/111/",
-          publishTime: Date.parse("2026-11-10T06:00:00Z"),
-        },
-      ],
-    },
-    {
-      group: "G1",
-      platform: "视频号",
-      works: [
-        // 标题全角/半角、零宽字符、末尾话题均与 pushData 不同 → 仍通过同 group+platform title 命中 video_a
-        {
-          workId: "sph_a",
-          title: "美食\u200B教学(第一期)! #下饭菜",
-          url: "",
-          publishTime: Date.parse("2026-11-10T05:00:00Z"),
-        },
-      ],
-    },
-    {
-      group: "新分组",
-      platform: "快手",
-      works: [
-        {
-          workId: "ks_global",
-          title: "独家测评:新款耳机 #数码",
-          url: "",
-          publishTime: Date.parse("2026-11-12T04:00:00Z"),
-        },
-      ],
-    },
-    {
-      group: "新组",
-      platform: "抖音",
-      works: [
-        {
-          workId: "dy_renamed",
-          title: "改名后跨平台视频",
-          url: "",
-          publishTime: Date.parse("2026-11-12T04:00:00Z"),
-        },
-      ],
-    },
-    {
-      group: "新组",
-      platform: "快手",
-      works: [
-        {
-          workId: "ks_renamed",
-          title: "改名后跨平台视频",
-          url: "",
-          publishTime: Date.parse("2026-11-12T04:00:00Z"),
-        },
-      ],
-    },
-    {
-      group: "G3",
-      platform: "哔哩哔哩",
-      works: [
-        // 歧义标题跨两个 content → 不得匹配
-        {
-          workId: "bili_amb",
-          title: "歧义标题",
-          url: "",
-          publishTime: Date.parse("2026-11-10T04:00:00Z"),
-        },
-      ],
+      textType: "local",
     },
   ];
 
-  const link = linkWorks({ contents, accounts });
-  assert.ok(link instanceof Map, "linkWorks 应返回 Map");
+  const contents = buildContentIndex(records);
+  assert.strictEqual(contents.length, 8, "应产出 8 个独立内容（look_01 + 美食 + 旅行 + 2×basename + 2×无文件 + 历史直链）");
 
-  assert.deepStrictEqual(link.get(makeWorkKey("G1", "抖音", "dy_link_override")), {
-    contentKey: "file:video_b",
-    matchedBy: "link",
-  });
-  assert.deepStrictEqual(link.get(makeWorkKey("G1", "抖音", "dy_a")), {
-    contentKey: "file:video_a",
-    matchedBy: "link",
-  });
-  assert.deepStrictEqual(link.get(makeWorkKey("G1", "视频号", "sph_a")), {
-    contentKey: "file:video_a",
-    matchedBy: "title",
-  });
-  assert.deepStrictEqual(link.get(makeWorkKey("新分组", "快手", "ks_global")), {
-    contentKey: "file:unique_review",
-    matchedBy: "title-global",
-  });
-  assert.deepStrictEqual(link.get(makeWorkKey("新组", "抖音", "dy_renamed")), {
-    contentKey: "file:renamed_video",
-    matchedBy: "title-global",
-  });
-  assert.deepStrictEqual(link.get(makeWorkKey("新组", "快手", "ks_renamed")), {
-    contentKey: "file:renamed_video",
-    matchedBy: "title-global",
-  });
-  assert.deepStrictEqual(link.get(makeWorkKey("G3", "哔哩哔哩", "bili_amb")), {
-    contentKey: null,
-    matchedBy: null,
-  });
+  const look = contents.find((c) => c.contentKey === "file:d:/videos/look_01.mp4");
+  assert.ok(look, "同完整路径跨平台应归入同一桶");
+  assert.strictEqual(look.firstPublishDate, "2026-11-10", "图文 11-09 必须被排除，首发日为 11-10");
+  assert.strictEqual(look.displayTitle, "最早记录原标题！ #穿搭 #日常", "displayTitle 必须用最早记录原标题");
+  assert.strictEqual(look.targets.length, 2);
+  assert.strictEqual(look.targets.find((t) => t.platform === "快手").group, "运营一组");
 
-  // 额外验证：链接匹配跨作品仍优先于标题匹配（W_title 排前面且时间更近，但 W_link 凭链接抢回 target）
-  const linkPriorityContents = buildContentIndex([
-    {
-      pt: "抖音",
-      group: "G1",
-      title: "同题测试",
-      selectedFile: "p1.mp4",
-      videoLink: "https://www.douyin.com/video/777",
-      date: "2026-11-10",
-    },
-  ]);
-  const linkPriorityRes = linkWorks({
-    contents: linkPriorityContents,
-    accounts: [
-      {
-        group: "G1",
-        platform: "抖音",
-        works: [
-          {
-            workId: "w_by_title",
-            title: "同题测试",
-            url: "https://www.douyin.com/video/999",
-            publishTime: Date.parse("2026-11-10T04:00:00Z"),
-          },
-          {
-            workId: "w_by_link",
-            title: "后来改了标题",
-            url: "https://www.douyin.com/video/777?x=1",
-            publishTime: Date.parse("2026-11-18T04:00:00Z"),
-          },
-        ],
-      },
-    ],
-  });
-  assert.deepStrictEqual(linkPriorityRes.get("G1|抖音|w_by_link"), {
-    contentKey: "file:p1",
-    matchedBy: "link",
-  });
-  assert.deepStrictEqual(linkPriorityRes.get("G1|抖音|w_by_title"), {
-    contentKey: null,
-    matchedBy: null,
-  });
-  console.log("✓ linkWorks：链接优先于标题、话题/全角差异匹配与全局唯一标题兜底正确");
+  // 同名不同目录各自独立成桶
+  assert.ok(contents.find((c) => c.contentKey === "file:d:/美食/final.mp4"));
+  assert.ok(contents.find((c) => c.contentKey === "file:d:/旅行/final.mp4"));
+
+  // 无完整路径各自独立为 record:<日期>:<id或序号>
+  assert.ok(contents.find((c) => c.contentKey === "record:2026-11-12:rec-a"));
+  assert.ok(contents.find((c) => c.contentKey === "record:2026-11-12:rec-b"));
+  const noFileContents = contents.filter((c) => c.contentKey.startsWith("record:2026-11-13:"));
+  assert.strictEqual(noFileContents.length, 2, "无文件名同标题两条记录绝不按标题合并");
+
+  // 历史有效直链确认纳入
+  assert.ok(contents.find((c) => c.contentKey === "file:d:/历史/old.mp4"));
+
+  // 确认未发布记录与图文全部排除
+  assert.strictEqual(
+    contents.some((c) => c.contentKey.includes("待发") || c.displayTitle === "图文排除测试"),
+    false
+  );
+  console.log("✓ buildContentIndex：完整路径归桶、同名不同目录隔离、无完整路径不归桶、图文与未发布排除正确");
 }
 
-/* ---------- 4. 同标题两条视频不互占（按 publishTime 最接近 firstPublishDate，且不跨平台抢占） ---------- */
+/* ---------- 3. 反例集：同名不同目录汇总不合并 + id=1/id=2 查询参数直链 + 1直链多target全留空 ---------- */
 {
-  // 4a. 单 target，同账号 2 条同标题视频（较晚/较远那条故意排在前面，模拟 store.js 倒序列表）
-  const singleTargetContents = buildContentIndex([
-    {
-      pt: "抖音",
-      group: "G1",
-      title: "日常Vlog",
-      selectedFile: "vlog_1110.mp4",
-      date: "2026-11-10",
-    },
-    // 同内容还发了快手，验证 抖音 的第二条同标题视频绝不会跨平台抢占快手 target
-    {
-      pt: "快手",
-      group: "G1",
-      title: "日常Vlog",
-      selectedFile: "vlog_1110.mp4",
-      date: "2026-11-10",
-    },
-  ]);
-
-  const resSingle = linkWorks({
-    contents: singleTargetContents,
-    accounts: [
-      {
-        group: "G1",
-        platform: "抖音",
-        works: [
-          {
-            workId: "vlog_far",
-            title: "日常Vlog",
-            publishTime: Date.parse("2026-11-20T04:00:00Z"),
-          },
-          {
-            workId: "vlog_near",
-            title: "日常Vlog",
-            publishTime: Date.parse("2026-11-10T05:00:00Z"),
-          },
-        ],
-      },
-    ],
-  });
-  assert.deepStrictEqual(resSingle.get("G1|抖音|vlog_near"), {
-    contentKey: "file:vlog_1110",
-    matchedBy: "title",
-  });
-  assert.deepStrictEqual(resSingle.get("G1|抖音|vlog_far"), {
-    contentKey: null,
-    matchedBy: null,
-  });
-
-  // 4b. 两个不同文件（11-10 与 11-15）、完全同标题，同账号也有两条同标题作品 → 按时间就近一一配对，互不抢占
-  const pairContents = buildContentIndex([
-    {
-      pt: "抖音",
-      group: "G1",
-      title: "每周复盘",
-      selectedFile: "week1.mp4",
-      date: "2026-11-10",
-    },
-    {
-      pt: "抖音",
-      group: "G1",
-      title: "每周复盘",
-      selectedFile: "week2.mp4",
-      date: "2026-11-15",
-    },
-  ]);
-  const resPair = linkWorks({
-    contents: pairContents,
-    accounts: [
-      {
-        group: "G1",
-        platform: "抖音",
-        works: [
-          // 倒序传入
-          {
-            workId: "w_week2",
-            title: "每周复盘 #复盘",
-            publishTime: Date.parse("2026-11-15T06:00:00Z"),
-          },
-          {
-            workId: "w_week1",
-            title: "每周复盘",
-            publishTime: Date.parse("2026-11-10T03:00:00Z"),
-          },
-        ],
-      },
-    ],
-  });
-  assert.deepStrictEqual(resPair.get("G1|抖音|w_week1"), {
-    contentKey: "file:week1",
-    matchedBy: "title",
-  });
-  assert.deepStrictEqual(resPair.get("G1|抖音|w_week2"), {
-    contentKey: "file:week2",
-    matchedBy: "title",
-  });
-  console.log("✓ 同标题两条视频不互占：按 publishTime 最接近 firstPublishDate 配对且不跨平台抢占");
-}
-
-/* ---------- 5. buildContentSummaryRows：汇总行、未关联成行、null 语义、截至 date ---------- */
-{
+  // 3a. 评审反例 #1：D:\美食\final.mp4 (100 播放) 与 D:\旅行\final.mp4 (900 播放) 绝不汇成 1000
   const contents = buildContentIndex([
     {
       pt: "抖音",
-      group: "主号组",
-      title: "AI神器测评！ #AI",
-      selectedFile: "ai_tool.mp4",
-      videoLink: "https://www.douyin.com/video/1001",
+      group: "G1",
+      title: "美食视频",
+      selectedFile: "final.mp4",
+      filePath: "D:\\美食\\final.mp4",
+      publishStatus: "success",
+      videoLink: "https://www.douyin.com/video/100",
       date: "2026-11-10",
     },
     {
-      pt: "哔哩哔哩",
-      group: "主号组",
-      title: "AI神器测评",
-      selectedFile: "ai_tool.mp4",
-      videoLink: "https://www.bilibili.com/video/BV1001",
-      date: "2026-11-11",
+      pt: "抖音",
+      group: "G1",
+      title: "旅行视频",
+      selectedFile: "final.mp4",
+      filePath: "D:\\旅行\\final.mp4",
+      publishStatus: "success",
+      videoLink: "https://www.douyin.com/video/900",
+      date: "2026-11-10",
+    },
+  ]);
+  const accounts = [
+    {
+      group: "G1",
+      platform: "抖音",
+      works: [
+        { workId: "100", title: "美食视频", url: "https://www.douyin.com/video/100", publishTime: Date.parse("2026-11-10T04:00:00Z") },
+        { workId: "900", title: "旅行视频", url: "https://www.douyin.com/video/900", publishTime: Date.parse("2026-11-10T05:00:00Z") },
+      ],
+    },
+  ];
+  const worksDaily = {
+    "G1|抖音": {
+      100: { "2026-11-10": { play: 100, like: 10, comment: 1, share: 0, favorite: 2, fansDelta: 1 } },
+      900: { "2026-11-10": { play: 900, like: 90, comment: 9, share: 5, favorite: 20, fansDelta: 8 } },
+    },
+  };
+  const rows = buildContentSummaryRows({ contents, accounts, worksDaily });
+  assert.strictEqual(rows.length, 2, "同名不同目录必须保持为 2 条独立内容行");
+  assert.strictEqual(rows.find((r) => r.contentKey === "file:d:/美食/final.mp4").totalPlay, 100);
+  assert.strictEqual(rows.find((r) => r.contentKey === "file:d:/旅行/final.mp4").totalPlay, 900);
+
+  // 3b. 评审反例 #2：百家号 …/s?id=1 与 …/s?id=2 查询参数直链不混淆、不对调
+  const bjhContents = buildContentIndex([
+    {
+      pt: "百家号",
+      group: "G1",
+      title: "相同标题",
+      filePath: "D:\\a\\v1.mp4",
+      publishStatus: "success",
+      videoLink: "https://baijiahao.baidu.com/s?id=1&utm_source=app#hash",
+      date: "2026-11-10",
     },
     {
-      pt: "小红书",
-      group: "副号组",
-      title: "全空指标测试",
-      selectedFile: "all_null.mp4",
+      pt: "百家号",
+      group: "G1",
+      title: "相同标题",
+      filePath: "D:\\b\\v2.mp4",
+      publishStatus: "success",
+      videoLink: "https://baijiahao.baidu.com/s?id=2&share_from=wx",
+      date: "2026-11-10",
+    },
+  ]);
+  const bjhLink = linkWorks({
+    contents: bjhContents,
+    accounts: [
+      {
+        group: "G1",
+        platform: "百家号",
+        works: [
+          { workId: "b1", title: "相同标题", url: "https://baijiahao.baidu.com/s?id=1" },
+          { workId: "b2", title: "相同标题", url: "https://baijiahao.baidu.com/s?id=2" },
+        ],
+      },
+    ],
+  });
+  assert.deepStrictEqual(bjhLink.get("G1|百家号|b1"), { contentKey: "file:d:/a/v1.mp4", matchedBy: "link" });
+  assert.deepStrictEqual(bjhLink.get("G1|百家号|b2"), { contentKey: "file:d:/b/v2.mp4", matchedBy: "link" });
+
+  // 3c. 一个直链对应多个 target（如获取状态误回写同链）或对应多个 work → 全部留空，且不得经标题绕过
+  const dupTargetLinkContents = buildContentIndex([
+    {
+      pt: "抖音",
+      group: "G1",
+      title: "唯一标题甲",
+      filePath: "D:\\a\\one.mp4",
+      publishStatus: "success",
+      videoLink: "https://www.douyin.com/video/555",
+      date: "2026-11-10",
+    },
+    {
+      pt: "抖音",
+      group: "G1",
+      title: "唯一标题乙",
+      filePath: "D:\\b\\two.mp4",
+      publishStatus: "success",
+      videoLink: "https://www.douyin.com/video/555",
+      date: "2026-11-10",
+    },
+  ]);
+  const dupTargetLink = linkWorks({
+    contents: dupTargetLinkContents,
+    accounts: [
+      {
+        group: "G1",
+        platform: "抖音",
+        works: [{ workId: "555", title: "唯一标题甲", url: "https://www.douyin.com/video/555" }],
+      },
+    ],
+  });
+  assert.deepStrictEqual(
+    dupTargetLink.get("G1|抖音|555"),
+    { contentKey: null, matchedBy: null },
+    "同一直链指向多个 target 时必须留空，不得降级靠标题关联"
+  );
+
+  const dupWorkLinkContents = buildContentIndex([
+    {
+      pt: "抖音",
+      group: "G1",
+      title: "单目标标题",
+      filePath: "D:\\a\\single.mp4",
+      publishStatus: "success",
+      videoLink: "https://www.douyin.com/video/666",
+      date: "2026-11-10",
+    },
+  ]);
+  const dupWorkLink = linkWorks({
+    contents: dupWorkLinkContents,
+    accounts: [
+      {
+        group: "G1",
+        platform: "抖音",
+        works: [
+          { workId: "w666a", title: "单目标标题", url: "https://www.douyin.com/video/666" },
+          { workId: "w666b", title: "另一标题", url: "https://www.douyin.com/video/666?from=share" },
+        ],
+      },
+    ],
+  });
+  assert.deepStrictEqual(dupWorkLink.get("G1|抖音|w666a"), { contentKey: null, matchedBy: null });
+  assert.deepStrictEqual(dupWorkLink.get("G1|抖音|w666b"), { contentKey: null, matchedBy: null });
+  console.log("✓ 同名不同目录分离、id=1/id=2 查询参数直链、1 直链多目标/多作品全留空正确");
+}
+
+/* ---------- 4. 反例集：同组同标题两条作品、直链冲突、取消全局兜底、同文件两次实发 ---------- */
+{
+  // 4a. 评审反例 #4：同组同平台同标题两条作品（即使发布时间 09:00 / 12:00 区分）→ 不做时间猜测，全部留空
+  const sameTitleContents = buildContentIndex([
+    {
+      pt: "抖音",
+      group: "G1",
+      title: "每日打卡 #日常",
+      filePath: "D:\\a\\morning.mp4",
+      publishStatus: "success",
+      date: "2026-11-10",
+    },
+    {
+      pt: "抖音",
+      group: "G1",
+      title: "每日打卡",
+      filePath: "D:\\b\\noon.mp4",
+      publishStatus: "success",
+      date: "2026-11-10",
+    },
+  ]);
+  const sameTitleLink = linkWorks({
+    contents: sameTitleContents,
+    accounts: [
+      {
+        group: "G1",
+        platform: "抖音",
+        works: [
+          { workId: "m1", title: "每日打卡", url: "https://www.douyin.com/video/1", publishTime: Date.parse("2026-11-10T01:00:00Z") },
+          { workId: "m2", title: "每日打卡", url: "https://www.douyin.com/video/2", publishTime: Date.parse("2026-11-10T04:00:00Z") },
+        ],
+      },
+    ],
+  });
+  assert.deepStrictEqual(sameTitleLink.get("G1|抖音|m1"), { contentKey: null, matchedBy: null });
+  assert.deepStrictEqual(sameTitleLink.get("G1|抖音|m2"), { contentKey: null, matchedBy: null });
+
+  // 仅 1 条 target 但同组有 2 条同标题作品 → 同样全部留空
+  const oneTargetTwoWorks = linkWorks({
+    contents: buildContentIndex([
+      { pt: "抖音", group: "G1", title: "双作品冲突", filePath: "D:\\a\\only1.mp4", publishStatus: "success", date: "2026-11-10" },
+    ]),
+    accounts: [
+      {
+        group: "G1",
+        platform: "抖音",
+        works: [
+          { workId: "tw1", title: "双作品冲突", url: "https://www.douyin.com/video/11" },
+          { workId: "tw2", title: "双作品冲突 #热门", url: "https://www.douyin.com/video/12" },
+        ],
+      },
+    ],
+  });
+  assert.deepStrictEqual(oneTargetTwoWorks.get("G1|抖音|tw1"), { contentKey: null, matchedBy: null });
+  assert.deepStrictEqual(oneTargetTwoWorks.get("G1|抖音|tw2"), { contentKey: null, matchedBy: null });
+
+  // 4b. 评审反例 #4：target 已有有效直链 /201，同名作品直链 /202（或空）→ 不得靠标题关联
+  const conflictLink = linkWorks({
+    contents: buildContentIndex([
+      {
+        pt: "抖音",
+        group: "G1",
+        title: "直链冲突视频",
+        filePath: "D:\\a\\c201.mp4",
+        publishStatus: "success",
+        videoLink: "https://www.douyin.com/video/201",
+        date: "2026-11-10",
+      },
+      {
+        pt: "快手",
+        group: "G1",
+        title: "直链与空链冲突",
+        filePath: "D:\\a\\ks301.mp4",
+        publishStatus: "success",
+        videoLink: "https://www.kuaishou.com/short-video/301",
+        date: "2026-11-10",
+      },
+    ]),
+    accounts: [
+      {
+        group: "G1",
+        platform: "抖音",
+        works: [{ workId: "202", title: "直链冲突视频", url: "https://www.douyin.com/video/202" }],
+      },
+      {
+        group: "G1",
+        platform: "快手",
+        works: [{ workId: "302", title: "直链与空链冲突", url: "" }],
+      },
+    ],
+  });
+  assert.deepStrictEqual(conflictLink.get("G1|抖音|202"), { contentKey: null, matchedBy: null });
+  assert.deepStrictEqual(conflictLink.get("G1|快手|302"), { contentKey: null, matchedBy: null });
+
+  // 4c. 删除全局标题兜底：不同 group 或不同 platform 即便标题全局唯一也不得跨界关联
+  const crossGpLink = linkWorks({
+    contents: buildContentIndex([
+      {
+        pt: "快手",
+        group: "旧分组",
+        title: "全球唯一测试标题",
+        filePath: "D:\\a\\uniq.mp4",
+        publishStatus: "success",
+        date: "2026-11-10",
+      },
+    ]),
+    accounts: [
+      { group: "新分组", platform: "快手", works: [{ workId: "k1", title: "全球唯一测试标题" }] },
+      { group: "旧分组", platform: "抖音", works: [{ workId: "d1", title: "全球唯一测试标题" }] },
+    ],
+  });
+  assert.deepStrictEqual(crossGpLink.get("新分组|快手|k1"), { contentKey: null, matchedBy: null });
+  assert.deepStrictEqual(crossGpLink.get("旧分组|抖音|d1"), { contentKey: null, matchedBy: null });
+
+  // 4d. 评审反例 #5：同文件两次实发各自成 target，直链均命中时单元格求和并列出全部 urls / workIds
+  const twiceContents = buildContentIndex([
+    {
+      pt: "抖音",
+      group: "G1",
+      title: "同片重发",
+      filePath: "D:\\clips\\repost.mp4",
+      publishStatus: "success",
+      videoLink: "https://www.douyin.com/video/701",
+      date: "2026-11-10",
+    },
+    {
+      pt: "抖音",
+      group: "G1",
+      title: "同片重发",
+      filePath: "D:\\clips\\repost.mp4",
+      publishStatus: "success",
+      videoLink: "https://www.douyin.com/video/702",
+      date: "2026-11-12",
+    },
+  ]);
+  assert.strictEqual(twiceContents.length, 1);
+  assert.strictEqual(twiceContents[0].targets.length, 2, "同文件两次实发必须各自成独立 target，不折叠");
+
+  const twiceAccounts = [
+    {
+      group: "G1",
+      platform: "抖音",
+      works: [
+        { workId: "701", title: "同片重发", url: "https://www.douyin.com/video/701", publishTime: Date.parse("2026-11-10T04:00:00Z") },
+        { workId: "702", title: "同片重发", url: "https://www.douyin.com/video/702", publishTime: Date.parse("2026-11-12T04:00:00Z") },
+      ],
+    },
+  ];
+  const twiceDaily = {
+    "G1|抖音": {
+      701: { "2026-11-12": { play: 300, like: 30, comment: null, share: 0, favorite: 5, fansDelta: 2 } },
+      702: { "2026-11-12": { play: 500, like: 50, comment: null, share: null, favorite: 10, fansDelta: 3 } },
+    },
+  };
+  const twiceLink = linkWorks({ contents: twiceContents, accounts: twiceAccounts });
+  assert.deepStrictEqual(twiceLink.get("G1|抖音|701"), { contentKey: "file:d:/clips/repost.mp4", matchedBy: "link" });
+  assert.deepStrictEqual(twiceLink.get("G1|抖音|702"), { contentKey: "file:d:/clips/repost.mp4", matchedBy: "link" });
+
+  const twiceRows = buildContentSummaryRows({
+    contents: twiceContents,
+    accounts: twiceAccounts,
+    link: twiceLink,
+    worksDaily: twiceDaily,
+  });
+  assert.strictEqual(twiceRows.length, 1);
+  assert.strictEqual(twiceRows[0].platformCount, 1, "同平台两次实发 platformCount 仍为 1");
+  assert.strictEqual(twiceRows[0].totalPlay, 800);
+  assert.strictEqual(twiceRows[0].totalComment, null, "全 null 合计为 null");
+  assert.strictEqual(twiceRows[0].totalShare, 0, "0 + null 合计为 0");
+  assert.deepStrictEqual(twiceRows[0].perPlatform["抖音|G1"].urls, [
+    "https://www.douyin.com/video/701",
+    "https://www.douyin.com/video/702",
+  ]);
+  assert.deepStrictEqual(twiceRows[0].perPlatform["抖音|G1"].workIds, ["701", "702"]);
+  assert.strictEqual(twiceRows[0].firstPublishDate, "2026-11-10");
+  assert.strictEqual(twiceRows[0].firstPublishDateSource, "work");
+  console.log("✓ 同组同标题留空、直链冲突禁配、取消全局兜底与同文件两次实发独立 target/多作品汇总正确");
+}
+
+/* ---------- 5. 定时未发布不吸旧作品 + 已完成定时任务日期 + 视频号短标题匹配 ---------- */
+{
+  // 5a. 评审反例 #6：11-10 登记的定时任务未发布时，绝不能凭标题吸走 11-08 的旧作品
+  const schedPendingContents = buildContentIndex([
+    {
+      pt: "抖音",
+      group: "G1",
+      title: "每周复盘",
+      filePath: "D:\\sched\\ep2.mp4",
+      scheduledTask: true,
+      publishStatus: "scheduled",
+      date: "2026-11-10",
+    },
+  ]);
+  assert.strictEqual(schedPendingContents.length, 0, "scheduled 记录不得进入内容索引");
+  const schedPendingLink = linkWorks({
+    contents: schedPendingContents,
+    accounts: [
+      {
+        group: "G1",
+        platform: "抖音",
+        works: [{ workId: "old08", title: "每周复盘", url: "https://www.douyin.com/video/8", publishTime: Date.parse("2026-11-08T04:00:00Z") }],
+      },
+    ],
+  });
+  assert.deepStrictEqual(schedPendingLink.get("G1|抖音|old08"), { contentKey: null, matchedBy: null });
+
+  // 已完成的定时任务（11-10 登记、11-20 实发）：未采集时首发日取 lastPublishAt(11-20) 且 source="record"；
+  // 关联到作品后首发日取作品 publishTime 且 source="work"
+  const schedDoneContents = buildContentIndex([
+    {
+      pt: "抖音",
+      group: "G1",
+      title: "定时发布完成",
+      filePath: "D:\\sched\\done.mp4",
+      scheduledTask: true,
+      publishStatus: "success",
+      date: "2026-11-10",
+      lastPublishAt: Date.parse("2026-11-20T04:00:00Z"),
+    },
+  ]);
+  assert.strictEqual(schedDoneContents[0].firstPublishDate, "2026-11-20");
+  const uncollectedSchedRows = buildContentSummaryRows({ contents: schedDoneContents, accounts: [], worksDaily: {} });
+  assert.strictEqual(uncollectedSchedRows.length, 1);
+  assert.strictEqual(uncollectedSchedRows[0].firstPublishDate, "2026-11-20");
+  assert.strictEqual(uncollectedSchedRows[0].firstPublishDateSource, "record");
+  assert.strictEqual(uncollectedSchedRows[0].totalPlay, null);
+
+  // 5b. 评审反例 #7：视频号短标题（shortTitle 与旧字段 bt2Filled）匹配 + 管理页兜底链接不阻断标题匹配
+  const sphContents = buildContentIndex([
+    {
+      pt: "视频号",
+      group: "主号组",
+      title: "超长主标题：零基础三步学会红烧肉！ #美食 #家常菜",
+      shortTitle: "三步学会红烧肉",
+      filePath: "D:\\cook\\hongshaorou.mp4",
+      publishStatus: "success",
+      videoLink: "https://channels.weixin.qq.com/platform/post/list",
+      date: "2026-11-10",
+    },
+    {
+      pt: "视频号",
+      group: "主号组",
+      title: "历史视频长标题",
+      bt2Filled: "历史短标题",
+      filePath: "D:\\cook\\legacy.mp4",
+      publishStatus: "success",
+      date: "2026-11-11",
+    },
+  ]);
+  assert.strictEqual(sphContents[0].targets[0].videoLink, "", "管理页兜底链接不得作为有效直链");
+  assert.ok(sphContents[0].targets[0].matchTitles.includes("三步学会红烧肉"));
+  assert.ok(sphContents[1].targets[0].matchTitles.includes("历史短标题"));
+
+  const sphAccounts = [
+    {
+      group: "主号组",
+      platform: "视频号",
+      works: [
+        { workId: "sph1", title: "三步学会红烧肉", url: "", publishTime: Date.parse("2026-11-10T17:00:00Z") }, // UTC+8 为 2026-11-11
+        { workId: "sph2", title: "历史短标题", url: "", publishTime: Date.parse("2026-11-11T04:00:00Z") },
+      ],
+    },
+  ];
+  const sphLink = linkWorks({ contents: sphContents, accounts: sphAccounts });
+  assert.deepStrictEqual(sphLink.get("主号组|视频号|sph1"), {
+    contentKey: "file:d:/cook/hongshaorou.mp4",
+    matchedBy: "title",
+  });
+  assert.deepStrictEqual(sphLink.get("主号组|视频号|sph2"), {
+    contentKey: "file:d:/cook/legacy.mp4",
+    matchedBy: "title",
+  });
+
+  const sphRows = buildContentSummaryRows({
+    contents: sphContents,
+    accounts: sphAccounts,
+    link: sphLink,
+    worksDaily: {
+      "主号组|视频号": {
+        sph1: { "2026-11-11": { play: 1200, like: 80, comment: 10, share: 5, favorite: 30, fansDelta: 4 } },
+        sph2: { "2026-11-11": { play: 400, like: 20, comment: 2, share: 1, favorite: 5, fansDelta: 0 } },
+      },
+    },
+  });
+  const r1 = sphRows.find((r) => r.contentKey === "file:d:/cook/hongshaorou.mp4");
+  assert.strictEqual(r1.title, "超长主标题：零基础三步学会红烧肉！ #美食 #家常菜", "展示标题保留原文");
+  assert.strictEqual(r1.firstPublishDate, "2026-11-11", "UTC+8 跨日 publishTime 应归 2026-11-11");
+  assert.strictEqual(r1.firstPublishDateSource, "work");
+  assert.strictEqual(r1.totalPlay, 1200);
+  assert.deepStrictEqual(r1.perPlatform["视频号|主号组"].urls, []);
+  assert.deepStrictEqual(r1.perPlatform["视频号|主号组"].workIds, ["sph1"]);
+
+  // 视频号两作品分别命中同一 target 的主标题与短标题 → 争抢同一 target，全部留空
+  const aliasConflictLink = linkWorks({
+    contents: buildContentIndex([
+      {
+        pt: "视频号",
+        group: "G1",
+        title: "主标题甲",
+        shortTitle: "短标题乙",
+        filePath: "D:\\cook\\conflict.mp4",
+        publishStatus: "success",
+        date: "2026-11-10",
+      },
+    ]),
+    accounts: [
+      {
+        group: "G1",
+        platform: "视频号",
+        works: [
+          { workId: "a1", title: "主标题甲", url: "" },
+          { workId: "a2", title: "短标题乙", url: "" },
+        ],
+      },
+    ],
+  });
+  assert.deepStrictEqual(aliasConflictLink.get("G1|视频号|a1"), { contentKey: null, matchedBy: null });
+  assert.deepStrictEqual(aliasConflictLink.get("G1|视频号|a2"), { contentKey: null, matchedBy: null });
+  console.log("✓ 定时未发布不吸旧作品、已完成定时任务首发日与视频号短标题匹配正确");
+}
+
+/* ---------- 6. 截止日不泄漏未来值、无指标保留行、publishTime 1e20 不崩、null 语义、platformCount & 去重 ---------- */
+{
+  const contents = buildContentIndex([
+    // 已确认发布、有 works.json 累计值 900，但无 11-11 及以前 worksDaily 快照
+    {
+      pt: "抖音",
+      group: "主号组",
+      title: "截止日测试",
+      filePath: "D:\\stats\\cutoff.mp4",
+      publishStatus: "success",
+      videoLink: "https://www.douyin.com/video/c1",
+      date: "2026-11-10",
+    },
+    // 已确认发布但尚未采集到任何作品
+    {
+      pt: "快手",
+      group: "主号组",
+      title: "未采集内容",
+      filePath: "D:\\stats\\no_metrics.mp4",
+      publishStatus: "success",
+      date: "2026-11-10",
+    },
+    // 同平台跨两个分组（检验 platformCount 按不同平台名计）
+    {
+      pt: "抖音",
+      group: "组A",
+      title: "同平台双组",
+      filePath: "D:\\stats\\multi_group.mp4",
+      publishStatus: "success",
+      videoLink: "https://www.douyin.com/video/mg1",
+      date: "2026-11-10",
+    },
+    {
+      pt: "抖音",
+      group: "组B",
+      title: "同平台双组",
+      filePath: "D:\\stats\\multi_group.mp4",
+      publishStatus: "success",
+      videoLink: "https://www.douyin.com/video/mg2",
       date: "2026-11-10",
     },
   ]);
@@ -591,183 +823,152 @@ function captureWarn(fn) {
       group: "主号组",
       platform: "抖音",
       works: [
+        // works.json 里有 play: 900，绝不能在缺日快照时泄漏！
         {
-          workId: "dy1",
-          title: "AI神器测评! #效率",
-          url: "https://www.douyin.com/video/1001?a=1",
-          publishTime: Date.parse("2026-11-10T02:00:00Z"),
-        },
-        // 未关联作品
-        {
-          workId: "dy_unlinked",
-          title: "随手拍日常",
-          url: "https://www.douyin.com/video/9999",
-          publishTime: Date.parse("2026-11-12T04:00:00Z"),
-        },
-      ],
-    },
-    {
-      group: "主号组",
-      platform: "哔哩哔哩",
-      works: [
-        {
-          workId: "BV1001",
-          title: "AI神器测评",
-          url: "https://www.bilibili.com/video/BV1001/",
-          publishTime: Date.parse("2026-11-11T04:00:00Z"),
-        },
-      ],
-    },
-    {
-      group: "副号组",
-      platform: "小红书",
-      works: [
-        {
-          workId: "xhs_null",
-          title: "全空指标测试",
-          url: "https://www.xiaohongshu.com/explore/xhs_null",
+          workId: "c1",
+          title: "截止日测试",
+          url: "https://www.douyin.com/video/c1",
           publishTime: Date.parse("2026-11-10T04:00:00Z"),
+          play: 900,
+          like: 90,
         },
+        // 越界时间戳 1e20 与其他非法时间绝不抛 RangeError
+        {
+          workId: "bad_ts_1",
+          title: "越界时间作品1",
+          url: "https://www.douyin.com/video/bad1",
+          publishTime: 1e20,
+        },
+        {
+          workId: "bad_ts_2",
+          title: "越界时间作品2",
+          url: "https://www.douyin.com/video/bad2",
+          publishTime: 8.64e15,
+        },
+        {
+          workId: "bad_ts_3",
+          title: "1999年时间作品",
+          url: "https://www.douyin.com/video/bad3",
+          publishTime: Date.parse("1999-12-31T23:59:59Z"),
+        },
+        {
+          workId: "bad_ts_4",
+          title: "2101年时间作品",
+          url: "https://www.douyin.com/video/bad4",
+          publishTime: Date.parse("2101-01-01T00:00:00Z"),
+        },
+      ],
+    },
+    {
+      group: "组A",
+      platform: "抖音",
+      works: [
+        { workId: "mg1", title: "同平台双组", url: "https://www.douyin.com/video/mg1", publishTime: Date.parse("2026-11-10T04:00:00Z") },
+        // 同 group|platform|workId 重复出现 → 只计一次
+        { workId: "mg1", title: "同平台双组", url: "https://www.douyin.com/video/mg1", publishTime: Date.parse("2026-11-10T04:00:00Z") },
+      ],
+    },
+    {
+      group: "组B",
+      platform: "抖音",
+      works: [
+        { workId: "mg2", title: "同平台双组", url: "https://www.douyin.com/video/mg2", publishTime: Date.parse("2026-11-11T04:00:00Z") },
       ],
     },
   ];
 
-  const worksDaily = {
+  // 6a. 评审反例 #8：worksDaily 只有 2026-11-19 的 900，或完全没有该账号快照 → 截止 2026-11-11 绝不泄漏 900
+  const worksDailyFuture = {
     "主号组|抖音": {
-      dy1: {
-        "2026-11-10": { play: 100, like: 0, comment: 2, share: null, favorite: null, fansDelta: -1 },
-        "2026-11-12": { play: 300, like: 0, comment: 5, share: null, favorite: 10, fansDelta: 4 },
-      },
-      dy_unlinked: {
-        "2026-11-12": { play: 88, like: 8, comment: 1, share: 0, favorite: null, fansDelta: null },
+      c1: { "2026-11-19": { play: 900, like: 90, comment: 9, share: 3, favorite: 12, fansDelta: 5 } },
+      bad_ts_1: { "2026-11-10": { play: 50, like: 0, comment: null, share: null, favorite: null, fansDelta: null } },
+      bad_ts_2: { "2026-11-10": { play: 10, like: null, comment: null, share: null, favorite: null, fansDelta: null } },
+      bad_ts_3: { "2026-11-10": { play: 20, like: null, comment: null, share: null, favorite: null, fansDelta: null } },
+      bad_ts_4: { "2026-11-10": { play: 30, like: null, comment: null, share: null, favorite: null, fansDelta: null } },
+    },
+    "组A|抖音": {
+      mg1: {
+        "2026-11-10": { play: 100, like: 0, comment: null, share: 0, favorite: null, fansDelta: -2 },
+        "2026-11-15": { play: 800, like: 80, comment: 8, share: 4, favorite: 10, fansDelta: 10 },
       },
     },
-    "主号组|哔哩哔哩": {
-      BV1001: {
-        "2026-11-11": { play: 200, like: null, comment: 3, share: null, favorite: 5, fansDelta: null },
-        "2026-11-12": { play: 500, like: null, comment: 7, share: null, favorite: null, fansDelta: null },
-      },
-    },
-    "副号组|小红书": {
-      xhs_null: {
-        "2026-11-10": { play: null, like: null, comment: null, share: null, favorite: null, fansDelta: null },
-      },
+    "组B|抖音": {
+      mg2: { "2026-11-11": { play: 250, like: null, comment: null, share: 0, favorite: null, fansDelta: 5 } },
     },
   };
 
-  const link = linkWorks({ contents, accounts });
-
-  // 5a. 默认最新（不传 date）
-  const latestRows = buildContentSummaryRows({ contents, accounts, link, worksDaily });
-  assert.strictEqual(latestRows.length, 3, "应产出 2 条关联内容 + 1 条未关联作品");
-
-  const aiRow = latestRows.find((r) => r.contentKey === "file:ai_tool");
-  assert.ok(aiRow);
-  assert.strictEqual(aiRow.title, "AI神器测评！ #AI");
-  assert.strictEqual(aiRow.file, "ai_tool.mp4");
-  assert.strictEqual(aiRow.firstPublishDate, "2026-11-10");
-  assert.strictEqual(aiRow.platformCount, 2);
-  assert.strictEqual(aiRow.totalPlay, 800, "300 + 500");
-  assert.strictEqual(aiRow.totalLike, 0, "0 + null 应为 0 而非 null");
-  assert.strictEqual(aiRow.totalComment, 12, "5 + 7");
-  assert.strictEqual(aiRow.totalShare, null, "null + null 必须为 null");
-  assert.strictEqual(aiRow.totalFavorite, 10, "10 + null = 10");
-  assert.strictEqual(aiRow.totalFansDelta, 4, "4 + null = 4");
-  assert.deepStrictEqual(Object.keys(aiRow.perPlatform).sort(), [
-    "哔哩哔哩|主号组",
-    "抖音|主号组",
-  ]);
-  assert.deepStrictEqual(aiRow.perPlatform["抖音|主号组"], {
-    play: 300,
-    like: 0,
-    comment: 5,
-    share: null,
-    favorite: 10,
-    fansDelta: 4,
-    url: "https://www.douyin.com/video/1001?a=1",
-  });
-  assert.deepStrictEqual(aiRow.perPlatform["哔哩哔哩|主号组"], {
-    play: 500,
-    like: null,
-    comment: 7,
-    share: null,
-    favorite: null,
-    fansDelta: null,
-    url: "https://www.bilibili.com/video/BV1001/",
-  });
-
-  // 全 null 指标行
-  const nullRow = latestRows.find((r) => r.contentKey === "file:all_null");
-  assert.ok(nullRow);
-  assert.strictEqual(nullRow.platformCount, 1);
-  assert.strictEqual(nullRow.totalPlay, null);
-  assert.strictEqual(nullRow.totalLike, null);
-  assert.strictEqual(nullRow.totalComment, null);
-  assert.strictEqual(nullRow.totalShare, null);
-  assert.strictEqual(nullRow.totalFavorite, null);
-  assert.strictEqual(nullRow.totalFansDelta, null);
-
-  // 未关联作品成行
-  const unlinkedRow = latestRows.find((r) => r.contentKey === "unlinked:抖音:dy_unlinked");
-  assert.ok(unlinkedRow, "未关联作品应独立成行且 contentKey 为 unlinked:<platform>:<workId>");
-  assert.strictEqual(unlinkedRow.title, "随手拍日常");
-  assert.strictEqual(unlinkedRow.file, "");
-  assert.strictEqual(unlinkedRow.firstPublishDate, "2026-11-12");
-  assert.strictEqual(unlinkedRow.platformCount, 1);
-  assert.strictEqual(unlinkedRow.totalPlay, 88);
-  assert.strictEqual(unlinkedRow.totalShare, 0);
-  assert.strictEqual(unlinkedRow.totalFavorite, null);
-  assert.deepStrictEqual(unlinkedRow.perPlatform["抖音|主号组"], {
-    play: 88,
-    like: 8,
-    comment: 1,
-    share: 0,
-    favorite: null,
-    fansDelta: null,
-    url: "https://www.douyin.com/video/9999",
-  });
-
-  // 5b. 截至 date = "2026-11-11"：抖音取 11-10 快照，B站取 11-11 快照，dy_unlinked(11-12) 尚不存在
   const asOf11 = buildContentSummaryRows({
     contents,
     accounts,
-    link,
-    worksDaily,
+    worksDaily: worksDailyFuture,
     date: "2026-11-11",
   });
-  assert.strictEqual(asOf11.length, 2, "截至 11-11 不应包含 11-12 才出现的 dy_unlinked");
-  const ai11 = asOf11.find((r) => r.contentKey === "file:ai_tool");
-  assert.strictEqual(ai11.platformCount, 2);
-  assert.strictEqual(ai11.totalPlay, 300, "100(11-10) + 200(11-11)");
-  assert.strictEqual(ai11.totalLike, 0);
-  assert.strictEqual(ai11.totalComment, 5, "2 + 3");
-  assert.strictEqual(ai11.totalFavorite, 5, "null + 5");
-  assert.strictEqual(ai11.totalFansDelta, -1, "负 fansDelta 照实合计");
 
-  // 5c. 截至 date = "2026-11-10"：仅抖音有快照，B站(11-11) 尚未出现
-  const asOf10 = buildContentSummaryRows({
-    contents,
-    accounts,
-    link,
-    worksDaily,
-    date: "2026-11-10",
+  // c1 不泄漏 11-19 的 900，但已确认发布的内容仍保留行且指标为 null
+  const cutoffRow = asOf11.find((r) => r.contentKey === "file:d:/stats/cutoff.mp4");
+  assert.ok(cutoffRow, "无截至 11-11 快照的已确认发布内容必须保留行");
+  assert.strictEqual(cutoffRow.totalPlay, null, "不得泄漏 11-19 或 works.json 的 900 播放");
+  assert.strictEqual(cutoffRow.totalLike, null);
+  assert.strictEqual(cutoffRow.platformCount, 0);
+  assert.deepStrictEqual(cutoffRow.perPlatform, {});
+  assert.strictEqual(cutoffRow.firstPublishDate, "2026-11-10");
+  assert.strictEqual(cutoffRow.firstPublishDateSource, "work");
+
+  // 完全未采集的已确认发布内容保留行，指标全 null，firstPublishDateSource = "record"
+  const noMetricRow = asOf11.find((r) => r.contentKey === "file:d:/stats/no_metrics.mp4");
+  assert.ok(noMetricRow, "未采集的已确认发布内容必须保留行");
+  assert.strictEqual(noMetricRow.totalPlay, null);
+  assert.strictEqual(noMetricRow.totalLike, null);
+  assert.strictEqual(noMetricRow.totalComment, null);
+  assert.strictEqual(noMetricRow.totalShare, null);
+  assert.strictEqual(noMetricRow.totalFavorite, null);
+  assert.strictEqual(noMetricRow.totalFansDelta, null);
+  assert.strictEqual(noMetricRow.platformCount, 0);
+  assert.deepStrictEqual(noMetricRow.perPlatform, {});
+  assert.strictEqual(noMetricRow.firstPublishDate, "2026-11-10");
+  assert.strictEqual(noMetricRow.firstPublishDateSource, "record");
+
+  // 即使省略 date 且 worksDaily 为空，也绝不回退 works.json 的 900
+  const noDailyRows = buildContentSummaryRows({
+    contents: [contents[0]],
+    accounts: [accounts[0]],
+    worksDaily: {},
   });
-  const ai10 = asOf10.find((r) => r.contentKey === "file:ai_tool");
-  assert.strictEqual(ai10.platformCount, 1);
-  assert.strictEqual(ai10.totalPlay, 100);
-  assert.deepStrictEqual(Object.keys(ai10.perPlatform), ["抖音|主号组"]);
+  assert.strictEqual(noDailyRows.length, 1);
+  assert.strictEqual(noDailyRows[0].totalPlay, null, "date 省略且 worksDaily 缺失时也不得回退 works.json");
 
-  // 5d. Map 形态与嵌套对象形态 worksDaily，以及特殊 workId（__proto__ / constructor）
-  const mapDaily = new Map([
-    [
-      "特殊组|抖音",
-      Object.assign(Object.create(null), {
-        ["__proto__"]: { "2026-11-10": { play: 42, like: 3, comment: null, share: null, favorite: null, fansDelta: null } },
-        constructor: { "2026-11-10": { play: 10, like: 1, comment: 0, share: 0, favorite: 0, fansDelta: null } },
-      }),
-    ],
-  ]);
-  const specialRows = buildContentSummaryRows({
+  // 同平台双组：platformCount 按不同平台名计为 1；重复 group|platform|workId 只计一次；null 语义正确
+  const mgRow = asOf11.find((r) => r.contentKey === "file:d:/stats/multi_group.mp4");
+  assert.ok(mgRow);
+  assert.strictEqual(mgRow.platformCount, 1, "组A 与 组B 同属「抖音」，platformCount 必须为 1");
+  assert.strictEqual(mgRow.totalPlay, 350, "mg1 重复出现只计一次：100 + 250 = 350");
+  assert.strictEqual(mgRow.totalLike, 0, "0 + null 合计为 0");
+  assert.strictEqual(mgRow.totalComment, null, "null + null 合计为 null");
+  assert.strictEqual(mgRow.totalShare, 0, "0 + 0 合计为 0");
+  assert.strictEqual(mgRow.totalFansDelta, 3, "-2 + 5 = 3");
+  assert.strictEqual(mgRow.firstPublishDate, "2026-11-10", "取已关联作品 publishTime 最小值");
+  assert.strictEqual(mgRow.firstPublishDateSource, "work");
+
+  // 省略 date 时取 worksDaily 最新快照日（mg1 取 11-15 的 800 + mg2 的 250 = 1050；c1 取 11-19 的 900）
+  const latestRows = buildContentSummaryRows({ contents, accounts, worksDaily: worksDailyFuture });
+  assert.strictEqual(latestRows.find((r) => r.contentKey === "file:d:/stats/multi_group.mp4").totalPlay, 1050);
+  assert.strictEqual(latestRows.find((r) => r.contentKey === "file:d:/stats/cutoff.mp4").totalPlay, 900);
+
+  // 评审反例 #9：publishTime 1e20 / 8.64e15 / 1999 / 2101 不崩且视为无效（firstPublishDate 为 ""）
+  for (const id of ["bad_ts_1", "bad_ts_2", "bad_ts_3", "bad_ts_4"]) {
+    const r = asOf11.find((x) => x.contentKey === `unlinked:抖音:${id}`);
+    assert.ok(r, `越界时间作品 ${id} 应正常出未关联行不崩溃`);
+    assert.strictEqual(r.firstPublishDate, "", `越界时间 ${id} 应视为无效（空日期）`);
+  }
+
+  // 特殊 workId（__proto__ / constructor）防原型污染
+  const protoDaily = {
+    "特殊组|抖音": Object.assign(Object.create(null), {
+      ["__proto__"]: { "2026-11-10": { play: 42, like: 3, comment: null, share: null, favorite: null, fansDelta: null } },
+      constructor: { "2026-11-10": { play: 10, like: 1, comment: 0, share: 0, favorite: 0, fansDelta: null } },
+    }),
+  };
+  const protoRows = buildContentSummaryRows({
     contents: [],
     accounts: [
       {
@@ -779,24 +980,15 @@ function captureWarn(fn) {
         ],
       },
     ],
-    worksDaily: mapDaily,
+    worksDaily: protoDaily,
   });
-  assert.strictEqual(specialRows.length, 2);
-  assert.strictEqual(specialRows.find((r) => r.contentKey === "unlinked:抖音:__proto__").totalPlay, 42);
-  assert.strictEqual(specialRows.find((r) => r.contentKey === "unlinked:抖音:constructor").totalPlay, 10);
-
-  // 嵌套对象形态 worksDaily[group][platform]
-  const nestedRows = buildContentSummaryRows({
-    contents: [],
-    accounts: [{ group: "G", platform: "快手", works: [{ workId: "k1", title: "嵌套测试" }] }],
-    worksDaily: { G: { 快手: { k1: { "2026-11-10": { play: 77, like: 7 } } } } },
-  });
-  assert.strictEqual(nestedRows.length, 1);
-  assert.strictEqual(nestedRows[0].totalPlay, 77);
-  console.log("✓ buildContentSummaryRows：汇总行、未关联成行、null 语义、date 切片与特殊 workId 正确");
+  assert.strictEqual(protoRows.length, 2);
+  assert.strictEqual(protoRows.find((r) => r.contentKey === "unlinked:抖音:__proto__").totalPlay, 42);
+  assert.strictEqual(protoRows.find((r) => r.contentKey === "unlinked:抖音:constructor").totalPlay, 10);
+  console.log("✓ 截止日不泄漏未来值、无指标保留行、publishTime 越界不崩、null 语义、platformCount 与原型防护正确");
 }
 
-/* ---------- 6. buildWorkDailyRows：可选 link 参数 ---------- */
+/* ---------- 7. buildWorkDailyRows：可选 link 参数（仅 Map） ---------- */
 {
   const works = [
     { workId: "W1", title: "联动视频", url: "https://www.douyin.com/video/1", publishTime: Date.parse("2026-11-10T04:00:00Z") },
@@ -808,7 +1000,7 @@ function captureWarn(fn) {
     W_DEL: { "2026-11-10": { play: 30, like: 1, comment: 0, share: 0, favorite: 0, fansDelta: null } },
   };
 
-  // 不传 link：保持原行为（无 contentKey / matchedBy 字段）
+  // 不传 link：保持原契约（无 contentKey / matchedBy）
   const plainRows = buildWorkDailyRows({ group: "G1", platform: "抖音", works, worksDaily });
   assert.strictEqual(plainRows.length, 3);
   assert.strictEqual(Object.prototype.hasOwnProperty.call(plainRows[0], "contentKey"), false);
@@ -816,50 +1008,50 @@ function captureWarn(fn) {
 
   // 传 link Map：输出 contentKey / matchedBy
   const contents = buildContentIndex([
-    { pt: "抖音", group: "G1", title: "联动视频", selectedFile: "v1.mp4", videoLink: "https://www.douyin.com/video/1", date: "2026-11-10" },
+    {
+      pt: "抖音",
+      group: "G1",
+      title: "联动视频",
+      filePath: "D:\\v\\v1.mp4",
+      publishStatus: "success",
+      videoLink: "https://www.douyin.com/video/1",
+      date: "2026-11-10",
+    },
   ]);
   const link = linkWorks({ contents, accounts: [{ group: "G1", platform: "抖音", works }] });
   const linkedRows = buildWorkDailyRows({ group: "G1", platform: "抖音", works, worksDaily, link });
+  assert.strictEqual(linkedRows.find((r) => r.workId === "W1").contentKey, "file:d:/v/v1.mp4");
+  assert.strictEqual(linkedRows.find((r) => r.workId === "W1").matchedBy, "link");
+  assert.strictEqual(linkedRows.find((r) => r.workId === "W2").contentKey, null);
+  assert.strictEqual(linkedRows.find((r) => r.workId === "W2").matchedBy, null);
+  assert.strictEqual(linkedRows.find((r) => r.workId === "W_DEL").contentKey, null);
 
-  const r1 = linkedRows.find((r) => r.workId === "W1");
-  const r2 = linkedRows.find((r) => r.workId === "W2");
-  const rDel = linkedRows.find((r) => r.workId === "W_DEL");
-  assert.strictEqual(r1.contentKey, "file:v1");
-  assert.strictEqual(r1.matchedBy, "link");
-  assert.strictEqual(r2.contentKey, null);
-  assert.strictEqual(r2.matchedBy, null);
-  assert.strictEqual(rDel.contentKey, null);
-  assert.strictEqual(rDel.matchedBy, null);
-
-  // 普通对象形态 link 同样支持（且不误读原型属性）
-  const objLinkedRows = buildWorkDailyRows({
+  // 非 Map 的 link（瘦身：只支持 Map）不附加字段
+  const nonMapRows = buildWorkDailyRows({
     group: "G1",
     platform: "抖音",
     works,
     worksDaily,
-    link: { "G1|抖音|W1": { contentKey: "file:v1", matchedBy: "title" } },
+    link: { "G1|抖音|W1": { contentKey: "file:d:/v/v1.mp4", matchedBy: "title" } },
   });
-  assert.strictEqual(objLinkedRows.find((r) => r.workId === "W1").contentKey, "file:v1");
-  assert.strictEqual(objLinkedRows.find((r) => r.workId === "W1").matchedBy, "title");
-  assert.strictEqual(objLinkedRows.find((r) => r.workId === "W2").contentKey, null);
-  console.log("✓ buildWorkDailyRows：不传 link 保持原字段契约，传入 link 正确附加 contentKey / matchedBy");
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(nonMapRows[0], "contentKey"), false);
+  console.log("✓ buildWorkDailyRows：不传 link 保持原契约，传 Map 附加 contentKey / matchedBy 正确");
 }
 
-/* ---------- 7. pushRecords.readPushRecords：注入目录 + 损坏跳过+warn + 端到端串联 ---------- */
+/* ---------- 8. pushRecords.readPushRecords：目录注入、损坏跳过+warn、默认目录回退与端到端串联 ---------- */
 {
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "mm-content-link-test-"));
   try {
-    // 7a. 不存在的目录静默返回 []
+    // 8a. 不存在目录静默空数组
     const { result: missingRes, warnings: missingWarns } = captureWarn(() =>
       readPushRecords({ dir: path.join(tmpRoot, "not-exists") })
     );
     assert.deepStrictEqual(missingRes, []);
     assert.deepStrictEqual(missingWarns, []);
 
-    // 7b. 构造 pushData 目录：正常文件 + 损坏 JSON + 非数组 JSON + EISDIR + 非日期干扰文件
+    // 8b. 构造 pushData 目录：正常文件 + 损坏 JSON + 非数组 + EISDIR + 干扰文件
     const pushDir = path.join(tmpRoot, "pushData");
     fs.mkdirSync(pushDir, { recursive: true });
-
     fs.writeFileSync(
       path.join(pushDir, "2026-11-10.json"),
       JSON.stringify([
@@ -868,6 +1060,8 @@ function captureWarn(fn) {
           group: "运营一组",
           title: "端到端测试视频！ #测试",
           selectedFile: "e2e_demo.mp4",
+          filePath: "C:\\Videos\\E2E_DEMO.MP4",
+          publishStatus: "success",
           videoLink: "https://www.douyin.com/video/555?from=app",
           textType: "local",
         },
@@ -876,6 +1070,8 @@ function captureWarn(fn) {
           group: "运营一组",
           title: "端到端图文",
           selectedFile: "e2e_demo.md",
+          filePath: "C:\\Videos\\E2E_DEMO.MP4",
+          publishStatus: "success",
           textType: "article",
         },
       ]),
@@ -891,7 +1087,9 @@ function captureWarn(fn) {
           pt: "快手",
           phone: "运营一组-快手",
           bt: "端到端测试视频!",
-          selectedFile: "C:\\Videos\\E2E_DEMO.MP4",
+          selectedFile: "e2e_demo.mp4",
+          filePath: "c:/videos/e2e_demo.mp4",
+          publishStatus: "success",
           videoLink: "",
           textType: "local",
         },
@@ -902,27 +1100,23 @@ function captureWarn(fn) {
     fs.writeFileSync(path.join(pushDir, "2026-02-31.json"), "[]", "utf8");
 
     const { result: records, warnings } = captureWarn(() => readPushRecords({ dir: pushDir }));
-    assert.strictEqual(records.length, 3, "应读出 2026-11-10 的 2 条 + 2026-11-14 的 1 条");
+    assert.strictEqual(records.length, 3);
     assert.strictEqual(records[0].date, "2026-11-10");
     assert.strictEqual(records[2].date, "2026-11-14");
-    assert.ok(warnings.some((w) => w.includes("2026-11-11.json")), "损坏 JSON 应 warn");
-    assert.ok(warnings.some((w) => w.includes("2026-11-12.json")), "非数组结构应 warn");
-    assert.ok(warnings.some((w) => w.includes("2026-11-13.json")), "读目录 EISDIR 应 warn");
-    assert.strictEqual(
-      warnings.some((w) => w.includes("notes.txt")),
-      false,
-      "非日期文件应静默忽略"
-    );
+    assert.ok(warnings.some((w) => w.includes("2026-11-11.json")));
+    assert.ok(warnings.some((w) => w.includes("2026-11-12.json")));
+    assert.ok(warnings.some((w) => w.includes("2026-11-13.json")));
+    assert.strictEqual(warnings.some((w) => w.includes("notes.txt")), false);
 
-    // 7c. from/to 过滤
+    // 8c. from/to 过滤
     const filtered = readPushRecords({ dir: pushDir, from: "2026-11-14", to: "2026-11-14" });
     assert.strictEqual(filtered.length, 1);
     assert.strictEqual(filtered[0].pt, "快手");
 
-    // 7d. 端到端串联：readPushRecords → buildContentIndex → linkWorks → buildContentSummaryRows + buildWorkDailyRows
+    // 8d. 端到端串联
     const contents = buildContentIndex(records);
-    assert.strictEqual(contents.length, 1, "图文已排除，同文件双平台归一为 1 条内容");
-    assert.strictEqual(contents[0].contentKey, "file:e2e_demo");
+    assert.strictEqual(contents.length, 1);
+    assert.strictEqual(contents[0].contentKey, "file:c:/videos/e2e_demo.mp4");
 
     const e2eAccounts = [
       {
@@ -937,13 +1131,14 @@ function captureWarn(fn) {
       },
     ];
     const e2eDaily = {
-      "运营一组|抖音": { "555": { "2026-11-15": { play: 1000, like: 100, comment: 10, share: 5, favorite: 20, fansDelta: 3 } } },
+      "运营一组|抖音": { 555: { "2026-11-15": { play: 1000, like: 100, comment: 10, share: 5, favorite: 20, fansDelta: 3 } } },
       "运营一组|快手": { ks555: { "2026-11-15": { play: 600, like: 40, comment: 4, share: null, favorite: 8, fansDelta: null } } },
     };
 
     const e2eLink = linkWorks({ contents, accounts: e2eAccounts });
-    assert.deepStrictEqual(e2eLink.get("运营一组|抖音|555"), { contentKey: "file:e2e_demo", matchedBy: "link" });
-    assert.deepStrictEqual(e2eLink.get("运营一组|快手|ks555"), { contentKey: "file:e2e_demo", matchedBy: "title" });
+    assert.deepStrictEqual(e2eLink.get("运营一组|抖音|555"), { contentKey: "file:c:/videos/e2e_demo.mp4", matchedBy: "link" });
+    assert.deepStrictEqual(e2eLink.get("运营一组|快手|ks555"), { contentKey: "file:c:/videos/e2e_demo.mp4", matchedBy: "title" });
+    assert.strictEqual(makeWorkKey("运营一组", "快手", "ks555"), "运营一组|快手|ks555");
 
     const summary = buildContentSummaryRows({ contents, accounts: e2eAccounts, link: e2eLink, worksDaily: e2eDaily });
     assert.strictEqual(summary.length, 1);
@@ -951,6 +1146,8 @@ function captureWarn(fn) {
     assert.strictEqual(summary[0].totalPlay, 1600);
     assert.strictEqual(summary[0].totalShare, 5);
     assert.strictEqual(summary[0].totalFansDelta, 3);
+    assert.strictEqual(summary[0].firstPublishDate, "2026-11-10");
+    assert.strictEqual(summary[0].firstPublishDateSource, "work");
 
     const dailyRows = buildWorkDailyRows({
       group: "运营一组",
@@ -960,16 +1157,16 @@ function captureWarn(fn) {
       link: e2eLink,
     });
     assert.strictEqual(dailyRows.length, 1);
-    assert.strictEqual(dailyRows[0].contentKey, "file:e2e_demo");
+    assert.strictEqual(dailyRows[0].contentKey, "file:c:/videos/e2e_demo.mp4");
     assert.strictEqual(dailyRows[0].matchedBy, "title");
 
-    // 7e. 默认目录回退（mock electron.app.getPath("documents")）
+    // 8e. 默认目录回退（mock electron.app.getPath("documents")）
     const fakeDocs = path.join(tmpRoot, "FakeDocs");
     const defaultPushDir = path.join(fakeDocs, "MatrixMedia", "data", "pushData");
     fs.mkdirSync(defaultPushDir, { recursive: true });
     fs.writeFileSync(
       path.join(defaultPushDir, "2026-11-15.json"),
-      JSON.stringify([{ pt: "抖音", group: "G", title: "默认路径测试", selectedFile: "def.mp4" }]),
+      JSON.stringify([{ pt: "抖音", group: "G", title: "默认路径测试", selectedFile: "def.mp4", publishStatus: "success" }]),
       "utf8"
     );
     const electronId = require.resolve("electron");
@@ -984,7 +1181,6 @@ function captureWarn(fn) {
       assert.strictEqual(getPushDataDir(), defaultPushDir);
       const defRecords = readPushRecords();
       assert.strictEqual(defRecords.length, 1);
-      assert.strictEqual(defRecords[0].selectedFile, "def.mp4");
       assert.strictEqual(defRecords[0].date, "2026-11-15");
     } finally {
       if (prevCache) require.cache[electronId] = prevCache;

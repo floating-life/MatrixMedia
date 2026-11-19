@@ -3,9 +3,10 @@
 /**
  * 跨平台作品关联与内容级汇总行构建（纯函数模块，不依赖 electron / fs）。
  *
- * 将 pushData 多平台发布记录按视频文件（或归一化标题）归并为「内容」（contentKey），
- * 再按「作品链接 > 同账号标题 > 全局唯一标题」三级优先级关联采集到的平台作品，
- * 并基于 works-daily 产出跨平台汇总行。
+ * 原则：误关联比漏关联更糟；证据不足一律留空（未关联作品单独成行）。
+ *
+ * 已知限制：同一分组同一平台挂多个账号时，统计存储（userData/data-stats/<分组>/<平台>/）
+ * 本身按「分组/平台」合并（上游结构），跨平台关联也只能到这一粒度。
  */
 
 const { WORK_STAT_KEYS, normalizeMetric } = require("./statsTable");
@@ -13,121 +14,94 @@ const { WORK_STAT_KEYS, normalizeMetric } = require("./statsTable");
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const ZERO_WIDTH_RE = /[\u200B-\u200F\u2060\uFEFF\u00AD]/g;
 const FULLWIDTH_ASCII_RE = /[\uFF01-\uFF5E]/g;
+const TRACKING_PARAM_RE =
+  /^(?:utm_|share_|spm(?:$|_)|from$|modefrom$|vd_source$|fbclid$|gclid$|xsec_token$|xsec_source$)/i;
+const MIN_YEAR = 2000;
+const MAX_YEAR = 2100;
+const UTC8_MS = 8 * 3600e3;
 
 const CJK_PUNCT_MAP = {
-  "。": ".",
-  "、": ",",
-  "“": '"',
-  "”": '"',
-  "‘": "'",
-  "’": "'",
-  "【": "[",
-  "】": "]",
-  "「": "[",
-  "」": "]",
-  "『": "[",
-  "』": "]",
-  "〔": "[",
-  "〕": "]",
-  "《": "<",
-  "》": ">",
-  "〈": "<",
-  "〉": ">",
-  "—": "-",
-  "–": "-",
-  "―": "-",
-  "…": "...",
-  "〜": "~",
-  "·": ".",
-  "・": ".",
-  "｡": ".",
-  "､": ",",
-  "｟": "(",
-  "｠": ")",
+  "。": ".", "、": ",", "“": '"', "”": '"', "‘": "'", "’": "'",
+  "【": "[", "】": "]", "「": "[", "」": "]", "『": "[", "』": "]", "〔": "[", "〕": "]",
+  "《": "<", "》": ">", "〈": "<", "〉": ">", "｟": "(", "｠": ")",
+  "—": "-", "–": "-", "―": "-", "…": "...", "〜": "~", "·": ".", "・": ".", "｡": ".", "､": ",",
 };
 const CJK_PUNCT_RE = new RegExp(
-  `[${Object.keys(CJK_PUNCT_MAP)
-    .map((ch) => ch.replace(/[.*+?^${}()|[\]\\-]/g, "\\$&"))
-    .join("")}]`,
+  `[${Object.keys(CJK_PUNCT_MAP).map((c) => c.replace(/[.*+?^${}()|[\]\\-]/g, "\\$&")).join("")}]`,
   "g"
 );
 
 const STAT_TO_TOTAL_KEY = {
-  play: "totalPlay",
-  like: "totalLike",
-  comment: "totalComment",
-  share: "totalShare",
-  favorite: "totalFavorite",
-  fansDelta: "totalFansDelta",
+  play: "totalPlay", like: "totalLike", comment: "totalComment",
+  share: "totalShare", favorite: "totalFavorite", fansDelta: "totalFansDelta",
 };
 
-function hasOwn(obj, key) {
-  return Boolean(obj && Object.prototype.hasOwnProperty.call(obj, key));
+// 对齐 src/main/config/ptConfig.js（index / listIndex / upload），管理页兜底链接不参与直链匹配
+const MANAGEMENT_URL_KEYS = new Set([
+  "creator.douyin.com/creator-micro/home", "creator.douyin.com/creator-micro/content/manage", "creator.douyin.com/creator-micro/content/post/video",
+  "channels.weixin.qq.com/platform", "channels.weixin.qq.com/platform/post/list", "channels.weixin.qq.com/platform/post/create",
+  "member.bilibili.com/platform/home", "member.bilibili.com/platform/upload-manager/article", "member.bilibili.com/platform/upload/video/frame",
+  "baijiahao.baidu.com/builder/rc/home", "baijiahao.baidu.com/builder/rc/content", "baijiahao.baidu.com/builder/rc/edit",
+  "mp.toutiao.com/profile_v4/index", "mp.toutiao.com/profile_v4/manage/content/all", "mp.toutiao.com/profile_v4/xigua/upload-video",
+  "cp.kuaishou.com/profile", "cp.kuaishou.com/article/manage/video", "cp.kuaishou.com/article/publish/video",
+  "creator.xiaohongshu.com/new/home", "creator.xiaohongshu.com/new/note-manager", "creator.xiaohongshu.com/publish/publish",
+  "juejin.cn/login", "juejin.cn/creator/content/article/essays", "juejin.cn/editor/drafts/new",
+  "pugc.yueduwuxian.com/fqvideo/login", "pugc.yueduwuxian.com/fqvideo/home/video-list", "pugc.yueduwuxian.com/fqvideo/home/publish-video",
+]);
+
+const hasOwn = (obj, k) => Boolean(obj && Object.prototype.hasOwnProperty.call(obj, k));
+const isPlainObject = (v) => Boolean(v && typeof v === "object" && !Array.isArray(v));
+const pushToMap = (map, k, v) => {
+  const arr = map.get(k);
+  if (arr) arr.push(v);
+  else map.set(k, [v]);
+};
+
+function isValidDateStr(s) {
+  if (typeof s !== "string" || !DATE_RE.test(s)) return false;
+  const ms = Date.parse(`${s}T00:00:00Z`);
+  if (!Number.isFinite(ms)) return false;
+  const d = new Date(ms);
+  const y = d.getUTCFullYear();
+  return y >= MIN_YEAR && y <= MAX_YEAR && d.toISOString().slice(0, 10) === s;
 }
 
-function isPlainObject(v) {
-  return Boolean(v && typeof v === "object" && !Array.isArray(v));
-}
-
-/** 解析 YYYY-MM-DD 为 UTC 零点毫秒时间戳，非法日期返回 null */
-function parseDateDayMs(dateStr) {
-  if (typeof dateStr !== "string" || !DATE_RE.test(dateStr)) return null;
-  const ms = Date.parse(`${dateStr}T00:00:00Z`);
-  if (!Number.isFinite(ms)) return null;
-  if (new Date(ms).toISOString().slice(0, 10) !== dateStr) return null;
-  return ms;
-}
-
-/** 将 YYYY-MM-DD 转为该 UTC+8 日历日正午（12:00+08:00 = 04:00Z），用于距离比较 */
-function parseDateMidUtc8Ms(dateStr) {
-  const dayMs = parseDateDayMs(dateStr);
-  return dayMs === null ? null : dayMs + 4 * 3600e3;
-}
-
-/** 将毫秒时间戳 / ISO 字符串 / Date 规范化为正毫秒时间戳，无效返回 null */
-function parsePublishTimeMs(raw) {
+/** 校验时间戳为合法 Date 且年份（含 UTC+8 偏移）在 2000–2100 内，否则返回 null，不抛错 */
+function parseValidTimestampMs(raw) {
   if (raw == null || raw === "") return null;
   let ms = NaN;
-  if (typeof raw === "number") {
-    ms = raw;
-  } else if (raw instanceof Date) {
-    ms = raw.getTime();
-  } else if (typeof raw === "string") {
+  if (typeof raw === "number") ms = raw;
+  else if (raw instanceof Date) ms = raw.getTime();
+  else if (typeof raw === "string") {
     const s = raw.trim();
     if (!s) return null;
     ms = /^\d+$/.test(s) ? Number(s) : Date.parse(s);
   }
-  if (!Number.isFinite(ms) || ms <= 0) return null;
-  return ms;
+  if (!Number.isFinite(ms)) return null;
+  const d = new Date(ms);
+  const t = d.getTime();
+  if (!Number.isFinite(t)) return null;
+  const shifted = new Date(t + UTC8_MS);
+  if (!Number.isFinite(shifted.getTime())) return null;
+  const y = d.getUTCFullYear();
+  const sy = shifted.getUTCFullYear();
+  return y >= MIN_YEAR && y <= MAX_YEAR && sy >= MIN_YEAR && sy <= MAX_YEAR ? t : null;
 }
 
-/** 毫秒时间戳转 UTC+8 日期串 YYYY-MM-DD */
-function toUtc8DateStr(ms) {
-  if (typeof ms !== "number" || !Number.isFinite(ms) || ms <= 0) return "";
-  return new Date(ms + 8 * 3600e3).toISOString().slice(0, 10);
+function toUtc8DateStr(raw) {
+  const ms = parseValidTimestampMs(raw);
+  return ms === null ? "" : new Date(ms + UTC8_MS).toISOString().slice(0, 10);
 }
 
-/**
- * 标题归一化（仅用于匹配，不用于展示）：
- * 去零宽字符、全角/中文标点归一、连续空白归一与首尾去空、去除末尾话题标签（#xxx / #xxx#）。
- *
- * @param {string} s
- * @returns {string}
- */
+/** 标题归一化（仅用于匹配）：去零宽字符、全角/中文标点归一、空白归一、去末尾话题标签 */
 function normalizeTitle(s) {
   if (s == null) return "";
-  let out = String(s);
-  // 1. 去零宽字符与 BOM
-  out = out.replace(ZERO_WIDTH_RE, "");
-  // 2. 全角 ASCII（含全角标点与全角 ＃）→ 半角
-  out = out.replace(FULLWIDTH_ASCII_RE, (ch) =>
-    String.fromCharCode(ch.charCodeAt(0) - 0xfee0)
-  );
-  // 3. 常见中文/全角标点 → 半角等价标点
-  out = out.replace(CJK_PUNCT_RE, (ch) => CJK_PUNCT_MAP[ch] || ch);
-  // 4. 连续空白（含 \u3000 全角空格、换行、制表）归一为单个半角空格并去首尾空白
-  out = out.replace(/\s+/g, " ").trim();
-  // 5. 逐个剥离末尾话题标签（#话题 / #话题# / #话题[话题]#），保留 "学习 C#" 等非标签写法
+  let out = String(s)
+    .replace(ZERO_WIDTH_RE, "")
+    .replace(FULLWIDTH_ASCII_RE, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0))
+    .replace(CJK_PUNCT_RE, (ch) => CJK_PUNCT_MAP[ch] || ch)
+    .replace(/\s+/g, " ")
+    .trim();
   while (out) {
     const next = out.replace(/\s*#[^\s#]+#?$/, "").trim();
     if (next === out) break;
@@ -136,148 +110,130 @@ function normalizeTitle(s) {
   return out;
 }
 
-/**
- * 作品链接归一化（仅用于匹配）：去 ?query、#hash 与末尾斜杠；http(s) 协议与主机名转小写，路径保留大小写。
- *
- * @param {string} raw
- * @returns {string}
- */
+function parseHttpUrl(raw) {
+  if (raw == null) return null;
+  const trimmed = String(raw).trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = new URL(trimmed);
+    return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/** URL 归一化：保留 path 与非追踪 query，去除 fragment、尾斜杠与常见追踪参数 */
 function normalizeUrl(raw) {
   if (raw == null) return "";
   const trimmed = String(raw).trim();
   if (!trimmed) return "";
-  try {
-    const parsed = new URL(trimmed);
-    if (parsed.protocol === "http:" || parsed.protocol === "https:") {
-      const pathname = parsed.pathname.replace(/\/+$/, "");
-      return `${parsed.origin}${pathname}`;
-    }
-  } catch (_) {
-    /* 非完整 URL 时走字符串回退 */
+  const parsed = parseHttpUrl(trimmed);
+  if (parsed) {
+    const pathname = parsed.pathname.replace(/\/+$/, "");
+    const kept = [...parsed.searchParams.entries()]
+      .filter(([k]) => !TRACKING_PARAM_RE.test(k))
+      .sort((a, b) =>
+        a[0] !== b[0] ? (a[0] < b[0] ? -1 : 1) : a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0
+      );
+    const qs = kept.length ? `?${new URLSearchParams(kept).toString()}` : "";
+    return `${parsed.origin}${pathname}${qs}`;
   }
-  return trimmed.split(/[?#]/)[0].replace(/\/+$/, "");
+  const noHash = trimmed.split("#")[0];
+  const qIdx = noHash.indexOf("?");
+  return qIdx === -1
+    ? noHash.replace(/\/+$/, "")
+    : `${noHash.slice(0, qIdx).replace(/\/+$/, "")}${noHash.slice(qIdx)}`;
 }
 
-/** 构造 linkWorks 的键：`group|platform|workId` */
-function makeWorkKey(group, platform, workId) {
-  const g = group == null ? "" : String(group);
-  const p = platform == null ? "" : String(platform);
-  const id = workId == null ? "" : String(workId);
-  return `${g}|${p}|${id}`;
+function isManagementUrl(raw) {
+  const parsed = parseHttpUrl(raw);
+  return Boolean(
+    parsed && MANAGEMENT_URL_KEYS.has(`${parsed.host.toLowerCase()}${parsed.pathname.replace(/\/+$/, "")}`)
+  );
 }
 
-/** 同时兼容 Windows（\）、POSIX（/）与远程 URL，取文件 basename */
-function extractFileBasename(raw) {
-  if (raw == null) return "";
-  let s = String(raw).trim();
+function normalizeDirectUrl(raw) {
+  return parseHttpUrl(raw) && !isManagementUrl(raw) ? normalizeUrl(raw) : "";
+}
+
+/** 规范化完整本地路径（Win 盘符 / UNC / POSIX 绝对路径），非完整路径返回 "" */
+function normalizeFullPath(raw) {
+  if (typeof raw !== "string") return "";
+  let s = raw.trim().replace(/\\/g, "/");
   if (!s) return "";
-  if (/^https?:\/\//i.test(s)) {
-    s = s.split(/[?#]/)[0];
-  }
-  s = s.replace(/[\\/]+$/, "");
-  if (!s) return "";
-  const parts = s.split(/[\\/]/);
-  return parts[parts.length - 1].trim();
-}
-
-/** 去最后一个扩展名（保留前导点如 .hidden） */
-function stripExtension(basename) {
-  if (!basename) return "";
-  const dotIdx = basename.lastIndexOf(".");
-  if (dotIdx <= 0) return basename;
-  return basename.slice(0, dotIdx);
-}
-
-/**
- * 从 pushData 记录提取分组名：与 src/shared/accountIdentity.js 的 recordGroupOf 一致，
- * 优先 rec.group，缺失时回退 rec.phone 的 "-" 前缀。
- */
-function extractRecordGroup(rec) {
-  if (!isPlainObject(rec)) return "";
-  const group = String(rec.group || "").trim();
-  if (group) return group;
-  return String(rec.phone || "").split("-")[0].trim();
-}
-
-/** 从 pushData 记录提取展示标题（title / bt / data.bt1 / textOtherName / bookName） */
-function extractRecordTitle(rec) {
-  if (!isPlainObject(rec)) return "";
-  const data = isPlainObject(rec.data) ? rec.data : null;
-  const candidates = [
-    rec.title,
-    rec.bt,
-    data ? data.title : "",
-    data ? data.bt1 : "",
-    rec.textOtherName,
-    rec.bookName,
-  ];
-  for (const c of candidates) {
-    const s = c == null ? "" : String(c).trim();
-    if (s) return s;
+  const isUnc = s.startsWith("//");
+  s = isUnc ? `//${s.slice(2).replace(/\/+/g, "/")}` : s.replace(/\/+/g, "/");
+  if (s.endsWith("/")) return "";
+  if (/^[a-zA-Z]:\/.+/.test(s) || (!isUnc && /^\/.+/.test(s)) || (isUnc && /^\/\/[^/]+\/[^/]+\/.+/.test(s))) {
+    return s;
   }
   return "";
 }
 
-/** 从 pushData 记录提取 YYYY-MM-DD 日期 */
-function extractRecordDate(rec) {
-  if (!isPlainObject(rec)) return "";
-  for (const field of [rec.date, rec.publishDate, rec.firstPublishDate]) {
-    if (typeof field === "string") {
-      const s = field.trim().slice(0, 10);
-      if (parseDateDayMs(s) !== null) return s;
-    }
+function makeWorkKey(group, platform, workId) {
+  return `${group == null ? "" : String(group)}|${platform == null ? "" : String(platform)}|${workId == null ? "" : String(workId)}`;
+}
+
+function extractRecordDate(rec, status) {
+  if (rec.scheduledTask === true && status === "success") {
+    const doneDate = toUtc8DateStr(rec.lastPublishAt);
+    if (doneDate) return doneDate;
   }
-  const ts = parsePublishTimeMs(rec.lastPublishAt || rec.createTime);
-  return ts !== null ? toUtc8DateStr(ts) : "";
+  if (typeof rec.date === "string") {
+    const s = rec.date.trim();
+    if (isValidDateStr(s)) return s;
+  }
+  return toUtc8DateStr(rec.lastPublishAt) || toUtc8DateStr(rec.createTime);
+}
+
+function collectMatchTitles(values) {
+  const out = [];
+  for (const item of values) {
+    const norm = normalizeTitle(item);
+    if (norm && !out.includes(norm)) out.push(norm);
+  }
+  return out;
 }
 
 /**
- * 将 pushData 各平台记录归并为内容索引。
- *
- * - 只看视频类记录（textType !== "article"）
- * - 按视频文件 basename（去扩展名、小写）分组；无文件名时退回 normalizeTitle(title)
- *
- * @param {Array<object>} pushRecords
- * @returns {Array<{
- *   contentKey: string,
- *   displayTitle: string,
- *   file: string,
- *   firstPublishDate: string,
- *   targets: Array<{ group: string, platform: string, title: string, videoLink: string }>
- * }>}
+ * 构建内容索引：
+ * - 排除图文与未确认发布记录（仅保留 publishStatus === "success" 或有效非管理页直链）
+ * - 仅按完整路径归桶（小写、/ 分隔）；无完整路径各自独立为 `record:<日期>:<id或序号>`
+ * - 每条平台记录独立成 target，不再按文件+平台折叠
  */
 function buildContentIndex(pushRecords) {
   if (!Array.isArray(pushRecords)) return [];
-
   const buckets = new Map();
 
-  for (const rec of pushRecords) {
+  for (let idx = 0; idx < pushRecords.length; idx++) {
+    const rec = pushRecords[idx];
     if (!isPlainObject(rec)) continue;
-    if (String(rec.textType || "").trim().toLowerCase() === "article") {
-      continue;
-    }
+    if (String(rec.textType || "").trim().toLowerCase() === "article") continue;
 
-    const platform = String(rec.pt || rec.platform || "").trim();
-    const group = extractRecordGroup(rec);
-    const title = extractRecordTitle(rec);
-    const normTitle = normalizeTitle(title);
-    const fileBasename =
-      extractFileBasename(rec.selectedFile) ||
-      extractFileBasename(rec.filePath) ||
-      extractFileBasename(rec.file);
-    const fileStem = stripExtension(fileBasename);
-    const fileStemLower = fileStem.toLowerCase();
-    const videoLink = String(rec.videoLink || "").trim();
-    const normLink = normalizeUrl(videoLink);
-    const date = extractRecordDate(rec);
+    const status = String(rec.publishStatus || "").trim().toLowerCase();
+    const rawVideoLink = String(rec.videoLink || "").trim();
+    const validLink = normalizeDirectUrl(rawVideoLink);
+    if (status !== "success" && !validLink) continue;
 
-    let contentKey = "";
-    if (fileStemLower) {
-      contentKey = `file:${fileStemLower}`;
-    } else if (normTitle) {
-      contentKey = `title:${normTitle}`;
+    const platform = String(rec.pt || "").trim();
+    const group = String(rec.group || "").trim() || String(rec.phone || "").split("-")[0].trim();
+    const recordDate = extractRecordDate(rec, status);
+    // 真实 pushData 完整路径在 filePath（LocalVideoPublish.vue:2095），兼容完整路径写入 selectedFile
+    const fullPath = normalizeFullPath(rec.filePath) || normalizeFullPath(rec.selectedFile);
+    const title = [rec.title, rec.bt, rec.textOtherName, rec.bookName]
+      .map((v) => (v == null ? "" : String(v).trim()))
+      .find(Boolean) || "";
+    const matchRaw = platform === "视频号"
+      ? [rec.title, rec.bt, rec.textOtherName, rec.shortTitle, rec.bt2Filled]
+      : [rec.title, rec.bt, rec.textOtherName];
+
+    let contentKey;
+    if (fullPath) {
+      contentKey = `file:${fullPath.toLowerCase()}`;
     } else {
-      continue;
+      const idPart = rec.id != null && String(rec.id).trim() ? String(rec.id).trim() : String(idx);
+      const baseKey = `record:${recordDate || "unknown"}:${idPart}`;
+      contentKey = buckets.has(baseKey) ? `${baseKey}:${idx}` : baseKey;
     }
 
     let bucket = buckets.get(contentKey);
@@ -286,584 +242,343 @@ function buildContentIndex(pushRecords) {
         contentKey,
         displayTitle: "",
         displayTitleDate: "",
-        file: "",
-        fileDate: "",
-        fallbackTitle: fileStem || title,
+        file: fullPath || String(rec.selectedFile || "").trim(),
+        fileDate: recordDate,
         firstPublishDate: "",
         targets: [],
       };
       buckets.set(contentKey, bucket);
     }
 
-    if (fileBasename) {
-      if (
-        !bucket.file ||
-        (date && (!bucket.fileDate || date < bucket.fileDate))
-      ) {
-        bucket.file = fileBasename;
-        bucket.fileDate = date;
-      }
+    if (fullPath && recordDate && (!bucket.fileDate || recordDate < bucket.fileDate)) {
+      bucket.file = fullPath;
+      bucket.fileDate = recordDate;
+    }
+    if (recordDate && (!bucket.firstPublishDate || recordDate < bucket.firstPublishDate)) {
+      bucket.firstPublishDate = recordDate;
+    }
+    if (title && (!bucket.displayTitle || (recordDate && (!bucket.displayTitleDate || recordDate < bucket.displayTitleDate)))) {
+      bucket.displayTitle = title;
+      bucket.displayTitleDate = recordDate;
     }
 
-    if (date && (!bucket.firstPublishDate || date < bucket.firstPublishDate)) {
-      bucket.firstPublishDate = date;
-    }
-
-    if (title) {
-      if (
-        !bucket.displayTitle ||
-        (date && (!bucket.displayTitleDate || date < bucket.displayTitleDate))
-      ) {
-        bucket.displayTitle = title;
-        bucket.displayTitleDate = date;
-      }
-    }
-
-    // 同一 content 下若重复登记同一 (group, platform)：
-    // - 归一化 videoLink 相同（同一作品链接），或
-    // - 归一化标题相同且链接不冲突（如重发/后补 videoLink），
-    // 合并为同一 target，避免造出冗余占位。
-    const existingTarget = bucket.targets.find((t) => {
-      if (t.group !== group || t.platform !== platform) return false;
-      if (t._normLink && normLink && t._normLink === normLink) return true;
-      if (t._normTitle !== normTitle) return false;
-      if (t._normLink && normLink && t._normLink !== normLink) return false;
-      return true;
+    bucket.targets.push({
+      contentKey,
+      group,
+      platform,
+      recordDate,
+      status,
+      videoLink: validLink ? rawVideoLink : "",
+      matchTitles: collectMatchTitles(matchRaw),
     });
-
-    if (existingTarget) {
-      if (!existingTarget.videoLink && videoLink) {
-        existingTarget.videoLink = videoLink;
-        existingTarget._normLink = normLink;
-      }
-      if (!existingTarget.title && title) {
-        existingTarget.title = title;
-      }
-    } else {
-      bucket.targets.push({
-        group,
-        platform,
-        title,
-        videoLink,
-        _normTitle: normTitle,
-        _normLink: normLink,
-      });
-    }
   }
 
-  const contents = [];
-  for (const b of buckets.values()) {
-    contents.push({
+  return [...buckets.values()]
+    .map((b) => ({
       contentKey: b.contentKey,
-      displayTitle: b.displayTitle || b.fallbackTitle || "(无标题)",
+      displayTitle: b.displayTitle || (b.file ? b.file.split("/").pop() : "") || "(无标题)",
       file: b.file,
       firstPublishDate: b.firstPublishDate,
-      targets: b.targets.map((t) => ({
-        group: t.group,
-        platform: t.platform,
-        title: t.title,
-        videoLink: t.videoLink,
-      })),
+      targets: b.targets,
+    }))
+    .sort((a, b) => {
+      if (a.firstPublishDate !== b.firstPublishDate) {
+        if (!a.firstPublishDate) return 1;
+        if (!b.firstPublishDate) return -1;
+        return a.firstPublishDate < b.firstPublishDate ? -1 : 1;
+      }
+      return a.contentKey < b.contentKey ? -1 : a.contentKey > b.contentKey ? 1 : 0;
     });
-  }
-
-  contents.sort((a, b) => {
-    if (a.firstPublishDate !== b.firstPublishDate) {
-      if (!a.firstPublishDate) return 1;
-      if (!b.firstPublishDate) return -1;
-      return a.firstPublishDate < b.firstPublishDate ? -1 : 1;
-    }
-    return a.contentKey < b.contentKey ? -1 : a.contentKey > b.contentKey ? 1 : 0;
-  });
-
-  return contents;
 }
 
 /**
- * 将各账号采集到的作品关联到内容索引。
- *
- * 匹配优先级：
- *   1. work.url 与 target.videoLink 归一化后相等（matchedBy: "link"）
- *   2. 同 group + platform 的 target 中 normalizeTitle 相等（matchedBy: "title"）
- *   3. 跨所有 target normalizeTitle 相等且目标唯一（matchedBy: "title-global"）
- *   4. 否则 contentKey = null, matchedBy = null
- *
- * 同一 target 最多被一个 work 占用；竞争时按 |work.publishTime - content.firstPublishDate| 最小者先得。
- *
- * @param {object} params
- * @param {Array<object>} [params.contents]
- * @param {Array<{ group: string, platform: string, works: Array<object> }>} [params.accounts]
- * @returns {Map<string, { contentKey: string | null, matchedBy: "link" | "title" | "title-global" | null }>}
+ * 在同 group + platform 内关联作品与 target，返回 Map<`group|platform|workId`, { contentKey, matchedBy }>。
+ * ① 有效直链 1:1 唯一匹配（多对一/一对多全部留空且禁止标题兜底）；
+ * ② 标题命中且同 group+platform 内唯一 work、唯一未被①占用的 target，且 target 无冲突直链。
  */
 function linkWorks({ contents, accounts } = {}) {
   const result = new Map();
   if (!Array.isArray(accounts)) return result;
 
-  // 1. 展开所有 target 并建立检索索引
-  const targets = [];
-  const targetsByUrl = new Map();
-  const targetsByGpTitle = new Map();
-  const targetsByTitle = new Map();
-
-  if (Array.isArray(contents)) {
-    for (const content of contents) {
-      if (!isPlainObject(content) || !content.contentKey) continue;
-      const contentKey = String(content.contentKey);
-      const firstPublishDate =
-        typeof content.firstPublishDate === "string"
-          ? content.firstPublishDate.trim()
-          : "";
-      const firstPublishMidMs = parseDateMidUtc8Ms(firstPublishDate);
-      const rawTargets = Array.isArray(content.targets) ? content.targets : [];
-
-      for (const t of rawTargets) {
-        if (!isPlainObject(t)) continue;
-        const group = t.group == null ? "" : String(t.group).trim();
-        const platform = t.platform == null ? "" : String(t.platform).trim();
-        const title = t.title == null ? "" : String(t.title);
-        const normTitle = normalizeTitle(title);
-        const normUrl = normalizeUrl(t.videoLink);
-
-        const entry = {
-          targetIdx: targets.length,
-          contentKey,
-          firstPublishDate,
-          firstPublishMidMs,
-          group,
-          platform,
-          title,
-          normTitle,
-          normUrl,
-        };
-        targets.push(entry);
-
-        if (normUrl) {
-          if (!targetsByUrl.has(normUrl)) targetsByUrl.set(normUrl, []);
-          targetsByUrl.get(normUrl).push(entry);
-        }
-        if (normTitle) {
-          const gpKey = `${group}|${platform}|${normTitle}`;
-          if (!targetsByGpTitle.has(gpKey)) targetsByGpTitle.set(gpKey, []);
-          targetsByGpTitle.get(gpKey).push(entry);
-
-          if (!targetsByTitle.has(normTitle)) targetsByTitle.set(normTitle, []);
-          targetsByTitle.get(normTitle).push(entry);
-        }
-      }
+  const targetsByGp = new Map();
+  let targetSeq = 0;
+  for (const c of Array.isArray(contents) ? contents : []) {
+    if (!isPlainObject(c) || !c.contentKey) continue;
+    const contentKey = String(c.contentKey);
+    for (const t of Array.isArray(c.targets) ? c.targets : []) {
+      if (!isPlainObject(t)) continue;
+      const gpKey = `${t.group == null ? "" : String(t.group).trim()}|${t.platform == null ? "" : String(t.platform).trim()}`;
+      pushToMap(targetsByGp, gpKey, {
+        idx: targetSeq++,
+        contentKey,
+        normUrl: normalizeDirectUrl(t.videoLink),
+        matchTitles: collectMatchTitles(Array.isArray(t.matchTitles) ? t.matchTitles : [t.title]),
+      });
     }
   }
 
-  // 2. 展开所有 work 并初始化结果 Map
-  const works = [];
+  const worksByGp = new Map();
+  let workSeq = 0;
   for (const acc of accounts) {
     if (!isPlainObject(acc)) continue;
-    const group = acc.group == null ? "" : String(acc.group);
-    const platform = acc.platform == null ? "" : String(acc.platform);
-    const accWorks = Array.isArray(acc.works) ? acc.works : [];
-
-    for (const w of accWorks) {
+    const rawGroup = acc.group == null ? "" : String(acc.group);
+    const rawPlatform = acc.platform == null ? "" : String(acc.platform);
+    const gpKey = `${rawGroup.trim()}|${rawPlatform.trim()}`;
+    for (const w of Array.isArray(acc.works) ? acc.works : []) {
       if (!isPlainObject(w) || w.workId == null || w.workId === "") continue;
-      const workId = String(w.workId);
-      const workKey = makeWorkKey(group, platform, workId);
+      const workKey = makeWorkKey(rawGroup, rawPlatform, String(w.workId));
       if (result.has(workKey)) continue;
-
       result.set(workKey, { contentKey: null, matchedBy: null });
-      works.push({
-        workIdx: works.length,
-        group,
-        platform,
-        workId,
+      pushToMap(worksByGp, gpKey, {
+        idx: workSeq++,
         workKey,
         normTitle: normalizeTitle(w.title),
-        normUrl: normalizeUrl(w.url),
-        publishTimeMs: parsePublishTimeMs(w.publishTime),
+        normUrl: normalizeDirectUrl(w.url),
       });
     }
   }
 
-  const matchedWorks = new Set();
-  const occupiedTargets = new Set();
+  for (const [gpKey, gpWorks] of worksByGp.entries()) {
+    const gpTargets = targetsByGp.get(gpKey);
+    if (!gpTargets || !gpTargets.length) continue;
 
-  function distanceMs(work, target) {
-    if (work.publishTimeMs !== null && target.firstPublishMidMs !== null) {
-      return Math.abs(work.publishTimeMs - target.firstPublishMidMs);
-    }
-    return Infinity;
-  }
+    const matchedWorks = new Set();
+    const occupiedTargets = new Set();
+    const blockedWorks = new Set();
+    const blockedTargets = new Set();
 
-  function applyPass(candidates, matchedBy) {
-    if (!candidates.length) return;
-    candidates.sort((a, b) => {
-      if (a.preference !== b.preference) return a.preference - b.preference;
-      if (a.distance !== b.distance) return a.distance - b.distance;
-      if (a.work.workIdx !== b.work.workIdx) return a.work.workIdx - b.work.workIdx;
-      return a.target.targetIdx - b.target.targetIdx;
-    });
-    for (const c of candidates) {
-      if (matchedWorks.has(c.work.workIdx) || occupiedTargets.has(c.target.targetIdx)) {
-        continue;
-      }
-      matchedWorks.add(c.work.workIdx);
-      occupiedTargets.add(c.target.targetIdx);
-      result.set(c.work.workKey, {
-        contentKey: c.target.contentKey,
-        matchedBy,
-      });
-    }
-  }
+    // ① 有效直链严格 1:1 匹配
+    const targetsByUrl = new Map();
+    const worksByUrl = new Map();
+    for (const t of gpTargets) if (t.normUrl) pushToMap(targetsByUrl, t.normUrl, t);
+    for (const w of gpWorks) if (w.normUrl) pushToMap(worksByUrl, w.normUrl, w);
 
-  // Pass 1：链接匹配（① work.url === target.videoLink，去 query/尾斜杠）
-  const pass1 = [];
-  for (const w of works) {
-    if (!w.normUrl) continue;
-    const hits = targetsByUrl.get(w.normUrl);
-    if (!hits || !hits.length) continue;
-    for (const t of hits) {
-      const sameGp = t.group === w.group && t.platform === w.platform;
-      const samePlatform = t.platform === w.platform;
-      pass1.push({
-        work: w,
-        target: t,
-        preference: sameGp ? 0 : samePlatform ? 1 : 2,
-        distance: distanceMs(w, t),
-      });
-    }
-  }
-  applyPass(pass1, "link");
-
-  // Pass 2：同 group + platform 标题匹配（②）
-  const pass2 = [];
-  for (const w of works) {
-    if (matchedWorks.has(w.workIdx) || !w.normTitle) continue;
-    const gpKey = `${w.group}|${w.platform}|${w.normTitle}`;
-    const hits = targetsByGpTitle.get(gpKey);
-    if (!hits || !hits.length) continue;
-    for (const t of hits) {
-      if (occupiedTargets.has(t.targetIdx)) continue;
-      pass2.push({
-        work: w,
-        target: t,
-        preference: 0,
-        distance: distanceMs(w, t),
-      });
-    }
-  }
-  applyPass(pass2, "title");
-
-  // Pass 3：跨所有 target 标题相等且唯一（③）
-  // 唯一性基于全量 targets 判定（避免已占用 target 掩盖多内容歧义）：
-  // - 全部匹配 target 必须同属 1 个 contentKey；
-  // - 若全量仅 1 个 target，直接作为候选；
-  // - 若该 content 下有多个不同平台 target（如分组改名场景），仅当同平台 target 唯一时作为候选，
-  //   杜绝同账号第二条同名视频跨平台抢占其他平台的 target。
-  const pass3 = [];
-  for (const w of works) {
-    if (matchedWorks.has(w.workIdx) || !w.normTitle) continue;
-    const allHits = targetsByTitle.get(w.normTitle);
-    if (!allHits || !allHits.length) continue;
-
-    const firstContentKey = allHits[0].contentKey;
-    let singleContent = true;
-    for (let i = 1; i < allHits.length; i++) {
-      if (allHits[i].contentKey !== firstContentKey) {
-        singleContent = false;
-        break;
-      }
-    }
-    if (!singleContent) continue;
-
-    let candidateTarget = null;
-    if (allHits.length === 1) {
-      candidateTarget = allHits[0];
-    } else {
-      const samePlat = allHits.filter((t) => t.platform === w.platform);
-      if (samePlat.length === 1) {
-        candidateTarget = samePlat[0];
+    for (const [url, urlWorks] of worksByUrl.entries()) {
+      const urlTargets = targetsByUrl.get(url);
+      if (!urlTargets) continue;
+      if (urlWorks.length === 1 && urlTargets.length === 1) {
+        matchedWorks.add(urlWorks[0].idx);
+        occupiedTargets.add(urlTargets[0].idx);
+        result.set(urlWorks[0].workKey, { contentKey: urlTargets[0].contentKey, matchedBy: "link" });
+      } else {
+        for (const w of urlWorks) blockedWorks.add(w.idx);
+        for (const t of urlTargets) blockedTargets.add(t.idx);
       }
     }
 
-    if (candidateTarget && !occupiedTargets.has(candidateTarget.targetIdx)) {
-      pass3.push({
-        work: w,
-        target: candidateTarget,
-        preference: 0,
-        distance: distanceMs(w, candidateTarget),
-      });
+    // ② 同 group+platform 唯一标题匹配
+    const worksByTitle = new Map();
+    const freeTargetsByTitle = new Map();
+    for (const w of gpWorks) if (w.normTitle) pushToMap(worksByTitle, w.normTitle, w);
+    for (const t of gpTargets) {
+      if (occupiedTargets.has(t.idx)) continue;
+      for (const mt of t.matchTitles) pushToMap(freeTargetsByTitle, mt, t);
+    }
+
+    const candidatesByTarget = new Map();
+    for (const w of gpWorks) {
+      if (matchedWorks.has(w.idx) || blockedWorks.has(w.idx) || !w.normTitle) continue;
+      if (worksByTitle.get(w.normTitle).length !== 1) continue;
+      const titleTargets = freeTargetsByTitle.get(w.normTitle);
+      if (!titleTargets || titleTargets.length !== 1) continue;
+      const t = titleTargets[0];
+      if (blockedTargets.has(t.idx) || (t.normUrl && t.normUrl !== w.normUrl)) continue;
+      pushToMap(candidatesByTarget, t.idx, { work: w, target: t });
+    }
+
+    for (const pairs of candidatesByTarget.values()) {
+      if (pairs.length === 1) {
+        result.set(pairs[0].work.workKey, { contentKey: pairs[0].target.contentKey, matchedBy: "title" });
+      }
     }
   }
-  applyPass(pass3, "title-global");
 
   return result;
 }
 
-/** 按账号查找 worksDaily：支持 Map 或对象（"group|platform"、嵌套 [group][platform]、"platform|group" 或 account.worksDaily） */
-function getAccountWorksDaily(worksDaily, group, platform, account) {
-  const g = group == null ? "" : String(group);
-  const p = platform == null ? "" : String(platform);
-  const keyGP = `${g}|${p}`;
-  const keyPG = `${p}|${g}`;
-
-  if (worksDaily instanceof Map) {
-    if (worksDaily.has(keyGP)) return worksDaily.get(keyGP);
-    if (worksDaily.has(keyPG)) return worksDaily.get(keyPG);
-  } else if (isPlainObject(worksDaily)) {
-    if (hasOwn(worksDaily, keyGP)) return worksDaily[keyGP];
-    if (hasOwn(worksDaily, g) && isPlainObject(worksDaily[g]) && hasOwn(worksDaily[g], p)) {
-      return worksDaily[g][p];
-    }
-    if (hasOwn(worksDaily, keyPG)) return worksDaily[keyPG];
-  }
-
-  if (account && isPlainObject(account.worksDaily)) {
-    return account.worksDaily;
-  }
-  return null;
-}
-
-/**
- * 读取某作品截至 cutoffDate（可省，默认最新）的累计指标。
- * 返回 `{ found, metrics }`；当指定 cutoffDate 且作品仅在更晚日期有快照时返回 `{ found: false }`。
- */
-function resolveWorkMetricsAsOf(work, accWorksDaily, cutoffDate) {
-  const workId = String(work.workId);
-  const hasAccDaily = isPlainObject(accWorksDaily);
-  const dateMap =
-    hasAccDaily && hasOwn(accWorksDaily, workId) && isPlainObject(accWorksDaily[workId])
-      ? accWorksDaily[workId]
-      : null;
-
-  if (dateMap) {
-    let hasAnyValidDate = false;
-    let bestDate = "";
-    let bestSnap = null;
-    for (const [d, snap] of Object.entries(dateMap)) {
-      if (!isPlainObject(snap)) continue;
-      if (parseDateDayMs(d) === null) continue;
-      hasAnyValidDate = true;
-      if (cutoffDate && d > cutoffDate) continue;
-      if (!bestDate || d > bestDate) {
-        bestDate = d;
-        bestSnap = snap;
-      }
-    }
-    if (bestSnap) {
-      const metrics = {};
-      for (const k of WORK_STAT_KEYS) {
-        metrics[k] = hasOwn(bestSnap, k) ? normalizeMetric(bestSnap[k]) : null;
-      }
-      return { found: true, metrics };
-    }
-    if (hasAnyValidDate) {
-      return { found: false, metrics: null };
-    }
-  }
-
-  // 若传入了该账号的 worksDaily 且指定了截止日期，但该作品无任何日快照，避免泄漏未来累计值
-  if (cutoffDate) {
-    if (hasAccDaily) {
-      return { found: false, metrics: null };
-    }
-    const pubMs = parsePublishTimeMs(work.publishTime);
-    if (pubMs !== null && toUtc8DateStr(pubMs) > cutoffDate) {
-      return { found: false, metrics: null };
-    }
-  }
-
-  const metrics = {};
-  for (const k of WORK_STAT_KEYS) {
-    metrics[k] = hasOwn(work, k) ? normalizeMetric(work[k]) : null;
-  }
-  return { found: true, metrics };
-}
-
-function lookupLinkEntry(link, workKey) {
-  if (link instanceof Map) return link.get(workKey) || null;
-  if (isPlainObject(link) && hasOwn(link, workKey)) return link[workKey] || null;
-  return null;
-}
-
-function sumNullable(values) {
-  let hasNumber = false;
-  let sum = 0;
-  for (const v of values) {
-    if (v === null || v === undefined) continue;
-    hasNumber = true;
-    sum += v;
-  }
-  if (!hasNumber) return null;
-  return sum === 0 ? 0 : sum;
-}
-
 function mergeMetricValue(prev, next) {
-  if (prev === null || prev === undefined) return next == null ? null : next;
-  if (next === null || next === undefined) return prev;
+  if (prev == null) return next == null ? null : next;
+  if (next == null) return prev;
   const total = prev + next;
   return total === 0 ? 0 : total;
 }
 
+/** 仅从 worksDaily 中取 ≤ cutoffDate 的最近有效快照，不回退 works.json */
+function resolveWorkMetricsAsOf(workId, accWorksDaily, cutoffDate) {
+  if (!isPlainObject(accWorksDaily) || !hasOwn(accWorksDaily, workId)) return null;
+  const dateMap = accWorksDaily[workId];
+  if (!isPlainObject(dateMap)) return null;
+
+  let bestDate = "";
+  let bestSnap = null;
+  for (const [d, snap] of Object.entries(dateMap)) {
+    if (!isPlainObject(snap) || !isValidDateStr(d)) continue;
+    if (cutoffDate && d > cutoffDate) continue;
+    if (!bestDate || d > bestDate) {
+      bestDate = d;
+      bestSnap = snap;
+    }
+  }
+  if (!bestSnap) return null;
+
+  const metrics = {};
+  for (const k of WORK_STAT_KEYS) {
+    metrics[k] = hasOwn(bestSnap, k) ? normalizeMetric(bestSnap[k]) : null;
+  }
+  return metrics;
+}
+
+function addWorkToBucket(bucket, platform, group, workId, rawUrl, metrics) {
+  const workUrl = rawUrl ? String(rawUrl).trim() : "";
+  const pgKey = `${platform}|${group}`;
+  if (platform) bucket.platforms.add(platform);
+
+  if (!hasOwn(bucket.perPlatform, pgKey)) {
+    bucket.perPlatform[pgKey] = {
+      ...metrics,
+      urls: workUrl ? [workUrl] : [],
+      workIds: [workId],
+    };
+  } else {
+    const cell = bucket.perPlatform[pgKey];
+    for (const k of WORK_STAT_KEYS) cell[k] = mergeMetricValue(cell[k], metrics[k]);
+    if (workUrl && !cell.urls.includes(workUrl)) cell.urls.push(workUrl);
+    cell.workIds.push(workId);
+  }
+}
+
 /**
- * 构建跨平台内容级汇总行（截至 date，默认最新）。
- *
- * - 已关联到同一 contentKey 的多平台作品合并为一行，null 指标不计入合计（全 null 时合计为 null）
- * - 未关联作品各自成行，contentKey = "unlinked:<platform>:<workId>"，title = 作品标题
- * - perPlatform 键格式为 "<平台>|<分组>"
- *
- * @param {object} params
- * @param {Array<object>} [params.contents]
- * @param {Array<{ group: string, platform: string, works: Array<object> }>} [params.accounts]
- * @param {Map|object} [params.link]
- * @param {Map|object} [params.worksDaily]  按账号的 worksDaily（键 "group|platform" 或嵌套 [group][platform]）
- * @param {string} [params.date]            截止日期 YYYY-MM-DD（含），可省（默认最新）
- * @returns {Array<object>}
+ * 构建跨平台内容级汇总行（截至 date，默认最新快照日）。
+ * - link：Map<`group|platform|workId`, { contentKey, matchedBy }>（可省）
+ * - worksDaily：`{ "group|platform": readWorksDaily(group, platform) }`
  */
 function buildContentSummaryRows({ contents, accounts, link, worksDaily, date } = {}) {
-  if (!Array.isArray(accounts)) return [];
-
   const cutoffDate = typeof date === "string" && date.trim() ? date.trim() : "";
-  if (cutoffDate && parseDateDayMs(cutoffDate) === null) {
-    return [];
-  }
+  if (cutoffDate && !isValidDateStr(cutoffDate)) return [];
 
-  const resolvedLink = link != null ? link : linkWorks({ contents, accounts });
+  const accountList = Array.isArray(accounts) ? accounts : [];
+  const resolvedLink = link instanceof Map ? link : linkWorks({ contents, accounts: accountList });
+  const dailyByGp = isPlainObject(worksDaily) ? worksDaily : null;
 
   const contentByKey = new Map();
-  if (Array.isArray(contents)) {
-    for (const c of contents) {
-      if (isPlainObject(c) && c.contentKey) {
-        contentByKey.set(String(c.contentKey), c);
-      }
+  const buckets = new Map();
+  const makeBucket = (contentKey, title, file, recordFirstDate, minWorkPublishMs, isUnlinked) => ({
+    contentKey,
+    title: title || "(无标题)",
+    file: file || "",
+    recordFirstDate: recordFirstDate || "",
+    minWorkPublishMs,
+    isUnlinked,
+    platforms: new Set(),
+    perPlatform: {},
+  });
+
+  for (const c of Array.isArray(contents) ? contents : []) {
+    if (!isPlainObject(c) || !c.contentKey) continue;
+    const contentKey = String(c.contentKey);
+    const rawDate = typeof c.firstPublishDate === "string" ? c.firstPublishDate.trim() : "";
+    const recordDate = isValidDateStr(rawDate) ? rawDate : "";
+    contentByKey.set(contentKey, { c, recordDate });
+    if (cutoffDate && recordDate && recordDate > cutoffDate) continue;
+    const bucketId = `linked:${contentKey}`;
+    if (!buckets.has(bucketId)) {
+      buckets.set(bucketId, makeBucket(contentKey, c.displayTitle, c.file, recordDate, null, false));
     }
   }
 
-  const buckets = new Map();
   const seenWorkKeys = new Set();
-
-  for (const acc of accounts) {
+  for (const acc of accountList) {
     if (!isPlainObject(acc)) continue;
     const group = acc.group == null ? "" : String(acc.group);
     const platform = acc.platform == null ? "" : String(acc.platform);
-    const accWorks = Array.isArray(acc.works) ? acc.works : [];
-    const accWorksDaily = getAccountWorksDaily(worksDaily, group, platform, acc);
+    const gpKey = `${group}|${platform}`;
+    const accWorksDaily = dailyByGp && hasOwn(dailyByGp, gpKey) ? dailyByGp[gpKey] : null;
 
-    for (const w of accWorks) {
+    for (const w of Array.isArray(acc.works) ? acc.works : []) {
       if (!isPlainObject(w) || w.workId == null || w.workId === "") continue;
       const workId = String(w.workId);
       const workKey = makeWorkKey(group, platform, workId);
       if (seenWorkKeys.has(workKey)) continue;
       seenWorkKeys.add(workKey);
 
-      const resolved = resolveWorkMetricsAsOf(w, accWorksDaily, cutoffDate);
-      if (!resolved.found) continue;
-      const metrics = resolved.metrics;
+      const linkEntry = resolvedLink.get(workKey);
+      const linkedKey = linkEntry && linkEntry.contentKey ? String(linkEntry.contentKey) : null;
+      const pubMs = parseValidTimestampMs(w.publishTime);
+      const pubDate = pubMs !== null ? toUtc8DateStr(pubMs) : "";
+      const metrics = resolveWorkMetricsAsOf(workId, accWorksDaily, cutoffDate);
 
-      const linkEntry = lookupLinkEntry(resolvedLink, workKey);
-      const linkedContentKey =
-        linkEntry && linkEntry.contentKey != null && String(linkEntry.contentKey)
-          ? String(linkEntry.contentKey)
-          : null;
-
-      const workTitle = w.title ? String(w.title) : "(无标题)";
-      const workUrl = w.url ? String(w.url) : "";
-      const workPubDate = toUtc8DateStr(parsePublishTimeMs(w.publishTime));
-
-      const rowContentKey = linkedContentKey || `unlinked:${platform}:${workId}`;
-      const bucketId = linkedContentKey
-        ? `linked:${linkedContentKey}`
-        : `unlinked:${group}|${platform}|${workId}`;
-
-      let bucket = buckets.get(bucketId);
-      if (!bucket) {
-        const meta = linkedContentKey ? contentByKey.get(linkedContentKey) : null;
-        bucket = {
-          contentKey: rowContentKey,
-          title: meta ? meta.displayTitle || workTitle : workTitle,
-          file: meta ? meta.file || "" : "",
-          firstPublishDate: meta ? meta.firstPublishDate || workPubDate : workPubDate,
-          perPlatform: {},
-          metricLists: {
-            play: [],
-            like: [],
-            comment: [],
-            share: [],
-            favorite: [],
-            fansDelta: [],
-          },
-        };
-        buckets.set(bucketId, bucket);
-      } else if (!bucket.firstPublishDate && workPubDate) {
-        bucket.firstPublishDate = workPubDate;
-      }
-
-      const pgKey = `${platform}|${group}`;
-      if (!hasOwn(bucket.perPlatform, pgKey)) {
-        bucket.perPlatform[pgKey] = {
-          play: metrics.play,
-          like: metrics.like,
-          comment: metrics.comment,
-          share: metrics.share,
-          favorite: metrics.favorite,
-          fansDelta: metrics.fansDelta,
-          url: workUrl,
-        };
-      } else {
-        const existing = bucket.perPlatform[pgKey];
-        for (const k of WORK_STAT_KEYS) {
-          existing[k] = mergeMetricValue(existing[k], metrics[k]);
+      if (linkedKey) {
+        const bucketId = `linked:${linkedKey}`;
+        let bucket = buckets.get(bucketId);
+        if (!bucket) {
+          if (!metrics) continue;
+          const meta = contentByKey.get(linkedKey);
+          bucket = meta
+            ? makeBucket(linkedKey, meta.c.displayTitle, meta.c.file, meta.recordDate, null, false)
+            : makeBucket(linkedKey, w.title ? String(w.title) : "", "", "", null, false);
+          buckets.set(bucketId, bucket);
         }
-        if (!existing.url && workUrl) existing.url = workUrl;
-      }
-
-      for (const k of WORK_STAT_KEYS) {
-        bucket.metricLists[k].push(metrics[k]);
+        if (pubMs !== null && (!cutoffDate || pubDate <= cutoffDate)) {
+          if (bucket.minWorkPublishMs === null || pubMs < bucket.minWorkPublishMs) {
+            bucket.minWorkPublishMs = pubMs;
+          }
+        }
+        if (metrics) addWorkToBucket(bucket, platform, group, workId, w.url, metrics);
+      } else if (metrics) {
+        const bucket = makeBucket(
+          `unlinked:${platform}:${workId}`,
+          w.title ? String(w.title) : "",
+          "",
+          "",
+          pubMs,
+          true
+        );
+        addWorkToBucket(bucket, platform, group, workId, w.url, metrics);
+        buckets.set(`unlinked:${group}|${platform}|${workId}`, bucket);
       }
     }
   }
 
   const rows = [];
   for (const b of buckets.values()) {
+    const hasWorkPub = b.minWorkPublishMs !== null;
     const row = {
       contentKey: b.contentKey,
       title: b.title,
       file: b.file,
-      firstPublishDate: b.firstPublishDate,
-      platformCount: Object.keys(b.perPlatform).length,
-      totalPlay: null,
-      totalLike: null,
-      totalComment: null,
-      totalShare: null,
-      totalFavorite: null,
-      totalFansDelta: null,
-      perPlatform: b.perPlatform,
+      firstPublishDate: hasWorkPub ? toUtc8DateStr(b.minWorkPublishMs) : b.recordFirstDate,
+      firstPublishDateSource: hasWorkPub || b.isUnlinked ? "work" : "record",
+      platformCount: b.platforms.size,
     };
+    const cells = Object.values(b.perPlatform);
     for (const k of WORK_STAT_KEYS) {
-      row[STAT_TO_TOTAL_KEY[k]] = sumNullable(b.metricLists[k]);
+      let total = null;
+      for (const cell of cells) total = mergeMetricValue(total, cell[k]);
+      row[STAT_TO_TOTAL_KEY[k]] = total;
     }
+    row.perPlatform = b.perPlatform;
     rows.push(row);
   }
 
-  // 按首次发布日期降序（无日期置后），同日按总播放降序（null 置后），再按 contentKey 升序
-  rows.sort((a, b) => {
+  return rows.sort((a, b) => {
     if (a.firstPublishDate !== b.firstPublishDate) {
       if (!a.firstPublishDate) return 1;
       if (!b.firstPublishDate) return -1;
       return a.firstPublishDate > b.firstPublishDate ? -1 : 1;
     }
-    const ap = a.totalPlay;
-    const bp = b.totalPlay;
-    if (ap !== bp) {
-      if (ap === null) return 1;
-      if (bp === null) return -1;
-      return bp - ap;
+    if (a.totalPlay !== b.totalPlay) {
+      if (a.totalPlay === null) return 1;
+      if (b.totalPlay === null) return -1;
+      return b.totalPlay - a.totalPlay;
     }
     return a.contentKey < b.contentKey ? -1 : a.contentKey > b.contentKey ? 1 : 0;
   });
-
-  return rows;
 }
 
 module.exports = {
   normalizeTitle,
   normalizeUrl,
+  isManagementUrl,
   makeWorkKey,
   buildContentIndex,
   linkWorks,
