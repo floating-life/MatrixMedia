@@ -119,6 +119,16 @@ function requestQuit() {
 async function checkUpdateFromTray(win) {
   try {
     const result = await checkForUpdate();
+    if (result && result.forkBuild) {
+      dialog.showMessageBox(win, {
+        type: "info",
+        title: "检查更新",
+        message: `当前为 fork 自用版，已关闭自动升级（v${result.currentVersion}）。`,
+        buttons: ["确定"],
+        noLink: true,
+      });
+      return;
+    }
     if (!result || !result.latestVersion) {
       dialog.showMessageBox(win, {
         type: "info",

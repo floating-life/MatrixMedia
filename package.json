@@ -1,6 +1,6 @@
 {
   "name": "matrix-video",
-  "version": "0.14.9",
+  "version": "0.14.9-fork.1",
   "author": "lhl",
   "description": "自媒体免费开源矩阵工具",
   "license": "GPL-2.0-only",
@@ -98,7 +98,8 @@
     "test:devtools-endpoint": "node scripts/test-devtools-endpoint.js",
     "test:scheduled-dedupe": "node scripts/test-scheduled-dedupe.js",
     "test:fans-history": "node scripts/test-fans-history.js",
-    "test:toutiao-stats": "node scripts/test-toutiao-stats.js"
+    "test:toutiao-stats": "node scripts/test-toutiao-stats.js",
+    "test:fork-guard": "node scripts/test-fork-guard.js"
   },
   "build": {
     "forceCodeSigning": false,

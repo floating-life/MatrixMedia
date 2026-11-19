@@ -11,6 +11,14 @@ import { app as electronApp } from "electron";
 import downloadFile from "./downloadFile";
 import { pickReleaseInstaller } from "./pickReleaseInstaller";
 
+const FORK_BUILD = /-fork\./.test(version);
+const FORK_UPDATE_DISABLED_MESSAGE =
+  "当前为 fork 自用版，已关闭自动升级；需要同步上游请联系维护者";
+
+function isForkVersion(ver) {
+  return /-fork\./.test(String(ver || ""));
+}
+
 // 获取托管在 Gitee 的 pubtw 仓库 Release 信息。
 // 公开仓库可匿名调用 API，无需 access_token，避免把可写 token 打进开源客户端。
 function requestGiteeJson(path, fallback) {
@@ -90,12 +98,20 @@ async function getLatestRelease() {
   return result;
 }
 
-/** 解析 v0.9.7 / 0.9.7 为可比较的数字（按段比较，避免 0.9.10 与 parseInt 拼接错误） */
+function resolveUpdateTarget(options) {
+  const hasOverride = options && options.version !== undefined;
+  const currentVersion = hasOverride ? options.version : version;
+  const forkBuild = hasOverride ? isForkVersion(currentVersion) : FORK_BUILD;
+  return { currentVersion, forkBuild };
+}
+
+/** 解析 v0.9.7 / 0.9.7 / 0.14.9-fork.1 为可比较的数字（剥离 -fork.N 等预发布后缀，按段比较，避免 0.9.10 与 parseInt 拼接错误） */
 function compareSemver(remoteRaw, localRaw) {
   const norm = (s) =>
     String(s || "")
       .replace(/^v/i, "")
       .trim()
+      .replace(/[-+].*$/, "")
       .split(".")
       .map((x) => parseInt(x, 10) || 0);
   const a = norm(remoteRaw);
@@ -115,7 +131,15 @@ function compareSemver(remoteRaw, localRaw) {
  * 检查是否有新版本。只做检测、返回版本信息，不自动开始下载；
  * 是否下载由调用方（用户确认后）通过 downloadLatestUpdate 触发。
  */
-async function checkForUpdate() {
+async function checkForUpdate(options = {}) {
+  const { currentVersion, forkBuild } = resolveUpdateTarget(options);
+  if (forkBuild) {
+    return {
+      hasUpdate: false,
+      forkBuild: true,
+      currentVersion,
+    };
+  }
   const lastData = await getLatestRelease();
   if (!lastData) {
     return { hasUpdate: false };
@@ -123,7 +147,7 @@ async function checkForUpdate() {
   const remoteVer =
     (lastData.tag_name && String(lastData.tag_name).replace(/^v/i, "")) ||
     (lastData.name && String(lastData.name).replace(/^v/i, ""));
-  const cmp = compareSemver(remoteVer, version);
+  const cmp = compareSemver(remoteVer, currentVersion);
   const assets = lastData.assets || [];
 
   const installer = pickReleaseInstaller(assets, {
@@ -133,7 +157,7 @@ async function checkForUpdate() {
 
   return {
     hasUpdate: Boolean(downloadURL && cmp > 0),
-    currentVersion: version,
+    currentVersion,
     latestVersion: remoteVer || "",
     releaseName: lastData.name || lastData.tag_name || "",
     releaseBody: lastData.body || "",
@@ -145,7 +169,14 @@ async function checkForUpdate() {
  * 由主进程重新解析一次 Release（1 小时缓存），避免被篡改。
  * 进度通过窗口 webContents 的 download-progress / download-done 等事件推送。
  */
-async function downloadLatestUpdate(win) {
+async function downloadLatestUpdate(win, options = {}) {
+  const { forkBuild } = resolveUpdateTarget(options);
+  if (forkBuild) {
+    return {
+      ok: false,
+      message: FORK_UPDATE_DISABLED_MESSAGE,
+    };
+  }
   try {
     const lastData = await getLatestRelease();
     if (!lastData) {
@@ -174,5 +205,13 @@ export {
   checkForUpdate,
   downloadLatestUpdate,
   version,
+  FORK_BUILD,
 };
-export default { getLatestRelease, compareSemver, checkForUpdate, downloadLatestUpdate, version };
+export default {
+  getLatestRelease,
+  compareSemver,
+  checkForUpdate,
+  downloadLatestUpdate,
+  version,
+  FORK_BUILD,
+};

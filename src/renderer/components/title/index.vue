@@ -176,6 +176,17 @@ export default {
       // 只做检测并询问，不擅自下载（非强制更新）
       return Promise.resolve(ipcRenderer.invoke("check-for-updates"))
         .then((res) => {
+          if (res && res.forkBuild) {
+            if (options.force || options.manual) {
+              const msg = "当前为 fork 自用版，已关闭自动升级";
+              if (this.$message && typeof this.$message.info === "function") {
+                this.$message.info(msg);
+              } else if (typeof this.$message === "function") {
+                this.$message({ type: "info", message: msg });
+              }
+            }
+            return res;
+          }
           if (res && res.hasUpdate) {
             this.updateInfo = {
               latestVersion: res.latestVersion || "",
