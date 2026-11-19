@@ -1335,6 +1335,32 @@ try {
     console.log("✓ 端到端串联与脏输入防护正确");
   }
 
+
+  /* ---------- 跨零点：同一次写入跨过 UTC+8 零点，不得改写「昨天」文件 ---------- */
+  {
+    const G = "跨零点组", P = "抖音";
+    const before = Date.parse("2026-11-10T15:59:59.900Z"); // UTC+8 23:59:59.900
+    store.mergeWorks(G, P, [{ workId: "A", title: "a", publishTime: 1, play: 1 }], before - 60000);
+    const dayFile = path.join(tmpRoot, "data-stats", G, P, "works-daily", "2026-11-10.json");
+    const bytesBefore = fs.readFileSync(dayFile);
+    const realNow = Date.now;
+    const realFsync = fs.fsyncSync;
+    let base = realNow();
+    try {
+      // fsync 期间「真实时间」前进 200ms → 推算时刻跨过零点
+      fs.fsyncSync = (fd) => { realFsync(fd); const t = base + 200; Date.now = () => t; };
+      Date.now = () => base;
+      store.mergeWorks(G, P, [{ workId: "B", title: "b", publishTime: 2, play: 2 }], before);
+    } finally {
+      Date.now = realNow;
+      fs.fsyncSync = realFsync;
+    }
+    assert.deepStrictEqual(fs.readFileSync(dayFile), bytesBefore, "跨零点写入改写了昨天的文件");
+    const leftovers = fs.readdirSync(path.dirname(dayFile)).filter((f) => f.endsWith(".tmp"));
+    assert.strictEqual(leftovers.length, 0, "跨零点放弃替换后残留临时文件");
+    console.log("✓ 跨零点写入放弃替换，昨天文件字节不变、无临时文件残留");
+  }
+
   console.log("\n全部通过：works-daily 存储与 statsTable 长表构建");
 } finally {
   fs.rmSync(tmpRoot, { recursive: true, force: true });

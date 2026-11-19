@@ -210,8 +210,10 @@ function writeAllSync(fd, buf) {
   }
 }
 
-function renameWithRetrySync(src, dest) {
+function renameWithRetrySync(src, dest, beforeRename) {
   for (let attempt = 0; attempt <= WORKS_DAILY_RENAME_MAX_RETRIES; attempt++) {
+    // 每次替换前校验（如跨零点）：校验失败抛错，由调用方清理临时文件、保留旧文件
+    if (beforeRename) beforeRename();
     try {
       fs.renameSync(src, dest);
       return;
@@ -229,7 +231,7 @@ function renameWithRetrySync(src, dest) {
  * 原子写入单日文件：同目录唯一临时文件 → writeSync 全量 → fsync → renameSync 覆盖。
  * 任何步骤失败都删除临时文件并保留旧文件完整。
  */
-function writeWorksDailyAtomic(file, payload) {
+function writeWorksDailyAtomic(file, payload, beforeRename) {
   const dir = path.dirname(file);
   const base = path.basename(file);
   const buf = Buffer.from(JSON.stringify(payload, null, 2), "utf8");
@@ -246,7 +248,7 @@ function writeWorksDailyAtomic(file, payload) {
     const closeFd = fd;
     fd = null;
     fs.closeSync(closeFd);
-    renameWithRetrySync(tmpFile, file);
+    renameWithRetrySync(tmpFile, file, beforeRename);
     tmpCreated = false;
   } catch (err) {
     if (fd !== null) {
@@ -387,6 +389,16 @@ function recordWorksDaily(group, platform, works, now = Date.now()) {
 
   const today = todayStr(now);
   const file = path.join(worksDailyDir(group, platform), `${today}.json`);
+  // 跨零点保护：写入耗时内若 UTC+8 日期已变，放弃替换，绝不改写已成为「昨天」的文件。
+  // 用「注入的 now + 实际流逝时间」推算当前时刻，兼容测试注入时间。
+  const startedReal = Date.now();
+  const ensureSameDay = () => {
+    if (todayStr(now + (Date.now() - startedReal)) !== today) {
+      const err = new Error(`写入跨过零点，放弃改写 ${today} 的快照`);
+      err.code = "EDAYROLL";
+      throw err;
+    }
+  };
   try {
     const dayWorks = parseDayWorksFile(file) || Object.create(null);
     for (const w of validWorks) {
@@ -396,7 +408,7 @@ function recordWorksDaily(group, platform, works, now = Date.now()) {
       date: today,
       updatedAt: now,
       works: dayWorks,
-    });
+    }, ensureSameDay);
   } catch (err) {
     console.warn(
       `[dataStats] 写入 works-daily/${today}.json 失败 (${group}/${platform}):`,

@@ -21,3 +21,8 @@
 
 ## 打包
 `.github/workflows/fork-build-win.yml`：推 fork/** 或 feat/stats-** 分支自动打 Windows 安装包（Actions Artifacts，14 天）。
+
+## 已知问题
+- 〔上游，路线 B 候选 PR〕`src/main/services/accountMigration.js:41` 启动迁移会把带连字符的合法分组目录（如 `品牌-A`，且 `品牌` 目录不存在时）整体改名为 `品牌`，导致该分组统计历史读回为空。应改为按账号记录中明确的旧 phone→group 映射迁移。（GPT Pro 评审 S1 时发现，2026-11-19）
+- 适配器把缺失指标写成 0（如抖音 view_count 缺失），会产生「掉 0 再回升」的假增量；需改采集层区分缺失与 0，暂在导出「字段说明」注明。
+- 一次采集的账号快照与作品快照若恰跨零点可能分属两天（影响极小，暂不处理）。
