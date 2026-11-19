@@ -56,11 +56,22 @@ const FUZZY_THRESHOLDS = Object.freeze({
 
 const KEYCAP_EMOJI_RE = /[#*0-9]\uFE0F?\u20E3/g;
 // 话题外词内 # 保护（如 C#、F#、J#、Q#，以及后接空白/标点/音调词的乐理音名 D#、G#、A# 等）；
-// 扫描时闭合话题（#…[话题]#、#…#）优先于词内 #，避免 #C# 的结束符被词内规则抢占
+// 扫描时按「完整 #…[话题]# → 通用 #…# 闭合边界 → 单 #… → 话题外词内 #」顺序处理：
+// 1. #…[话题]# 内部允许词内 C#/F# 等，防止 #学C#入门[话题]# 被 C# 提前截断并吞掉后续集数
+// 2. 通用 #…# 闭合边界优先于词内 #，防止 #C#第1集 的结束符被词内规则抢占
+// 3. 话题外保护 C#/F# 等词内 #
 const WORD_INTERNAL_HASH_STICKY_RE =
   /(?:([CcFfJjQq])#(?!\[话题\]#)|([A-Ga-g])#(?=$|[\s.,!?;:)\]}\-/]|大调|小调|和弦|调|音|major|minor|m(?![A-Za-z])))/y;
 const HASH_PLACEHOLDER = "\u0000";
-const XHS_TOPIC_STICKY_RE = /#[^\s#]+\[话题\]#/y;
+const XHS_TOPIC_BODY_SOURCE =
+  "(?:[^\\s#]|(?<![A-Za-z0-9])(?:[CcFfJjQq]#|[A-Ga-g]#(?=[.,!?;:)\\]}\\-/]|\\[话题\\]#|大调|小调|和弦|调|音|major|minor|m(?![A-Za-z]))))+";
+const XHS_TOPIC_TAIL_RE = new RegExp(
+  `(?:^|\\s)#(?:(?:${XHS_TOPIC_BODY_SOURCE}|[^\\s#]+#[^\\s#]*)\\[话题\\]#|[^\\s#]+)$`
+);
+const XHS_TOPIC_STICKY_RE = new RegExp(`#${XHS_TOPIC_BODY_SOURCE}\\[话题\\]#`, "y");
+// 兜底：若 #…[话题]# 内部仅含 1 个非词内 #（如 #2025#年度计划[话题]#），避免提前按 #2025# 闭合后残留孤立 [话题]# 吞掉后续集数；
+// 仍不会跨过 #美食#中间正文#摄影[话题]#（含 2 个非词内 #）吞掉中间正文
+const XHS_TOPIC_ONE_HASH_STICKY_RE = /#[^\s#]+#[^\s#]*\[话题\]#/y;
 const WRAPPED_TOPIC_STICKY_RE = /#[^\s#]+#/y;
 const SINGLE_TOPIC_STICKY_RE = /#[^\s#]+/y;
 const ASCII_ALNUM_RE = /[A-Za-z0-9]/;
@@ -168,8 +179,8 @@ function normalizeTitle(s) {
     .trim();
   while (out) {
     // 仅剥离尾部、且 # 前为字符串开头或空白的话题标签（保留 C#入门 等词内 #）；
-    // 结尾 # 只在小红书 `#xx[话题]#` 格式下允许，避免把 `#2025#` 这类编号剥掉
-    const next = out.replace(/(?:^|\s)#(?:[^\s#]+\[话题\]#|[^\s#]+)$/, "").trim();
+    // 结尾 # 只在小红书 `#xx[话题]#` 格式下允许（含内部 C#/F#），避免把 `#2025#` 这类编号剥掉
+    const next = out.replace(XHS_TOPIC_TAIL_RE, "").trim();
     if (next === out) break;
     out = next;
   }
@@ -199,6 +210,10 @@ function stripTopicsAndProtectHash(s) {
     if (ch === "#") {
       XHS_TOPIC_STICKY_RE.lastIndex = i;
       let m = XHS_TOPIC_STICKY_RE.exec(text);
+      if (!m) {
+        XHS_TOPIC_ONE_HASH_STICKY_RE.lastIndex = i;
+        m = XHS_TOPIC_ONE_HASH_STICKY_RE.exec(text);
+      }
       if (m) {
         out += " ";
         i += m[0].length;
@@ -621,13 +636,15 @@ function computeAutoClusterKey(sortedMemberKeys) {
 }
 
 /**
- * 清洗手工矫正配置，兼容传入 `{ version, updatedAt, contents?, overrides }` 或直接传入 overrides 字典。
- * overrides 键为作品身份 `platform|workId`；返回 `{ overrides: Map<pwKey, entry>, contents: Map<contentKey, { title, createdAt }> }`。
+ * 清洗手工矫正配置，兼容传入 `{ version, updatedAt, contents?, excludedAuto?, overrides }` 或直接传入 overrides 字典。
+ * overrides 键为作品身份 `platform|workId`；
+ * 返回 `{ overrides: Map<pwKey, entry>, contents: Map<contentKey, { title, createdAt }>, excludedAuto: Set<pwKey> }`。
  */
 function normalizeOverridesDoc(raw) {
   const overrides = new Map();
   const contents = new Map();
-  if (!isPlainObject(raw)) return { overrides, contents };
+  const excludedAuto = new Set();
+  if (!isPlainObject(raw)) return { overrides, contents, excludedAuto };
   const isDoc =
     hasOwn(raw, "overrides") && isPlainObject(raw.overrides) && typeof raw.action !== "string";
   const source = isDoc ? raw.overrides : raw;
@@ -639,10 +656,23 @@ function normalizeOverridesDoc(raw) {
     const action = typeof entry.action === "string" ? entry.action.trim() : "";
     if (action === "detach") {
       overrides.set(pwKey, { action: "detach" });
+      excludedAuto.add(pwKey);
     } else if (action === "assign") {
       const contentKey = typeof entry.contentKey === "string" ? entry.contentKey.trim() : "";
       if (contentKey && !contentKey.startsWith("unlinked:")) {
         overrides.set(pwKey, { action: "assign", contentKey });
+        if (entry.excludeAuto === true) {
+          excludedAuto.add(pwKey);
+        }
+      }
+    }
+  }
+  if (isDoc && hasOwn(raw, "excludedAuto") && isPlainObject(raw.excludedAuto)) {
+    for (const pwKey of Object.keys(raw.excludedAuto)) {
+      if (!isValidWorkIdentityKey(pwKey)) continue;
+      const desc = Object.getOwnPropertyDescriptor(raw.excludedAuto, pwKey);
+      if (desc && desc.value === true) {
+        excludedAuto.add(pwKey);
       }
     }
   }
@@ -657,7 +687,7 @@ function normalizeOverridesDoc(raw) {
       contents.set(ck, { title: meta.title, createdAt: meta.createdAt });
     }
   }
-  return { overrides, contents };
+  return { overrides, contents, excludedAuto };
 }
 
 function buildPreparedCores(titles) {
@@ -826,7 +856,8 @@ function scoreDayBucket(bucket, queryCore, querySeries, onHit) {
   if (!bucket.invIndex) {
     for (let ai = 0; ai < aliasCount; ai++) {
       const li = aliasLocalTi[ai];
-      if (effectiveQuerySeries && itemSeries[li] && hasConflictingSeries(effectiveQuerySeries, itemSeries[li])) {
+      const targetSeries = itemSeries[li] || aliasCores[ai].series;
+      if (effectiveQuerySeries && targetSeries && hasConflictingSeries(effectiveQuerySeries, targetSeries)) {
         continue;
       }
       const sim = computePreparedSimilarity(queryCore, aliasCores[ai]);
@@ -1826,7 +1857,11 @@ function linkWorks({ contents, accounts, date, overrides, worksDaily } = {}) {
   const { ok, cutoffDate } = parseCutoffDate(date);
   if (!ok) return result;
 
-  const { overrides: overrideMap, contents: overrideContents } = normalizeOverridesDoc(overrides);
+  const {
+    overrides: overrideMap,
+    contents: overrideContents,
+    excludedAuto: excludedAutoSet,
+  } = normalizeOverridesDoc(overrides);
   const dailyByGp = isPlainObject(worksDaily) ? worksDaily : null;
   const assignableContentKeys = new Set();
   const targetsByGp = new Map();
@@ -1854,7 +1889,9 @@ function linkWorks({ contents, accounts, date, overrides, worksDaily } = {}) {
       const gpKey = `${toSafeTrimmed(t.group)}|${toSafeTrimmed(t.platform)}`;
       const rawTitles = Array.isArray(t.matchTitles)
         ? t.matchTitles
-        : [t.title, t.shortTitle].filter((v) => v != null && v !== "");
+        : [t.title, t.shortTitle, ...(Array.isArray(t.altTitles) ? t.altTitles : [])].filter(
+            (v) => v != null && v !== ""
+          );
       const matchTitles = collectMatchTitles(rawTitles);
       pushToMap(targetsByGp, gpKey, {
         idx: targetSeq++,
@@ -1862,7 +1899,7 @@ function linkWorks({ contents, accounts, date, overrides, worksDaily } = {}) {
         normUrl: normalizeDirectUrl(t.videoLink),
         matchTitles,
         preparedCores: buildPreparedCores(rawTitles),
-        // 目标全部标题别名（主标题+短标题等）汇总的集数标记：评分前先拒绝集数冲突
+        // 目标全部标题别名（主标题+短标题等）汇总的集数标记：②唯一标题与③模糊阶段共用集数冲突拒绝
         series: extractSeriesMarkersFromTitles(rawTitles),
         // ③ 模糊匹配时间窗只看该 target 自身日期，缺则走缺时间门槛 +0.1
         dayNum: dateStrToDayNum(ownTargetDate),
@@ -1898,7 +1935,6 @@ function linkWorks({ contents, accounts, date, overrides, worksDaily } = {}) {
 
   const worksByGp = new Map();
   const obsByPw = new Map();
-  const detachedPwKeys = new Set();
   const gpInfoByKey = new Map();
   let workSeq = 0;
 
@@ -1926,21 +1962,20 @@ function linkWorks({ contents, accounts, date, overrides, worksDaily } = {}) {
         continue;
       }
 
-      const ov = overrideMap.get(pwKey);
-      if (ov && ov.action === "detach") {
-        detachedPwKeys.add(pwKey);
-      }
-
       const normTitle = normalizeTitle(w.title);
       const rawTitle = w.title;
       const preparedCore = prepareCore(rawTitle);
+      const rawAltTitles = Array.isArray(w.altTitles) ? w.altTitles : [];
+      const rawMatchTitles = Array.isArray(w.matchTitles) ? w.matchTitles : [];
       const hasExtraWorkTitles =
-        (Array.isArray(w.matchTitles) && w.matchTitles.length > 0) ||
+        rawAltTitles.length > 0 ||
+        rawMatchTitles.length > 0 ||
         (w.shortTitle != null && w.shortTitle !== "");
       const workSeries = hasExtraWorkTitles
         ? extractSeriesMarkersFromTitles([
             rawTitle,
-            ...(Array.isArray(w.matchTitles) ? w.matchTitles : []),
+            ...rawAltTitles,
+            ...rawMatchTitles,
             w.shortTitle,
           ])
         : preparedCore.series || extractSeriesMarkers(rawTitle);
@@ -2052,7 +2087,13 @@ function linkWorks({ contents, accounts, date, overrides, worksDaily } = {}) {
         const titleTargets = freeTargetsByTitle.get(w.normTitle);
         if (!titleTargets || titleTargets.length !== 1) continue;
         const t = titleTargets[0];
-        if (blockedTargets.has(t.idx) || (t.normUrl && t.normUrl !== w.normUrl)) continue;
+        if (
+          blockedTargets.has(t.idx) ||
+          (t.normUrl && t.normUrl !== w.normUrl) ||
+          hasConflictingSeries(w.series, t.series)
+        ) {
+          continue;
+        }
         pushToMap(candidatesByTarget, t.idx, { work: w, target: t });
       }
 
@@ -2064,13 +2105,13 @@ function linkWorks({ contents, accounts, date, overrides, worksDaily } = {}) {
         }
       }
 
-      // ③ 作品↔发布记录 target 模糊匹配（只排除已匹配/已阻断/按作品身份 manual-detach；被 assign 的作品照常参与占位）
+      // ③ 作品↔发布记录 target 模糊匹配（只排除已匹配/已阻断/按作品身份排除自动；仅 assign 且未排除的作品照常参与占位）
       const freeWorks = [];
       for (const w of gpWorks) {
         if (
           matchedWorks.has(w.idx) ||
           blockedWorks.has(w.idx) ||
-          detachedPwKeys.has(w.pwKey)
+          excludedAutoSet.has(w.pwKey)
         ) {
           continue;
         }
@@ -2086,7 +2127,7 @@ function linkWorks({ contents, accounts, date, overrides, worksDaily } = {}) {
     }
 
     for (const w of gpWorks) {
-      if (matchedWorks.has(w.idx) || detachedPwKeys.has(w.pwKey)) {
+      if (matchedWorks.has(w.idx) || excludedAutoSet.has(w.pwKey)) {
         continue;
       }
       unlinkedForCluster.push(w);
@@ -2136,8 +2177,12 @@ function linkWorks({ contents, accounts, date, overrides, worksDaily } = {}) {
     if (ov) {
       if (ov.action === "detach") {
         resolved = { contentKey: null, matchedBy: "manual-detach" };
-      } else if (ov.action === "assign" && isValidAssignTarget(ov.contentKey)) {
-        resolved = { contentKey: ov.contentKey, matchedBy: "manual" };
+      } else if (ov.action === "assign") {
+        if (isValidAssignTarget(ov.contentKey)) {
+          resolved = { contentKey: ov.contentKey, matchedBy: "manual" };
+        } else if (excludedAutoSet.has(pwKey)) {
+          resolved = { contentKey: null, matchedBy: "manual-detach" };
+        }
       }
     }
 
@@ -2316,7 +2361,11 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, o
 
   const accountList = Array.isArray(accounts) ? accounts : [];
   const dailyByGp = isPlainObject(worksDaily) ? worksDaily : null;
-  const { overrides: overrideMap, contents: overrideContents } = normalizeOverridesDoc(overrides);
+  const {
+    overrides: overrideMap,
+    contents: overrideContents,
+    excludedAuto: excludedAutoSet,
+  } = normalizeOverridesDoc(overrides);
   const groupSet =
     groups instanceof Set
       ? groups.size > 0
@@ -2591,7 +2640,7 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, o
     const resolvedLinkedKey = obsList[0].linkedKey;
     const resolvedMatchedBy = obsList[0].matchedBy;
     const resolvedScore = obsList[0].score;
-    const hasOverride = overrideMap.has(pwKey);
+    const hasOverride = overrideMap.has(pwKey) || excludedAutoSet.has(pwKey);
     const bestSnap = pickLatestSnapshot(obsList);
 
     if (resolvedLinkedKey != null) {

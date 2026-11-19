@@ -710,14 +710,20 @@ function validateExportDateRange(from, to) {
   return { from: validFrom, to: validTo };
 }
 
-function buildDefaultExportFileName(from, to, now = Date.now()) {
-  const today = formatUtc8Date(now);
-  let resolvedTo = to || today;
-  if (!to && from && resolvedTo < from) {
-    resolvedTo = from;
+function buildDefaultExportFileName(from, to) {
+  const f = typeof from === "string" ? from.trim() : "";
+  const t = typeof to === "string" ? to.trim() : "";
+  if (f && t) {
+    return `MatrixMedia-作品数据-${f}_${t}.xlsx`;
   }
-  const resolvedFrom = from || shiftDateStr(resolvedTo, -DEFAULT_RANGE_DAYS);
-  return `MatrixMedia-作品数据-${resolvedFrom}_${resolvedTo}.xlsx`;
+  if (!f && t) {
+    const resolvedFrom = shiftDateStr(t, -DEFAULT_RANGE_DAYS);
+    return `MatrixMedia-作品数据-${resolvedFrom}_${t}.xlsx`;
+  }
+  if (f && !t) {
+    return `MatrixMedia-作品数据-${f}_起.xlsx`;
+  }
+  return "MatrixMedia-作品数据.xlsx";
 }
 
 /**

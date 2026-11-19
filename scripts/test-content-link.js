@@ -3183,6 +3183,355 @@ async function testMatchWorksIpcAmbiguity() {
     console.log("✓ S6-r3#8: assign 不改变其他作品自动归属（剩余 ≥2 或仅剩 1 条均保留原 auto 键与 fuzzy 标记）通过");
   }
 
+  /* ---------- 14. S6-r4 窄卡返修回归：#1 / #2 / #3 ---------- */
+  // S6-r4#1(testS6r4SphAltTitlesSeriesConflictAllStages):
+  // 视频号作品 altTitles 保留描述标题，②唯一标题 / ③模糊 / ④聚类 三阶段共用集数冲突检查
+  function testS6r4SphAltTitlesSeriesConflictAllStages() {
+    const day = "2026-11-18";
+    const pubTs = Date.parse(`${day}T04:00:00Z`);
+
+    // 1a. ②唯一标题阶段：短标题完全相同，但目标主标题第1集 vs 作品 altTitles 描述第2集 → 拒绝（不得以 title 或 fuzzy 关联）
+    const targetWithSameShort = buildContentIndex([
+      {
+        id: "sph-r4-ep1-short",
+        pt: "视频号",
+        group: "G1",
+        publishStatus: "success",
+        filePath: "/v/sph_r4_ep1.mp4",
+        title: "家庭红烧肉完整教程第1集",
+        shortTitle: "家庭红烧肉完整教程",
+        date: day,
+      },
+    ]);
+    const sphEp2Work = {
+      workId: "sph_r4_w2",
+      title: "家庭红烧肉完整教程",
+      altTitles: ["家庭红烧肉完整教程第2集"],
+      publishTime: pubTs,
+    };
+    const stage2Reject = linkWorks({
+      contents: targetWithSameShort,
+      accounts: [{ group: "G1", platform: "视频号", works: [sphEp2Work] }],
+    });
+    assert.deepStrictEqual(
+      stage2Reject.get("G1|视频号|sph_r4_w2"),
+      { contentKey: null, matchedBy: null },
+      "S6-r4#1: 短标题完全相同时，②唯一标题与③模糊两阶段均须依据作品 altTitles 第2集与目标第1集冲突拒绝"
+    );
+
+    // 1b. ③模糊阶段：目标仅主标题第1集（无短标题）vs 作品短标题+altTitles描述第2集 → 拒绝（不得以 fuzzy 0.95 关联）
+    const targetNoShort = buildContentIndex([
+      {
+        id: "sph-r4-ep1-noshort",
+        pt: "视频号",
+        group: "G1",
+        publishStatus: "success",
+        filePath: "/v/sph_r4_ep1.mp4",
+        title: "家庭红烧肉完整教程第1集",
+        date: day,
+      },
+    ]);
+    const stage3Reject = linkWorks({
+      contents: targetNoShort,
+      accounts: [{ group: "G1", platform: "视频号", works: [sphEp2Work] }],
+    });
+    assert.deepStrictEqual(
+      stage3Reject.get("G1|视频号|sph_r4_w2"),
+      { contentKey: null, matchedBy: null },
+      "S6-r4#1: ③模糊阶段须依据作品 altTitles 第2集拒绝挂到第1集目标"
+    );
+
+    // 1c. ④跨平台聚类阶段：视频号第2集（短标题无集数+altTitles第2集）vs 抖音第1集 → 拒绝
+    const stage4Reject = linkWorks({
+      contents: [],
+      accounts: [
+        { group: "G1", platform: "视频号", works: [sphEp2Work] },
+        {
+          group: "G1",
+          platform: "抖音",
+          works: [{ workId: "dy_r4_w1", title: "家庭红烧肉完整教程第1集", publishTime: pubTs }],
+        },
+      ],
+    });
+    assert.deepStrictEqual(
+      stage4Reject.get("G1|视频号|sph_r4_w2"),
+      { contentKey: null, matchedBy: null },
+      "S6-r4#1: ④跨平台聚类阶段须依据作品 altTitles 第2集拒绝与抖音第1集合并"
+    );
+    assert.deepStrictEqual(stage4Reject.get("G1|抖音|dy_r4_w1"), { contentKey: null, matchedBy: null });
+
+    // 1d. 目标侧别名冲突也在 ②唯一标题阶段拦截：目标主标题第1集+短标题第2集 vs 作品第2集 → 拒绝
+    const targetConflictAlias = buildContentIndex([
+      {
+        id: "sph-r4-conflict-alias",
+        pt: "视频号",
+        group: "G1",
+        publishStatus: "success",
+        filePath: "/v/sph_r4_conflict.mp4",
+        title: "家庭红烧肉完整教程第1集",
+        shortTitle: "家庭红烧肉完整教程第2集",
+        date: day,
+      },
+    ]);
+    const stage2TargetConflict = linkWorks({
+      contents: targetConflictAlias,
+      accounts: [
+        {
+          group: "G1",
+          platform: "视频号",
+          works: [{ workId: "sph_r4_w2_exact", title: "家庭红烧肉完整教程第2集", publishTime: pubTs }],
+        },
+      ],
+    });
+    assert.deepStrictEqual(
+      stage2TargetConflict.get("G1|视频号|sph_r4_w2_exact"),
+      { contentKey: null, matchedBy: null },
+      "S6-r4#1: 目标侧别名含不同集数时，②唯一标题阶段也必须拒绝"
+    );
+
+    // 1e. 正向对照：第1集视频号作品（短标题+altTitles第1集）匹配第1集目标（②title 与 ③fuzzy 均正常命中）
+    const sphEp1Work = {
+      workId: "sph_r4_w1",
+      title: "家庭红烧肉完整教程",
+      altTitles: ["家庭红烧肉完整教程第1集"],
+      publishTime: pubTs,
+    };
+    const stage2Accept = linkWorks({
+      contents: targetWithSameShort,
+      accounts: [{ group: "G1", platform: "视频号", works: [sphEp1Work] }],
+    });
+    assert.deepStrictEqual(stage2Accept.get("G1|视频号|sph_r4_w1"), {
+      contentKey: "file:/v/sph_r4_ep1.mp4",
+      matchedBy: "title",
+    });
+    const stage3Accept = linkWorks({
+      contents: targetNoShort,
+      accounts: [{ group: "G1", platform: "视频号", works: [sphEp1Work] }],
+    });
+    assert.strictEqual(stage3Accept.get("G1|视频号|sph_r4_w1").contentKey, "file:/v/sph_r4_ep1.mp4");
+    assert.strictEqual(stage3Accept.get("G1|视频号|sph_r4_w1").matchedBy, "fuzzy");
+  }
+  testS6r4SphAltTitlesSeriesConflictAllStages();
+  console.log("✓ S6-r4#1(testS6r4SphAltTitlesSeriesConflictAllStages): altTitles 与 ②③④ 三阶段共用集数冲突检查通过");
+
+  // S6-r4#2(testS6r4XhsTopicWithInternalCSharp):
+  // 先识别完整 #…[话题]#（含内部 C#/F# 等），再处理通用 #…# 边界，最后保护话题外 C#/F#
+  function testS6r4XhsTopicWithInternalCSharp() {
+    const t1 = "零基础学习编程完整实战教程#学C#入门[话题]#第1集";
+    const t2 = "零基础学习编程完整实战教程第2集";
+    const t1Same = "零基础学习编程完整实战教程第1集";
+    assert.strictEqual(
+      extractCoreTitle(t1),
+      "零基础学习编程完整实战教程第1集",
+      "S6-r4#2: #学C#入门[话题]# 必须整体按 [话题]# 剥离，不得把 C# 当作闭合边界吞掉第1集"
+    );
+    assert.strictEqual(extractCoreTitle(t2), "零基础学习编程完整实战教程第2集");
+    assert.strictEqual(
+      computeTitleSimilarity(t1, t2),
+      0,
+      "S6-r4#2: 含词内 C# 的小红书话题第1集 vs 第2集相似度必须为 0"
+    );
+    assert.strictEqual(
+      computeTitleSimilarity(t1, t1Same),
+      1,
+      "S6-r4#2: 同集数第1集应保持满分匹配"
+    );
+
+    const day = "2026-11-18";
+    const pubTs = Date.parse(`${day}T04:00:00Z`);
+    const noMerge = linkWorks({
+      contents: [],
+      accounts: [
+        { group: "G", platform: "小红书", works: [{ workId: "xhs_c1", title: t1, publishTime: pubTs }] },
+        { group: "G", platform: "抖音", works: [{ workId: "dy_c2", title: t2, publishTime: pubTs }] },
+      ],
+      date: day,
+    });
+    assert.deepStrictEqual(
+      noMerge.get("G|小红书|xhs_c1"),
+      { contentKey: null, matchedBy: null },
+      "S6-r4#2: 小红书「…#学C#入门[话题]#第1集」与抖音「…第2集」不得合并"
+    );
+    assert.deepStrictEqual(noMerge.get("G|抖音|dy_c2"), { contentKey: null, matchedBy: null });
+
+    // 边界回归：含 F#/多词内#/其他单# 的 [话题]#、不跨正文吞并、话题外保留 C#/F#、上轮 #C#第1集 保持通过
+    assert.strictEqual(extractCoreTitle("零基础教程#学F#入门[话题]#第1集"), "零基础教程第1集");
+    assert.strictEqual(extractCoreTitle("零基础教程#C#[话题]#第1集"), "零基础教程第1集");
+    assert.strictEqual(extractCoreTitle("零基础教程#C#与F#对比[话题]#第1集"), "零基础教程第1集");
+    assert.strictEqual(extractCoreTitle("零基础教程#2025#年度计划[话题]#第1集"), "零基础教程第1集");
+    assert.strictEqual(extractCoreTitle("零基础教程#美食#中间正文#摄影[话题]#第1集"), "零基础教程中间正文第1集");
+    assert.strictEqual(extractCoreTitle("学C#入门#美食[话题]#第1集"), "学c#入门第1集");
+    assert.strictEqual(extractCoreTitle("C#教程#学C#入门[话题]#第1集"), "c#教程第1集");
+    assert.strictEqual(normalizeTitle("零基础学习编程完整实战教程 #学C#入门[话题]#"), "零基础学习编程完整实战教程");
+    assert.strictEqual(extractCoreTitle("零基础教程#C#第1集"), "零基础教程第1集");
+    assert.strictEqual(computeTitleSimilarity("零基础教程#C#第1集", "零基础教程#C#第2集"), 0);
+  }
+  testS6r4XhsTopicWithInternalCSharp();
+  console.log("✓ S6-r4#2(testS6r4XhsTopicWithInternalCSharp): 先 #…[话题]# 再 #…# 后保护话题外 C#/F# 通过");
+
+  // S6-r4#3(testS6r4ExcludedAutoWithAssignInLinkWorks):
+  // 自动匹配排除状态（excludedAuto）与手工归属（overrides）分开存：同时排除+assign 时在 ③④ 中始终不参与
+  function testS6r4ExcludedAutoWithAssignInLinkWorks() {
+    const day = "2026-11-18";
+    const pubTs = Date.parse(`${day}T04:00:00Z`);
+    const otherTarget = buildContentIndex([
+      {
+        id: "r4-other",
+        pt: "视频号",
+        group: "X",
+        title: "完全独立的老式住宅翻新记录",
+        filePath: "/media/other.mp4",
+        publishStatus: "success",
+        date: day,
+      },
+    ]);
+    const accounts = [
+      {
+        group: "A",
+        platform: "抖音",
+        works: [
+          { workId: "D1", title: "家庭咖啡磨豆器入门教程", publishTime: pubTs },
+          { workId: "D2", title: "家庭咖啡磨豆器入门实操", publishTime: pubTs },
+        ],
+      },
+      {
+        group: "A",
+        platform: "快手",
+        works: [{ workId: "K", title: "家庭咖啡磨豆器入门教程", publishTime: pubTs }],
+      },
+    ];
+
+    // 基线：D1 + K 成簇，D2 未关联
+    const base = linkWorks({ contents: otherTarget, accounts });
+    const baseKey = base.get("A|抖音|D1").contentKey;
+    assert.ok(baseKey && baseKey.startsWith("auto:"));
+    assert.strictEqual(base.get("A|快手|K").contentKey, baseKey);
+    assert.strictEqual(base.get("A|抖音|D2").contentKey, null);
+
+    // detach D1 → D2 + K 成簇
+    const detached = linkWorks({
+      contents: otherTarget,
+      accounts,
+      overrides: {
+        version: 1,
+        updatedAt: 1,
+        contents: {},
+        excludedAuto: { "抖音|D1": true },
+        overrides: { "抖音|D1": { action: "detach" } },
+      },
+    });
+    const d2kKey = detached.get("A|抖音|D2").contentKey;
+    assert.ok(d2kKey && d2kKey.startsWith("auto:") && d2kKey !== baseKey);
+    assert.strictEqual(detached.get("A|快手|K").contentKey, d2kKey);
+    assert.deepStrictEqual(detached.get("A|抖音|D1"), { contentKey: null, matchedBy: "manual-detach" });
+
+    // 同时 excludedAuto + assign D1 到无关素材 → D1 仍在 ④ 被排除，D2 + K 保持原簇不被打散
+    const excludedAndAssigned = linkWorks({
+      contents: otherTarget,
+      accounts,
+      overrides: {
+        version: 1,
+        updatedAt: 2,
+        contents: {},
+        excludedAuto: { "抖音|D1": true },
+        overrides: { "抖音|D1": { action: "assign", contentKey: "file:/media/other.mp4" } },
+      },
+    });
+    assert.deepStrictEqual(excludedAndAssigned.get("A|抖音|D1"), {
+      contentKey: "file:/media/other.mp4",
+      matchedBy: "manual",
+    });
+    assert.strictEqual(
+      excludedAndAssigned.get("A|抖音|D2").contentKey,
+      d2kKey,
+      "S6-r4#3: 已排除作品再 assign 不得打散其他作品 D2 的自动成簇结果"
+    );
+    assert.strictEqual(
+      excludedAndAssigned.get("A|快手|K").contentKey,
+      d2kKey,
+      "S6-r4#3: 已排除作品再 assign 不得改变 K 的自动成簇结果"
+    );
+
+    // 若 assign 的目标素材后续被删除，excludedAuto 仍保持排除（D1 回到 manual-detach，D2 + K 不受影响）
+    const deletedTarget = linkWorks({
+      contents: [],
+      accounts,
+      overrides: {
+        version: 1,
+        updatedAt: 3,
+        contents: {},
+        excludedAuto: { "抖音|D1": true },
+        overrides: { "抖音|D1": { action: "assign", contentKey: "file:/media/other.mp4" } },
+      },
+    });
+    assert.deepStrictEqual(deletedTarget.get("A|抖音|D1"), {
+      contentKey: null,
+      matchedBy: "manual-detach",
+    });
+    assert.strictEqual(deletedTarget.get("A|抖音|D2").contentKey, d2kKey);
+    assert.strictEqual(deletedTarget.get("A|快手|K").contentKey, d2kKey);
+
+    // ③ 模糊阶段同理：D1 排除后 D2 命中 coffee.mp4；再将 D1 assign 到 other.mp4，D2 仍保留对 coffee.mp4 的 ③ 匹配
+    const stage3Contents = buildContentIndex([
+      {
+        id: "r4-coffee",
+        pt: "抖音",
+        group: "A",
+        title: "家庭咖啡磨豆器入门教程完整版",
+        filePath: "/media/coffee.mp4",
+        publishStatus: "success",
+        date: day,
+      },
+      {
+        id: "r4-other-s3",
+        pt: "视频号",
+        group: "X",
+        title: "完全独立的老式住宅翻新记录",
+        filePath: "/media/other.mp4",
+        publishStatus: "success",
+        date: day,
+      },
+    ]);
+    const s3Accounts = [accounts[0]];
+    const s3Detached = linkWorks({
+      contents: stage3Contents,
+      accounts: s3Accounts,
+      overrides: {
+        version: 1,
+        updatedAt: 1,
+        contents: {},
+        excludedAuto: { "抖音|D1": true },
+        overrides: { "抖音|D1": { action: "detach" } },
+      },
+    });
+    assert.strictEqual(s3Detached.get("A|抖音|D2").contentKey, "file:/media/coffee.mp4");
+    assert.strictEqual(s3Detached.get("A|抖音|D2").matchedBy, "fuzzy");
+
+    const s3ExcludedAssign = linkWorks({
+      contents: stage3Contents,
+      accounts: s3Accounts,
+      overrides: {
+        version: 1,
+        updatedAt: 2,
+        contents: {},
+        excludedAuto: { "抖音|D1": true },
+        overrides: { "抖音|D1": { action: "assign", contentKey: "file:/media/other.mp4" } },
+      },
+    });
+    assert.deepStrictEqual(s3ExcludedAssign.get("A|抖音|D1"), {
+      contentKey: "file:/media/other.mp4",
+      matchedBy: "manual",
+    });
+    assert.strictEqual(
+      s3ExcludedAssign.get("A|抖音|D2").contentKey,
+      "file:/media/coffee.mp4",
+      "S6-r4#3: ③阶段已排除作品再 assign 不得抢占或改变 D2 的自动匹配"
+    );
+    assert.strictEqual(s3ExcludedAssign.get("A|抖音|D2").matchedBy, "fuzzy");
+  }
+  testS6r4ExcludedAutoWithAssignInLinkWorks();
+  console.log("✓ S6-r4#3(testS6r4ExcludedAutoWithAssignInLinkWorks): excludedAuto+assign 在 ③④ 中保持排除不扰动他人通过");
+
   // S6-fix#7: 性能基准（常规 2000×2000 + 评审密集 63 字前缀 × 3 别名 + ④ 3 平台各 2000 条）
   {
     const dayTs = (ymd) => Date.parse(`${ymd}T02:00:00Z`);

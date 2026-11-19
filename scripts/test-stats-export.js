@@ -2429,6 +2429,227 @@ async function main() {
       console.log("✓ S6-fix#10(跨组手工引用先解析后裁剪+共享默认截止日) & S6-fix#7(同次导出单次匹配复用) & S6-r3#1/#10 通过");
     }
 
+    /* ---------- 12. S6-r4#1 & #8 端到端回归：视频号 altTitles 回放防误合 + 默认导出建议文件名无日期 ---------- */
+    {
+      // S6-r4#1(testS6r4SphReplayAltTitlesEndToEnd):
+      // 回放视频号采集脚本第2集（描述带「第2集」、短标题无集数）→ store.mergeWorks 原样保存 altTitles →
+      // 旧数据缺省 altTitles 读回为空数组 → GUI 汇总与 Excel 导出在 ②唯一标题 与 ③模糊阶段均拒绝挂到第1集
+      const { ADAPTERS } = require("../src/main/services/dataStats/adapters.js");
+      const sphReplayFetch = async (url) => {
+        const respond = (obj) => ({ status: 200, text: async () => JSON.stringify(obj) });
+        if (url.includes("/statistic/fans_trend")) {
+          return respond({ errCode: 0, data: { total: [10, 12] } });
+        }
+        if (url.includes("/post/post_list")) {
+          return respond({
+            errCode: 0,
+            data: {
+              continueFlag: false,
+              lastBuff: "",
+              list: [
+                {
+                  objectId: "sph_replay_ep2",
+                  desc: {
+                    shortTitle: [{ shortTitle: "家庭红烧肉完整教程" }],
+                    description: "家庭红烧肉完整教程第2集 #美食教程",
+                  },
+                  createTime: Math.floor(dayTs("2026-11-18") / 1000),
+                  readCount: 320,
+                  favCount: 25,
+                  commentCount: 5,
+                  forwardCount: 3,
+                  likeCount: 8,
+                  followCount: 2,
+                },
+              ],
+            },
+          });
+        }
+        throw new Error(`未 mock 的视频号 URL: ${url}`);
+      };
+      const sphReplayOut = await vm.runInNewContext(ADAPTERS["视频号"].collectScript(), {
+        fetch: sphReplayFetch,
+        console,
+        setTimeout,
+        clearTimeout,
+        Date,
+        JSON,
+        Number,
+        String,
+        Math,
+        Set,
+        Object,
+        Array,
+        Promise,
+        Error,
+        Infinity,
+        isFinite,
+      });
+      assert.strictEqual(sphReplayOut.works.length, 1);
+      assert.strictEqual(sphReplayOut.works[0].title, "家庭红烧肉完整教程");
+      assert.strictEqual(Array.isArray(sphReplayOut.works[0].altTitles), true);
+      assert.deepStrictEqual(
+        Array.from(sphReplayOut.works[0].altTitles),
+        ["家庭红烧肉完整教程第2集 #美食教程"],
+        "S6-r4#1: 视频号采集必须同时保留短标题与描述标题（altTitles）"
+      );
+
+      // store.mergeWorks 原样保存 altTitles，读回完整；旧版缺 altTitles 的 works.json 读回缺省为空数组
+      const sphGroup = "S6R4视频号组";
+      store.mergeWorks(sphGroup, "视频号", sphReplayOut.works, dayTs("2026-11-18"));
+      const storedWorks = store.readWorks(sphGroup, "视频号").works;
+      assert.strictEqual(storedWorks.length, 1);
+      assert.deepStrictEqual(
+        storedWorks[0].altTitles,
+        ["家庭红烧肉完整教程第2集 #美食教程"],
+        "S6-r4#1: store 必须原样保存 altTitles"
+      );
+
+      const legacyWorksFile = path.join(userDataDir, "data-stats", "S6R4旧数据组", "视频号", "works.json");
+      fs.mkdirSync(path.dirname(legacyWorksFile), { recursive: true });
+      fs.writeFileSync(
+        legacyWorksFile,
+        JSON.stringify({ works: [{ workId: "legacy_w1", title: "旧版视频号作品", publishTime: dayTs("2026-11-10") }] }),
+        "utf8"
+      );
+      const legacyRead = store.readWorks("S6R4旧数据组", "视频号").works;
+      assert.deepStrictEqual(
+        legacyRead[0].altTitles,
+        [],
+        "S6-r4#1: 旧数据缺少 altTitles 字段时 store 读回必须缺省为空数组"
+      );
+
+      // GUI 与 Excel 验证：分别针对「无短标题第1集目标(③模糊)」和「同短标题第1集目标(②唯一标题)」均不得误合
+      for (const [caseName, rec] of [
+        [
+          "③模糊阶段(无短标题目标)",
+          {
+            id: "sph-r4-ep1-fuzzy",
+            pt: "视频号",
+            group: sphGroup,
+            publishStatus: "success",
+            title: "家庭红烧肉完整教程第1集",
+            filePath: "/videos/sph_hsr_ep1.mp4",
+            lastPublishAt: dayTs("2026-11-18"),
+          },
+        ],
+        [
+          "②唯一标题阶段(同短标题目标)",
+          {
+            id: "sph-r4-ep1-title",
+            pt: "视频号",
+            group: sphGroup,
+            publishStatus: "success",
+            title: "家庭红烧肉完整教程第1集",
+            shortTitle: "家庭红烧肉完整教程",
+            filePath: "/videos/sph_hsr_ep1.mp4",
+            lastPublishAt: dayTs("2026-11-18"),
+          },
+        ],
+      ]) {
+        const sphDeps = {
+          listAccounts: () => [{ group: sphGroup, platform: "视频号" }],
+          readWorks: (g, p) => store.readWorks(g, p),
+          readWorksDaily: (g, p) => store.readWorksDaily(g, p),
+          readWorksDailyLatestAsOf: (g, p, d) => store.readWorksDailyLatestAsOf(g, p, d),
+          readDaily: () => ({}),
+          readPushRecords: () => [rec],
+          readLinkOverrides: () => ({ version: 1, updatedAt: 0, contents: {}, excludedAuto: {}, overrides: {} }),
+        };
+        const guiRes = buildContentSummaryData({ date: "2026-11-18" }, sphDeps);
+        assert.ok(
+          guiRes.rows.find((r) => r.contentKey === "unlinked:视频号:sph_replay_ep2"),
+          `S6-r4#1(${caseName}): GUI 汇总中第2集作品必须保持未关联，不得挂到第1集`
+        );
+        const ep1GuiRow = guiRes.rows.find((r) => r.contentKey === "file:/videos/sph_hsr_ep1.mp4");
+        assert.ok(ep1GuiRow && ep1GuiRow.platformCount === 0, `S6-r4#1(${caseName}): 第1集目标不得吸收第2集`);
+
+        const wbRes = buildStatsWorkbookData({ to: "2026-11-18", now: dayTs("2026-11-18") }, sphDeps);
+        const dailyRows = wbRes.sheets["作品日明细"].slice(1);
+        assert.strictEqual(dailyRows.length, 1);
+        assert.strictEqual(
+          dailyRows[0][3],
+          null,
+          `S6-r4#1(${caseName}): Excel 作品日明细中第2集内容ID必须为 null`
+        );
+        assert.strictEqual(
+          dailyRows[0][4],
+          null,
+          `S6-r4#1(${caseName}): Excel 作品日明细中第2集关联方式必须为 null`
+        );
+      }
+
+      // S6-r4#8(testS6r4DefaultExportFileNameWithoutDates):
+      // 未手动调整区间的默认导出保存框建议文件名不带日期（MatrixMedia-作品数据.xlsx），显式区间仍带日期
+      assert.strictEqual(buildDefaultExportFileName("", ""), "MatrixMedia-作品数据.xlsx");
+      assert.strictEqual(buildDefaultExportFileName(undefined, undefined), "MatrixMedia-作品数据.xlsx");
+      assert.strictEqual(
+        buildDefaultExportFileName("2026-11-01", "2026-11-18"),
+        "MatrixMedia-作品数据-2026-11-01_2026-11-18.xlsx"
+      );
+      assert.strictEqual(
+        buildDefaultExportFileName("", "2026-11-18"),
+        "MatrixMedia-作品数据-2026-10-20_2026-11-18.xlsx"
+      );
+      assert.strictEqual(
+        buildDefaultExportFileName("2026-11-01", ""),
+        "MatrixMedia-作品数据-2026-11-01_起.xlsx"
+      );
+
+      // 评审 #8 端到端复现：系统日期为 11 月 19 日、最新作品快照为 11 月 18 日
+      const r4ExportOut = path.join(tmpRoot, "r4-default-export.xlsx");
+      const r4ExplicitOut = path.join(tmpRoot, "r4-explicit-export.xlsx");
+      const r4ExportDeps = {
+        listAccounts: () => [{ group: sphGroup, platform: "视频号" }],
+        readWorks: (g, p) => store.readWorks(g, p),
+        readWorksDaily: (g, p) => store.readWorksDaily(g, p),
+        readWorksDailyLatestAsOf: (g, p, d) => store.readWorksDailyLatestAsOf(g, p, d),
+        readDaily: () => ({}),
+        readPushRecords: () => [],
+        readLinkOverrides: () => ({ version: 1, updatedAt: 0, contents: {}, excludedAuto: {}, overrides: {} }),
+      };
+      registerDataStatsIpc({ exportDeps: r4ExportDeps });
+      const r4ExportHandler = ipcHandlers.get("stats:export-xlsx");
+      const origDateNow = Date.now;
+      Date.now = () => dayTs("2026-11-19");
+      try {
+        mockDialogResult = { canceled: false, filePath: r4ExportOut };
+        const defRes = await r4ExportHandler(
+          { sender: {}, senderFrame: { url: "file:///app/index.html" } },
+          {}
+        );
+        assert.strictEqual(defRes.ok, true);
+        assert.strictEqual(defRes.to, "2026-11-18", "默认导出工作簿截止日应为最新快照日 2026-11-18");
+        const defSuggestedPath = saveDialogCalls[saveDialogCalls.length - 1].opts.defaultPath;
+        assert.strictEqual(
+          path.basename(defSuggestedPath),
+          "MatrixMedia-作品数据.xlsx",
+          `S6-r4#8(testS6r4DefaultExportFileNameWithoutDates): 默认导出保存框建议文件名不得带系统日期，实际 ${path.basename(defSuggestedPath)}`
+        );
+        const defWb = xlsx.readFile(r4ExportOut);
+        const metaRows = xlsx.utils.sheet_to_json(defWb.Sheets["导出信息"], { header: 1 });
+        const dateRangeRow = metaRows.find((r) => r[0] === "日期范围");
+        assert.ok(dateRangeRow && String(dateRangeRow[1]).endsWith("2026-11-18"));
+
+        mockDialogResult = { canceled: false, filePath: r4ExplicitOut };
+        const expRes = await r4ExportHandler(
+          { sender: {}, senderFrame: { url: "file:///app/index.html" } },
+          { from: "2026-11-01", to: "2026-11-18" }
+        );
+        assert.strictEqual(expRes.ok, true);
+        const expSuggestedPath = saveDialogCalls[saveDialogCalls.length - 1].opts.defaultPath;
+        assert.strictEqual(
+          path.basename(expSuggestedPath),
+          "MatrixMedia-作品数据-2026-11-01_2026-11-18.xlsx",
+          "S6-r4#8: 显式区间导出保存框建议文件名仍须带日期"
+        );
+      } finally {
+        Date.now = origDateNow;
+      }
+
+      console.log("✓ S6-r4#1(testS6r4SphReplayAltTitlesEndToEnd) & S6-r4#8(testS6r4DefaultExportFileNameWithoutDates) 通过");
+    }
+
     // 恢复 require.cache
     if (origElectronCache) require.cache[electronId] = origElectronCache;
     else delete require.cache[electronId];

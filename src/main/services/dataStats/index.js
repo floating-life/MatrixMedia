@@ -78,6 +78,23 @@ function toPlainOverrides(raw) {
   return out;
 }
 
+function toPlainBoolMap(raw) {
+  const out = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const key of Object.keys(raw)) {
+    const desc = Object.getOwnPropertyDescriptor(raw, key);
+    if (desc && desc.value === true) {
+      Object.defineProperty(out, key, {
+        value: true,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+    }
+  }
+  return out;
+}
+
 function cloneNoProtoMap(raw) {
   const out = Object.create(null);
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
@@ -85,6 +102,18 @@ function cloneNoProtoMap(raw) {
     const desc = Object.getOwnPropertyDescriptor(raw, key);
     if (desc && desc.value && typeof desc.value === "object" && !Array.isArray(desc.value)) {
       out[key] = { ...desc.value };
+    }
+  }
+  return out;
+}
+
+function cloneNoProtoBoolMap(raw) {
+  const out = Object.create(null);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const key of Object.keys(raw)) {
+    const desc = Object.getOwnPropertyDescriptor(raw, key);
+    if (desc && desc.value === true) {
+      out[key] = true;
     }
   }
   return out;
@@ -166,7 +195,13 @@ function pickMergedWorksTitle(pwKeys, workInfoByPwKey, explicitTitle) {
  * 将请求中的 workKey（规范作品身份 `platform|workId`，或兼容观测键 `group|platform|workId`）
  * 归一解析为作品身份 `platform|workId`。
  */
-function resolveOpWorkIdentity(rawKey, ctx, workingOverrides, allowMissing = false) {
+function resolveOpWorkIdentity(
+  rawKey,
+  ctx,
+  workingOverrides,
+  allowMissing = false,
+  workingExcludedAuto = null
+) {
   if (typeof rawKey !== "string" || !rawKey) return null;
   if (ctx.workInfoByPwKey.has(rawKey)) return rawKey;
   if (ctx.pwKeyByObsWorkKey.has(rawKey)) return ctx.pwKeyByObsWorkKey.get(rawKey);
@@ -177,7 +212,9 @@ function resolveOpWorkIdentity(rawKey, ctx, workingOverrides, allowMissing = fal
       const candidate = rawKey.slice(firstPipe + 1);
       if (
         isValidWorkIdentityKey(candidate) &&
-        Object.prototype.hasOwnProperty.call(workingOverrides, candidate)
+        (Object.prototype.hasOwnProperty.call(workingOverrides, candidate) ||
+          (workingExcludedAuto &&
+            Object.prototype.hasOwnProperty.call(workingExcludedAuto, candidate)))
       ) {
         return candidate;
       }
@@ -193,6 +230,7 @@ function applyOverrideOpsSync(rawOps, exportDeps) {
     version: current.version,
     updatedAt: current.updatedAt,
     contents: cloneNoProtoMap(current.contents),
+    excludedAuto: cloneNoProtoBoolMap(current.excludedAuto),
     overrides: cloneNoProtoMap(current.overrides),
   };
 
@@ -220,16 +258,24 @@ function applyOverrideOpsSync(rawOps, exportDeps) {
       if (!pwKey) {
         throw new Error(`作品不存在或未纳入当前统计范围：${op.workKey}`);
       }
+      workingDoc.excludedAuto[pwKey] = true;
       workingDoc.overrides[pwKey] = { action: "detach" };
       stateDirty = true;
       expectedFinalByPwKey.set(pwKey, { action: "detach" });
       resolvedWorkKeys.push(pwKey);
     } else if (op.action === "clear") {
-      const pwKey = resolveOpWorkIdentity(op.workKey, ctx, workingDoc.overrides, true);
+      const pwKey = resolveOpWorkIdentity(
+        op.workKey,
+        ctx,
+        workingDoc.overrides,
+        true,
+        workingDoc.excludedAuto
+      );
       if (!pwKey) {
         throw new Error(`无效的作品标识：${op.workKey}`);
       }
       delete workingDoc.overrides[pwKey];
+      delete workingDoc.excludedAuto[pwKey];
       stateDirty = true;
       expectedFinalByPwKey.set(pwKey, { action: "clear" });
       resolvedWorkKeys.push(pwKey);
@@ -261,6 +307,7 @@ function applyOverrideOpsSync(rawOps, exportDeps) {
       } else if (!ctx.eligibleAssignableKeys.has(ck)) {
         throw new Error(`目标内容不存在或不可用：${ck}`);
       }
+      // 保留既有 excludedAuto 状态：已拆出作品再手工 assign 仍在 ③④ 中排除，不得打散其他作品自动结果
       workingDoc.overrides[pwKey] = { action: "assign", contentKey: ck };
       stateDirty = true;
       expectedFinalByPwKey.set(pwKey, { action: "assign", contentKey: ck });
@@ -291,6 +338,7 @@ function applyOverrideOpsSync(rawOps, exportDeps) {
       const title = pickMergedWorksTitle(uniquePwKeys, ctx.workInfoByPwKey, op.title);
       workingDoc.contents[contentKey] = { title, createdAt: now };
       for (const pwKey of uniquePwKeys) {
+        // 保留既有 excludedAuto 状态（如已被拆出的作品参与手工合并时，继续排除于 ③④ 之外）
         workingDoc.overrides[pwKey] = { action: "assign", contentKey };
         expectedFinalByPwKey.set(pwKey, { action: "assign", contentKey });
       }
@@ -316,11 +364,18 @@ function applyOverrideOpsSync(rawOps, exportDeps) {
       if (
         !finalEntry ||
         finalEntry.contentKey !== null ||
-        finalEntry.matchedBy !== "manual-detach"
+        finalEntry.matchedBy !== "manual-detach" ||
+        workingDoc.excludedAuto[pwKey] !== true
       ) {
         throw new Error(`拆出后作品最终归属与请求不一致：${pwKey}`);
       }
     } else if (expected.action === "clear") {
+      if (
+        Object.prototype.hasOwnProperty.call(workingDoc.overrides, pwKey) ||
+        Object.prototype.hasOwnProperty.call(workingDoc.excludedAuto, pwKey)
+      ) {
+        throw new Error(`恢复自动后作品仍残留手动覆盖：${pwKey}`);
+      }
       if (
         ctx.workInfoByPwKey.has(pwKey) &&
         finalEntry &&
@@ -332,7 +387,11 @@ function applyOverrideOpsSync(rawOps, exportDeps) {
   }
 
   const doc = store.writeLinkOverrides(
-    { overrides: workingDoc.overrides, contents: workingDoc.contents },
+    {
+      overrides: workingDoc.overrides,
+      contents: workingDoc.contents,
+      excludedAuto: workingDoc.excludedAuto,
+    },
     now
   );
   return {
@@ -622,7 +681,13 @@ function registerDataStatsIpc(options = {}) {
   ipcMain.handle("stats:get-link-overrides", async (event) => {
     try {
       if (!isLocalFrameEvent(event)) {
-        return { ok: false, error: "不允许外部页面读取手动关联配置", contents: {}, overrides: {} };
+        return {
+          ok: false,
+          error: "不允许外部页面读取手动关联配置",
+          contents: {},
+          excludedAuto: {},
+          overrides: {},
+        };
       }
       await overrideWriteChain;
       const doc = store.readLinkOverrides();
@@ -631,6 +696,7 @@ function registerDataStatsIpc(options = {}) {
         version: doc.version,
         updatedAt: doc.updatedAt,
         contents: toPlainOverrides(doc.contents),
+        excludedAuto: toPlainBoolMap(doc.excludedAuto),
         overrides: toPlainOverrides(doc.overrides),
       };
     } catch (err) {
@@ -638,6 +704,7 @@ function registerDataStatsIpc(options = {}) {
         ok: false,
         error: (err && err.message) || "读取手动关联配置失败",
         contents: {},
+        excludedAuto: {},
         overrides: {},
       };
     }

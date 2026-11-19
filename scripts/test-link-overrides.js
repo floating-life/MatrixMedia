@@ -226,6 +226,84 @@ async function main() {
       assert.strictEqual(partialRes.updatedAt, 5000);
       assert.deepStrictEqual(Object.keys(partialRes.contents).sort(), ["auto:good2", "manual:good1"]);
       assert.deepStrictEqual(Object.keys(partialRes.overrides).sort(), ["抖音|ok1", "抖音|ok2"]);
+      assert.strictEqual(
+        partialRes.excludedAuto["抖音|ok1"],
+        true,
+        "S6-r4#3: 兼容不含 excludedAuto 字段的旧 v1 文件，detach 条目读取时自动回填 excludedAuto"
+      );
+
+      // S6-r4#3(testS6r4StoreExcludedAutoPersistence):
+      // 自动匹配排除状态与手工归属分开存：detach 后再 assign 保留 excludedAuto；clear 同时清除两者；非法 excludedAuto 严格校验
+      {
+        fs.writeFileSync(
+          overridesFile,
+          '{"version":1,"updatedAt":1000,"excludedAuto":[],"overrides":{}}',
+          "utf8"
+        );
+        const { result: badExRes, warnings: badExWarns } = captureWarn(() => store.readLinkOverrides());
+        assert.deepStrictEqual(Object.keys(badExRes.excludedAuto), []);
+        assert.ok(badExWarns.some((w) => w.includes("excludedAuto")), "非对象 excludedAuto 应 warn 并视为空");
+
+        fs.writeFileSync(
+          overridesFile,
+          JSON.stringify({
+            version: 1,
+            updatedAt: 5100,
+            contents: {},
+            excludedAuto: {
+              "抖音|valid_ex": true,
+              "抖音|false_ex": false,
+              "G1|抖音|legacy_3seg": true,
+              "invalid_key": true,
+            },
+            overrides: {
+              "抖音|valid_ex": { action: "assign", contentKey: "file:/v/a.mp4" },
+            },
+          }),
+          "utf8"
+        );
+        const { result: exRead, warnings: exWarns } = captureWarn(() => store.readLinkOverrides());
+        assert.deepStrictEqual(exWarns, []);
+        assert.deepStrictEqual(Object.keys(exRead.excludedAuto), ["抖音|valid_ex"]);
+        assert.deepStrictEqual(exRead.overrides["抖音|valid_ex"], {
+          action: "assign",
+          contentKey: "file:/v/a.mp4",
+        });
+
+        // detach → assign 保留 excludedAuto；clear 同时清除两者
+        const afterDet = store.setLinkOverride("快手|ex_cycle", { action: "detach" }, 5200);
+        assert.strictEqual(afterDet.excludedAuto["快手|ex_cycle"], true);
+        assert.deepStrictEqual(afterDet.overrides["快手|ex_cycle"], { action: "detach" });
+
+        const afterAsg = store.setLinkOverride(
+          "快手|ex_cycle",
+          { action: "assign", contentKey: "file:/v/other.mp4" },
+          5300
+        );
+        assert.strictEqual(
+          afterAsg.excludedAuto["快手|ex_cycle"],
+          true,
+          "S6-r4#3(testS6r4StoreExcludedAutoPersistence): detach 后再 assign 必须保留 excludedAuto"
+        );
+        assert.deepStrictEqual(afterAsg.overrides["快手|ex_cycle"], {
+          action: "assign",
+          contentKey: "file:/v/other.mp4",
+        });
+        const persistedAsg = store.readLinkOverrides();
+        assert.strictEqual(persistedAsg.excludedAuto["快手|ex_cycle"], true);
+        assert.deepStrictEqual(persistedAsg.overrides["快手|ex_cycle"], {
+          action: "assign",
+          contentKey: "file:/v/other.mp4",
+        });
+
+        const afterClr = store.clearLinkOverride("快手|ex_cycle", 5400);
+        assert.strictEqual(afterClr.overrides["快手|ex_cycle"], undefined);
+        assert.strictEqual(
+          afterClr.excludedAuto["快手|ex_cycle"],
+          undefined,
+          "S6-r4#3(testS6r4StoreExcludedAutoPersistence): clearLinkOverride 必须同时清除 excludedAuto 与 overrides"
+        );
+      }
 
       fs.rmSync(overridesFile, { force: true });
       fs.mkdirSync(overridesFile);
@@ -1323,7 +1401,154 @@ async function main() {
         fs.rmSync(r3PushFile, { force: true });
       }
 
-      console.log("✓ IPC 安全/参数/并发串行写入 + S6-fix#4/#6/#13 + S6-r3#1/#2/#9/#11 端到端与导出一致性全通过");
+      // S6-r4#3(testS6r4DetachThenAssignPreservesPeerAutoCluster):
+      // 评审 #3 端到端复现：同组两条抖音(D1/D2)+一条快手(K)；拆出 D1 后 D2+K 成簇；
+      // 再把已拆出的 D1「合并到…」无关素材（或与无关作品手工合并），原簇 D2+K 不得被打散；
+      // 最后对 D1 执行「恢复自动」（clear）同时清除排除状态与手工归属，恢复 D1+K 自动成簇。
+      {
+        const r4PushFile = path.join(pushDataDir, "2026-11-18.json");
+        fs.writeFileSync(
+          r4PushFile,
+          JSON.stringify([
+            {
+              id: "r4-other-target",
+              pt: "视频号",
+              group: "R4组X",
+              publishStatus: "success",
+              title: "完全独立的老式住宅翻新记录",
+              filePath: "/media/r4_other.mp4",
+              lastPublishAt: dayTs("2026-11-18"),
+            },
+          ]),
+          "utf8"
+        );
+        store.mergeWorks(
+          "R4组A",
+          "抖音",
+          [
+            { workId: "R4_D1", title: "家庭咖啡磨豆器入门教程", publishTime: dayTs("2026-11-18"), play: 10 },
+            { workId: "R4_D2", title: "家庭咖啡磨豆器入门实操", publishTime: dayTs("2026-11-18"), play: 30 },
+          ],
+          dayTs("2026-11-18")
+        );
+        store.mergeWorks(
+          "R4组A",
+          "快手",
+          [{ workId: "R4_K", title: "家庭咖啡磨豆器入门教程", publishTime: dayTs("2026-11-18"), play: 20 }],
+          dayTs("2026-11-18")
+        );
+        store.mergeWorks(
+          "R4组A",
+          "小红书",
+          [{ workId: "R4_X", title: "清晨湖边慢跑配速记录分享", publishTime: dayTs("2026-11-18"), play: 40 }],
+          dayTs("2026-11-18")
+        );
+
+        const summaryWorkMap = (summary) =>
+          Object.fromEntries(
+            summary.rows.flatMap((r) =>
+              Object.values(r.perPlatform).flatMap((cell) =>
+                (cell.works || []).map((w) => [
+                  w.workKey,
+                  { contentKey: r.contentKey, matchedBy: w.matchedBy, hasOverride: Boolean(w.hasOverride) },
+                ])
+              )
+            )
+          );
+
+        // 1) 基线：D1 + K 成簇，D2 未关联
+        const baseMap = summaryWorkMap(await getSummary(localEv, { date: "2026-11-18" }));
+        const baseD1K = baseMap["抖音|R4_D1"].contentKey;
+        assert.ok(baseD1K && baseD1K.startsWith("auto:"));
+        assert.strictEqual(baseMap["快手|R4_K"].contentKey, baseD1K);
+        assert.strictEqual(baseMap["抖音|R4_D2"].contentKey, "unlinked:抖音:R4_D2");
+
+        // 2) 拆出 D1 → D2 + K 自动成簇
+        assert.strictEqual(
+          (await setOverride(localEv, { workKey: "R4组A|抖音|R4_D1", action: "detach" })).ok,
+          true
+        );
+        const afterDetachMap = summaryWorkMap(await getSummary(localEv, { date: "2026-11-18" }));
+        const d2kAutoKey = afterDetachMap["抖音|R4_D2"].contentKey;
+        assert.ok(d2kAutoKey && d2kAutoKey.startsWith("auto:") && d2kAutoKey !== baseD1K);
+        assert.strictEqual(afterDetachMap["快手|R4_K"].contentKey, d2kAutoKey);
+        assert.strictEqual(afterDetachMap["抖音|R4_D1"].matchedBy, "manual-detach");
+
+        // 3) 把已拆出的 D1「合并到…」无关素材 → 保持 excludedAuto，D2 + K 原簇纹丝不动（GUI 与 Excel 一致）
+        const assignAfterDetach = await setOverride(localEv, {
+          workKey: "抖音|R4_D1",
+          action: "assign",
+          contentKey: "file:/media/r4_other.mp4",
+        });
+        assert.strictEqual(assignAfterDetach.ok, true);
+
+        const ovAfterAssign = await getOverrides(localEv);
+        assert.strictEqual(
+          ovAfterAssign.excludedAuto["抖音|R4_D1"],
+          true,
+          "S6-r4#3: 拆出后 assign 必须在 link-overrides.json 中保留 excludedAuto 状态"
+        );
+        assert.deepStrictEqual(ovAfterAssign.overrides["抖音|R4_D1"], {
+          action: "assign",
+          contentKey: "file:/media/r4_other.mp4",
+        });
+
+        const afterAssignMap = summaryWorkMap(await getSummary(localEv, { date: "2026-11-18" }));
+        assert.strictEqual(afterAssignMap["抖音|R4_D1"].contentKey, "file:/media/r4_other.mp4");
+        assert.strictEqual(afterAssignMap["抖音|R4_D1"].matchedBy, "manual");
+        assert.strictEqual(afterAssignMap["抖音|R4_D1"].hasOverride, true);
+        assert.strictEqual(
+          afterAssignMap["抖音|R4_D2"].contentKey,
+          d2kAutoKey,
+          "S6-r4#3(testS6r4DetachThenAssignPreservesPeerAutoCluster): 已拆出作品再 assign 不得把 D2 打回未关联"
+        );
+        assert.strictEqual(
+          afterAssignMap["快手|R4_K"].contentKey,
+          d2kAutoKey,
+          "S6-r4#3(testS6r4DetachThenAssignPreservesPeerAutoCluster): 已拆出作品再 assign 不得改变 K 的 auto 键"
+        );
+        const wbAfterAssign = buildStatsWorkbookData({
+          to: "2026-11-18",
+          groups: ["R4组A"],
+          now: dayTs("2026-11-18"),
+        });
+        const r4Daily = wbAfterAssign.sheets["作品日明细"].slice(1);
+        assert.strictEqual(r4Daily.find((r) => r[6] === "R4_D1")[3], "file:/media/r4_other.mp4");
+        assert.strictEqual(r4Daily.find((r) => r[6] === "R4_D1")[4], "manual");
+        assert.strictEqual(r4Daily.find((r) => r[6] === "R4_D2")[3], d2kAutoKey);
+        assert.strictEqual(r4Daily.find((r) => r[6] === "R4_K")[3], d2kAutoKey);
+
+        // 4) 再次拆出 D1 并与无关作品 R4_X 手工 merge → 同样保留 excludedAuto，D2 + K 仍不散
+        assert.strictEqual((await setOverride(localEv, { workKey: "抖音|R4_D1", action: "detach" })).ok, true);
+        const mergeAfterDetach = await applyOverrides(localEv, {
+          ops: [{ action: "merge", workKeys: ["抖音|R4_D1", "小红书|R4_X"] }],
+        });
+        assert.strictEqual(mergeAfterDetach.ok, true);
+        const afterMergeMap = summaryWorkMap(await getSummary(localEv, { date: "2026-11-18" }));
+        assert.strictEqual(afterMergeMap["抖音|R4_D1"].contentKey, mergeAfterDetach.contentKey);
+        assert.strictEqual(afterMergeMap["抖音|R4_D2"].contentKey, d2kAutoKey);
+        assert.strictEqual(afterMergeMap["快手|R4_K"].contentKey, d2kAutoKey);
+
+        // 5) 对 D1 执行「恢复自动」（clear）→ 同时清除 excludedAuto 与 assign，D1 + K 恢复原自动成簇
+        assert.strictEqual((await clearOverride(localEv, { workKey: "抖音|R4_D1" })).ok, true);
+        const ovAfterClear = await getOverrides(localEv);
+        assert.strictEqual(ovAfterClear.overrides["抖音|R4_D1"], undefined);
+        assert.strictEqual(
+          ovAfterClear.excludedAuto["抖音|R4_D1"],
+          undefined,
+          "S6-r4#3: 「恢复自动」必须同时清除 excludedAuto 与手工归属"
+        );
+        const afterClearMap = summaryWorkMap(await getSummary(localEv, { date: "2026-11-18" }));
+        assert.strictEqual(afterClearMap["抖音|R4_D1"].contentKey, baseD1K);
+        assert.strictEqual(afterClearMap["快手|R4_K"].contentKey, baseD1K);
+        assert.strictEqual(afterClearMap["抖音|R4_D2"].contentKey, "unlinked:抖音:R4_D2");
+
+        // 清理 R4 测试残留，不影响后续测试
+        await clearOverride(localEv, { workKey: "小红书|R4_X" });
+        fs.rmSync(r4PushFile, { force: true });
+      }
+
+      console.log("✓ IPC 安全/参数/并发串行写入 + S6-fix#4/#6/#13 + S6-r3#1/#2/#9/#11 + S6-r4#3 端到端与导出一致性全通过");
     }
 
     /* ---------- 4. dataStats/index.vue 模板编译与手工矫正交互方法校验 ---------- */

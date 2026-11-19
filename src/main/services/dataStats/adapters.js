@@ -148,10 +148,36 @@ const ADAPTERS = {
     const data = j.data || {};
     for (const v of data.list || []) {
       const d = v.desc || {};
+      const rawShort =
+        Array.isArray(d.shortTitle) && d.shortTitle[0] && typeof d.shortTitle[0].shortTitle === "string"
+          ? d.shortTitle[0].shortTitle
+          : typeof d.shortTitle === "string"
+          ? d.shortTitle
+          : "";
+      const rawDesc = typeof d.description === "string" ? d.description : "";
+      const primaryShort = rawShort.trim() ? rawShort : "";
+      const primaryDesc = rawDesc.trim() ? rawDesc : "";
+      const title = primaryShort || primaryDesc || "(无标题)";
+      const altTitles = [];
+      const seenTitles = new Set(title === "(无标题)" ? [] : [title.trim()]);
+      const pushAltTitle = (val) => {
+        if (typeof val !== "string") return;
+        const trimmed = val.trim();
+        if (!trimmed || seenTitles.has(trimmed)) return;
+        seenTitles.add(trimmed);
+        altTitles.push(trimmed);
+      };
+      if (Array.isArray(d.shortTitle)) {
+        for (const it of d.shortTitle) pushAltTitle(it && it.shortTitle);
+      } else {
+        pushAltTitle(d.shortTitle);
+      }
+      pushAltTitle(d.description);
       const w = {
         workId: String(v.objectId || v.exportId || ""),
         url: "",
-        title: (d.shortTitle && d.shortTitle[0] && d.shortTitle[0].shortTitle) || d.description || "(无标题)",
+        title,
+        altTitles,
         publishTime: __num(v.createTime) * 1000,
         // 注意视频号字段与直觉相反：likeCount=收藏，favCount=推荐(点赞)
         play: __num(v.readCount),

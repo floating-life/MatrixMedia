@@ -83,10 +83,29 @@ function mergeDaily(group, platform, overview, fansHistory, now = Date.now()) {
 
 /* ---------------- works（发布增长） ---------------- */
 
+function normalizeAltTitles(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const item of raw) {
+    if (typeof item !== "string") continue;
+    if (!item.trim() || seen.has(item)) continue;
+    seen.add(item);
+    out.push(item);
+  }
+  return out;
+}
+
 function readWorks(group, platform) {
-  return readJson(path.join(accountDir(group, platform), "works.json"), {
+  const data = readJson(path.join(accountDir(group, platform), "works.json"), {
     works: [],
   });
+  const works = Array.isArray(data && data.works)
+    ? data.works.map((w) =>
+        isPlainObject(w) ? { ...w, altTitles: normalizeAltTitles(w.altTitles) } : w
+      )
+    : [];
+  return { ...(isPlainObject(data) ? data : {}), works };
 }
 
 function writeWorks(group, platform, data) {
@@ -123,6 +142,11 @@ function mergeWorks(group, platform, newWorks, now = Date.now()) {
       Object.assign(existing, pickStats(w), { updatedAt: now });
       if (w.title) existing.title = w.title;
       if (w.url) existing.url = w.url;
+      if (Array.isArray(w.altTitles)) {
+        existing.altTitles = normalizeAltTitles(w.altTitles);
+      } else if (!Array.isArray(existing.altTitles)) {
+        existing.altTitles = [];
+      }
       continue;
     }
     // 新作品：封闭比它早的最近一条未封闭作品（仅非首次导入时）
@@ -138,6 +162,7 @@ function mergeWorks(group, platform, newWorks, now = Date.now()) {
     const row = {
       workId: w.workId,
       title: w.title || "(无标题)",
+      altTitles: normalizeAltTitles(w.altTitles),
       url: w.url || "",
       publishTime: w.publishTime || 0,
       ...pickStats(w),
@@ -637,6 +662,7 @@ function emptyLinkOverrides() {
     version: LINK_OVERRIDES_VERSION,
     updatedAt: 0,
     contents: Object.create(null),
+    excludedAuto: Object.create(null),
     overrides: Object.create(null),
   };
 }
@@ -681,6 +707,19 @@ function normalizeLinkContentsMap(rawMap) {
   return out;
 }
 
+function normalizeExcludedAutoMap(rawMap) {
+  const out = Object.create(null);
+  if (!isPlainObject(rawMap)) return out;
+  for (const pwKey of Object.keys(rawMap)) {
+    if (!isValidWorkIdentityKey(pwKey)) continue;
+    const desc = Object.getOwnPropertyDescriptor(rawMap, pwKey);
+    if (desc && desc.value === true) {
+      out[pwKey] = true;
+    }
+  }
+  return out;
+}
+
 function normalizeLinkOverrideEntry(entry) {
   if (!isPlainObject(entry)) return null;
   if (typeof entry.action !== "string") return null;
@@ -711,9 +750,23 @@ function normalizeLinkOverridesMap(rawMap) {
   return out;
 }
 
+function syncExcludedAutoFromOverrides(excludedAuto, overrides, rawOverrides) {
+  for (const pwKey of Object.keys(overrides)) {
+    if (overrides[pwKey].action === "detach") {
+      excludedAuto[pwKey] = true;
+    } else if (isPlainObject(rawOverrides)) {
+      const desc = Object.getOwnPropertyDescriptor(rawOverrides, pwKey);
+      if (desc && isPlainObject(desc.value) && desc.value.excludeAuto === true) {
+        excludedAuto[pwKey] = true;
+      }
+    }
+  }
+  return excludedAuto;
+}
+
 /**
  * 读取 <userData>/data-stats/link-overrides.json。
- * 不存在静默返回空；严格校验 version === 1、updatedAt 为有限数字、overrides/contents 结构；
+ * 不存在静默返回空；严格校验 version === 1、updatedAt 为有限数字、overrides/contents/excludedAuto 结构；
  * 条目结构不对的逐条丢弃；任何读取/解析/校验异常均 console.warn 并视为空配置，绝不抛错。
  */
 function readLinkOverrides() {
@@ -758,11 +811,25 @@ function readLinkOverrides() {
       console.warn(`[dataStats] link-overrides.json contents 结构无效 (${file})`);
       return emptyLinkOverrides();
     }
+    const hasExcludedAuto =
+      Object.prototype.hasOwnProperty.call(parsed, "excludedAuto") &&
+      parsed.excludedAuto !== undefined;
+    if (hasExcludedAuto && !isPlainObject(parsed.excludedAuto)) {
+      console.warn(`[dataStats] link-overrides.json excludedAuto 结构无效 (${file})`);
+      return emptyLinkOverrides();
+    }
+    const overrides = normalizeLinkOverridesMap(parsed.overrides);
+    const excludedAuto = syncExcludedAutoFromOverrides(
+      hasExcludedAuto ? normalizeExcludedAutoMap(parsed.excludedAuto) : Object.create(null),
+      overrides,
+      parsed.overrides
+    );
     return {
       version: LINK_OVERRIDES_VERSION,
       updatedAt: parsed.updatedAt,
       contents: hasContents ? normalizeLinkContentsMap(parsed.contents) : Object.create(null),
-      overrides: normalizeLinkOverridesMap(parsed.overrides),
+      excludedAuto,
+      overrides,
     };
   } catch (err) {
     console.warn(`[dataStats] 解析 link-overrides.json 异常 (${file}):`, (err && err.message) || err);
@@ -775,13 +842,21 @@ function writeLinkOverrides(docOrMap, now = Date.now()) {
   const isDoc = isPlainObject(docOrMap) && isPlainObject(docOrMap.overrides);
   const rawMap = isDoc ? docOrMap.overrides : docOrMap;
   const rawContents = isDoc && isPlainObject(docOrMap.contents) ? docOrMap.contents : null;
+  const rawExcludedAuto =
+    isDoc && isPlainObject(docOrMap.excludedAuto) ? docOrMap.excludedAuto : null;
   const overrides = normalizeLinkOverridesMap(rawMap);
   const contents = normalizeLinkContentsMap(rawContents);
+  const excludedAuto = syncExcludedAutoFromOverrides(
+    normalizeExcludedAutoMap(rawExcludedAuto),
+    overrides,
+    rawMap
+  );
   const ts = typeof now === "number" && Number.isFinite(now) ? now : Date.now();
   const payload = {
     version: LINK_OVERRIDES_VERSION,
     updatedAt: ts,
     contents,
+    excludedAuto,
     overrides,
   };
   writeWorksDailyAtomic(linkOverridesFile(), payload);
@@ -798,6 +873,9 @@ function setLinkOverride(workKey, entry, now = Date.now(), contentMeta) {
   }
   const ts = typeof now === "number" && Number.isFinite(now) ? now : Date.now();
   const current = readLinkOverrides();
+  if (normalized.action === "detach" || (entry && entry.excludeAuto === true)) {
+    current.excludedAuto[workKey] = true;
+  }
   current.overrides[workKey] = normalized;
   if (
     normalized.action === "assign" &&
@@ -825,6 +903,7 @@ function clearLinkOverride(workKey, now = Date.now()) {
   }
   const current = readLinkOverrides();
   delete current.overrides[workKey];
+  delete current.excludedAuto[workKey];
   return writeLinkOverrides(current, now);
 }
 
