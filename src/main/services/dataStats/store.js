@@ -444,7 +444,7 @@ function readCollectLogs() {
   return readJson(collectLogFile(), []);
 }
 
-/* ---------------- auto-run（每日自动采集认领记录） ---------------- */
+/* ---------------- auto-run（每日自动采集运行记录） ---------------- */
 
 const MAX_AUTO_RUN_DATES = 14;
 
@@ -504,11 +504,15 @@ function readAutoRuns() {
 }
 
 /**
- * 原子写入 <userData>/data-stats/auto-run.json（复用 S1 同款原子写，仅保留最近 14 个日期）。
+ * 追加运行日期到 <userData>/data-stats/auto-run.json（复用 S1 同款原子写，仅保留最近 14 个日期）。
  * 写入失败直接抛错，保留旧文件完整。
  */
-function writeAutoRuns(runs) {
-  const normalized = normalizeAutoRuns(runs);
+function appendAutoRun(date) {
+  if (!isValidAutoRunDate(date)) {
+    throw new Error(`非法自动采集日期: ${date}`);
+  }
+  const runs = readAutoRuns();
+  const normalized = normalizeAutoRuns([...runs, date]);
   writeWorksDailyAtomic(autoRunFile(), { runs: normalized });
   return normalized;
 }
@@ -583,6 +587,6 @@ module.exports = {
   readCollectLogs,
   MAX_AUTO_RUN_DATES,
   readAutoRuns,
-  writeAutoRuns,
+  appendAutoRun,
   todayStr,
 };

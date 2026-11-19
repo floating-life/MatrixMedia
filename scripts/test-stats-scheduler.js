@@ -1,20 +1,27 @@
 /**
- * 每日定时自动采集调度器与主进程权威认领单元测试（不依赖 Electron 运行环境）：
- * 1. 纯函数 shouldRun：未到点/到点/快速跳过/跨天/补跑/关闭/坏设置/边界时间，且已移除依赖 Date 的启动闸门
+ * 每日定时自动采集调度器与主进程 stats:auto-run 单元测试（不依赖 Electron 运行环境）：
+ * 1. 纯函数 shouldRun：未到点/到点/doneLocalDate 抑制/跨天/补跑/关闭/坏设置/边界时间，且 lastRunDate 不参与跳过判定
  * 2. 配置归一化与保存失败反馈（saveSettings/updateSettings 返回 { ok, settings, error }，失败不广播供 UI 回滚）
- * 3. 单调时钟启动延迟（performance.now）：系统时间大幅回拨不卡死、前拨不提前跑
+ * 3. 单调时钟启动延迟（performance.now）：启动 2 分钟内不调用、挂钟前拨不提前、挂钟回拨 6 天不卡死
  * 4. isMainWindowLocation 主窗口判定（主页面放行，登录窗/加载窗/子窗口/外部页拦截）
- * 5. buildCollectAccounts 区分解析失败（null）与空列表（[]），调度器遇 null 不认领、空数组仍走 auto-claim
- * 6. 调度器全流程：通知（含 skipped）、异常不释放认领、认领 busy 与采集 busy（触发 auto-release）重试上限、并发防重入、改设置即时生效
- * 7. 主进程权威认领 + store.js 真实落盘 + match-works 互斥 + auto 跳过今日已成功账号：
- *    - stats:auto-claim 忽略渲染层传值（UTC+8）、同日二次认领拒绝、双窗口并发仅跑一次、只读 localStorage + 重挂载不重跑
- *    - collecting 中（stats:collect / stats:match-works）认领返回 busy 且不写入
- *    - stats:auto-release 释放后可再认领
- *    - 系统校时回拨到已跑日期拒绝
- *    - auto-run.json 只保留最近 14 个日期（含回拨新日期不自逐）
- *    - 原子写失败（ENOSPC）返回 store-failed、旧文件完整、无 .tmp 残留、不触发采集
- *    - stats:match-works 与 stats:collect 双向互斥 & finally 复位
- *    - stats:collect(trigger:"auto") 跳过今日（UTC+8）lastError 为空的账号（skipped:true，不打开窗口），manual 不跳过
+ * 5. 调度器全流程：
+ *    - done 后当天本地不再调用、弹一条 notify、跨天再跑、stop 静默
+ *    - already-ran 后当天本地不再调用、更新 lastRunDate、不弹 notify
+ *    - busy / IPC 异常后不设标记，下一分钟继续重试（无 6 次上限）
+ *    - null 账号不调用 stats:auto-run
+ *    - 并发防重入、改设置即时生效、buildNotifyPayload（含 skipped/cancelled/error）
+ * 6. UTC 时区 23:30 设置连续两天都会调用（含单实例跨天与重启实例验证不混用本地与 UTC+8 日期）
+ * 7. 主进程 stats:auto-run + store.js 真实落盘 + collectedToday 跳重 + 三方互斥：
+ *    - 已删除 stats:auto-claim / stats:auto-release
+ *    - buildCollectAccounts：无 accountTree / 损坏 JSON / 非对象根 / 空列表 → null；坏 children 节点跳过
+ *    - 同日二次 auto-run 返回 already-ran 且不调用 collectAccount
+ *    - collecting 中（stats:collect / stats:match-works / stats:auto-run）返回 busy 且不写 runs
+ *    - 采集中途抛错（单账号抛错 & 意外异常逃逸）与取消后：runs 仍写入、collecting 复位
+ *    - 原子写 auto-run.json 失败（ENOSPC）：只 warn、旧文件完整、无 .tmp 残留、collecting 复位
+ *    - 系统校时回拨到已跑日期返回 already-ran；runs 最多保留 14 个日期
+ *    - collectedToday（按 trim 后 partition）：match-works 或手动 collect 成功在 auto-run 跳过、
+ *      同分组同平台另一 partition 不跳过、跨组同 partition 跳过、失败不记入、日期变化清空
+ *    - 双窗口并发触发：仅跑一次、仅通知一次；只读 localStorage + 重挂载仍由主进程挡住
  *
  * 运行：yarn test:stats-scheduler
  */
@@ -40,13 +47,10 @@ const {
   STORAGE_KEY,
   DEFAULT_SETTINGS,
   STARTUP_DELAY_MS,
-  MAX_BUSY_RETRIES,
-  BUSY_ERROR_TEXT,
   formatLocalDate,
   normalizeSettings,
   isMainWindowLocation,
   shouldRun,
-  isBusyError,
   buildNotifyPayload,
   loadSettings,
   saveSettings,
@@ -76,9 +80,6 @@ function createMemoryStorage(initial = {}) {
     removeItem(key) {
       map.delete(key);
     },
-    dump() {
-      return Object.fromEntries(map.entries());
-    },
   };
 }
 
@@ -90,24 +91,6 @@ function createDeferred() {
     reject = rej;
   });
   return { promise, resolve, reject };
-}
-
-/** 构造内存态假主进程认领器（供渲染层纯调度单测使用） */
-function createFakeClaimer(getNow) {
-  const runs = new Set();
-  return {
-    runs,
-    autoClaim: async () => {
-      const date = formatLocalDate(getNow());
-      if (runs.has(date)) return { ok: false, reason: "already-ran" };
-      runs.add(date);
-      return { ok: true, date };
-    },
-    autoRelease: async (date) => {
-      const existed = runs.delete(date);
-      return { ok: true, released: existed };
-    },
-  };
 }
 
 function withMockDateNow(getNow, fn) {
@@ -129,102 +112,92 @@ function withMockDateNow(getNow, fn) {
   }
 }
 
+function withImmediateTimers(fn) {
+  const origSetTimeout = global.setTimeout;
+  global.setTimeout = (cb) => {
+    cb();
+    return 0;
+  };
+  const restore = () => {
+    global.setTimeout = origSetTimeout;
+  };
+  try {
+    const out = fn();
+    if (out && typeof out.then === "function") {
+      return out.finally(restore);
+    }
+    restore();
+    return out;
+  } catch (err) {
+    restore();
+    throw err;
+  }
+}
+
 async function main() {
-  /* ---------- 1. shouldRun 纯函数（不含依赖 Date 的启动闸门） ---------- */
+  /* ---------- 1. shouldRun 纯函数 ---------- */
   {
-    // 未到点不跑
     assert.strictEqual(
       shouldRun({
         now: localTime(2026, 11, 19, 9, 59, 59),
         settings: { enabled: true, time: "10:00", lastRunDate: "" },
       }),
       false,
-      "未到设定时间（09:59:59 < 10:00）不应运行"
+      "未到设定时间不应运行"
     );
-
-    // 到点跑
     assert.strictEqual(
       shouldRun({
         now: localTime(2026, 11, 19, 10, 0, 0),
         settings: { enabled: true, time: "10:00", lastRunDate: "" },
       }),
       true,
-      "刚好到点（10:00:00）应运行"
+      "刚好到点应运行"
     );
-    assert.strictEqual(
-      shouldRun({
-        now: localTime(2026, 11, 19, 10, 0, 30),
-        settings: { enabled: true, time: "10:00", lastRunDate: "" },
-      }),
-      true,
-      "到点后同分钟内应运行"
-    );
-
-    // 当天已跑快速跳过
-    assert.strictEqual(
-      shouldRun({
-        now: localTime(2026, 11, 19, 10, 30, 0),
-        settings: { enabled: true, time: "10:00", lastRunDate: "2026-11-19" },
-      }),
-      false,
-      "当天已跑过应快速跳过"
-    );
-
-    // 跨天：未到点不跑，到点再跑
-    assert.strictEqual(
-      shouldRun({
-        now: localTime(2026, 11, 20, 9, 30, 0),
-        settings: { enabled: true, time: "10:00", lastRunDate: "2026-11-19" },
-      }),
-      false,
-      "跨天后未到点不应运行"
-    );
-    assert.strictEqual(
-      shouldRun({
-        now: localTime(2026, 11, 20, 10, 0, 0),
-        settings: { enabled: true, time: "10:00", lastRunDate: "2026-11-19" },
-      }),
-      true,
-      "跨天到点应再次运行"
-    );
-
-    // 错过补跑
     assert.strictEqual(
       shouldRun({
         now: localTime(2026, 11, 19, 15, 30, 0),
         settings: { enabled: true, time: "10:00", lastRunDate: "2026-11-18" },
       }),
       true,
-      "错过设定时间且当天未跑时应补跑"
+      "错过设定时间应补跑"
     );
-
-    // shouldRun 已删除依赖 Date 的启动闸门：即使调用方传未来 startedAt 也不会阻塞
     assert.strictEqual(
       shouldRun({
-        now: localTime(2026, 11, 19, 15, 0, 0),
+        now: localTime(2026, 11, 19, 10, 30, 0),
         settings: { enabled: true, time: "10:00", lastRunDate: "" },
-        startedAt: localTime(2026, 11, 25, 15, 0, 0).getTime(),
+        doneLocalDate: "2026-11-19",
+      }),
+      false,
+      "doneLocalDate 为当天本地日期时不再调用"
+    );
+    // lastRunDate 仅作显示，不参与跳过判定（避免 UTC 与 UTC+8 混用导致隔天漏跑）
+    assert.strictEqual(
+      shouldRun({
+        now: localTime(2026, 11, 20, 23, 30, 0),
+        settings: { enabled: true, time: "23:30", lastRunDate: "2026-11-20" },
+        doneLocalDate: "2026-11-19",
       }),
       true,
-      "shouldRun 不应再含依赖 Date 的启动闸门"
+      "settings.lastRunDate 不得阻断次日本地定时触发"
     );
-
-    // 关闭不跑
+    assert.strictEqual(
+      shouldRun({
+        now: localTime(2026, 11, 20, 9, 59, 0),
+        settings: { enabled: true, time: "10:00", lastRunDate: "2026-11-19" },
+        doneLocalDate: "2026-11-19",
+      }),
+      false
+    );
     assert.strictEqual(
       shouldRun({
         now: localTime(2026, 11, 19, 12, 0, 0),
         settings: { enabled: false, time: "10:00", lastRunDate: "" },
       }),
-      false,
-      "enabled=false 时不应运行"
+      false
     );
-
-    // 坏设置回落默认
+    // 坏设置回落默认（10:00 / enabled:true）
     assert.strictEqual(
-      shouldRun({
-        now: localTime(2026, 11, 19, 9, 59, 0),
-        settings: null,
-      }),
+      shouldRun({ now: localTime(2026, 11, 19, 9, 59, 0), settings: null }),
       false
     );
     assert.strictEqual(
@@ -234,12 +207,12 @@ async function main() {
       }),
       true
     );
-
     // 边界时间 00:00 与 23:30
     assert.strictEqual(
       shouldRun({
         now: localTime(2026, 11, 20, 0, 0, 0),
-        settings: { enabled: true, time: "00:00", lastRunDate: "2026-11-19" },
+        settings: { enabled: true, time: "00:00", lastRunDate: "" },
+        doneLocalDate: "2026-11-19",
       }),
       true
     );
@@ -257,51 +230,34 @@ async function main() {
       }),
       true
     );
-
-    // 非法时间戳
     assert.strictEqual(shouldRun({ now: NaN, settings: DEFAULT_SETTINGS }), false);
-    console.log("✓ shouldRun 纯函数判定（无 Date 启动闸门 / 未到点 / 到点 / 跨天 / 补跑 / 关闭 / 坏设置）");
+    console.log("✓ shouldRun 纯函数判定（未到点 / 到点 / doneLocalDate / lastRunDate 不拦截 / 边界 / 坏设置）");
   }
 
   /* ---------- 2. 配置归一化、读写容错与保存失败反馈 ---------- */
   {
-    assert.deepStrictEqual(normalizeSettings(null), DEFAULT_SETTINGS);
-    assert.deepStrictEqual(normalizeSettings(undefined), DEFAULT_SETTINGS);
-    assert.deepStrictEqual(normalizeSettings([]), DEFAULT_SETTINGS);
-    assert.deepStrictEqual(normalizeSettings("bad"), DEFAULT_SETTINGS);
-    assert.deepStrictEqual(normalizeSettings(123), DEFAULT_SETTINGS);
-
+    for (const bad of [null, undefined, [], "bad", 123]) {
+      assert.deepStrictEqual(normalizeSettings(bad), DEFAULT_SETTINGS);
+    }
     assert.deepStrictEqual(
-      normalizeSettings({
-        enabled: false,
-        time: "25:00",
-        lastRunDate: "2026-11-18",
-      }),
+      normalizeSettings({ enabled: false, time: "25:00", lastRunDate: "2026-11-18" }),
       { enabled: false, time: "10:00", lastRunDate: "2026-11-18" }
     );
     assert.deepStrictEqual(
-      normalizeSettings({
-        enabled: "false",
-        time: "10:60",
-        lastRunDate: "2026-02-30",
-      }),
+      normalizeSettings({ enabled: "false", time: "10:60", lastRunDate: "2026-02-30" }),
       { enabled: true, time: "10:00", lastRunDate: "" }
     );
     assert.deepStrictEqual(
-      normalizeSettings({
-        enabled: true,
-        time: "08:30",
-        lastRunDate: "2024-02-29",
-      }),
+      normalizeSettings({ enabled: true, time: "08:30", lastRunDate: "2024-02-29" }),
       { enabled: true, time: "08:30", lastRunDate: "2024-02-29" }
     );
-
     for (const badRaw of ["", "{broken", "null", "[]", "123", '"hello"', "true"]) {
-      const storage = createMemoryStorage({ [STORAGE_KEY]: badRaw });
-      assert.deepStrictEqual(loadSettings(storage), DEFAULT_SETTINGS);
+      assert.deepStrictEqual(
+        loadSettings(createMemoryStorage({ [STORAGE_KEY]: badRaw })),
+        DEFAULT_SETTINGS
+      );
     }
 
-    // 写入失败：返回 { ok: false, settings: 旧有效配置, error }，不广播
     const origGlobalLS = global.localStorage;
     const broadcasted = [];
     const unsub = subscribeSettings((s) => broadcasted.push(s));
@@ -311,30 +267,28 @@ async function main() {
         time: "10:00",
         lastRunDate: "2026-11-18",
       });
-      const failingStorage = {
+      global.localStorage = {
         getItem: () => storedRaw,
         setItem() {
           throw new Error("QuotaExceededError");
         },
       };
-      global.localStorage = failingStorage;
 
       const saveFail = saveSettings({ enabled: false, time: "11:30" });
-      assert.strictEqual(saveFail.ok, false, "setItem 抛错必须返回 ok:false");
+      assert.strictEqual(saveFail.ok, false);
       assert.ok(saveFail.error.includes("QuotaExceededError"));
-      assert.deepStrictEqual(
-        saveFail.settings,
-        { enabled: true, time: "10:00", lastRunDate: "2026-11-18" },
-        "保存失败应返回当前实际生效的旧配置供开关 UI 回滚"
-      );
-      assert.strictEqual(broadcasted.length, 0, "保存失败不得广播假状态");
+      assert.deepStrictEqual(saveFail.settings, {
+        enabled: true,
+        time: "10:00",
+        lastRunDate: "2026-11-18",
+      });
+      assert.strictEqual(broadcasted.length, 0);
 
       const updateFail = updateSettings({ enabled: false });
       assert.strictEqual(updateFail.ok, false);
       assert.strictEqual(updateFail.settings.enabled, true);
       assert.strictEqual(broadcasted.length, 0);
 
-      // 无 storage 时同样返回 ok:false
       const noStorageRes = saveSettings({ enabled: false }, null);
       assert.strictEqual(noStorageRes.ok, false);
       assert.deepStrictEqual(noStorageRes.settings, DEFAULT_SETTINGS);
@@ -344,13 +298,11 @@ async function main() {
       else global.localStorage = origGlobalLS;
     }
 
-    // 正常写入与局部更新
     const storage = createMemoryStorage();
-    const saved = saveSettings(
-      { enabled: true, time: "10:00", lastRunDate: "2026-11-18" },
-      storage
+    assert.strictEqual(
+      saveSettings({ enabled: true, time: "10:00", lastRunDate: "2026-11-18" }, storage).ok,
+      true
     );
-    assert.strictEqual(saved.ok, true);
     const updated = updateSettings({ time: "14:30", lastRunDate: undefined }, storage);
     assert.strictEqual(updated.ok, true);
     assert.deepStrictEqual(updated.settings, {
@@ -358,29 +310,23 @@ async function main() {
       time: "14:30",
       lastRunDate: "2026-11-18",
     });
-    assert.deepStrictEqual(loadSettings(storage), updated.settings);
-    console.log("✓ 配置归一化、读写容错与保存失败回滚结果正确");
+    console.log("✓ 配置归一化、读写容错与保存失败回滚正确");
   }
 
-  /* ---------- 3. 单调时钟启动延迟（不受系统时间回拨/前拨影响） ---------- */
+  /* ---------- 3. 单调时钟启动延迟（2 分钟内不调用，不受挂钟回拨/前拨影响） ---------- */
   {
-    // 启动时系统时钟错误超前 6 天（2026-11-25 10:00），随后校时回拨到 2026-11-19 10:05
     let wallNow = localTime(2026, 11, 25, 10, 0, 0).getTime();
     let monoNow = 1000;
-    const storage = createMemoryStorage();
-    const claimer = createFakeClaimer(() => wallNow);
-    let collectCalls = 0;
+    let calls = 0;
 
     const sMono = createStatsScheduler({
-      storage,
+      storage: createMemoryStorage(),
       now: () => wallNow,
       monotonicNow: () => monoNow,
       getAccounts: () => [{ group: "G1", platform: "抖音", partition: "p1" }],
-      autoClaim: claimer.autoClaim,
-      autoRelease: claimer.autoRelease,
-      collect: async () => {
-        collectCalls++;
-        return { cancelled: false, results: [{ success: true }] };
+      autoRun: async () => {
+        calls++;
+        return { status: "done", date: "2026-11-19", results: [{ success: true }] };
       },
       setIntervalFn: () => 1,
       clearIntervalFn: () => {},
@@ -388,20 +334,20 @@ async function main() {
 
     sMono.start();
 
-    // 即使挂钟往前跳 10 分钟，单调时钟只过了 60s（< 120s），仍必须等待
+    // 启动后 119 秒（即使挂钟跳快 10 分钟），仍不调用
     wallNow = localTime(2026, 11, 25, 10, 10, 0).getTime();
-    monoNow += 60 * 1000;
+    monoNow += STARTUP_DELAY_MS - 1000;
     assert.deepStrictEqual(await sMono.tick(), { ran: false, reason: "startup-delay" });
-    assert.strictEqual(collectCalls, 0);
+    assert.strictEqual(calls, 0);
 
-    // 挂钟大幅回拨 6 天到 2026-11-19 10:05，但单调时钟已满 2 分钟 → 立刻放行
+    // 挂钟大幅回拨 6 天到 2026-11-19 10:05，单调时钟满 2 分钟 → 立即放行
     wallNow = localTime(2026, 11, 19, 10, 5, 0).getTime();
-    monoNow += 60 * 1000;
+    monoNow += 1000;
     const out = await sMono.tick();
-    assert.strictEqual(out.ran, true, "系统校时回拨后单调时钟满 2 分钟应正常触发");
-    assert.strictEqual(collectCalls, 1);
+    assert.strictEqual(out.ran, true);
+    assert.strictEqual(calls, 1);
     sMono.stop();
-    console.log("✓ 单调时钟启动延迟（挂钟前拨不提前、挂钟回拨 6 天不卡死）");
+    console.log("✓ 单调时钟 2 分钟启动延迟（启动 2 分钟内不调用、挂钟前拨/回拨不影响）");
   }
 
   /* ---------- 4. isMainWindowLocation 主窗口判定 ---------- */
@@ -418,11 +364,7 @@ async function main() {
       { protocol: "http:", hostname: "127.0.0.1", pathname: "/index.html", hash: "" },
     ];
     for (const loc of mainCases) {
-      assert.strictEqual(
-        isMainWindowLocation(loc),
-        true,
-        `主窗口 URL 应放行: ${JSON.stringify(loc)}`
-      );
+      assert.strictEqual(isMainWindowLocation(loc), true);
     }
 
     const nonMainCases = [
@@ -431,49 +373,42 @@ async function main() {
       { protocol: "http:", hostname: "localhost", pathname: "/static/loader.html", hash: "" },
       { protocol: "file:", hostname: "", pathname: "/app/index.html", hash: "#/login" },
       { protocol: "http:", hostname: "localhost", pathname: "/", hash: "#/print" },
-      { protocol: "file:", hostname: "", pathname: "/app/index.html", hash: "#/child" },
       { protocol: "https:", hostname: "creator.douyin.com", pathname: "/creator-micro/home", hash: "" },
       { protocol: "about:", hostname: "", pathname: "blank", hash: "" },
     ];
     for (const loc of nonMainCases) {
-      assert.strictEqual(
-        isMainWindowLocation(loc),
-        false,
-        `非主窗口 URL 应拒绝: ${JSON.stringify(loc)}`
-      );
+      assert.strictEqual(isMainWindowLocation(loc), false);
     }
     console.log("✓ isMainWindowLocation 主窗口与登录/子窗口区分正确");
   }
 
-  /* ---------- 5. 调度器主流程、失败不释放、busy 重试与 autoRelease ---------- */
+  /* ---------- 5. 调度器行为：done/already-ran/busy/IPC异常/null账号/防重入/改设置 ---------- */
   {
-    // 5a. 主流程：延迟 → 认领 → 采集 → 通知 → 同天不再跑 → 跨天再跑 → stop 清理
-    let currentTime = localTime(2026, 11, 19, 9, 59, 0).getTime();
-    let mono = 0;
-    const storage = createMemoryStorage();
-    const claimer = createFakeClaimer(() => currentTime);
-    const calls = [];
-    const notifications = [];
-    let intervalId = 0;
-    const clearedIds = [];
-    let claimedBeforeCollect = false;
-
-    const accounts = [
+    const sampleAccounts = [
       { group: "G1", platform: "抖音", partition: "persist:G1-抖音" },
       { group: "G1", platform: "快手", partition: "persist:G1-快手" },
     ];
 
-    const scheduler = createStatsScheduler({
+    // 5a. done 后当天本地不再调用、弹 notify、跨天再跑、stop 清理
+    let tMain = localTime(2026, 11, 19, 9, 59, 0).getTime();
+    let mono = 0;
+    const storage = createMemoryStorage();
+    const calls = [];
+    const notifications = [];
+    let intervalId = 0;
+    const clearedIds = [];
+
+    const sched = createStatsScheduler({
       storage,
-      now: () => currentTime,
+      now: () => tMain,
       monotonicNow: () => mono,
-      getAccounts: () => accounts,
-      autoClaim: claimer.autoClaim,
-      autoRelease: claimer.autoRelease,
-      collect: async (accs) => {
-        claimedBeforeCollect = claimer.runs.has("2026-11-19");
-        calls.push({ at: formatLocalDate(currentTime), count: accs.length });
+      getAccounts: () => sampleAccounts,
+      autoRun: async (accs) => {
+        const d = formatLocalDate(tMain);
+        calls.push({ date: d, count: accs.length });
         return {
+          status: "done",
+          date: d,
           cancelled: false,
           results: [
             { group: "G1", platform: "抖音", success: true, workCount: 10 },
@@ -481,193 +416,174 @@ async function main() {
           ],
         };
       },
-      notify: (payload) => notifications.push(payload),
+      notify: (p) => notifications.push(p),
       setIntervalFn: () => ++intervalId,
       clearIntervalFn: (id) => clearedIds.push(id),
     });
 
-    assert.deepStrictEqual(await scheduler.tick(), { ran: false, reason: "stopped" });
-    scheduler.start();
+    assert.deepStrictEqual(await sched.tick(), { ran: false, reason: "stopped" });
+    sched.start();
     assert.strictEqual(intervalId, 1);
 
-    currentTime = localTime(2026, 11, 19, 10, 0, 0).getTime();
+    tMain = localTime(2026, 11, 19, 10, 0, 0).getTime();
     mono += 60 * 1000;
-    assert.deepStrictEqual(await scheduler.tick(), { ran: false, reason: "startup-delay" });
+    assert.deepStrictEqual(await sched.tick(), { ran: false, reason: "startup-delay" });
 
-    currentTime = localTime(2026, 11, 19, 10, 1, 0).getTime();
+    tMain = localTime(2026, 11, 19, 10, 1, 0).getTime();
     mono += 60 * 1000;
-    const r1 = await scheduler.tick();
+    const r1 = await sched.tick();
     assert.strictEqual(r1.ran, true);
     assert.strictEqual(calls.length, 1);
-    assert.strictEqual(claimedBeforeCollect, true, "采集前必须已完成主进程认领");
+    assert.strictEqual(sched.getState().doneLocalDate, "2026-11-19");
     assert.strictEqual(loadSettings(storage).lastRunDate, "2026-11-19");
     assert.strictEqual(notifications.length, 1);
     assert.strictEqual(notifications[0].type, "warning");
     assert.ok(notifications[0].message.includes("成功 1 / 失败 1"));
 
-    // 同天再 tick 不跑
-    currentTime = localTime(2026, 11, 19, 10, 2, 0).getTime();
-    mono += 60 * 1000;
-    assert.deepStrictEqual(await scheduler.tick(), { ran: false, reason: "not-due" });
+    // 当天本地再次 tick：不再调用 autoRun
+    tMain = localTime(2026, 11, 19, 10, 2, 0).getTime();
+    assert.deepStrictEqual(await sched.tick(), { ran: false, reason: "not-due" });
+    assert.strictEqual(calls.length, 1);
 
     // 跨天未到点不跑，到点再跑
-    currentTime = localTime(2026, 11, 20, 9, 59, 0).getTime();
-    assert.deepStrictEqual(await scheduler.tick(), { ran: false, reason: "not-due" });
-    currentTime = localTime(2026, 11, 20, 10, 0, 0).getTime();
-    const r2 = await scheduler.tick();
+    tMain = localTime(2026, 11, 20, 9, 59, 0).getTime();
+    assert.deepStrictEqual(await sched.tick(), { ran: false, reason: "not-due" });
+    tMain = localTime(2026, 11, 20, 10, 0, 0).getTime();
+    const r2 = await sched.tick();
     assert.strictEqual(r2.ran, true);
     assert.strictEqual(calls.length, 2);
     assert.strictEqual(loadSettings(storage).lastRunDate, "2026-11-20");
 
-    scheduler.stop();
+    sched.stop();
     assert.deepStrictEqual(clearedIds, [1]);
-    assert.deepStrictEqual(await scheduler.tick(), { ran: false, reason: "stopped" });
+    assert.deepStrictEqual(await sched.tick(), { ran: false, reason: "stopped" });
 
-    // 5b. collect 抛异常：不释放认领，不重炸平台
-    let tErr = localTime(2026, 11, 19, 10, 0, 0).getTime();
-    const errClaimer = createFakeClaimer(() => tErr);
-    let errCollectCount = 0;
-    let errReleaseCount = 0;
-    const errNotifies = [];
-    const sErr = createStatsScheduler({
-      storage: createMemoryStorage(),
-      now: () => tErr,
+    // 5b. busy 与 IPC 异常后不设标记，下一分钟无限重试（无 6 次上限），恢复后成功
+    let tRetry = localTime(2026, 11, 19, 10, 0, 0).getTime();
+    let attempt = 0;
+    const retryNotifies = [];
+    const retryStorage = createMemoryStorage();
+    const sRetry = createStatsScheduler({
+      storage: retryStorage,
+      now: () => tRetry,
       monotonicNow: () => STARTUP_DELAY_MS,
       startupDelayMs: 0,
-      getAccounts: () => accounts,
-      autoClaim: errClaimer.autoClaim,
-      autoRelease: async (d) => {
-        errReleaseCount++;
-        return errClaimer.autoRelease(d);
+      getAccounts: () => sampleAccounts,
+      autoRun: async () => {
+        attempt++;
+        if (attempt <= 7) return { status: "busy" }; // 超过旧 6 次上限仍继续重试
+        if (attempt === 8) throw new Error("IPC 通道断开");
+        return {
+          status: "done",
+          date: "2026-11-19",
+          results: [{ group: "G1", platform: "抖音", success: true }],
+        };
       },
-      collect: async () => {
-        errCollectCount++;
-        throw new Error("网络断开");
-      },
-      notify: (p) => errNotifies.push(p),
+      notify: (p) => retryNotifies.push(p),
       setIntervalFn: () => 1,
       clearIntervalFn: () => {},
     });
-    sErr.start();
-    const outErr = await sErr.tick();
-    assert.strictEqual(outErr.ran, true);
-    assert.strictEqual(errCollectCount, 1);
-    assert.strictEqual(errReleaseCount, 0, "采集抛异常不得释放当日认领");
-    assert.strictEqual(errNotifies.length, 1);
-    assert.ok(errNotifies[0].message.includes("网络断开"));
-    tErr += 60 * 1000;
-    await sErr.tick();
-    assert.strictEqual(errCollectCount, 1);
-    sErr.stop();
-
-    // 5c. 认领后 collect 返回 busy → 调用 autoRelease，最多重试 6 次（共 7 次），跨天清零
-    let tBusy = localTime(2026, 11, 19, 10, 0, 0).getTime();
-    const busyStorage = createMemoryStorage();
-    saveSettings({ enabled: true, time: "10:00", lastRunDate: "2026-11-18" }, busyStorage);
-    const busyClaimer = createFakeClaimer(() => tBusy);
-    let busyCollectCalls = 0;
-    let busyReleaseCalls = 0;
-    const busyNotifies = [];
-    const sBusy = createStatsScheduler({
-      storage: busyStorage,
-      now: () => tBusy,
-      monotonicNow: () => STARTUP_DELAY_MS,
-      startupDelayMs: 0,
-      getAccounts: () => accounts,
-      autoClaim: busyClaimer.autoClaim,
-      autoRelease: async (date) => {
-        busyReleaseCalls++;
-        return busyClaimer.autoRelease(date);
-      },
-      collect: async () => {
-        busyCollectCalls++;
-        if (busyCollectCalls === 2) {
-          updateSettings({ time: "09:30" }, busyStorage);
-        }
-        return { results: [], error: BUSY_ERROR_TEXT };
-      },
-      notify: (p) => busyNotifies.push(p),
-      setIntervalFn: () => 1,
-      clearIntervalFn: () => {},
-    });
-    sBusy.start();
-
-    for (let i = 1; i <= 10; i++) {
-      const out = await sBusy.tick();
-      if (i <= MAX_BUSY_RETRIES + 1) {
-        assert.strictEqual(out.busy, true);
-        assert.strictEqual(out.retryCount, i);
-        assert.strictEqual(out.exhausted, i > MAX_BUSY_RETRIES);
-        assert.strictEqual(busyClaimer.runs.has("2026-11-19"), false, "每次 busy 后必须释放认领");
-        assert.strictEqual(loadSettings(busyStorage).lastRunDate, "2026-11-18");
-      } else {
-        assert.deepStrictEqual(out, { ran: false, reason: "not-due" });
-      }
-      tBusy += 60 * 1000;
+    sRetry.start();
+    for (let i = 1; i <= 7; i++) {
+      assert.deepStrictEqual(await sRetry.tick(), { ran: false, reason: "busy" });
+      assert.strictEqual(sRetry.getState().doneLocalDate, "");
+      assert.strictEqual(loadSettings(retryStorage).lastRunDate, "");
+      tRetry += 60 * 1000;
     }
-    assert.strictEqual(busyCollectCalls, MAX_BUSY_RETRIES + 1);
-    assert.strictEqual(busyReleaseCalls, MAX_BUSY_RETRIES + 1);
-    assert.strictEqual(busyNotifies.length, 0);
-    assert.strictEqual(loadSettings(busyStorage).time, "09:30");
+    const ipcErrOut = await sRetry.tick();
+    assert.strictEqual(ipcErrOut.ran, false);
+    assert.strictEqual(ipcErrOut.reason, "ipc-error");
+    assert.strictEqual(sRetry.getState().doneLocalDate, "");
+    assert.strictEqual(retryNotifies.length, 0);
 
-    // 跨天重试计数清零
-    tBusy = localTime(2026, 11, 20, 9, 30, 0).getTime();
-    const nextDayBusy = await sBusy.tick();
-    assert.strictEqual(nextDayBusy.busy, true);
-    assert.strictEqual(nextDayBusy.retryCount, 1);
-    sBusy.stop();
+    // 第 9 分钟恢复成功
+    tRetry += 60 * 1000;
+    const okOut = await sRetry.tick();
+    assert.strictEqual(okOut.ran, true);
+    assert.strictEqual(attempt, 9);
+    assert.strictEqual(sRetry.getState().doneLocalDate, "2026-11-19");
+    assert.strictEqual(loadSettings(retryStorage).lastRunDate, "2026-11-19");
+    assert.strictEqual(retryNotifies.length, 1);
 
-    // 5d. autoClaim 直接返回 busy → 不调 autoRelease、不调 collect，中途恢复后成功
-    let tClaimBusy = localTime(2026, 11, 19, 10, 0, 0).getTime();
-    let claimAttempts = 0;
-    let releaseOnClaimBusy = 0;
-    let collectAfterBusy = 0;
-    const sClaimBusy = createStatsScheduler({
-      storage: createMemoryStorage(),
-      now: () => tClaimBusy,
+    // 成功后当天不再调
+    tRetry += 60 * 1000;
+    assert.deepStrictEqual(await sRetry.tick(), { ran: false, reason: "not-due" });
+    assert.strictEqual(attempt, 9);
+    sRetry.stop();
+
+    // 5c. already-ran → 设 doneLocalDate & 更新 lastRunDate，不弹 notify，当天不再调
+    let tAlready = localTime(2026, 11, 19, 10, 0, 0).getTime();
+    let alreadyCalls = 0;
+    const alreadyNotifies = [];
+    const alreadyStorage = createMemoryStorage();
+    const sAlready = createStatsScheduler({
+      storage: alreadyStorage,
+      now: () => tAlready,
       monotonicNow: () => STARTUP_DELAY_MS,
       startupDelayMs: 0,
-      getAccounts: () => accounts,
-      autoClaim: async () => {
-        claimAttempts++;
-        if (claimAttempts <= 2) return { ok: false, reason: "busy" };
-        return { ok: true, date: "2026-11-19" };
+      getAccounts: () => sampleAccounts,
+      autoRun: async () => {
+        alreadyCalls++;
+        return { status: "already-ran", date: "2026-11-19" };
       },
-      autoRelease: async () => {
-        releaseOnClaimBusy++;
-        return { ok: true, released: true };
-      },
-      collect: async () => {
-        collectAfterBusy++;
-        return { cancelled: false, results: [{ success: true }] };
+      notify: (p) => alreadyNotifies.push(p),
+      setIntervalFn: () => 1,
+      clearIntervalFn: () => {},
+    });
+    sAlready.start();
+    assert.deepStrictEqual(await sAlready.tick(), {
+      ran: false,
+      reason: "already-ran",
+      date: "2026-11-19",
+    });
+    assert.strictEqual(alreadyCalls, 1);
+    assert.strictEqual(alreadyNotifies.length, 0);
+    assert.strictEqual(sAlready.getState().doneLocalDate, "2026-11-19");
+    assert.strictEqual(loadSettings(alreadyStorage).lastRunDate, "2026-11-19");
+    tAlready += 60 * 1000;
+    assert.deepStrictEqual(await sAlready.tick(), { ran: false, reason: "not-due" });
+    assert.strictEqual(alreadyCalls, 1);
+    sAlready.stop();
+
+    // 5d. getAccounts 返回 null 或空数组 → 本轮跳过，不调用 autoRun
+    let nullCalls = 0;
+    let mockAccs = null;
+    const sNull = createStatsScheduler({
+      storage: createMemoryStorage(),
+      now: () => localTime(2026, 11, 19, 10, 0, 0).getTime(),
+      monotonicNow: () => STARTUP_DELAY_MS,
+      startupDelayMs: 0,
+      getAccounts: () => mockAccs,
+      autoRun: async () => {
+        nullCalls++;
+        return { status: "done", date: "2026-11-19", results: [{ success: true }] };
       },
       setIntervalFn: () => 1,
       clearIntervalFn: () => {},
     });
-    sClaimBusy.start();
-    assert.strictEqual((await sClaimBusy.tick()).busy, true);
-    tClaimBusy += 60 * 1000;
-    assert.strictEqual((await sClaimBusy.tick()).busy, true);
-    assert.strictEqual(releaseOnClaimBusy, 0, "autoClaim 返回 busy 时从未认领，不得调 autoRelease");
-    assert.strictEqual(collectAfterBusy, 0);
-    tClaimBusy += 60 * 1000;
-    assert.strictEqual((await sClaimBusy.tick()).ran, true);
-    assert.strictEqual(collectAfterBusy, 1);
-    sClaimBusy.stop();
+    sNull.start();
+    assert.deepStrictEqual(await sNull.tick(), { ran: false, reason: "no-accounts" });
+    mockAccs = [];
+    assert.deepStrictEqual(await sNull.tick(), { ran: false, reason: "no-accounts" });
+    assert.strictEqual(nullCalls, 0);
+    assert.strictEqual(sNull.getState().doneLocalDate, "");
+    // 有账号后下一轮正常触发
+    mockAccs = sampleAccounts;
+    assert.strictEqual((await sNull.tick()).ran, true);
+    assert.strictEqual(nullCalls, 1);
+    sNull.stop();
 
-    // 5e. 并发防重入 + stop 后静默 + 改设置即时生效 + buildNotifyPayload(含 skipped)
-    let tConc = localTime(2026, 11, 19, 10, 0, 0).getTime();
+    // 5e. 并发防重入 + stop 后静默 + 改设置即时生效 + buildNotifyPayload
     const pending = createDeferred();
     let concCalls = 0;
     const concNotifies = [];
     const sConc = createStatsScheduler({
       storage: createMemoryStorage(),
-      now: () => tConc,
+      now: () => localTime(2026, 11, 19, 10, 0, 0).getTime(),
       monotonicNow: () => STARTUP_DELAY_MS,
       startupDelayMs: 0,
-      getAccounts: () => accounts,
-      autoClaim: async () => ({ ok: true, date: "2026-11-19" }),
-      collect: () => {
+      getAccounts: () => sampleAccounts,
+      autoRun: () => {
         concCalls++;
         return pending.promise;
       },
@@ -680,25 +596,22 @@ async function main() {
     assert.deepStrictEqual(await sConc.tick(), { ran: false, reason: "in-flight" });
     assert.strictEqual(concCalls, 1);
     sConc.stop();
-    pending.resolve({ cancelled: false, results: [{ success: true }] });
+    pending.resolve({ status: "done", date: "2026-11-19", results: [{ success: true }] });
     await p1;
     assert.strictEqual(concNotifies.length, 0);
 
-    // 改设置即时生效
-    let tLive = localTime(2026, 11, 19, 11, 0, 0).getTime();
     const liveStorage = createMemoryStorage();
     saveSettings({ enabled: false, time: "18:00", lastRunDate: "" }, liveStorage);
     let liveCalls = 0;
     const sLive = createStatsScheduler({
       storage: liveStorage,
-      now: () => tLive,
+      now: () => localTime(2026, 11, 19, 11, 0, 0).getTime(),
       monotonicNow: () => STARTUP_DELAY_MS,
       startupDelayMs: 0,
-      getAccounts: () => accounts,
-      autoClaim: async () => ({ ok: true, date: "2026-11-19" }),
-      collect: async () => {
+      getAccounts: () => sampleAccounts,
+      autoRun: async () => {
         liveCalls++;
-        return { cancelled: false, results: [{ success: true }] };
+        return { status: "done", date: "2026-11-19", results: [{ success: true }] };
       },
       setIntervalFn: () => 1,
       clearIntervalFn: () => {},
@@ -712,25 +625,22 @@ async function main() {
     assert.strictEqual(liveCalls, 1);
     sLive.stop();
 
-    // buildNotifyPayload（含 skipped 账号）与 isBusyError
-    assert.strictEqual(isBusyError({ error: "已有采集任务进行中" }), true);
-    assert.strictEqual(isBusyError({ error: "没有可采集的账号" }), false);
-    assert.strictEqual(isBusyError(null), false);
-    const skipOnlyNotify = buildNotifyPayload({
+    // buildNotifyPayload
+    const skipOnly = buildNotifyPayload({
       cancelled: false,
       results: [{ group: "G1", platform: "抖音", success: true, skipped: true }],
     });
-    assert.strictEqual(skipOnlyNotify.type, "info");
-    assert.ok(skipOnlyNotify.message.includes("跳过 1"));
-    const mixNotify = buildNotifyPayload({
+    assert.strictEqual(skipOnly.type, "info");
+    assert.ok(skipOnly.message.includes("跳过 1"));
+    const mixed = buildNotifyPayload({
       cancelled: false,
       results: [
         { group: "G1", platform: "抖音", success: true, skipped: true },
         { group: "G1", platform: "快手", success: true },
       ],
     });
-    assert.strictEqual(mixNotify.type, "success");
-    assert.ok(mixNotify.message.includes("成功 1 / 跳过 1 / 失败 0"));
+    assert.strictEqual(mixed.type, "success");
+    assert.ok(mixed.message.includes("成功 1 / 跳过 1 / 失败 0"));
     assert.strictEqual(
       buildNotifyPayload({ cancelled: true, results: [{ success: true }] }).type,
       "info"
@@ -739,10 +649,10 @@ async function main() {
       buildNotifyPayload({ results: [], error: "服务异常" }).title,
       "每日自动采集失败"
     );
-    console.log("✓ 调度器主流程、异常不释放、busy 重试上限、防重入与 skipped 通知正确");
+    console.log("✓ 调度器行为（done/already-ran/busy 无限重试/IPC 异常/null 账号/防重入/通知）正确");
   }
 
-  /* ---------- 6. 主进程权威认领 + store 真实落盘 + match-works 互斥 + auto 跳过今日已成功 + accountTree 损坏 ---------- */
+  /* ---------- 6. 主进程 stats:auto-run + store.js 真实落盘 + collectedToday + 互斥 + UTC 23:30 ---------- */
   {
     const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "mm-stats-sched-"));
     const electronId = require.resolve("electron");
@@ -772,12 +682,17 @@ async function main() {
     };
 
     const ipcHandlers = new Map();
-    const invokeCalls = [];
     const collectedBatches = [];
     let collectorImpl = async ({ partition, platform }) => ({
       overview: { plays: 10 },
       fansHistory: [],
-      works: [{ workId: `${partition}-w1`, title: `标题-${platform}`, url: "https://example.com/1" }],
+      works: [
+        {
+          workId: `${partition}-w1`,
+          title: `标题-${platform}`,
+          url: "https://example.com/1",
+        },
+      ],
     });
 
     require.cache[electronId] = {
@@ -791,7 +706,6 @@ async function main() {
         },
         ipcRenderer: {
           invoke: async (channel, payload) => {
-            invokeCalls.push({ channel, payload });
             const handler = ipcHandlers.get(channel);
             if (!handler) throw new Error(`未注册 IPC: ${channel}`);
             return handler({ sender: { send: () => {} } }, payload);
@@ -822,19 +736,25 @@ async function main() {
       const { buildCollectAccounts } = require(statsApiId);
       registerDataStatsIpc();
 
-      const claimHandler = ipcHandlers.get("stats:auto-claim");
-      const releaseHandler = ipcHandlers.get("stats:auto-release");
+      // 已彻底移除 stats:auto-claim / stats:auto-release，新增 stats:auto-run
+      assert.strictEqual(ipcHandlers.has("stats:auto-claim"), false);
+      assert.strictEqual(ipcHandlers.has("stats:auto-release"), false);
+      assert.strictEqual(typeof store.writeAutoRuns, "undefined");
+      assert.strictEqual(typeof store.appendAutoRun, "function");
+
+      const autoRunHandler = ipcHandlers.get("stats:auto-run");
       const collectHandler = ipcHandlers.get("stats:collect");
+      const cancelHandler = ipcHandlers.get("stats:cancel");
       const matchHandler = ipcHandlers.get("stats:match-works");
-      assert.strictEqual(typeof claimHandler, "function");
-      assert.strictEqual(typeof releaseHandler, "function");
+      assert.strictEqual(typeof autoRunHandler, "function");
       assert.strictEqual(typeof collectHandler, "function");
+      assert.strictEqual(typeof cancelHandler, "function");
       assert.strictEqual(typeof matchHandler, "function");
 
       const fakeEvent = { sender: { send: () => {} } };
       const autoRunFile = path.join(tmpRoot, "data-stats", "auto-run.json");
 
-      /* ---- 6a. buildCollectAccounts 解析失败返回 null vs 空数组 [] + 调度器遇损坏不认领 ---- */
+      /* ---- 6a. buildCollectAccounts：无数据/损坏/非对象/空列表 → null；坏 children 节点跳过 ---- */
       {
         const lsMap = new Map();
         global.localStorage = {
@@ -843,20 +763,45 @@ async function main() {
           removeItem: (k) => lsMap.delete(k),
         };
 
-        // 未初始化 / 空对象 → []
-        assert.deepStrictEqual(buildCollectAccounts(), []);
-        lsMap.set("accountTree", "{}");
-        assert.deepStrictEqual(buildCollectAccounts(), []);
-
-        // 损坏 JSON / 非对象 JSON → null
-        for (const bad of ["{broken", "null", "[]", "123", '"oops"']) {
+        // 无 accountTree / 空串 / 空对象 / 损坏 JSON / 非对象根 → null
+        assert.strictEqual(buildCollectAccounts(), null);
+        for (const bad of ["", "{}", "{broken", "null", "[]", "123", '"oops"']) {
           lsMap.set("accountTree", bad);
           assert.strictEqual(
             buildCollectAccounts(),
             null,
-            `损坏 accountTree(${bad}) 应返回 null`
+            `accountTree=${bad} 应返回 null`
           );
         }
+
+        // 所有节点 children 非数组，或仅含不参与统计平台 → 最终为空 → null
+        lsMap.set(
+          "accountTree",
+          JSON.stringify({
+            badGroup: { children: "not-an-array" },
+            nullGroup: null,
+            excludedOnly: {
+              children: [{ meta: { phone: "G1", pt: "番茄视频" } }],
+            },
+          })
+        );
+        assert.strictEqual(buildCollectAccounts(), null);
+
+        // 混合坏节点与好节点 → 跳过坏节点，返回有效账号
+        lsMap.set(
+          "accountTree",
+          JSON.stringify({
+            badGroup: { children: { broken: true } },
+            goodGroup: {
+              children: [null, { meta: { phone: "Good", pt: "抖音" } }],
+            },
+          })
+        );
+        const built = buildCollectAccounts();
+        assert.strictEqual(Array.isArray(built), true);
+        assert.strictEqual(built.length, 1);
+        assert.strictEqual(built[0].group, "goodGroup");
+        assert.strictEqual(built[0].platform, "抖音");
 
         // localStorage.getItem 抛错 → null
         global.localStorage = {
@@ -867,577 +812,589 @@ async function main() {
         };
         assert.strictEqual(buildCollectAccounts(), null);
 
-        // 调度器遇到损坏 accountTree：不调用 auto-claim、不写入 auto-run.json、继续轮询；修复后正常认领
+        // 调度器遇到缺失/空/损坏 accountTree：不触发 stats:auto-run、不写 auto-run.json
         global.localStorage = {
           getItem: (k) => (lsMap.has(k) ? lsMap.get(k) : null),
           setItem: (k, v) => lsMap.set(k, String(v)),
           removeItem: (k) => lsMap.delete(k),
         };
+        lsMap.delete("accountTree");
+        const sEmpty = createStatsScheduler({
+          storage: createMemoryStorage(),
+          now: () => localTime(2026, 11, 19, 10, 0, 0).getTime(),
+          monotonicNow: () => STARTUP_DELAY_MS,
+          startupDelayMs: 0,
+          setIntervalFn: () => 1,
+          clearIntervalFn: () => {},
+        });
+        sEmpty.start();
+        assert.deepStrictEqual(await sEmpty.tick(), { ran: false, reason: "no-accounts" });
+        lsMap.set("accountTree", "{}");
+        assert.deepStrictEqual(await sEmpty.tick(), { ran: false, reason: "no-accounts" });
         lsMap.set("accountTree", "{broken");
-
-        let mockNow = cnTime(2026, 11, 19, 10, 0, 0);
-        await withMockDateNow(
-          () => mockNow,
-          async () => {
-            const sched = createStatsScheduler({
-              storage: createMemoryStorage(),
-              now: () => localTime(2026, 11, 19, 10, 0, 0).getTime(),
-              monotonicNow: () => STARTUP_DELAY_MS,
-              startupDelayMs: 0,
-              setIntervalFn: () => 1,
-              clearIntervalFn: () => {},
-            });
-            sched.start();
-            const brokenOut = await sched.tick();
-            assert.deepStrictEqual(brokenOut, {
-              ran: false,
-              reason: "accounts-unavailable",
-            });
-            assert.strictEqual(
-              fs.existsSync(autoRunFile),
-              false,
-              "accountTree 损坏时绝不得向主进程认领"
-            );
-
-            // 修复为空账号树 {} → 确认为空数组，此时走 auto-claim 记录当天已跑，但不调 collect
-            lsMap.set("accountTree", "{}");
-            const beforeCollectLen = collectedBatches.length;
-            const emptyOut = await sched.tick();
-            assert.strictEqual(emptyOut.ran, true);
-            assert.strictEqual(emptyOut.skippedEmpty, true);
-            assert.strictEqual(emptyOut.date, "2026-11-19");
-            assert.strictEqual(collectedBatches.length, beforeCollectLen);
-            assert.deepStrictEqual(
-              JSON.parse(fs.readFileSync(autoRunFile, "utf8")).runs,
-              ["2026-11-19"],
-              "确认空账号时仍须调用 auto-claim 落盘记录当日已跑"
-            );
-            sched.stop();
-          }
-        );
-
-        // 释放 2026-11-19 以便后续用例从干净状态开始
-        const relClean = await releaseHandler(fakeEvent, { date: "2026-11-19" });
-        assert.deepStrictEqual(relClean, { ok: true, released: true });
-        console.log("✓ buildCollectAccounts 区分 null/[]，损坏不认领，空数组走 auto-claim");
+        assert.deepStrictEqual(await sEmpty.tick(), { ran: false, reason: "no-accounts" });
+        assert.strictEqual(fs.existsSync(autoRunFile), false);
+        sEmpty.stop();
+        console.log("✓ buildCollectAccounts 空/损坏/坏节点处理与调度器跳过正确");
       }
 
-      /* ---- 6b. 主进程每日认领：忽略渲染层传值、同日二次拒绝、release 后可再认领、回拨拒绝、14 天上限 ---- */
+      /* ---- 6b. 同日二次 auto-run 返回 already-ran 且不调 collectAccount；回拨已跑日期 already-ran；14 天上限 ---- */
       {
+        const acc = [{ group: "G1", platform: "抖音", partition: "persist:G1-抖音" }];
         let mockNow = cnTime(2026, 11, 19, 10, 0, 0);
+
         await withMockDateNow(
           () => mockNow,
           async () => {
-            // 传入伪造日期 2020-01-01，主进程必须忽略并用 store.todayStr()（2026-11-19）
-            const c1 = await claimHandler(fakeEvent, { date: "2020-01-01" });
-            assert.deepStrictEqual(c1, { ok: true, date: "2026-11-19" });
+            const before1 = collectedBatches.length;
+            const r1 = await autoRunHandler(fakeEvent, { accounts: acc });
+            assert.strictEqual(r1.status, "done");
+            assert.strictEqual(r1.date, "2026-11-19");
+            assert.strictEqual(r1.results.length, 1);
+            assert.strictEqual(r1.results[0].success, true);
+            assert.strictEqual(collectedBatches.length - before1, 1);
             assert.deepStrictEqual(store.readAutoRuns(), ["2026-11-19"]);
+            assert.strictEqual(store.readCollectLogs()[0].trigger, "auto");
 
-            // 同日二次认领拒绝
-            const c2 = await claimHandler(fakeEvent, { date: "2026-11-19" });
-            assert.deepStrictEqual(c2, { ok: false, reason: "already-ran" });
+            // 同日二次 auto-run → already-ran 且不调用 collectAccount
+            const before2 = collectedBatches.length;
+            const r2 = await autoRunHandler(fakeEvent, { accounts: acc });
+            assert.deepStrictEqual(r2, { status: "already-ran", date: "2026-11-19" });
+            assert.strictEqual(collectedBatches.length, before2);
 
-            // 非法日期 release 返回 invalid-date；未存在日期返回 released:false
-            assert.deepStrictEqual(await releaseHandler(fakeEvent, { date: "bad" }), {
-              ok: false,
-              reason: "invalid-date",
-            });
-            assert.deepStrictEqual(
-              await releaseHandler(fakeEvent, { date: "2026-11-18" }),
-              { ok: true, released: false }
-            );
-
-            // release 后可再认领
-            assert.deepStrictEqual(
-              await releaseHandler(fakeEvent, { date: "2026-11-19" }),
-              { ok: true, released: true }
-            );
-            assert.deepStrictEqual(store.readAutoRuns(), []);
-            const c3 = await claimHandler(fakeEvent, {});
-            assert.deepStrictEqual(c3, { ok: true, date: "2026-11-19" });
-
-            // 次日（2026-11-20）认领成功
+            // 次日 2026-11-20 正常执行
             mockNow = cnTime(2026, 11, 20, 10, 0, 0);
-            assert.deepStrictEqual(await claimHandler(fakeEvent, {}), {
-              ok: true,
-              date: "2026-11-20",
-            });
+            const r3 = await autoRunHandler(fakeEvent, { accounts: acc });
+            assert.strictEqual(r3.status, "done");
+            assert.strictEqual(r3.date, "2026-11-20");
+            assert.deepStrictEqual(store.readAutoRuns(), ["2026-11-19", "2026-11-20"]);
 
-            // 系统校时回拨到已跑过的 2026-11-19 → 拒绝（already-ran）
+            // 系统校时回拨到已跑过的 2026-11-19 → already-ran 且不调 collectAccount
+            const beforeRollback = collectedBatches.length;
             mockNow = cnTime(2026, 11, 19, 15, 0, 0);
-            assert.deepStrictEqual(await claimHandler(fakeEvent, {}), {
-              ok: false,
-              reason: "already-ran",
-            });
+            const rBack = await autoRunHandler(fakeEvent, { accounts: acc });
+            assert.deepStrictEqual(rBack, { status: "already-ran", date: "2026-11-19" });
+            assert.strictEqual(collectedBatches.length, beforeRollback);
 
-            // 连续认领 16 天 → auto-run.json 只保留最近 14 个日期
+            // 连续运行 16 天 → auto-run.json 只保留最近 14 个日期
             for (let day = 1; day <= 16; day++) {
               mockNow = cnTime(2026, 12, day, 10, 0, 0);
-              const res = await claimHandler(fakeEvent, {});
-              assert.strictEqual(res.ok, true, `12-${day} 应认领成功`);
+              const rDay = await autoRunHandler(fakeEvent, { accounts: acc });
+              assert.strictEqual(rDay.status, "done");
             }
-            const runsAfter16 = store.readAutoRuns();
-            assert.strictEqual(runsAfter16.length, 14, "runs 必须只保留 14 个日期");
-            assert.strictEqual(runsAfter16[0], "2026-12-03");
-            assert.strictEqual(runsAfter16[13], "2026-12-16");
+            const runs16 = store.readAutoRuns();
+            assert.strictEqual(runs16.length, 14);
+            assert.strictEqual(runs16[0], "2026-12-03");
+            assert.strictEqual(runs16[13], "2026-12-16");
 
-            // 回拨到未跑过的早先日期（2026-11-10）：认领后必须留存在 runs 末尾，二次认领被拒（防死循环）
+            // 回拨到未跑过的早先日期（2026-11-10）→ 跑一次后保留在末尾，二次 already-ran
             mockNow = cnTime(2026, 11, 10, 10, 0, 0);
-            assert.deepStrictEqual(await claimHandler(fakeEvent, {}), {
-              ok: true,
-              date: "2026-11-10",
-            });
+            assert.strictEqual((await autoRunHandler(fakeEvent, { accounts: acc })).status, "done");
             assert.strictEqual(store.readAutoRuns().length, 14);
             assert.strictEqual(store.readAutoRuns().includes("2026-11-10"), true);
-            assert.deepStrictEqual(await claimHandler(fakeEvent, {}), {
-              ok: false,
-              reason: "already-ran",
+            assert.deepStrictEqual(await autoRunHandler(fakeEvent, { accounts: acc }), {
+              status: "already-ran",
+              date: "2026-11-10",
             });
           }
         );
-        console.log("✓ 主进程 auto-claim/auto-release（UTC+8/二次拒绝/释放重领/回拨拒绝/14天上限）");
+        console.log("✓ stats:auto-run 同日二次 already-ran、回拨已跑日期 already-ran、14 天上限正确");
       }
 
-      /* ---- 6c. 双窗口并发 + localStorage 只读/重挂载 → 仅跑一次；原子写失败不采集 ---- */
+      /* ---- 6c. 互斥：collecting 中 auto-run 返回 busy 且不写 runs；三方互斥与双窗口并发 ---- */
       {
-        const testDay = cnTime(2026, 11, 25, 10, 0, 0);
-        const sampleAcc = [
-          { group: "MultiG", platform: "抖音", partition: "persist:MultiG-抖音" },
-        ];
-        await withMockDateNow(
-          () => testDay,
-          async () => {
-            const startLen = collectedBatches.length;
-            // 模拟两个窗口各自独立的空 localStorage 同时 tick
-            const winA = createStatsScheduler({
-              storage: createMemoryStorage(),
-              now: () => localTime(2026, 11, 25, 10, 0, 0).getTime(),
-              monotonicNow: () => STARTUP_DELAY_MS,
-              startupDelayMs: 0,
-              getAccounts: () => sampleAcc,
-              setIntervalFn: () => 1,
-              clearIntervalFn: () => {},
-            });
-            const winB = createStatsScheduler({
-              storage: createMemoryStorage(),
-              now: () => localTime(2026, 11, 25, 10, 0, 0).getTime(),
-              monotonicNow: () => STARTUP_DELAY_MS,
-              startupDelayMs: 0,
-              getAccounts: () => sampleAcc,
-              setIntervalFn: () => 2,
-              clearIntervalFn: () => {},
-            });
-            winA.start();
-            winB.start();
-            const [resA, resB] = await Promise.all([winA.tick(), winB.tick()]);
-            const ranCount = [resA, resB].filter((r) => r.ran).length;
-            assert.strictEqual(ranCount, 1, "双窗口同时触发时仅允许一个窗口执行采集");
-            assert.strictEqual(
-              [resA, resB].some((r) => r.reason === "already-ran"),
-              true,
-              "第二个窗口应收到 already-ran，绝不覆盖或释放第一个窗口的认领"
-            );
-            assert.strictEqual(
-              collectedBatches.length - startLen,
-              1,
-              "真实采集函数只能被调用一次"
-            );
-            winA.stop();
-            winB.stop();
-
-            // localStorage 只读且重新创建调度器（模拟重挂载），主进程 auto-run.json 仍挡住二次采集
-            const roStorage = {
-              getItem: () => null,
-              setItem: () => {
-                throw new Error("QuotaExceededError");
-              },
-            };
-            const remounted = createStatsScheduler({
-              storage: roStorage,
-              now: () => localTime(2026, 11, 25, 10, 5, 0).getTime(),
-              monotonicNow: () => STARTUP_DELAY_MS,
-              startupDelayMs: 0,
-              getAccounts: () => sampleAcc,
-              setIntervalFn: () => 3,
-              clearIntervalFn: () => {},
-            });
-            remounted.start();
-            assert.deepStrictEqual(await remounted.tick(), {
-              ran: false,
-              reason: "already-ran",
-            });
-            assert.strictEqual(collectedBatches.length - startLen, 1);
-            remounted.stop();
-          }
-        );
-
-        // 原子写失败（ENOSPC）→ store-failed、旧文件完整、无 .tmp 残留、调度器不采集
-        const failDay = cnTime(2026, 11, 26, 10, 0, 0);
-        const beforeBytes = fs.readFileSync(autoRunFile, "utf8");
-        const beforeCollectCount = collectedBatches.length;
-        const origWriteSync = fs.writeSync;
-        const origWarn = console.warn;
-        console.warn = () => {};
-        fs.writeSync = function patchedWriteSync() {
-          const err = new Error("ENOSPC: no space left on device");
-          err.code = "ENOSPC";
-          throw err;
-        };
-        try {
-          await withMockDateNow(
-            () => failDay,
-            async () => {
-              const sFail = createStatsScheduler({
-                storage: createMemoryStorage(),
-                now: () => localTime(2026, 11, 26, 10, 0, 0).getTime(),
-                monotonicNow: () => STARTUP_DELAY_MS,
-                startupDelayMs: 0,
-                getAccounts: () => sampleAcc,
-                setIntervalFn: () => 1,
-                clearIntervalFn: () => {},
-              });
-              sFail.start();
-              const out = await sFail.tick();
-              assert.deepStrictEqual(out, { ran: false, reason: "store-failed" });
-              assert.strictEqual(
-                collectedBatches.length,
-                beforeCollectCount,
-                "auto-run.json 写失败时绝不得发起采集"
-              );
-              sFail.stop();
-            }
-          );
-        } finally {
-          fs.writeSync = origWriteSync;
-          console.warn = origWarn;
-        }
-        assert.strictEqual(
-          fs.readFileSync(autoRunFile, "utf8"),
-          beforeBytes,
-          "写失败后旧 auto-run.json 必须字节完整"
-        );
-        const leftovers = fs
-          .readdirSync(path.join(tmpRoot, "data-stats"))
-          .filter((f) => f.endsWith(".tmp"));
-        assert.deepStrictEqual(leftovers, [], "原子写失败后不得遗留 .tmp 临时文件");
-        console.log("✓ 双窗口并发仅跑一次、只读存储重挂载防重、ENOSPC 写失败不采集且旧文件完整");
-      }
-
-      /* ---- 6d. stats:collect 与 stats:match-works 双向互斥 & collecting 中 auto-claim 返回 busy 不写入 ---- */
-      {
-        const mutexDay = cnTime(2026, 11, 27, 10, 0, 0);
-        const gate1 = createDeferred();
+        const acc = [{ group: "MutexG", platform: "抖音", partition: "persist:MutexG-抖音" }];
+        const mutexDay = cnTime(2026, 11, 21, 10, 0, 0);
         const origImpl = collectorImpl;
-        collectorImpl = async (params) => {
-          await gate1.promise;
-          return origImpl(params);
-        };
 
         await withMockDateNow(
           () => mutexDay,
           async () => {
-            // 1) stats:collect 运行中 → stats:match-works 返回 busy:true；stats:auto-claim 返回 busy 且不写入
+            // 1) stats:collect 运行中 → auto-run 返回 busy 且不写 runs；match-works 返回 busy:true
+            const gate1 = createDeferred();
+            collectorImpl = async (params) => {
+              await gate1.promise;
+              return origImpl(params);
+            };
             const inFlightCollect = collectHandler(fakeEvent, {
-              accounts: [{ group: "MutexG", platform: "抖音", partition: "persist:MutexG-抖音" }],
+              accounts: acc,
               trigger: "manual",
             });
-            const matchWhileCollecting = await matchHandler(fakeEvent, {
-              tasks: [
-                {
-                  key: "0",
-                  group: "MutexG",
-                  platform: "抖音",
-                  partition: "persist:MutexG-抖音",
-                  title: "标题-抖音",
-                },
-              ],
+            assert.deepStrictEqual(await autoRunHandler(fakeEvent, { accounts: acc }), {
+              status: "busy",
             });
-            assert.deepStrictEqual(matchWhileCollecting, {
-              matches: {},
-              errors: [{ error: "已有采集任务进行中" }],
-              busy: true,
-            });
-
-            const claimWhileCollecting = await claimHandler(fakeEvent, {});
-            assert.deepStrictEqual(claimWhileCollecting, { ok: false, reason: "busy" });
             assert.strictEqual(
-              store.readAutoRuns().includes("2026-11-27"),
+              store.readAutoRuns().includes("2026-11-21"),
               false,
-              "collecting 期间 auto-claim 返回 busy 不得写入 auto-run.json"
+              "busy 绝不能写 runs"
             );
-
+            const matchWhileCollect = await matchHandler(fakeEvent, {
+              tasks: [{ key: "0", group: "MutexG", platform: "抖音", partition: "persist:MutexG-抖音", title: "x" }],
+            });
+            assert.strictEqual(matchWhileCollect.busy, true);
             gate1.resolve();
             await inFlightCollect;
 
-            // 2) stats:match-works 运行中 → stats:collect 返回忙；stats:auto-claim 返回 busy 且不写入；二次 match-works 返回 busy:true
+            // 2) stats:match-works 运行中 → auto-run 返回 busy 且不写 runs；stats:collect 返回忙
             const gate2 = createDeferred();
             collectorImpl = async (params) => {
               await gate2.promise;
               return origImpl(params);
             };
             const inFlightMatch = matchHandler(fakeEvent, {
-              tasks: [
-                {
-                  key: "0",
-                  group: "MutexG",
-                  platform: "快手",
-                  partition: "persist:MutexG-快手",
-                  title: "标题-快手",
-                },
-              ],
+              tasks: [{ key: "0", group: "MutexG", platform: "快手", partition: "persist:MutexG-快手", title: "标题-快手" }],
             });
-            const collectWhileMatch = await collectHandler(fakeEvent, {
-              accounts: [{ group: "MutexG", platform: "快手", partition: "persist:MutexG-快手" }],
-              trigger: "auto",
+            assert.deepStrictEqual(await autoRunHandler(fakeEvent, { accounts: acc }), {
+              status: "busy",
             });
-            assert.deepStrictEqual(collectWhileMatch, {
-              results: [],
-              error: "已有采集任务进行中",
-            });
-            const match2WhileMatch = await matchHandler(fakeEvent, { tasks: [] });
-            assert.deepStrictEqual(match2WhileMatch, {
-              matches: {},
-              errors: [{ error: "已有采集任务进行中" }],
-              busy: true,
-            });
-            const claimWhileMatch = await claimHandler(fakeEvent, {});
-            assert.deepStrictEqual(claimWhileMatch, { ok: false, reason: "busy" });
-            assert.strictEqual(store.readAutoRuns().includes("2026-11-27"), false);
-
+            assert.strictEqual(store.readAutoRuns().includes("2026-11-21"), false);
+            assert.strictEqual(
+              (await collectHandler(fakeEvent, { accounts: acc })).error,
+              "已有采集任务进行中"
+            );
             gate2.resolve();
-            const matchDone = await inFlightMatch;
-            assert.strictEqual(matchDone.matches["0"].found, true);
+            assert.strictEqual((await inFlightMatch).matches["0"].found, true);
 
-            // 3) match-works 完成后 collecting 已复位，后续 auto-claim 可正常成功
-            collectorImpl = origImpl;
-            assert.deepStrictEqual(await claimHandler(fakeEvent, {}), {
-              ok: true,
-              date: "2026-11-27",
-            });
-
-            // 4) match-works 内部抛错时 finally 同样复位 collecting
-            collectorImpl = async () => {
-              throw new Error("页面超时");
+            // 3) 双窗口同时触发 auto-run：A 执行 done，B 收到 busy，下一分钟 B 收到 already-ran，仅采 1 次、通知 1 次
+            const gate3 = createDeferred();
+            const multiDay = cnTime(2026, 11, 22, 10, 0, 0);
+            const multiAcc = [{ group: "MultiG", platform: "抖音", partition: "persist:MultiG-抖音" }];
+            collectorImpl = async (params) => {
+              await gate3.promise;
+              return origImpl(params);
             };
-            const matchErr = await matchHandler(fakeEvent, {
-              tasks: [
-                {
-                  key: "0",
-                  group: "MutexG",
-                  platform: "B站",
-                  partition: "persist:MutexG-B站",
-                  title: "x",
-                },
-              ],
-            });
-            assert.strictEqual(matchErr.errors.length, 1);
-            collectorImpl = origImpl;
-            const afterErrCollect = await collectHandler(fakeEvent, {
-              accounts: [{ group: "MutexG", platform: "B站", partition: "persist:MutexG-B站" }],
-              trigger: "manual",
-            });
-            assert.strictEqual(afterErrCollect.results.length, 1);
-            assert.strictEqual(afterErrCollect.results[0].success, true);
+            await withMockDateNow(
+              () => multiDay,
+              async () => {
+                const startLen = collectedBatches.length;
+                const notifiesA = [];
+                const notifiesB = [];
+                const winA = createStatsScheduler({
+                  storage: createMemoryStorage(),
+                  now: () => localTime(2026, 11, 22, 10, 0, 0).getTime(),
+                  monotonicNow: () => STARTUP_DELAY_MS,
+                  startupDelayMs: 0,
+                  getAccounts: () => multiAcc,
+                  notify: (p) => notifiesA.push(p),
+                  setIntervalFn: () => 1,
+                  clearIntervalFn: () => {},
+                });
+                const winB = createStatsScheduler({
+                  storage: createMemoryStorage(),
+                  now: () => localTime(2026, 11, 22, 10, 0, 0).getTime(),
+                  monotonicNow: () => STARTUP_DELAY_MS,
+                  startupDelayMs: 0,
+                  getAccounts: () => multiAcc,
+                  notify: (p) => notifiesB.push(p),
+                  setIntervalFn: () => 2,
+                  clearIntervalFn: () => {},
+                });
+                winA.start();
+                winB.start();
+                const pA = winA.tick();
+                const resB1 = await winB.tick();
+                assert.deepStrictEqual(resB1, { ran: false, reason: "busy" });
+                assert.strictEqual(store.readAutoRuns().includes("2026-11-22"), false);
+
+                gate3.resolve();
+                const resA = await pA;
+                assert.strictEqual(resA.ran, true);
+                assert.strictEqual(collectedBatches.length - startLen, 1);
+                assert.strictEqual(notifiesA.length, 1);
+                assert.strictEqual(notifiesB.length, 0);
+
+                // 下一分钟 B 重试：主进程返回 already-ran，不重采、不通知
+                const resB2 = await winB.tick();
+                assert.deepStrictEqual(resB2, {
+                  ran: false,
+                  reason: "already-ran",
+                  date: "2026-11-22",
+                });
+                assert.strictEqual(collectedBatches.length - startLen, 1);
+                assert.strictEqual(notifiesB.length, 0);
+                winA.stop();
+                winB.stop();
+
+                // 只读 localStorage 重挂载调度器：主进程 auto-run.json 仍挡住
+                const roSched = createStatsScheduler({
+                  storage: {
+                    getItem: () => null,
+                    setItem() {
+                      throw new Error("QuotaExceededError");
+                    },
+                  },
+                  now: () => localTime(2026, 11, 22, 10, 5, 0).getTime(),
+                  monotonicNow: () => STARTUP_DELAY_MS,
+                  startupDelayMs: 0,
+                  getAccounts: () => multiAcc,
+                  setIntervalFn: () => 3,
+                  clearIntervalFn: () => {},
+                });
+                roSched.start();
+                assert.deepStrictEqual(await roSched.tick(), {
+                  ran: false,
+                  reason: "already-ran",
+                  date: "2026-11-22",
+                });
+                assert.strictEqual(collectedBatches.length - startLen, 1);
+                roSched.stop();
+              }
+            );
           }
         );
-        console.log("✓ stats:match-works 与 stats:collect 双向互斥、busy 不写 auto-run、finally 正确复位");
+        collectorImpl = origImpl;
+        console.log("✓ busy 不写 runs、三方互斥、双窗口并发仅跑一次、只读存储重挂载防重正确");
       }
 
-      /* ---- 6e. trigger==="auto" 跳过今日（UTC+8）已成功采集的账号 + trigger 日志向后兼容 ---- */
+      /* ---- 6d. 采集中途抛错 / 取消 / 写 auto-run.json 失败：runs 仍写入（或 warn）、collecting 复位 ---- */
       {
-        const skipDay = cnTime(2026, 11, 28, 10, 0, 0);
-        const yesterday = cnTime(2026, 11, 27, 23, 0, 0);
+        const origImpl = collectorImpl;
 
-        // 预设 4 个账号的 meta：
-        // A: 今日成功（lastError:""）→ auto 跳过
-        // B: 今日失败（lastError:"未登录"）→ auto 不跳过
-        // C: 昨日成功（lastError:""）→ auto 不跳过
-        // D: 从未采集 → auto 不跳过
-        store.writeMeta("SkipG", "抖音", {
-          lastCollectAt: cnTime(2026, 11, 28, 9, 30, 0),
-          lastError: "",
-          workCount: 12,
-        });
-        store.writeMeta("SkipG", "快手", {
-          lastCollectAt: cnTime(2026, 11, 28, 9, 31, 0),
-          lastError: "未登录",
-          workCount: 0,
-        });
-        store.writeMeta("SkipG", "视频号", {
-          lastCollectAt: yesterday,
-          lastError: "",
-          workCount: 8,
-        });
-
-        const fourAccounts = [
-          { group: "SkipG", platform: "抖音", partition: "persist:SkipG-抖音" },
-          { group: "SkipG", platform: "快手", partition: "persist:SkipG-快手" },
-          { group: "SkipG", platform: "视频号", partition: "persist:SkipG-视频号" },
-          { group: "SkipG", platform: "B站", partition: "persist:SkipG-B站" },
-        ];
-
-        await withMockDateNow(
-          () => skipDay,
-          async () => {
-            const progressEvents = [];
-            const progressEvent = {
-              sender: { send: (_ch, payload) => progressEvents.push(payload) },
-            };
-            const beforeLen = collectedBatches.length;
-
-            // 先用 2000ms 延迟控制：临时替换 setTimeout 以免单测等待 4 秒
-            const origSetTimeout = global.setTimeout;
-            global.setTimeout = (fn) => {
-              fn();
-              return 0;
-            };
-            let resAuto;
-            let resManual;
-            let resDefault;
-            let resInvalid;
-            try {
-              resAuto = await collectHandler(progressEvent, {
-                accounts: fourAccounts,
-                trigger: "auto",
+        // 1) 单账号采集中途抛错（部分失败）→ runs 仍写入，collecting 复位
+        await withImmediateTimers(() =>
+          withMockDateNow(
+            () => cnTime(2026, 11, 23, 10, 0, 0),
+            async () => {
+              collectorImpl = async ({ partition }) => {
+                if (partition === "persist:ErrG-快手") {
+                  throw new Error("页面崩溃");
+                }
+                return origImpl({ partition, platform: "抖音" });
+              };
+              const res = await autoRunHandler(fakeEvent, {
+                accounts: [
+                  { group: "ErrG", platform: "抖音", partition: "persist:ErrG-抖音" },
+                  { group: "ErrG", platform: "快手", partition: "persist:ErrG-快手" },
+                ],
               });
-              const calledPlatforms = collectedBatches
-                .slice(beforeLen)
-                .map((x) => x.platform);
-              assert.deepStrictEqual(
-                calledPlatforms,
-                ["快手", "视频号", "B站"],
-                "auto 触发应跳过今日已成功的抖音，仅采集快手/视频号/B站"
-              );
-              assert.strictEqual(resAuto.results.length, 4);
-              assert.strictEqual(resAuto.results[0].platform, "抖音");
-              assert.strictEqual(resAuto.results[0].skipped, true);
-              assert.strictEqual(resAuto.results[0].success, true);
-              assert.strictEqual(resAuto.results[0].workCount, 12);
-              assert.strictEqual(resAuto.results[1].skipped, undefined);
-              assert.strictEqual(resAuto.results[1].success, true);
-              assert.ok(
-                progressEvents.some(
-                  (e) => e.platform === "抖音" && e.status === "skipped"
-                ),
-                "跳过账号应推送 skipped 进度而非 failed"
-              );
+              assert.strictEqual(res.status, "done");
+              assert.strictEqual(res.date, "2026-11-23");
+              assert.strictEqual(res.results[0].success, true);
+              assert.strictEqual(res.results[1].success, false);
+              assert.ok(res.results[1].error.includes("页面崩溃"));
+              assert.strictEqual(store.readAutoRuns().includes("2026-11-23"), true);
 
-              // 日志应记录 trigger: "auto"
-              assert.strictEqual(store.readCollectLogs()[0].trigger, "auto");
-
-              // 手动触发（trigger:"manual"）：今日已成功的账号照常采集，不跳过
-              const beforeManualLen = collectedBatches.length;
-              resManual = await collectHandler(fakeEvent, {
-                accounts: [fourAccounts[0]],
+              // collecting 已复位：紧接着手动采集可正常运行
+              collectorImpl = origImpl;
+              const manualAfter = await collectHandler(fakeEvent, {
+                accounts: [{ group: "ErrG", platform: "快手", partition: "persist:ErrG-快手" }],
                 trigger: "manual",
               });
-              assert.strictEqual(collectedBatches.length - beforeManualLen, 1);
-              assert.strictEqual(resManual.results[0].skipped, undefined);
-              assert.strictEqual(store.readCollectLogs()[0].trigger, "manual");
-
-              // 缺省不传 trigger：不跳过、向后兼容不写 trigger 字段
-              resDefault = await collectHandler(fakeEvent, {
-                accounts: [fourAccounts[0]],
-              });
-              assert.strictEqual(resDefault.results[0].skipped, undefined);
-              assert.strictEqual(
-                Object.prototype.hasOwnProperty.call(
-                  store.readCollectLogs()[0],
-                  "trigger"
-                ),
-                false
-              );
-
-              // 非法 trigger 忽略
-              resInvalid = await collectHandler(fakeEvent, {
-                accounts: [fourAccounts[0]],
-                trigger: "invalid-trigger",
-              });
-              assert.strictEqual(resInvalid.results[0].skipped, undefined);
-              assert.strictEqual(
-                Object.prototype.hasOwnProperty.call(
-                  store.readCollectLogs()[0],
-                  "trigger"
-                ),
-                false
-              );
-            } finally {
-              global.setTimeout = origSetTimeout;
+              assert.strictEqual(manualAfter.results[0].success, true);
             }
+          )
+        );
+
+        // 2) 未捕获异常逃逸 collectAccounts（如坏对象 getter 抛错）→ finally 仍写 runs 并复位 collecting
+        await withMockDateNow(
+          () => cnTime(2026, 11, 24, 10, 0, 0),
+          async () => {
+            const poisonAcc = {
+              get group() {
+                throw new Error("意外异常");
+              },
+              platform: "抖音",
+              partition: "persist:Poison-抖音",
+            };
+            let threw = false;
+            const origWarn2 = console.warn;
+            console.warn = () => {};
+            try {
+              await autoRunHandler(fakeEvent, { accounts: [poisonAcc] });
+            } catch (err) {
+              threw = true;
+              assert.ok(err.message.includes("意外异常"));
+            } finally {
+              console.warn = origWarn2;
+            }
+            assert.strictEqual(threw, true);
+            assert.strictEqual(
+              store.readAutoRuns().includes("2026-11-24"),
+              true,
+              "异常逃逸后 finally 仍必须写入 runs"
+            );
+            // collecting 已复位
+            const afterPoison = await collectHandler(fakeEvent, {
+              accounts: [{ group: "OkG", platform: "抖音", partition: "persist:OkG-抖音" }],
+              trigger: "manual",
+            });
+            assert.strictEqual(afterPoison.results[0].success, true);
           }
         );
 
-        // 端到端场景：「手动同步全部」进行中时自动到点遇 busy，手动完成后下周期自动重试跳过已成功账号
-        const e2eDay = cnTime(2026, 11, 29, 10, 0, 0);
-        const e2eAccounts = [
-          { group: "E2E", platform: "抖音", partition: "persist:E2E-抖音" },
-          { group: "E2E", platform: "快手", partition: "persist:E2E-快手" },
-        ];
-        const manualGate = createDeferred();
-        const origImpl2 = collectorImpl;
-        let manualBlocking = true;
-        collectorImpl = async (params) => {
-          if (manualBlocking) await manualGate.promise;
-          return origImpl2(params);
-        };
-        const origSetTimeout = global.setTimeout;
-        global.setTimeout = (fn) => {
-          fn();
-          return 0;
+        // 3) 采集中途取消（stats:cancel）→ runs 仍写入、collecting 复位、返回 cancelled:true
+        await withMockDateNow(
+          () => cnTime(2026, 11, 25, 10, 0, 0),
+          async () => {
+            const gateCancel = createDeferred();
+            collectorImpl = async (params) => {
+              await gateCancel.promise;
+              return origImpl(params);
+            };
+            const cancelRun = autoRunHandler(fakeEvent, {
+              accounts: [
+                { group: "CanG", platform: "抖音", partition: "persist:CanG-抖音" },
+                { group: "CanG", platform: "快手", partition: "persist:CanG-快手" },
+              ],
+            });
+            await cancelHandler(fakeEvent);
+            gateCancel.resolve();
+            const cancelRes = await cancelRun;
+            assert.strictEqual(cancelRes.status, "done");
+            assert.strictEqual(cancelRes.date, "2026-11-25");
+            assert.strictEqual(cancelRes.cancelled, true);
+            assert.strictEqual(cancelRes.results.length, 1, "取消后应中断后续账号");
+            assert.strictEqual(store.readAutoRuns().includes("2026-11-25"), true);
+
+            // collecting 已复位
+            collectorImpl = origImpl;
+            const afterCancel = await collectHandler(fakeEvent, {
+              accounts: [{ group: "CanG", platform: "快手", partition: "persist:CanG-快手" }],
+              trigger: "manual",
+            });
+            assert.strictEqual(afterCancel.results[0].success, true);
+          }
+        );
+
+        // 4) auto-run.json 原子写失败（ENOSPC）→ 只 warn、旧文件字节完整、无 .tmp 残留、collecting 复位、仍返回 done
+        const beforeBytes = fs.readFileSync(autoRunFile, "utf8");
+        const origWriteSync = fs.writeSync;
+        const origWarn = console.warn;
+        const warns = [];
+        console.warn = (...args) => warns.push(args.join(" "));
+        fs.writeSync = () => {
+          const err = new Error("ENOSPC: no space left on device");
+          err.code = "ENOSPC";
+          throw err;
         };
         try {
           await withMockDateNow(
-            () => e2eDay,
+            () => cnTime(2026, 11, 26, 10, 0, 0),
             async () => {
-              const sE2E = createStatsScheduler({
-                storage: createMemoryStorage(),
-                now: () => localTime(2026, 11, 29, 10, 0, 0).getTime(),
-                monotonicNow: () => STARTUP_DELAY_MS,
-                startupDelayMs: 0,
-                getAccounts: () => e2eAccounts,
-                setIntervalFn: () => 1,
-                clearIntervalFn: () => {},
+              const res = await autoRunHandler(fakeEvent, {
+                accounts: [{ group: "DiskG", platform: "抖音", partition: "persist:DiskG-抖音" }],
               });
-              sE2E.start();
-
-              // 手动同步全部正在进行
-              const manualPromise = collectHandler(fakeEvent, {
-                accounts: e2eAccounts,
-                trigger: "manual",
-              });
-
-              // 到点自动触发：遇 busy，不写入 auto-run.json
-              const autoTick1 = await sE2E.tick();
-              assert.strictEqual(autoTick1.busy, true);
-              assert.strictEqual(store.readAutoRuns().includes("2026-11-29"), false);
-
-              // 手动同步完成
-              manualBlocking = false;
-              manualGate.resolve();
-              await manualPromise;
-
-              // 下周期自动重试：认领 2026-11-29，但两个账号今日都已成功采集 → 全部跳过，0 次打开采集窗口！
-              const beforeRetryCollects = collectedBatches.length;
-              const autoTick2 = await sE2E.tick();
-              assert.strictEqual(autoTick2.ran, true);
-              assert.strictEqual(
-                collectedBatches.length,
-                beforeRetryCollects,
-                "手动同步全部完成后，自动重试不得再打开窗口重采已成功账号"
-              );
-              assert.strictEqual(
-                autoTick2.result.results.every((r) => r.skipped === true),
-                true
-              );
-              assert.strictEqual(store.readAutoRuns().includes("2026-11-29"), true);
-              sE2E.stop();
+              assert.strictEqual(res.status, "done");
+              assert.strictEqual(res.date, "2026-11-26");
+              assert.strictEqual(res.results[0].success, true);
             }
           );
         } finally {
-          global.setTimeout = origSetTimeout;
-          collectorImpl = origImpl2;
+          fs.writeSync = origWriteSync;
+          console.warn = origWarn;
         }
-        console.log("✓ trigger==='auto' 跳过今日已成功账号、manual 不跳过、手动后自动重试不重采");
+        assert.ok(warns.some((w) => w.includes("auto-run.json")));
+        assert.strictEqual(fs.readFileSync(autoRunFile, "utf8"), beforeBytes);
+        assert.deepStrictEqual(
+          fs.readdirSync(path.join(tmpRoot, "data-stats")).filter((f) => f.endsWith(".tmp")),
+          []
+        );
+        // collecting 已复位
+        const afterDiskErr = await collectHandler(fakeEvent, {
+          accounts: [{ group: "DiskG", platform: "抖音", partition: "persist:DiskG-抖音" }],
+          trigger: "manual",
+        });
+        assert.strictEqual(afterDiskErr.results[0].success, true);
+
+        collectorImpl = origImpl;
+        console.log("✓ 采集中途抛错/异常逃逸/取消/写盘失败：runs 行为与 collecting 复位均正确");
+      }
+
+      /* ---- 6e. collectedToday 按规范化 partition（trim）跳过 + 同分组同平台另一 partition 不跳过 + 日期变化清空 ---- */
+      {
+        const origImpl = collectorImpl;
+        const day1 = cnTime(2026, 11, 27, 10, 0, 0);
+        const day2 = cnTime(2026, 11, 28, 10, 0, 0);
+
+        await withImmediateTimers(async () => {
+          // 即使磁盘 meta 存在「今日成功」，未进入内存 collectedToday 的 partition 不应被旧 meta 逻辑误跳过
+          store.writeMeta("SameGroup", "抖音", {
+            lastCollectAt: day1,
+            lastError: "",
+            workCount: 99,
+          });
+
+          await withMockDateNow(
+            () => day1,
+            async () => {
+              // 1) 手动 collect 成功：SameGroup/抖音 的 acc1（带前后空格验证 trim）
+              await collectHandler(fakeEvent, {
+                accounts: [
+                  { group: "SameGroup", platform: "抖音", partition: " persist:acc1-抖音 " },
+                ],
+                trigger: "manual",
+              });
+
+              // 2) match-works 成功：SameGroup/快手 的 acc1（带空格验证 trim）
+              await matchHandler(fakeEvent, {
+                tasks: [
+                  {
+                    key: "0",
+                    group: "SameGroup",
+                    platform: "快手",
+                    partition: "  persist:acc1-快手  ",
+                    title: "标题-快手",
+                  },
+                ],
+              });
+
+              // 3) 手动 collect 失败的 partition 不得被记为已采集
+              collectorImpl = async () => {
+                throw new Error("未登录");
+              };
+              const failedManual = await collectHandler(fakeEvent, {
+                accounts: [
+                  { group: "SameGroup", platform: "B站", partition: "persist:fail-B站" },
+                ],
+                trigger: "manual",
+              });
+              assert.strictEqual(failedManual.results[0].success, false);
+              collectorImpl = origImpl;
+
+              // 4) auto-run 校验：
+              //    - persist:acc1-抖音（手动 collect 成功）→ 跳过
+              //    - persist:acc2-抖音（同分组同平台不同 partition！）→ 不跳过！
+              //    - persist:acc1-抖音 在另一分组 OtherGroup（同 partition）→ 跳过！
+              //    - persist:acc1-快手（match-works 成功）→ 跳过
+              //    - persist:fail-B站（手动失败）→ 不跳过！
+              const beforeLen = collectedBatches.length;
+              const progressEvents = [];
+              const progressEv = {
+                sender: { send: (_ch, p) => progressEvents.push(p) },
+              };
+              const resDay1 = await autoRunHandler(progressEv, {
+                accounts: [
+                  { group: "SameGroup", platform: "抖音", partition: "persist:acc1-抖音" },
+                  { group: "SameGroup", platform: "抖音", partition: "persist:acc2-抖音" },
+                  { group: "OtherGroup", platform: "抖音", partition: "persist:acc1-抖音" },
+                  { group: "SameGroup", platform: "快手", partition: "persist:acc1-快手" },
+                  { group: "SameGroup", platform: "B站", partition: "persist:fail-B站" },
+                ],
+              });
+              assert.strictEqual(resDay1.status, "done");
+              assert.strictEqual(resDay1.date, "2026-11-27");
+
+              const actuallyCollected = collectedBatches
+                .slice(beforeLen)
+                .map((x) => x.partition);
+              assert.deepStrictEqual(
+                actuallyCollected,
+                ["persist:acc2-抖音", "persist:fail-B站"],
+                "仅应采集未成功过的 partition（同分组同平台另一 partition 绝不能被跳过）"
+              );
+              assert.strictEqual(resDay1.results[0].skipped, true);
+              assert.strictEqual(resDay1.results[1].skipped, undefined);
+              assert.strictEqual(resDay1.results[1].success, true);
+              assert.strictEqual(resDay1.results[2].skipped, true);
+              assert.strictEqual(resDay1.results[3].skipped, true);
+              assert.strictEqual(resDay1.results[4].skipped, undefined);
+              assert.strictEqual(resDay1.results[4].success, true);
+              assert.strictEqual(
+                progressEvents.filter((e) => e.status === "skipped").length,
+                3
+              );
+            }
+          );
+
+          // 5) 日期变化到次日（2026-11-28）→ collectedToday 自动清空，先前跳过的 partition 次日照常采集
+          await withMockDateNow(
+            () => day2,
+            async () => {
+              const beforeDay2 = collectedBatches.length;
+              const resDay2 = await autoRunHandler(fakeEvent, {
+                accounts: [
+                  { group: "SameGroup", platform: "抖音", partition: "persist:acc1-抖音" },
+                  { group: "SameGroup", platform: "快手", partition: "persist:acc1-快手" },
+                ],
+              });
+              assert.strictEqual(resDay2.status, "done");
+              assert.strictEqual(resDay2.date, "2026-11-28");
+              assert.deepStrictEqual(
+                collectedBatches.slice(beforeDay2).map((x) => x.partition),
+                ["persist:acc1-抖音", "persist:acc1-快手"],
+                "跨天后 collectedToday 必须清空，两个账号都应重新采集"
+              );
+              assert.strictEqual(resDay2.results.every((r) => !r.skipped && r.success), true);
+            }
+          );
+        });
+        console.log("✓ collectedToday 按 trim 后 partition 跳过、同分组同平台另一 partition 不跳过、跨天清空正确");
+      }
+
+      /* ---- 6f. UTC 时区 23:30 设置连续两天都会调用（主进程 UTC+8 与渲染层本地日期解耦） ---- */
+      {
+        const origTZ = process.env.TZ;
+        process.env.TZ = "UTC";
+        try {
+          const utcStorage = createMemoryStorage();
+          saveSettings({ enabled: true, time: "23:30", lastRunDate: "" }, utcStorage);
+          const utcAccs = [{ group: "UtcG", platform: "抖音", partition: "persist:UtcG-抖音" }];
+          const notifies = [];
+          let utcNow = Date.parse("2026-12-20T23:30:00Z"); // 本地 2026-12-20 23:30, UTC+8 2026-12-21 07:30
+
+          await withMockDateNow(
+            () => utcNow,
+            async () => {
+              const sUtc = createStatsScheduler({
+                storage: utcStorage,
+                now: () => utcNow,
+                monotonicNow: () => STARTUP_DELAY_MS,
+                startupDelayMs: 0,
+                getAccounts: () => utcAccs,
+                notify: (p) => notifies.push(p),
+                setIntervalFn: () => 1,
+                clearIntervalFn: () => {},
+              });
+              sUtc.start();
+
+              const startCount = collectedBatches.length;
+              // 第 1 天：UTC 2026-12-20 23:30 → 主进程记 UTC+8 2026-12-21，渲染层 doneLocalDate="2026-12-20"
+              const d1 = await sUtc.tick();
+              assert.strictEqual(d1.ran, true);
+              assert.strictEqual(d1.date, "2026-12-21");
+              assert.strictEqual(sUtc.getState().doneLocalDate, "2026-12-20");
+              assert.strictEqual(loadSettings(utcStorage).lastRunDate, "2026-12-21");
+              assert.strictEqual(collectedBatches.length - startCount, 1);
+
+              // 同日 23:31 不再调用
+              utcNow = Date.parse("2026-12-20T23:31:00Z");
+              assert.deepStrictEqual(await sUtc.tick(), { ran: false, reason: "not-due" });
+
+              // 第 2 天：UTC 2026-12-21 23:30（此时 localStorage.lastRunDate==="2026-12-21" 与本地日期相同，绝不能误拦截！）
+              utcNow = Date.parse("2026-12-21T23:30:00Z"); // 本地 2026-12-21 23:30, UTC+8 2026-12-22 07:30
+              const d2 = await sUtc.tick();
+              assert.strictEqual(d2.ran, true, "UTC 时区 23:30 设置第 2 天必须正常调用");
+              assert.strictEqual(d2.date, "2026-12-22");
+              assert.strictEqual(sUtc.getState().doneLocalDate, "2026-12-21");
+              assert.strictEqual(loadSettings(utcStorage).lastRunDate, "2026-12-22");
+              assert.strictEqual(collectedBatches.length - startCount, 2);
+              assert.strictEqual(notifies.length, 2);
+              sUtc.stop();
+
+              // 模拟第 3 天重启新调度器（带持久化 lastRunDate="2026-12-22"）同样正常触发
+              utcNow = Date.parse("2026-12-22T23:30:00Z"); // 本地 2026-12-22 23:30, UTC+8 2026-12-23 07:30
+              const sUtcRestart = createStatsScheduler({
+                storage: utcStorage,
+                now: () => utcNow,
+                monotonicNow: () => STARTUP_DELAY_MS,
+                startupDelayMs: 0,
+                getAccounts: () => utcAccs,
+                setIntervalFn: () => 2,
+                clearIntervalFn: () => {},
+              });
+              sUtcRestart.start();
+              const d3 = await sUtcRestart.tick();
+              assert.strictEqual(d3.ran, true);
+              assert.strictEqual(d3.date, "2026-12-23");
+              assert.strictEqual(collectedBatches.length - startCount, 3);
+              sUtcRestart.stop();
+            }
+          );
+        } finally {
+          if (origTZ === undefined) delete process.env.TZ;
+          else process.env.TZ = origTZ;
+        }
+        console.log("✓ UTC 时区 23:30 设置连续多天（含重启）均正常调用，不混用本地与 UTC+8 日期");
       }
     } finally {
       if (origGlobalLS === undefined) delete global.localStorage;
@@ -1457,7 +1414,7 @@ async function main() {
     }
   }
 
-  console.log("\n全部通过：每日定时自动采集调度器、主进程权威认领与互斥跳重");
+  console.log("\n全部通过：每日定时自动采集调度器、主进程 stats:auto-run 与 partition 跳重");
 }
 
 main().catch((err) => {
