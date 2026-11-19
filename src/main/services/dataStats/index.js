@@ -17,10 +17,12 @@ const { normalizeStatusTitle, buildTitleIndex } = require("./contentLink");
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+const VALID_TRIGGERS = new Set(["auto", "manual"]);
+
 let collecting = false;
 let cancelled = false;
 
-async function collectAccounts(accounts, sender) {
+async function collectAccounts(accounts, sender, options = {}) {
   const results = [];
   const total = accounts.length;
   const startedAt = Date.now();
@@ -78,12 +80,16 @@ async function collectAccounts(accounts, sender) {
     if (i < total - 1) await sleep(2000); // 账号间间隔
   }
   // 任务日志落盘（拉取记录弹窗用）
-  store.appendCollectLog({
+  const logEntry = {
     startedAt,
     finishedAt: Date.now(),
     cancelled,
     results,
-  });
+  };
+  if (options && VALID_TRIGGERS.has(options.trigger)) {
+    logEntry.trigger = options.trigger;
+  }
+  store.appendCollectLog(logEntry);
   return { results, cancelled };
 }
 
@@ -94,10 +100,12 @@ function registerDataStatsIpc() {
     }
     const accounts = Array.isArray(args && args.accounts) ? args.accounts : [];
     if (!accounts.length) return { results: [], error: "没有可采集的账号" };
+    const trigger =
+      args && VALID_TRIGGERS.has(args.trigger) ? args.trigger : undefined;
     collecting = true;
     cancelled = false;
     try {
-      return await collectAccounts(accounts, event.sender);
+      return await collectAccounts(accounts, event.sender, { trigger });
     } finally {
       collecting = false;
     }

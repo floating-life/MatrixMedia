@@ -87,6 +87,7 @@
     "test:stats-trend": "node scripts/test-stats-trend.js",
     "test:works-daily": "node scripts/test-works-daily.js",
     "test:content-link": "node scripts/test-content-link.js",
+    "test:stats-scheduler": "node scripts/test-stats-scheduler.js",
     "test:ai-content": "node scripts/test-ai-content.js",
     "test:ai-key-store": "node scripts/test-ai-key-store.js",
     "test:ai-content-ipc": "node scripts/test-ai-content-ipc.js",

@@ -10,7 +10,29 @@
 </template>
 
 <script setup>
+import { getCurrentInstance, onMounted, onBeforeUnmount } from "vue";
 import CHeader from "./components/title";
+import statsScheduler from "@/utils/statsScheduler";
+
+const instance = getCurrentInstance();
+
+onMounted(() => {
+  statsScheduler.start({
+    notify: (options) => {
+      if (
+        instance &&
+        instance.proxy &&
+        typeof instance.proxy.$notify === "function"
+      ) {
+        instance.proxy.$notify(options);
+      }
+    },
+  });
+});
+
+onBeforeUnmount(() => {
+  statsScheduler.stop();
+});
 </script>
 
 <style>

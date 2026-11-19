@@ -19,6 +19,29 @@
       </div>
       <collect-log-dialog :visible.sync="logVisible" :logs="logs" />
     </div>
+    <div class="auto-collect-bar">
+      <div class="auto-collect-controls">
+        <span class="auto-collect-label">每日自动采集</span>
+        <el-switch
+          v-model="autoCollect.enabled"
+          @change="onAutoCollectChange"
+        />
+        <el-time-select
+          v-model="autoCollect.time"
+          size="mini"
+          class="auto-collect-time"
+          :disabled="!autoCollect.enabled"
+          :clearable="false"
+          :editable="false"
+          :picker-options="{ start: '00:00', step: '00:30', end: '23:30' }"
+          placeholder="选择时间"
+          @change="onAutoCollectChange"
+        />
+      </div>
+      <span class="auto-collect-last">
+        上次自动采集：{{ autoCollect.lastRunDate || "暂无" }}
+      </span>
+    </div>
     <stats-overview :rows="rows" />
     <div class="platform-card">
       <div class="card-head">
@@ -51,6 +74,12 @@ import {
   getOverviewStats,
   onStatsProgress,
 } from "@/utils/statsApi";
+import {
+  loadSettings as loadAutoCollectSettings,
+  subscribeRunComplete,
+  subscribeSettings as subscribeAutoCollectSettings,
+  updateSettings as updateAutoCollectSettings,
+} from "@/utils/statsScheduler";
 
 export default {
   name: "DataStatsAll",
@@ -62,6 +91,7 @@ export default {
       progressText: "",
       logVisible: false,
       logs: [],
+      autoCollect: loadAutoCollectSettings(),
     };
   },
   computed: {
@@ -98,11 +128,31 @@ export default {
           : "✗ " + (p.error || "")
       }`;
     });
+    this._unsubAutoCollect = subscribeAutoCollectSettings((next) => {
+      this.autoCollect = next;
+    });
+    this._unsubAutoRunComplete = subscribeRunComplete(() => {
+      if (!this.syncing) {
+        this.progressText = "";
+        this.refresh();
+      }
+    });
+  },
+  activated() {
+    this.autoCollect = loadAutoCollectSettings();
   },
   beforeDestroy() {
     if (this._unsubProgress) this._unsubProgress();
+    if (this._unsubAutoCollect) this._unsubAutoCollect();
+    if (this._unsubAutoRunComplete) this._unsubAutoRunComplete();
   },
   methods: {
+    onAutoCollectChange() {
+      this.autoCollect = updateAutoCollectSettings({
+        enabled: this.autoCollect.enabled,
+        time: this.autoCollect.time,
+      });
+    },
     async refresh() {
       this.overview = await getOverviewStats();
     },
@@ -169,6 +219,39 @@ export default {
 }
 
 .progress-text {
+  font-size: 12px;
+  color: #909399;
+}
+
+.auto-collect-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+  padding: 8px 14px;
+  background: #ffffff;
+  border: 1px solid $borderColor;
+  border-radius: 8px;
+}
+
+.auto-collect-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.auto-collect-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: #303133;
+}
+
+.auto-collect-time {
+  width: 110px;
+}
+
+.auto-collect-last {
   font-size: 12px;
   color: #909399;
 }
