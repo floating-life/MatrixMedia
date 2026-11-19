@@ -1,14 +1,16 @@
 /**
- * 作品日快照存储（store.js）与长表行构建（statsTable.js）单元测试（不依赖 Electron 运行环境）：
+ * 作品日快照存储（store.js，按天分文件无锁）与长表行构建（statsTable.js）单元测试（不依赖 Electron 运行环境）：
  * 1. statsTable.js 纯函数模块独立加载（不依赖 electron / fs）
- * 2. store.mergeWorks → works-daily.json：同日覆盖、UTC+8 切日、跨日累计、null 指标、缺席作品不伪造
- * 3. store.mergeWorks：works-daily.json 写失败（EISDIR / EACCES）仅 warn，不影响 works.json 与返回值
- * 4. 读失败不清空历史：① JSON 损坏（保留原文件 + 生成 corrupt 备份）+ 根结构非对象；② 读 EIO（保留完整历史）
- * 5. 原子写与容错：③ 写入中途 ENOSPC（writeSync 半写 / fsyncSync）保留旧文件并清临时文件；rename EPERM/EBUSY 重试
- * 6. 跨进程锁：④ 双进程交错写入（锁内重读合并，多日数据都在）+ 锁超时告警跳过；⑤ 陈旧锁（>30s）被抢占
- * 7. ⑥ 指标校验统一（normalizeMetric）：畸形指标归 null 且不产生假增量，真实 0 照常保留
- * 8. ⑦ 特殊 workId（"__proto__" / "constructor" / "hasOwnProperty" / "toString"）无原型字典往返不丢
- * 9. buildWorkDailyRows：增量、断档 gapDays、from/to 过滤、已删除作品、排序、端到端串联与脏输入防护
+ * 2. 同日两次采集合并（第二次缺某作品时保留第一次该作品的值）+ UTC+8 切日 + null 指标
+ * 3. 跨日各自成文件、历史文件内容在后续采集中字节不变、缺席作品不伪造
+ * 4. 某天文件损坏 / 读失败 / 文件名与内容 date 不一致 → warn 并跳过，其余天正常读出
+ * 5. 当天文件损坏 → warn 且本次采集覆盖为有效文件（不做备份、历史文件不变）
+ * 6. 写失败 / 写入中途 ENOSPC（writeSync 半写 / fsyncSync）→ 旧当天文件完整、mergeWorks 成功、清临时文件
+ * 7. renameSync 遇 EPERM / EBUSY 重试（3 次×50ms）与重试耗尽容错
+ * 8. 旧单文件 works-daily.json 兼容读取（目录文件优先、不删除、不迁移写入、旧文件损坏跳过）
+ * 9. 畸形指标校验统一（normalizeMetric）：畸形指标归 null 且不产生假增量，真实 0 照常保留
+ * 10. 特殊 workId（"__proto__" / "constructor" / "hasOwnProperty" / "toString"）无原型字典往返不丢
+ * 11. buildWorkDailyRows：增量、断档 gapDays、from/to 过滤、已删除作品、排序、端到端串联与脏输入防护
  *
  * 运行：yarn test:works-daily
  */
@@ -16,7 +18,6 @@
 "use strict";
 
 const assert = require("assert");
-const { spawn } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -63,13 +64,12 @@ const EXPECTED_ROW_KEYS = [
   "gapDays",
 ];
 
-const SLEEP_VIEW = new Int32Array(new SharedArrayBuffer(4));
-function sleepSync(ms) {
-  if (ms > 0) Atomics.wait(SLEEP_VIEW, 0, 0, ms);
-}
-
 function accPath(group, platform, ...rest) {
   return path.join(tmpRoot, "data-stats", group, platform, ...rest);
+}
+
+function dailyDir(group, platform, ...rest) {
+  return accPath(group, platform, "works-daily", ...rest);
 }
 
 function captureWarn(fn) {
@@ -84,24 +84,33 @@ function captureWarn(fn) {
   }
 }
 
-function listLeftoverTempOrLock(dir) {
+function listLeftoverArtifacts(dir) {
   if (!fs.existsSync(dir)) return [];
   return fs
     .readdirSync(dir)
-    .filter((f) => f.endsWith(".tmp") || f.endsWith(".lock") || f.endsWith(".reap"));
+    .filter(
+      (f) =>
+        f.endsWith(".tmp") ||
+        f.endsWith(".lock") ||
+        f.endsWith(".reap") ||
+        f.includes(".corrupt-")
+    );
 }
 
 try {
-  /* ---------- 1. store: 同日覆盖 + UTC+8 切日 + 跨日累计 + null 指标 ---------- */
+  /* ---------- 1. 同日两次采集合并（第二次缺某作品保留第一次值）+ UTC+8 切日 + 跨日历史字节不变 ---------- */
   {
     const group = "测试组A";
     const platform = "抖音";
 
-    const empty = store.readWorksDaily(group, platform);
-    assert.strictEqual(Object.getPrototypeOf(empty), null, "无文件时应返回无原型空字典");
-    assert.deepStrictEqual(Object.keys(empty), [], "无文件时 readWorksDaily 应无键");
+    const { result: empty, warnings: emptyWarns } = captureWarn(() =>
+      store.readWorksDaily(group, platform)
+    );
+    assert.strictEqual(Object.getPrototypeOf(empty), null, "无目录时应返回无原型空字典");
+    assert.deepStrictEqual(Object.keys(empty), [], "无目录时 readWorksDaily 应无键");
+    assert.deepStrictEqual(emptyWarns, [], "目录不存在时不应输出告警");
 
-    // 2026-11-10 上午 09:00（UTC+8）首次采集
+    // 2026-11-10 上午 09:00（UTC+8）首次采集：W1 + W2
     const tDay1Morning = Date.parse("2026-11-10T01:00:00Z");
     store.mergeWorks(
       group,
@@ -135,7 +144,7 @@ try {
       tDay1Morning
     );
 
-    // 2026-11-10 晚上 22:00（UTC+8，同一天）二次采集：覆盖为最后一次
+    // 2026-11-10 晚上 22:00（UTC+8，同一天）二次采集：W1 更新 + W3 新增，故意缺少 W2
     const tDay1Evening = Date.parse("2026-11-10T14:00:00Z");
     store.mergeWorks(
       group,
@@ -154,24 +163,41 @@ try {
           fansDelta: 6,
         },
         {
-          workId: "W2",
-          title: "视频二",
-          url: "https://example.com/w2",
-          publishTime: Date.parse("2026-11-10T00:00:00Z"),
-          play: 70,
-          like: 1,
-          comment: 0,
-          share: null,
-          favorite: null,
+          workId: "W3",
+          title: "视频三",
+          url: "https://example.com/w3",
+          publishTime: Date.parse("2026-11-10T12:00:00Z"),
+          play: 20,
+          like: 2,
+          comment: 1,
+          share: 0,
+          favorite: 1,
           fansDelta: null,
         },
       ],
       tDay1Evening
     );
 
+    const day1File = dailyDir(group, platform, "2026-11-10.json");
+    assert.ok(fs.existsSync(day1File), "当天快照应落在 works-daily/2026-11-10.json");
+    assert.strictEqual(
+      fs.existsSync(accPath(group, platform, "works-daily.json")),
+      false,
+      "新结构不应生成单文件 works-daily.json"
+    );
+
+    const day1Raw = fs.readFileSync(day1File, "utf8");
+    const day1Doc = JSON.parse(day1Raw);
+    assert.strictEqual(day1Doc.date, "2026-11-10");
+    assert.strictEqual(day1Doc.updatedAt, tDay1Evening);
+    assert.deepStrictEqual(Object.keys(day1Doc.works).sort(), ["W1", "W2", "W3"]);
+    assert.strictEqual(day1Doc.works.W1.play, 180, "同日二次采集应覆盖 W1");
+    assert.strictEqual(day1Doc.works.W2.play, 50, "同日二次采集缺 W2 时应保留第一次 W2 的值");
+    assert.strictEqual(day1Doc.works.W2.share, null);
+    assert.strictEqual(day1Doc.works.W3.play, 20, "同日新增作品 W3 应并入当天文件");
+
     let daily = store.readWorksDaily(group, platform);
-    assert.strictEqual(Object.getPrototypeOf(daily), null, "读回 JSON 后应为无原型字典");
-    assert.deepStrictEqual(Object.keys(daily.W1), ["2026-11-10"], "同日多次采集只保留一条日期键");
+    assert.strictEqual(Object.getPrototypeOf(daily), null, "readWorksDaily 返回值必须无原型");
     assert.deepStrictEqual(daily.W1["2026-11-10"], {
       play: 180,
       like: 15,
@@ -181,16 +207,24 @@ try {
       fansDelta: 6,
     });
     assert.deepStrictEqual(daily.W2["2026-11-10"], {
-      play: 70,
-      like: 1,
+      play: 50,
+      like: 0,
       comment: 0,
       share: null,
       favorite: null,
       fansDelta: null,
     });
+    assert.deepStrictEqual(daily.W3["2026-11-10"], {
+      play: 20,
+      like: 2,
+      comment: 1,
+      share: 0,
+      favorite: 1,
+      fansDelta: null,
+    });
 
-    // UTC 2026-11-10T16:30:00Z = UTC+8 2026-11-11 00:30 → 应记为 2026-11-11
-    // 此次采集不包含 W2（模拟已删或未返回），不应伪造 W2 的 11-11 快照
+    // UTC 2026-11-10T16:30:00Z = UTC+8 2026-11-11 00:30 → 跨日写入 2026-11-11.json
+    // 此次采集仅含 W1（不含 W2/W3），不应伪造 W2/W3 的 11-11 快照，也不得修改 2026-11-10.json
     const tDay2Utc8 = Date.parse("2026-11-10T16:30:00Z");
     store.mergeWorks(
       group,
@@ -212,278 +246,221 @@ try {
       tDay2Utc8
     );
 
-    daily = store.readWorksDaily(group, platform);
-    assert.deepStrictEqual(Object.keys(daily.W1).sort(), ["2026-11-10", "2026-11-11"]);
-    assert.strictEqual(daily.W1["2026-11-10"].play, 180, "历史日期快照不得被覆盖");
-    assert.strictEqual(daily.W1["2026-11-11"].play, 260, "UTC+8 切日后记为次日快照");
-    assert.deepStrictEqual(
-      Object.keys(daily.W2),
-      ["2026-11-10"],
-      "当日未采集到的作品不应伪造当日快照"
-    );
-
-    // 验证物理文件路径与无残留锁/临时文件
-    const diskPath = accPath(group, platform, "works-daily.json");
-    assert.ok(fs.existsSync(diskPath), "works-daily.json 应落在 userData/data-stats/<分组>/<平台>/");
-    assert.deepStrictEqual(
-      Object.assign(Object.create(null), JSON.parse(fs.readFileSync(diskPath, "utf8"))),
-      daily
-    );
-    assert.deepStrictEqual(listLeftoverTempOrLock(accPath(group, platform)), []);
-    console.log("✓ store.mergeWorks：同日覆盖 + UTC+8 切日 + 跨日累计 + null 指标正确");
-  }
-
-  /* ---------- 2. store: works-daily.json 写失败（EISDIR / EACCES）不得影响 mergeWorks ---------- */
-  {
-    const group = "写失败组";
-    const platform = "快手";
-    const dir = accPath(group, platform);
-    fs.mkdirSync(dir, { recursive: true });
-    // 在 works-daily.json 位置放置一个同名目录，确保读/写必然抛 EISDIR
-    fs.mkdirSync(path.join(dir, "works-daily.json"));
-
-    const { result: res, warnings } = captureWarn(() =>
-      store.mergeWorks(
-        group,
-        platform,
-        [
-          {
-            workId: "KS1",
-            title: "快手测试",
-            url: "https://kuaishou.com/ks1",
-            publishTime: Date.parse("2026-11-10T08:00:00Z"),
-            play: 300,
-            like: 20,
-            comment: 3,
-            share: null,
-            favorite: null,
-            fansDelta: null,
-          },
-        ],
-        Date.parse("2026-11-11T04:00:00Z")
-      )
-    );
-
-    assert.strictEqual(res.works.length, 1, "写日快照失败不得影响 mergeWorks 返回值");
-    assert.strictEqual(res.works[0].workId, "KS1");
-    assert.strictEqual(res.works[0].play, 300);
-    assert.strictEqual(store.readWorks(group, platform).works[0].play, 300, "works.json 应正常落盘");
-    assert.ok(warnings.some((m) => m.includes("works-daily.json")), "失败应通过 console.warn 告警");
-    assert.deepStrictEqual(listLeftoverTempOrLock(dir), [], "失败后不应残留锁或临时文件");
-
-    // mock 原子写打开临时文件抛 EACCES
-    const origOpenSync = fs.openSync;
-    fs.openSync = function patchedOpen(file, ...rest) {
-      if (String(file).includes("works-daily.json") && String(file).endsWith(".tmp")) {
-        const err = new Error("EACCES: permission denied");
-        err.code = "EACCES";
-        throw err;
-      }
-      return origOpenSync.call(fs, file, ...rest);
-    };
-    let out2;
-    try {
-      out2 = captureWarn(() =>
-        store.mergeWorks(
-          "写失败组2",
-          "哔哩哔哩",
-          [
-            {
-              workId: "BV1",
-              title: "B站测试",
-              publishTime: Date.parse("2026-11-11T02:00:00Z"),
-              play: 99,
-              like: 5,
-              comment: 1,
-              share: 0,
-              favorite: 2,
-              fansDelta: null,
-            },
-          ],
-          Date.parse("2026-11-11T05:00:00Z")
-        )
-      );
-    } finally {
-      fs.openSync = origOpenSync;
-    }
-    assert.strictEqual(out2.result.works[0].workId, "BV1");
-    assert.strictEqual(store.readWorks("写失败组2", "哔哩哔哩").works[0].play, 99);
-    assert.ok(out2.warnings.some((m) => m.includes("EACCES")));
-    assert.deepStrictEqual(listLeftoverTempOrLock(accPath("写失败组2", "哔哩哔哩")), []);
-    console.log("✓ store.mergeWorks：works-daily 写失败只 warn，不影响 works.json 与结果");
-  }
-
-  /* ---------- 3. ① 既有历史 JSON 损坏 & 根结构非对象：不清空历史 + 生成 corrupt 备份 ---------- */
-  {
-    const group = "损坏恢复组";
-    const platform = "抖音";
-    const dir = accPath(group, platform);
-    const file = path.join(dir, "works-daily.json");
-
-    // 先写入正常历史，再制造 JSON 损坏（截断残留）
-    store.mergeWorks(
-      group,
-      platform,
-      [{ workId: "H1", title: "历史视频", publishTime: Date.parse("2026-11-01T00:00:00Z"), play: 100 }],
-      Date.parse("2026-11-08T04:00:00Z")
-    );
-    const corruptRaw = '{"H1":{"2026-11-08":{"play":100,"like":5';
-    fs.writeFileSync(file, corruptRaw, "utf8");
-
-    // readWorksDaily 必须直接抛 SyntaxError，不能静默返回空
-    assert.throws(() => store.readWorksDaily(group, platform), SyntaxError);
-
-    // mergeWorks 触发 recordWorksDaily：告警、不覆盖原文件、复制出 corrupt 备份、mergeWorks 仍成功
-    const { result, warnings } = captureWarn(() =>
-      store.mergeWorks(
-        group,
-        platform,
-        [{ workId: "H1", title: "历史视频", publishTime: Date.parse("2026-11-01T00:00:00Z"), play: 220 }],
-        Date.parse("2026-11-10T04:00:00Z")
-      )
-    );
-    assert.strictEqual(result.works[0].play, 220, "mergeWorks 本身仍应成功");
-    assert.strictEqual(store.readWorks(group, platform).works[0].play, 220);
-    assert.strictEqual(fs.readFileSync(file, "utf8"), corruptRaw, "原 works-daily.json 字节不得被覆盖");
-    assert.ok(warnings.some((m) => m.includes("works-daily.json")), "损坏时应输出告警");
-
-    const backups = fs
-      .readdirSync(dir)
-      .filter((name) => /^works-daily\.corrupt-\d+\.json$/.test(name));
-    assert.strictEqual(backups.length, 1, "JSON 损坏应生成一份 works-daily.corrupt-<时间戳>.json 备份");
+    const day2File = dailyDir(group, platform, "2026-11-11.json");
+    assert.ok(fs.existsSync(day2File), "跨日应独立生成 2026-11-11.json");
     assert.strictEqual(
-      fs.readFileSync(path.join(dir, backups[0]), "utf8"),
-      corruptRaw,
-      "corrupt 备份内容应与原损坏文件一致"
+      fs.readFileSync(day1File, "utf8"),
+      day1Raw,
+      "跨日后续采集中历史文件 2026-11-10.json 字节必须完全不变"
     );
-    assert.deepStrictEqual(listLeftoverTempOrLock(dir), []);
+    const day2Raw = fs.readFileSync(day2File, "utf8");
+    const day2Doc = JSON.parse(day2Raw);
+    assert.strictEqual(day2Doc.date, "2026-11-11");
+    assert.strictEqual(day2Doc.updatedAt, tDay2Utc8);
+    assert.deepStrictEqual(Object.keys(day2Doc.works), ["W1"], "当日未采集到的作品不应伪造");
 
-    // 根结构非对象（数组 / null / 原始类型）同样抛错且不覆盖原文件
-    const groupBadRoot = "非对象根组";
-    const dirBadRoot = accPath(groupBadRoot, platform);
-    const fileBadRoot = path.join(dirBadRoot, "works-daily.json");
-    fs.mkdirSync(dirBadRoot, { recursive: true });
-    for (const badPayload of ["[]", "null", "123", '"hello"']) {
-      fs.writeFileSync(fileBadRoot, badPayload, "utf8");
-      assert.throws(
-        () => store.readWorksDaily(groupBadRoot, platform),
-        (err) => err && err.code === "EINVALID_WORKS_DAILY",
-        `根结构 ${badPayload} 应抛 EINVALID_WORKS_DAILY`
-      );
-      const outBad = captureWarn(() =>
-        store.mergeWorks(
-          groupBadRoot,
-          platform,
-          [{ workId: "R1", title: "根测试", publishTime: Date.parse("2026-11-01T00:00:00Z"), play: 50 }],
-          Date.parse("2026-11-10T04:00:00Z")
-        )
-      );
-      assert.strictEqual(outBad.result.works[0].play, 50);
-      assert.strictEqual(fs.readFileSync(fileBadRoot, "utf8"), badPayload, "非对象根原文件应保持不变");
-      assert.ok(outBad.warnings.some((m) => m.includes("works-daily.json")));
-    }
-    assert.deepStrictEqual(listLeftoverTempOrLock(dirBadRoot), []);
-    console.log("✓ ① JSON 损坏与非对象根：readWorksDaily 抛错、保留原文件、生成 corrupt 备份、mergeWorks 成功");
+    // 第三天采集：验证前两天文件字节全部不变
+    store.mergeWorks(
+      group,
+      platform,
+      [{ workId: "W1", title: "视频一", publishTime: Date.parse("2026-11-09T10:00:00Z"), play: 310 }],
+      Date.parse("2026-11-12T02:00:00Z")
+    );
+    assert.strictEqual(fs.readFileSync(day1File, "utf8"), day1Raw, "第 3 日采集后第 1 日文件字节不变");
+    assert.strictEqual(fs.readFileSync(day2File, "utf8"), day2Raw, "第 3 日采集后第 2 日文件字节不变");
+    assert.deepStrictEqual(
+      fs.readdirSync(dailyDir(group, platform)).sort(),
+      ["2026-11-10.json", "2026-11-11.json", "2026-11-12.json"]
+    );
+
+    daily = store.readWorksDaily(group, platform);
+    assert.deepStrictEqual(Object.keys(daily.W1).sort(), ["2026-11-10", "2026-11-11", "2026-11-12"]);
+    assert.strictEqual(daily.W1["2026-11-10"].play, 180);
+    assert.strictEqual(daily.W1["2026-11-11"].play, 260);
+    assert.strictEqual(daily.W1["2026-11-12"].play, 310);
+    assert.deepStrictEqual(Object.keys(daily.W2), ["2026-11-10"]);
+    assert.deepStrictEqual(Object.keys(daily.W3), ["2026-11-10"]);
+    assert.deepStrictEqual(listLeftoverArtifacts(dailyDir(group, platform)), []);
+    assert.deepStrictEqual(listLeftoverArtifacts(accPath(group, platform)), []);
+    console.log("✓ 同日合并保留缺席作品 + UTC+8 切日 + 跨日独立文件与历史字节不变");
   }
 
-  /* ---------- 4. ② 带既有历史时读 EIO（mock fs）：历史文件内容不变、无 corrupt 备份、mergeWorks 成功 ---------- */
+  /* ---------- 2. 某天文件损坏 / 读失败 / 文件名与内容 date 不一致 → 其余天正常读出 ---------- */
   {
-    const group = "读EIO组";
+    const group = "单日损坏组";
     const platform = "视频号";
-    const dir = accPath(group, platform);
-    const file = path.join(dir, "works-daily.json");
+    const dir = dailyDir(group, platform);
+    fs.mkdirSync(dir, { recursive: true });
 
-    store.mergeWorks(
-      group,
-      platform,
-      [{ workId: "E1", title: "重要历史", publishTime: Date.parse("2026-11-01T00:00:00Z"), play: 500, like: 50 }],
-      Date.parse("2026-11-08T04:00:00Z")
+    // 正常日：11-08
+    fs.writeFileSync(
+      path.join(dir, "2026-11-08.json"),
+      JSON.stringify({ date: "2026-11-08", updatedAt: 1000, works: { H1: { play: 100, like: 10 } } }),
+      "utf8"
     );
-    store.mergeWorks(
-      group,
-      platform,
-      [{ workId: "E1", title: "重要历史", publishTime: Date.parse("2026-11-01T00:00:00Z"), play: 650, like: 62 }],
-      Date.parse("2026-11-09T04:00:00Z")
+    // 损坏 JSON：11-09
+    fs.writeFileSync(path.join(dir, "2026-11-09.json"), '{"date":"2026-11-09","works":{"H1":', "utf8");
+    // 无效结构（works 非对象）：11-10
+    fs.writeFileSync(
+      path.join(dir, "2026-11-10.json"),
+      JSON.stringify({ date: "2026-11-10", updatedAt: 2000, works: [] }),
+      "utf8"
     );
-    const beforeBytes = fs.readFileSync(file, "utf8");
+    // 文件名日期与内容 date 不一致：11-11 文件内写了 2026-01-01，应以文件名 2026-11-11 为准
+    fs.writeFileSync(
+      path.join(dir, "2026-11-11.json"),
+      JSON.stringify({ date: "2026-01-01", updatedAt: 3000, works: { H1: { play: 220, like: 22 } } }),
+      "utf8"
+    );
+    // 读失败（同名目录触发 EISDIR）：11-12
+    fs.mkdirSync(path.join(dir, "2026-11-12.json"));
+    // 干扰文件（不符合 YYYY-MM-DD.json）：静默忽略
+    fs.writeFileSync(path.join(dir, ".2026-11-08.json.123.tmp"), "{incomplete", "utf8");
+    fs.writeFileSync(path.join(dir, "notes.txt"), "ignore me", "utf8");
 
+    const { result: daily, warnings } = captureWarn(() => store.readWorksDaily(group, platform));
+    assert.strictEqual(Object.getPrototypeOf(daily), null);
+    assert.deepStrictEqual(
+      Object.keys(daily.H1).sort(),
+      ["2026-11-08", "2026-11-11"],
+      "损坏/无效/读失败日期应跳过，其余天正常读出且以文件名日期为准"
+    );
+    assert.strictEqual(daily.H1["2026-11-08"].play, 100);
+    assert.strictEqual(daily.H1["2026-11-08"].like, 10);
+    assert.strictEqual(daily.H1["2026-11-11"].play, 220);
+    assert.strictEqual(daily.H1["2026-01-01"], undefined, "不得使用内容中不一致的 date");
+    assert.ok(warnings.some((m) => m.includes("2026-11-09.json")), "损坏 JSON 应 warn");
+    assert.ok(warnings.some((m) => m.includes("2026-11-10.json")), "结构无效应 warn");
+    assert.ok(warnings.some((m) => m.includes("2026-11-12.json")), "读失败应 warn");
+    assert.strictEqual(
+      warnings.some((m) => m.includes("notes.txt") || m.includes(".tmp")),
+      false,
+      "非 YYYY-MM-DD.json 文件应静默忽略"
+    );
+
+    // 进一步测试 mock EIO 读单日文件：同样 warn 并跳过，不影响其余天
     const origReadFileSync = fs.readFileSync;
+    const eioTarget = path.join(dir, "2026-11-08.json");
     fs.readFileSync = function patchedRead(target, ...rest) {
-      if (String(target) === file) {
+      if (String(target) === eioTarget) {
         const err = new Error("EIO: i/o error, read");
         err.code = "EIO";
         throw err;
       }
       return origReadFileSync.call(fs, target, ...rest);
     };
-
     let outEio;
     try {
-      assert.throws(
-        () => store.readWorksDaily(group, platform),
-        (err) => err && err.code === "EIO",
-        "readWorksDaily 遇 EIO 应抛错"
-      );
-      outEio = captureWarn(() =>
-        store.mergeWorks(
-          group,
-          platform,
-          [{ workId: "E1", title: "重要历史", publishTime: Date.parse("2026-11-01T00:00:00Z"), play: 800, like: 75 }],
-          Date.parse("2026-11-10T04:00:00Z")
-        )
-      );
+      outEio = captureWarn(() => store.readWorksDaily(group, platform));
     } finally {
       fs.readFileSync = origReadFileSync;
     }
-
-    assert.strictEqual(outEio.result.works[0].play, 800, "读 EIO 不得影响 mergeWorks 返回值");
-    assert.strictEqual(store.readWorks(group, platform).works[0].play, 800, "works.json 应正常更新");
-    assert.ok(outEio.warnings.some((m) => m.includes("EIO")), "应记录 EIO 告警");
-    assert.strictEqual(fs.readFileSync(file, "utf8"), beforeBytes, "读 EIO 后原历史文件字节必须完全不变");
-    assert.strictEqual(
-      fs.readdirSync(dir).filter((f) => f.includes(".corrupt-")).length,
-      0,
-      "读 EIO 不应生成 corrupt 备份"
-    );
-    assert.deepStrictEqual(listLeftoverTempOrLock(dir), []);
-
-    // EIO 恢复后可读出完整历史
-    const recovered = store.readWorksDaily(group, platform);
-    assert.deepStrictEqual(Object.keys(recovered.E1).sort(), ["2026-11-08", "2026-11-09"]);
-    assert.strictEqual(recovered.E1["2026-11-08"].play, 500);
-    assert.strictEqual(recovered.E1["2026-11-09"].play, 650);
-    console.log("✓ ② 带既有历史读 EIO：历史文件完整保留、无 corrupt 备份、mergeWorks 成功");
+    assert.deepStrictEqual(Object.keys(outEio.result.H1), ["2026-11-11"]);
+    assert.ok(outEio.warnings.some((m) => m.includes("2026-11-08.json") && m.includes("EIO")));
+    console.log("✓ 某天文件损坏/读失败/date 不一致：warn 并跳过异常天，其余天以文件名日期正常读出");
   }
 
-  /* ---------- 5. ③ 写入中途 ENOSPC（writeSync 半写 / fsyncSync）+ renameSync 重试 ---------- */
+  /* ---------- 3. 当天文件损坏 → 本次采集 warn 并覆盖为有效文件（不做备份、历史不变） ---------- */
+  {
+    const group = "当天损坏覆盖组";
+    const platform = "抖音";
+    const dir = dailyDir(group, platform);
+
+    // 先写入前一天正常历史
+    store.mergeWorks(
+      group,
+      platform,
+      [{ workId: "C1", title: "历史视频", publishTime: Date.parse("2026-11-01T00:00:00Z"), play: 100 }],
+      Date.parse("2026-11-09T04:00:00Z")
+    );
+    const prevFile = path.join(dir, "2026-11-09.json");
+    const prevBytes = fs.readFileSync(prevFile, "utf8");
+
+    // 3a. 当天文件 JSON 损坏
+    const todayFile = path.join(dir, "2026-11-10.json");
+    fs.writeFileSync(todayFile, '{"date":"2026-11-10","works":{"C1":{"play":150', "utf8");
+
+    const tToday = Date.parse("2026-11-10T04:00:00Z");
+    const { result, warnings } = captureWarn(() =>
+      store.mergeWorks(
+        group,
+        platform,
+        [{ workId: "C1", title: "历史视频", publishTime: Date.parse("2026-11-01T00:00:00Z"), play: 220, like: 18 }],
+        tToday
+      )
+    );
+
+    assert.strictEqual(result.works[0].play, 220);
+    assert.ok(warnings.some((m) => m.includes("2026-11-10.json")), "当天文件损坏应输出 warn");
+    const repaired = JSON.parse(fs.readFileSync(todayFile, "utf8"));
+    assert.strictEqual(repaired.date, "2026-11-10");
+    assert.strictEqual(repaired.updatedAt, tToday);
+    assert.strictEqual(repaired.works.C1.play, 220, "当天损坏文件应被本次采集覆盖为有效文件");
+    assert.strictEqual(repaired.works.C1.like, 18);
+    assert.strictEqual(fs.readFileSync(prevFile, "utf8"), prevBytes, "前一天历史文件字节不得变化");
+    assert.deepStrictEqual(listLeftoverArtifacts(dir), [], "不得生成 corrupt 备份或残留临时文件");
+    assert.deepStrictEqual(listLeftoverArtifacts(accPath(group, platform)), []);
+
+    // 3b. 当天文件根结构非对象 / works 非对象 → 同样 warn 并覆盖为有效文件
+    for (const badPayload of ["[]", "null", '{"date":"2026-11-10","works":null}']) {
+      fs.writeFileSync(todayFile, badPayload, "utf8");
+      const outBad = captureWarn(() =>
+        store.mergeWorks(
+          group,
+          platform,
+          [{ workId: "C1", title: "历史视频", publishTime: Date.parse("2026-11-01T00:00:00Z"), play: 260 }],
+          tToday + 1000
+        )
+      );
+      assert.ok(outBad.warnings.some((m) => m.includes("2026-11-10.json")));
+      const doc = JSON.parse(fs.readFileSync(todayFile, "utf8"));
+      assert.strictEqual(doc.works.C1.play, 260);
+    }
+
+    const { result: afterDaily, warnings: readWarns } = captureWarn(() =>
+      store.readWorksDaily(group, platform)
+    );
+    assert.deepStrictEqual(readWarns, [], "覆盖修复后读取不应再有告警");
+    assert.deepStrictEqual(Object.keys(afterDaily.C1).sort(), ["2026-11-09", "2026-11-10"]);
+    assert.strictEqual(afterDaily.C1["2026-11-09"].play, 100);
+    assert.strictEqual(afterDaily.C1["2026-11-10"].play, 260);
+    console.log("✓ 当天文件损坏：warn 且本次采集覆盖为有效文件，不做备份，历史文件完整");
+  }
+
+  /* ---------- 4. 写失败 / 写入中途 ENOSPC（writeSync 半写 / fsyncSync）→ 旧当天文件完整、mergeWorks 成功 ---------- */
   {
     const group = "原子写组";
-    const platform = "抖音";
-    const dir = accPath(group, platform);
-    const file = path.join(dir, "works-daily.json");
+    const platform = "快手";
+    const dir = dailyDir(group, platform);
+    const tDay1 = Date.parse("2026-11-09T04:00:00Z");
+    const tDay2 = Date.parse("2026-11-10T04:00:00Z");
 
     store.mergeWorks(
       group,
       platform,
       [{ workId: "A1", title: "原子写测试", publishTime: Date.parse("2026-11-01T00:00:00Z"), play: 1000, like: 80 }],
-      Date.parse("2026-11-08T04:00:00Z")
+      tDay1
     );
     store.mergeWorks(
       group,
       platform,
       [{ workId: "A1", title: "原子写测试", publishTime: Date.parse("2026-11-01T00:00:00Z"), play: 1200, like: 95 }],
-      Date.parse("2026-11-09T04:00:00Z")
+      tDay2
     );
-    const intactBytes = fs.readFileSync(file, "utf8");
 
-    // 5a. writeSync 半写（先写 16 字节再抛 ENOSPC）→ 旧文件完整可解析、临时文件已清理
+    const day1File = path.join(dir, "2026-11-09.json");
+    const day2File = path.join(dir, "2026-11-10.json");
+    const intactDay1Bytes = fs.readFileSync(day1File, "utf8");
+    const intactDay2Bytes = fs.readFileSync(day2File, "utf8");
+
+    // 4a. writeSync 半写（先写 16 字节再抛 ENOSPC）→ 旧当天文件完整可解析、临时文件已清理、mergeWorks 成功
     const origOpenSync = fs.openSync;
     const origWriteSync = fs.writeSync;
     const tmpFds = new Set();
     let partialDone = false;
     fs.openSync = function patchedOpen(target, ...rest) {
       const fd = origOpenSync.call(fs, target, ...rest);
-      if (String(target).includes("works-daily.json") && String(target).endsWith(".tmp")) {
+      if (String(target).includes("2026-11-10.json") && String(target).endsWith(".tmp")) {
         tmpFds.add(fd);
       }
       return fd;
@@ -509,7 +486,7 @@ try {
           group,
           platform,
           [{ workId: "A1", title: "原子写测试", publishTime: Date.parse("2026-11-01T00:00:00Z"), play: 1500, like: 120 }],
-          Date.parse("2026-11-10T04:00:00Z")
+          tDay2 + 3600e3
         )
       );
     } finally {
@@ -519,15 +496,14 @@ try {
 
     assert.strictEqual(partialDone, true, "确认已命中半写路径");
     assert.strictEqual(outHalfWrite.result.works[0].play, 1500, "writeSync ENOSPC 不得影响 mergeWorks");
+    assert.strictEqual(store.readWorks(group, platform).works[0].play, 1500, "works.json 应正常更新");
     assert.ok(outHalfWrite.warnings.some((m) => m.includes("ENOSPC")));
-    assert.strictEqual(fs.readFileSync(file, "utf8"), intactBytes, "半写 ENOSPC 后旧文件必须字节完整不变");
-    assert.deepStrictEqual(Object.keys(store.readWorksDaily(group, platform).A1).sort(), [
-      "2026-11-08",
-      "2026-11-09",
-    ]);
-    assert.deepStrictEqual(listLeftoverTempOrLock(dir), [], "半写失败后临时文件与锁均应清理");
+    assert.strictEqual(fs.readFileSync(day2File, "utf8"), intactDay2Bytes, "半写 ENOSPC 后旧当天文件必须字节完整");
+    assert.strictEqual(fs.readFileSync(day1File, "utf8"), intactDay1Bytes, "历史文件不受影响");
+    assert.strictEqual(store.readWorksDaily(group, platform).A1["2026-11-10"].play, 1200);
+    assert.deepStrictEqual(listLeftoverArtifacts(dir), [], "半写失败后临时文件应被清理");
 
-    // 5b. fsyncSync 抛 ENOSPC → 旧文件完整可解析、临时文件已清理
+    // 4b. fsyncSync 抛 ENOSPC → 旧当天文件完整可解析、临时文件已清理、mergeWorks 成功
     const origFsyncSync = fs.fsyncSync;
     fs.fsyncSync = function patchedFsync() {
       const err = new Error("ENOSPC: no space left on device, fsync");
@@ -541,7 +517,7 @@ try {
           group,
           platform,
           [{ workId: "A1", title: "原子写测试", publishTime: Date.parse("2026-11-01T00:00:00Z"), play: 1600, like: 130 }],
-          Date.parse("2026-11-10T05:00:00Z")
+          tDay2 + 7200e3
         )
       );
     } finally {
@@ -549,14 +525,73 @@ try {
     }
     assert.strictEqual(outFsync.result.works[0].play, 1600);
     assert.ok(outFsync.warnings.some((m) => m.includes("ENOSPC")));
-    assert.strictEqual(fs.readFileSync(file, "utf8"), intactBytes, "fsync ENOSPC 后旧文件必须完整可解析");
-    assert.deepStrictEqual(listLeftoverTempOrLock(dir), []);
+    assert.strictEqual(fs.readFileSync(day2File, "utf8"), intactDay2Bytes, "fsync ENOSPC 后旧当天文件必须字节完整");
+    assert.deepStrictEqual(listLeftoverArtifacts(dir), []);
 
-    // 5c. renameSync 遇 EPERM/EBUSY 重试：前 2 次失败第 3 次成功
+    // 4c. 目录位置被文件占据（ENOTDIR / EEXIST）& openSync EACCES → 仅 warn，不影响 mergeWorks
+    const badGroup = "写失败组";
+    const badAccDir = accPath(badGroup, "哔哩哔哩");
+    fs.mkdirSync(badAccDir, { recursive: true });
+    fs.writeFileSync(path.join(badAccDir, "works-daily"), "occupy-as-file", "utf8");
+    const outBlocked = captureWarn(() =>
+      store.mergeWorks(
+        badGroup,
+        "哔哩哔哩",
+        [{ workId: "BV1", title: "B站测试", publishTime: Date.parse("2026-11-10T02:00:00Z"), play: 99 }],
+        tDay2
+      )
+    );
+    assert.strictEqual(outBlocked.result.works[0].play, 99);
+    assert.strictEqual(store.readWorks(badGroup, "哔哩哔哩").works[0].play, 99);
+    assert.ok(outBlocked.warnings.some((m) => m.includes("works-daily")));
+
+    fs.openSync = function patchedOpenAcc(target, ...rest) {
+      if (String(target).endsWith(".tmp")) {
+        const err = new Error("EACCES: permission denied");
+        err.code = "EACCES";
+        throw err;
+      }
+      return origOpenSync.call(fs, target, ...rest);
+    };
+    let outAcc;
+    try {
+      outAcc = captureWarn(() =>
+        store.mergeWorks(
+          "写失败组2",
+          "哔哩哔哩",
+          [{ workId: "BV2", title: "权限测试", publishTime: Date.parse("2026-11-10T02:00:00Z"), play: 88 }],
+          tDay2
+        )
+      );
+    } finally {
+      fs.openSync = origOpenSync;
+    }
+    assert.strictEqual(outAcc.result.works[0].play, 88);
+    assert.ok(outAcc.warnings.some((m) => m.includes("EACCES")));
+    assert.deepStrictEqual(listLeftoverArtifacts(dailyDir("写失败组2", "哔哩哔哩")), []);
+    console.log("✓ 写入中途 ENOSPC/fsync 失败与路径/权限异常：旧当天文件完整、mergeWorks 成功、临时文件已清理");
+  }
+
+  /* ---------- 5. renameSync 遇 EPERM / EBUSY 重试（3 次×50ms）与耗尽容错 ---------- */
+  {
+    const group = "重命名重试组";
+    const platform = "抖音";
+    const dir = dailyDir(group, platform);
+    const tDay = Date.parse("2026-11-10T04:00:00Z");
+    const targetFile = path.join(dir, "2026-11-10.json");
+
+    store.mergeWorks(
+      group,
+      platform,
+      [{ workId: "R1", title: "重试测试", publishTime: Date.parse("2026-11-01T00:00:00Z"), play: 100 }],
+      tDay
+    );
+
+    // 5a. 前 2 次分别抛 EPERM、EBUSY，第 3 次成功
     const origRenameSync = fs.renameSync;
     let renameAttempts = 0;
     fs.renameSync = function patchedRename(src, dest) {
-      if (String(dest) === file) {
+      if (String(dest) === targetFile) {
         renameAttempts++;
         if (renameAttempts === 1) {
           const err = new Error("EPERM: operation not permitted");
@@ -571,34 +606,32 @@ try {
       }
       return origRenameSync.call(fs, src, dest);
     };
+    let outRetryOk;
     try {
-      store.mergeWorks(
-        group,
-        platform,
-        [{ workId: "A1", title: "原子写测试", publishTime: Date.parse("2026-11-01T00:00:00Z"), play: 1700, like: 140 }],
-        Date.parse("2026-11-10T06:00:00Z")
+      outRetryOk = captureWarn(() =>
+        store.mergeWorks(
+          group,
+          platform,
+          [{ workId: "R1", title: "重试测试", publishTime: Date.parse("2026-11-01T00:00:00Z"), play: 170 }],
+          tDay + 1000
+        )
       );
     } finally {
       fs.renameSync = origRenameSync;
     }
     assert.strictEqual(renameAttempts, 3, "EPERM/EBUSY 后应自动重试并成功");
-    const afterRetry = store.readWorksDaily(group, platform);
-    assert.deepStrictEqual(Object.keys(afterRetry.A1).sort(), [
-      "2026-11-08",
-      "2026-11-09",
-      "2026-11-10",
-    ]);
-    assert.strictEqual(afterRetry.A1["2026-11-10"].play, 1700);
-    assert.deepStrictEqual(listLeftoverTempOrLock(dir), []);
+    assert.deepStrictEqual(outRetryOk.warnings, []);
+    assert.strictEqual(store.readWorksDaily(group, platform).R1["2026-11-10"].play, 170);
+    assert.deepStrictEqual(listLeftoverArtifacts(dir), []);
 
-    // 5d. renameSync 连续 4 次 EBUSY（耗尽 3 次重试）→ 保留上一完整版本、清理临时文件
-    const beforeExhaustBytes = fs.readFileSync(file, "utf8");
+    // 5b. 连续 EPERM 耗尽 3 次重试（共 4 次调用）→ 保留旧文件、清临时文件、warn、mergeWorks 成功
+    const beforeExhaustBytes = fs.readFileSync(targetFile, "utf8");
     let exhaustAttempts = 0;
     fs.renameSync = function patchedRenameFail(src, dest) {
-      if (String(dest) === file) {
+      if (String(dest) === targetFile) {
         exhaustAttempts++;
-        const err = new Error("EBUSY: still locked");
-        err.code = "EBUSY";
+        const err = new Error("EPERM: still locked");
+        err.code = "EPERM";
         throw err;
       }
       return origRenameSync.call(fs, src, dest);
@@ -609,262 +642,112 @@ try {
         store.mergeWorks(
           group,
           platform,
-          [{ workId: "A1", title: "原子写测试", publishTime: Date.parse("2026-11-01T00:00:00Z"), play: 1900, like: 150 }],
-          Date.parse("2026-11-11T04:00:00Z")
+          [{ workId: "R1", title: "重试测试", publishTime: Date.parse("2026-11-01T00:00:00Z"), play: 250 }],
+          tDay + 2000
         )
       );
     } finally {
       fs.renameSync = origRenameSync;
     }
     assert.strictEqual(exhaustAttempts, 4, "应为首次尝试 + 3 次重试共 4 次");
-    assert.strictEqual(outExhaust.result.works[0].play, 1900);
-    assert.ok(outExhaust.warnings.some((m) => m.includes("EBUSY")));
-    assert.strictEqual(fs.readFileSync(file, "utf8"), beforeExhaustBytes, "耗尽重试后旧文件应完好保留");
-    assert.deepStrictEqual(listLeftoverTempOrLock(dir), []);
-    console.log("✓ ③ 原子写：writeSync 半写/fsync ENOSPC 保留完整旧文件 + rename EPERM/EBUSY 重试正确");
+    assert.strictEqual(outExhaust.result.works[0].play, 250);
+    assert.ok(outExhaust.warnings.some((m) => m.includes("EPERM")));
+    assert.strictEqual(fs.readFileSync(targetFile, "utf8"), beforeExhaustBytes, "重试耗尽后旧文件应字节完好");
+    assert.deepStrictEqual(listLeftoverArtifacts(dir), []);
+    console.log("✓ renameSync EPERM/EBUSY 重试（3 次×50ms）与耗尽容错正确");
   }
 
-  /* ---------- 6. ④ 两个写入者交错（跨进程持锁等待、锁内重读合并）+ 锁超时告警跳过 ---------- */
+  /* ---------- 6. 旧单文件 works-daily.json 兼容读取（目录文件优先、不删除、不迁移写入） ---------- */
   {
-    const group = "并发交错组";
-    const platform = "抖音";
-    const dir = accPath(group, platform);
-    const flagFile = path.join(tmpRoot, "child-in-lock.flag");
-    const doneFile = path.join(tmpRoot, "child-done.json");
-    const childLogFile = path.join(tmpRoot, "child-interleave.log");
+    const group = "旧单文件兼容组";
+    const platform = "头条";
+    const accDir = accPath(group, platform);
+    const legacyFile = path.join(accDir, "works-daily.json");
+    const dir = dailyDir(group, platform);
+    fs.mkdirSync(accDir, { recursive: true });
 
-    // 预置 Day 0 历史
+    const legacyPayload = JSON.stringify(
+      {
+        W1: {
+          "2026-11-08": { play: 100, like: 10, comment: 1, share: 0, favorite: 2, fansDelta: 1 },
+          "2026-11-09": { play: 150, like: 15, comment: 2, share: 1, favorite: 3, fansDelta: 2 },
+        },
+        W2: {
+          "2026-11-09": { play: 40, like: 4, comment: 0, share: null, favorite: 1, fansDelta: null },
+        },
+        W_OLD: {
+          "2026-11-08": { play: 20, like: " 3 ", comment: "   ", share: [], favorite: 0, fansDelta: null },
+        },
+        ["__proto__"]: {
+          "2026-11-08": { play: 77, like: 7, comment: 0, share: 0, favorite: 0, fansDelta: null },
+        },
+      },
+      null,
+      2
+    );
+    fs.writeFileSync(legacyFile, legacyPayload, "utf8");
+
+    // 6a. 仅存在旧单文件、无 works-daily/ 目录时正常读出，且不创建目录、不改旧文件
+    const { result: legacyOnly, warnings: wLegacyOnly } = captureWarn(() =>
+      store.readWorksDaily(group, platform)
+    );
+    assert.deepStrictEqual(wLegacyOnly, []);
+    assert.strictEqual(Object.getPrototypeOf(legacyOnly), null);
+    assert.strictEqual(legacyOnly.W1["2026-11-08"].play, 100);
+    assert.strictEqual(legacyOnly.W1["2026-11-09"].play, 150);
+    assert.strictEqual(legacyOnly.W2["2026-11-09"].play, 40);
+    assert.strictEqual(legacyOnly.W_OLD["2026-11-08"].like, 3);
+    assert.strictEqual(legacyOnly.W_OLD["2026-11-08"].comment, null);
+    assert.strictEqual(legacyOnly.W_OLD["2026-11-08"].share, null);
+    assert.strictEqual(legacyOnly["__proto__"]["2026-11-08"].play, 77);
+    assert.strictEqual(fs.existsSync(dir), false, "仅读取时不得迁移创建 works-daily/ 目录");
+    assert.strictEqual(fs.readFileSync(legacyFile, "utf8"), legacyPayload, "旧单文件不得被改动");
+
+    // 6b. 目录文件同时存在：同日期同作品以目录文件优先，其余由旧单文件补充
     store.mergeWorks(
       group,
       platform,
-      [{ workId: "W1", title: "作品一", publishTime: Date.parse("2026-11-01T00:00:00Z"), play: 50, like: 5 }],
+      [{ workId: "W1", title: "作品一", publishTime: Date.parse("2026-11-01T00:00:00Z"), play: 165, like: 16 }],
       Date.parse("2026-11-09T04:00:00Z")
     );
-
-    const childScript = `
-      "use strict";
-      const fs = require("fs");
-      const tmpRoot = process.env.TEST_TMP_ROOT;
-      const flagFile = process.env.TEST_FLAG_FILE;
-      const doneFile = process.env.TEST_DONE_FILE;
-      const storePath = process.env.TEST_STORE_PATH;
-      const group = process.env.TEST_GROUP;
-      const platform = process.env.TEST_PLATFORM;
-      const day1Ms = Number(process.env.TEST_DAY1_MS);
-      require.cache[require.resolve("electron")] = {
-        id: "electron",
-        filename: "electron",
-        loaded: true,
-        exports: { app: { getPath: () => tmpRoot } },
-      };
-      const sleepArr = new Int32Array(new SharedArrayBuffer(4));
-      const origRead = fs.readFileSync;
-      let held = false;
-      fs.readFileSync = function (target, ...rest) {
-        const res = origRead.call(fs, target, ...rest);
-        if (!held && String(target).endsWith("works-daily.json")) {
-          held = true;
-          fs.writeFileSync(flagFile, String(process.pid), "utf8");
-          Atomics.wait(sleepArr, 0, 0, 350);
-        }
-        return res;
-      };
-      try {
-        const s = require(storePath);
-        s.mergeWorks(
-          group,
-          platform,
-          [
-            { workId: "W1", title: "作品一", publishTime: Date.parse("2026-11-01T00:00:00Z"), play: 100, like: 10, comment: 2, share: 1, favorite: 3, fansDelta: 1 },
-            { workId: "W2", title: "作品二", publishTime: Date.parse("2026-11-02T00:00:00Z"), play: 30, like: 3, comment: 0, share: 0, favorite: 1, fansDelta: null },
-          ],
-          day1Ms
-        );
-        fs.writeFileSync(doneFile, JSON.stringify({ ok: true }), "utf8");
-      } catch (err) {
-        fs.writeFileSync(doneFile, JSON.stringify({ ok: false, error: (err && err.stack) || String(err) }), "utf8");
-        process.exitCode = 1;
-      }
-    `;
-
-    const logFd = fs.openSync(childLogFile, "w");
-    const child = spawn(process.execPath, ["-e", childScript], {
-      env: {
-        ...process.env,
-        TEST_TMP_ROOT: tmpRoot,
-        TEST_FLAG_FILE: flagFile,
-        TEST_DONE_FILE: doneFile,
-        TEST_STORE_PATH: storePath,
-        TEST_GROUP: group,
-        TEST_PLATFORM: platform,
-        TEST_DAY1_MS: String(Date.parse("2026-11-10T04:00:00Z")),
-      },
-      stdio: ["ignore", logFd, logFd],
-    });
-    fs.closeSync(logFd);
-
-    try {
-      // 等待子进程拿到 works-daily.json.lock 并停在读后写前
-      const waitFlagDeadline = Date.now() + 5000;
-      while (!fs.existsSync(flagFile) && Date.now() < waitFlagDeadline) {
-        sleepSync(10);
-      }
-      assert.ok(fs.existsSync(flagFile), "子进程应在超时前拿到锁并写入标记");
-
-      // 在子进程持锁期间发起第二个写入者（Day 2）
-      const tStart = Date.now();
-      store.mergeWorks(
-        group,
-        platform,
-        [
-          { workId: "W1", title: "作品一", publishTime: Date.parse("2026-11-01T00:00:00Z"), play: 200, like: 22, comment: 4, share: 2, favorite: 6, fansDelta: 3 },
-          { workId: "W3", title: "作品三", publishTime: Date.parse("2026-11-03T00:00:00Z"), play: 80, like: 8, comment: 1, share: 0, favorite: 2, fansDelta: null },
-        ],
-        Date.parse("2026-11-11T04:00:00Z")
-      );
-      const elapsed = Date.now() - tStart;
-
-      // 等待子进程结束写出结果
-      const waitDoneDeadline = Date.now() + 5000;
-      while (!fs.existsSync(doneFile) && Date.now() < waitDoneDeadline) {
-        sleepSync(10);
-      }
-      assert.ok(fs.existsSync(doneFile), "子进程应正常完成");
-      const childRes = JSON.parse(fs.readFileSync(doneFile, "utf8"));
-      assert.strictEqual(childRes.ok, true, `子进程写入失败: ${childRes.error || ""}`);
-      assert.ok(elapsed >= 150, `第二个写入者应等待锁释放（实际耗时 ${elapsed}ms）`);
-
-      // 验证三日数据与两进程各自作品全部保留
-      const merged = store.readWorksDaily(group, platform);
-      assert.deepStrictEqual(Object.keys(merged.W1).sort(), [
-        "2026-11-09",
-        "2026-11-10",
-        "2026-11-11",
-      ]);
-      assert.strictEqual(merged.W1["2026-11-09"].play, 50, "Day 0 历史应保留");
-      assert.strictEqual(merged.W1["2026-11-10"].play, 100, "第一个写入者的 Day 1 不得被覆盖");
-      assert.strictEqual(merged.W1["2026-11-11"].play, 200, "第二个写入者的 Day 2 应成功合并");
-      assert.strictEqual(merged.W2["2026-11-10"].play, 30, "第一个写入者独有作品应保留");
-      assert.strictEqual(merged.W3["2026-11-11"].play, 80, "第二个写入者独有作品应合并");
-      assert.deepStrictEqual(listLeftoverTempOrLock(dir), [], "完成后不应残留锁或临时文件");
-    } finally {
-      try {
-        child.kill();
-      } catch (_) {}
-    }
-
-    // 6b. 新鲜锁持续占用（超过 5s）→ 告警跳过、不破坏原历史、不误删他人锁、mergeWorks 成功
-    const lockGroup = "锁超时组";
-    const lockDir = accPath(lockGroup, platform);
-    const lockFile = path.join(lockDir, "works-daily.json.lock");
     store.mergeWorks(
-      lockGroup,
+      group,
       platform,
-      [{ workId: "L1", title: "锁超时测试", publishTime: Date.parse("2026-11-01T00:00:00Z"), play: 100 }],
+      [{ workId: "W1", title: "作品一", publishTime: Date.parse("2026-11-01T00:00:00Z"), play: 220, like: 22 }],
       Date.parse("2026-11-10T04:00:00Z")
     );
-    const foreignLockPayload = JSON.stringify({
-      pid: 999999,
-      createdAt: Date.now(),
-      token: "foreign-active-lock",
-    });
-    fs.writeFileSync(lockFile, foreignLockPayload, "utf8");
 
-    const tLockStart = Date.now();
-    const outTimeout = captureWarn(() =>
-      store.mergeWorks(
-        lockGroup,
-        platform,
-        [{ workId: "L1", title: "锁超时测试", publishTime: Date.parse("2026-11-01T00:00:00Z"), play: 300 }],
-        Date.parse("2026-11-11T04:00:00Z")
-      )
-    );
-    const lockElapsed = Date.now() - tLockStart;
+    const merged = store.readWorksDaily(group, platform);
+    assert.deepStrictEqual(Object.keys(merged.W1).sort(), ["2026-11-08", "2026-11-09", "2026-11-10"]);
+    assert.strictEqual(merged.W1["2026-11-08"].play, 100, "旧单文件独有日期应补充合并");
+    assert.strictEqual(merged.W1["2026-11-09"].play, 165, "冲突日期应以目录文件优先");
+    assert.strictEqual(merged.W1["2026-11-10"].play, 220, "目录新日期应正常读出");
+    assert.strictEqual(merged.W2["2026-11-09"].play, 40, "旧单文件独有作品应补充合并");
+    assert.strictEqual(merged.W_OLD["2026-11-08"].play, 20);
+    assert.strictEqual(merged["__proto__"]["2026-11-08"].play, 77);
 
-    assert.ok(
-      lockElapsed >= 4500 && lockElapsed <= 7000,
-      `等待超时应贴近 5s（实际 ${lockElapsed}ms）`
-    );
-    assert.strictEqual(outTimeout.result.works[0].play, 300, "拿不到锁不得影响 mergeWorks");
-    assert.strictEqual(store.readWorks(lockGroup, platform).works[0].play, 300);
-    assert.ok(outTimeout.warnings.some((m) => m.includes("锁超时")), "超时应输出告警");
+    // 验证不删除、不迁移写入旧单文件
+    assert.strictEqual(fs.existsSync(legacyFile), true, "不得删除旧 works-daily.json");
+    assert.strictEqual(fs.readFileSync(legacyFile, "utf8"), legacyPayload, "不得修改旧 works-daily.json");
     assert.deepStrictEqual(
-      Object.keys(store.readWorksDaily(lockGroup, platform).L1),
-      ["2026-11-10"],
-      "拿不到锁应跳过写入并保留既有历史"
+      fs.readdirSync(dir).sort(),
+      ["2026-11-09.json", "2026-11-10.json"],
+      "不得把旧单文件里的 2026-11-08 迁移写入目录"
     );
-    assert.strictEqual(
-      fs.readFileSync(lockFile, "utf8"),
-      foreignLockPayload,
-      "超时退出不得误删其他进程的新鲜锁"
+
+    // 6c. 旧单文件损坏时 warn 并跳过，不影响目录文件读取
+    fs.writeFileSync(legacyFile, "{corrupt-legacy", "utf8");
+    const { result: afterCorruptLegacy, warnings: wCorruptLegacy } = captureWarn(() =>
+      store.readWorksDaily(group, platform)
     );
-    fs.unlinkSync(lockFile);
-    console.log("✓ ④ 跨进程锁：双进程交错重读合并无丢数 + 锁超时告警跳过正确");
+    assert.ok(wCorruptLegacy.some((m) => m.includes("works-daily.json")));
+    assert.deepStrictEqual(Object.keys(afterCorruptLegacy.W1).sort(), ["2026-11-09", "2026-11-10"]);
+    assert.strictEqual(afterCorruptLegacy.W1["2026-11-09"].play, 165);
+    assert.strictEqual(afterCorruptLegacy.W1["2026-11-10"].play, 220);
+    console.log("✓ 旧单文件 works-daily.json 兼容读取：目录优先、补充合并、不删不迁移、损坏跳过");
   }
 
-  /* ---------- 7. ⑤ 陈旧锁（>30s）被抢占 ---------- */
-  {
-    const group = "陈旧锁组";
-    const platform = "快手";
-    const dir = accPath(group, platform);
-    const lockFile = path.join(dir, "works-daily.json.lock");
-
-    // 预置 Day 1
-    store.mergeWorks(
-      group,
-      platform,
-      [{ workId: "S1", title: "陈旧锁测试", publishTime: Date.parse("2026-11-01T00:00:00Z"), play: 100 }],
-      Date.parse("2026-11-10T04:00:00Z")
-    );
-
-    // 7a. mtime 超过 30s 且内容为空（模拟进程建锁后立刻崩溃）
-    fs.writeFileSync(lockFile, "", "utf8");
-    const staleDate = new Date(Date.now() - 45000);
-    fs.utimesSync(lockFile, staleDate, staleDate);
-
-    const t1 = Date.now();
-    store.mergeWorks(
-      group,
-      platform,
-      [{ workId: "S1", title: "陈旧锁测试", publishTime: Date.parse("2026-11-01T00:00:00Z"), play: 180 }],
-      Date.parse("2026-11-11T04:00:00Z")
-    );
-    const elapsed1 = Date.now() - t1;
-    assert.ok(elapsed1 < 2000, `陈旧锁应立刻被抢占，而非等 5s（实际 ${elapsed1}ms）`);
-
-    let daily = store.readWorksDaily(group, platform);
-    assert.deepStrictEqual(Object.keys(daily.S1).sort(), ["2026-11-10", "2026-11-11"]);
-    assert.strictEqual(daily.S1["2026-11-10"].play, 100);
-    assert.strictEqual(daily.S1["2026-11-11"].play, 180);
-    assert.deepStrictEqual(listLeftoverTempOrLock(dir), [], "抢占并写完后锁与 .reap 均应清理");
-
-    // 7b. JSON payload 中 createdAt 超过 30s 的陈旧锁
-    fs.writeFileSync(
-      lockFile,
-      JSON.stringify({ pid: 777777, createdAt: Date.now() - 35000, token: "dead-worker" }),
-      "utf8"
-    );
-    const t2 = Date.now();
-    store.mergeWorks(
-      group,
-      platform,
-      [{ workId: "S1", title: "陈旧锁测试", publishTime: Date.parse("2026-11-01T00:00:00Z"), play: 260 }],
-      Date.parse("2026-11-12T04:00:00Z")
-    );
-    const elapsed2 = Date.now() - t2;
-    assert.ok(elapsed2 < 2000, `createdAt 超 30s 的陈旧锁也应立刻被抢占（实际 ${elapsed2}ms）`);
-    daily = store.readWorksDaily(group, platform);
-    assert.deepStrictEqual(Object.keys(daily.S1).sort(), [
-      "2026-11-10",
-      "2026-11-11",
-      "2026-11-12",
-    ]);
-    assert.strictEqual(daily.S1["2026-11-12"].play, 260);
-    assert.deepStrictEqual(listLeftoverTempOrLock(dir), []);
-    console.log("✓ ⑤ 陈旧锁（>30s）：mtime 过期与 createdAt 过期均正确抢占并清理");
-  }
-
-  /* ---------- 8. ⑥ 畸形指标校验统一（normalizeMetric）→ null 且不产生假增量 ---------- */
+  /* ---------- 7. 畸形指标校验统一（normalizeMetric）→ null 且不产生假增量 ---------- */
   {
     // normalizeMetric 合法值
     assert.strictEqual(normalizeMetric(0), 0);
@@ -1041,10 +924,10 @@ try {
     assert.strictEqual(rows[2].share, null);
     assert.strictEqual(rows[2].fansDelta, 8);
     assert.strictEqual(rows[2].fansDeltaDelta, null);
-    console.log("✓ ⑥ 畸形指标校验统一：store 与 statsTable 均归 null，不产生假零与假增量");
+    console.log("✓ 畸形指标校验统一：store 与 statsTable 均归 null，不产生假零与假增量");
   }
 
-  /* ---------- 9. ⑦ 特殊 workId 往返（"__proto__" / "constructor" / "hasOwnProperty" / "toString"） ---------- */
+  /* ---------- 8. 特殊 workId 往返（"__proto__" / "constructor" / "hasOwnProperty" / "toString"） ---------- */
   {
     const group = "特殊ID组";
     const platform = "小红书";
@@ -1053,7 +936,7 @@ try {
     const empty = store.readWorksDaily(group, platform);
     assert.strictEqual(Object.getPrototypeOf(empty), null);
 
-    // Day 1 写入
+    // Day 1 首次写入
     store.mergeWorks(
       group,
       platform,
@@ -1072,7 +955,28 @@ try {
       Date.parse("2026-11-10T04:00:00Z")
     );
 
-    // Day 2 更新（验证读回 JSON 转为无原型对象后再合并不会丢失 Day 1 或 __proto__）
+    // Day 1 同日二次采集仅更新 "constructor"（验证读回当天文件再合并不会丢失 "__proto__" 等其余特殊 ID）
+    store.mergeWorks(
+      group,
+      platform,
+      [
+        {
+          workId: "constructor",
+          title: "特殊作品-constructor",
+          url: "https://example.com/constructor",
+          publishTime: Date.parse("2026-11-01T00:00:00Z") + 1000,
+          play: 110,
+          like: 11,
+          comment: 1,
+          share: 0,
+          favorite: 2,
+          fansDelta: null,
+        },
+      ],
+      Date.parse("2026-11-10T08:00:00Z")
+    );
+
+    // Day 2 更新（验证跨日写入与读回不会丢失 Day 1 或 __proto__）
     store.mergeWorks(
       group,
       platform,
@@ -1119,7 +1023,7 @@ try {
       assert.strictEqual(day2Row.playDelta, 50 + idx * 10);
       assert.strictEqual(day2Row.gapDays, 0);
     }
-    console.log('✓ ⑦ 特殊 workId（"__proto__" / "constructor" 等）无原型字典往返完整');
+    console.log('✓ 特殊 workId（"__proto__" / "constructor" 等）无原型字典往返完整');
   }
 
   /* ---------- 10. statsTable: 基本增量、连续 gapDays=0、断档 gapDays、null 指标、负增量 ---------- */

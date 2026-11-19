@@ -4,7 +4,7 @@
  * 数据统计本地存储（userData/data-stats/<分组>/<平台>/）：
  *   daily.json       每日总量快照 { "YYYY-MM-DD": { fans, plays, likes, comments, favorites, shares } }
  *   works.json       作品列表 + 发布增长封闭记录
- *   works-daily.json 作品每日累计值快照 { "<workId>": { "YYYY-MM-DD": { play, like, comment, share, favorite, fansDelta } } }
+ *   works-daily/     作品每日累计值快照目录（每日一文件 YYYY-MM-DD.json：{ date, updatedAt, works }）
  *   meta.json        { lastCollectAt, lastError, workCount }
  *
  * 日趋势口径：所有平台统一为「当日总量快照」；抖音/视频号额外回填粉丝历史（只补缺日期）。
@@ -158,11 +158,10 @@ function mergeWorks(group, platform, newWorks, now = Date.now()) {
   return data;
 }
 
-/* ---------------- works-daily（作品日快照） ---------------- */
+/* ---------------- works-daily（作品日快照，按天分文件） ---------------- */
 
-const WORKS_DAILY_LOCK_TIMEOUT_MS = 5000;
-const WORKS_DAILY_LOCK_STALE_MS = 30000;
-const WORKS_DAILY_LOCK_RETRY_MS = 25;
+const WORKS_DAILY_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const WORKS_DAILY_FILE_RE = /^(\d{4}-\d{2}-\d{2})\.json$/;
 const WORKS_DAILY_RENAME_MAX_RETRIES = 3;
 const WORKS_DAILY_RENAME_RETRY_DELAY_MS = 50;
 
@@ -171,57 +170,31 @@ const SLEEP_VIEW =
     ? new Int32Array(new SharedArrayBuffer(4))
     : null;
 
-function sleepSync(ms) {
-  if (!ms || ms <= 0) return;
-  if (SLEEP_VIEW) {
-    try {
-      Atomics.wait(SLEEP_VIEW, 0, 0, ms);
-      return;
-    } catch (_) {
-      // 环境不支持 Atomics.wait 时退回短忙等
-    }
-  }
-  const end = Date.now() + ms;
-  while (Date.now() < end) {
-    // busy wait fallback
-  }
+function sleepMs(ms) {
+  if (!SLEEP_VIEW || !ms || ms <= 0) return;
+  try {
+    Atomics.wait(SLEEP_VIEW, 0, 0, ms);
+  } catch (_) {}
 }
 
-function worksDailyFile(group, platform) {
+function isPlainObject(v) {
+  return Boolean(v && typeof v === "object" && !Array.isArray(v));
+}
+
+function worksDailyDir(group, platform) {
+  return path.join(accountDir(group, platform), "works-daily");
+}
+
+function legacyWorksDailyFile(group, platform) {
   return path.join(accountDir(group, platform), "works-daily.json");
 }
 
-function toNullProtoDict(obj) {
-  const dict = Object.create(null);
-  for (const key of Object.keys(obj)) {
-    const desc = Object.getOwnPropertyDescriptor(obj, key);
-    if (desc) dict[key] = desc.value;
+function pickWorkDailyStats(w) {
+  const out = {};
+  for (const k of WORK_STAT_KEYS) {
+    out[k] = normalizeMetric(w[k]);
   }
-  return dict;
-}
-
-/**
- * 读取作品日快照。
- * 仅 ENOENT 返回空无原型字典；EIO / JSON 损坏 / 根结构非对象一律抛错，避免误把异常当空库覆写历史。
- */
-function readWorksDaily(group, platform) {
-  const file = worksDailyFile(group, platform);
-  let raw;
-  try {
-    raw = fs.readFileSync(file, "utf8");
-  } catch (err) {
-    if (err && err.code === "ENOENT") {
-      return Object.create(null);
-    }
-    throw err;
-  }
-  const parsed = JSON.parse(raw);
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    const err = new Error("works-daily.json 根结构必须为对象");
-    err.code = "EINVALID_WORKS_DAILY";
-    throw err;
-  }
-  return toNullProtoDict(parsed);
+  return out;
 }
 
 function writeAllSync(fd, buf) {
@@ -247,19 +220,19 @@ function renameWithRetrySync(src, dest) {
       if (!retryable || attempt === WORKS_DAILY_RENAME_MAX_RETRIES) {
         throw err;
       }
-      sleepSync(WORKS_DAILY_RENAME_RETRY_DELAY_MS);
+      sleepMs(WORKS_DAILY_RENAME_RETRY_DELAY_MS);
     }
   }
 }
 
 /**
- * 原子写入 works-daily.json：同目录唯一临时文件 → 写全 → fsync → renameSync 覆盖。
+ * 原子写入单日文件：同目录唯一临时文件 → writeSync 全量 → fsync → renameSync 覆盖。
  * 任何步骤失败都删除临时文件并保留旧文件完整。
  */
-function writeWorksDailyAtomic(file, daily) {
+function writeWorksDailyAtomic(file, payload) {
   const dir = path.dirname(file);
   const base = path.basename(file);
-  const buf = Buffer.from(JSON.stringify(daily, null, 2), "utf8");
+  const buf = Buffer.from(JSON.stringify(payload, null, 2), "utf8");
   fs.mkdirSync(dir, { recursive: true });
   const rand = crypto.randomBytes(6).toString("hex");
   const tmpFile = path.join(dir, `.${base}.${process.pid}.${Date.now()}.${rand}.tmp`);
@@ -270,8 +243,9 @@ function writeWorksDailyAtomic(file, daily) {
     tmpCreated = true;
     writeAllSync(fd, buf);
     fs.fsyncSync(fd);
-    fs.closeSync(fd);
+    const closeFd = fd;
     fd = null;
+    fs.closeSync(closeFd);
     renameWithRetrySync(tmpFile, file);
     tmpCreated = false;
   } catch (err) {
@@ -279,7 +253,6 @@ function writeWorksDailyAtomic(file, daily) {
       try {
         fs.closeSync(fd);
       } catch (_) {}
-      fd = null;
     }
     if (tmpCreated) {
       try {
@@ -290,195 +263,119 @@ function writeWorksDailyAtomic(file, daily) {
   }
 }
 
-function tryCreateLock(lockFile, token) {
-  const fd = fs.openSync(lockFile, "wx");
-  let closed = false;
+/**
+ * 解析单日快照文件，返回无原型 works 字典。
+ * 不存在返回 null；JSON 损坏或结构无效告警并返回 null；读 I/O 错误上抛由调用方处理。
+ */
+function parseDayWorksFile(file) {
+  let raw;
   try {
-    const payload = JSON.stringify({
-      pid: process.pid,
-      createdAt: Date.now(),
-      token,
-    });
-    writeAllSync(fd, Buffer.from(payload, "utf8"));
-    fs.closeSync(fd);
-    closed = true;
+    raw = fs.readFileSync(file, "utf8");
   } catch (err) {
-    if (!closed) {
-      try {
-        fs.closeSync(fd);
-      } catch (_) {}
-    }
-    try {
-      fs.unlinkSync(lockFile);
-    } catch (_) {}
+    if (err && err.code === "ENOENT") return null;
     throw err;
   }
-}
-
-function isLockStale(lockFile, nowMs, staleMs = WORKS_DAILY_LOCK_STALE_MS) {
-  let stat;
+  let parsed;
   try {
-    stat = fs.statSync(lockFile);
-  } catch (_) {
-    return false;
-  }
-  if (nowMs - stat.mtimeMs > staleMs) {
-    return true;
-  }
-  try {
-    const raw = fs.readFileSync(lockFile, "utf8");
-    if (raw) {
-      const info = JSON.parse(raw);
-      const ts = info && (info.createdAt ?? info.time ?? info.timestamp);
-      if (typeof ts === "number" && Number.isFinite(ts) && nowMs - ts > staleMs) {
-        return true;
-      }
-    }
-  } catch (_) {
-    // 锁文件可能正在写入中或非 JSON，以 mtime 为准
-  }
-  return false;
-}
-
-function tryPreemptStaleLock(lockFile, token, staleMs) {
-  const reapLock = `${lockFile}.reap`;
-  let reapFd = null;
-  try {
-    reapFd = fs.openSync(reapLock, "wx");
-    fs.closeSync(reapFd);
-    reapFd = null;
+    parsed = JSON.parse(raw);
   } catch (err) {
-    if (reapFd !== null) {
-      try {
-        fs.closeSync(reapFd);
-      } catch (_) {}
-    }
-    if (err && err.code === "EEXIST") {
-      try {
-        const st = fs.statSync(reapLock);
-        if (Date.now() - st.mtimeMs > staleMs) {
-          fs.unlinkSync(reapLock);
-        }
-      } catch (_) {}
-      return false;
-    }
-    throw err;
-  }
-
-  try {
-    if (!isLockStale(lockFile, Date.now(), staleMs)) {
-      return false;
-    }
-    try {
-      fs.unlinkSync(lockFile);
-    } catch (err) {
-      if (!err || err.code !== "ENOENT") {
-        throw err;
-      }
-    }
-    try {
-      tryCreateLock(lockFile, token);
-      return true;
-    } catch (err) {
-      if (err && err.code === "EEXIST") {
-        return false;
-      }
-      throw err;
-    }
-  } finally {
-    try {
-      fs.unlinkSync(reapLock);
-    } catch (_) {}
-  }
-}
-
-function acquireWorksDailyLock(lockFile, options = {}) {
-  const timeoutMs = options.timeoutMs ?? WORKS_DAILY_LOCK_TIMEOUT_MS;
-  const staleMs = options.staleMs ?? WORKS_DAILY_LOCK_STALE_MS;
-  const retryMs = options.retryMs ?? WORKS_DAILY_LOCK_RETRY_MS;
-  const token = `${process.pid}-${Date.now()}-${crypto.randomBytes(6).toString("hex")}`;
-  const deadline = Date.now() + timeoutMs;
-
-  while (true) {
-    try {
-      tryCreateLock(lockFile, token);
-      return { lockFile, token, acquiredAt: Date.now(), staleMs };
-    } catch (err) {
-      if (!err || err.code !== "EEXIST") {
-        throw err;
-      }
-    }
-
-    if (isLockStale(lockFile, Date.now(), staleMs)) {
-      if (tryPreemptStaleLock(lockFile, token, staleMs)) {
-        return { lockFile, token, acquiredAt: Date.now(), staleMs };
-      }
-    }
-
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) {
-      const err = new Error(`获取 works-daily.json 锁超时 (${timeoutMs}ms): ${lockFile}`);
-      err.code = "ELOCK_TIMEOUT";
-      throw err;
-    }
-    sleepSync(Math.min(retryMs, remaining));
-  }
-}
-
-function releaseWorksDailyLock(lock) {
-  if (!lock) return;
-  let shouldUnlink = false;
-  try {
-    const raw = fs.readFileSync(lock.lockFile, "utf8");
-    const info = JSON.parse(raw);
-    shouldUnlink = Boolean(info && info.token === lock.token);
-  } catch (err) {
-    if (err && err.code === "ENOENT") return;
-    // 自身持锁未超陈旧阈值时，遇临时读失败仍清理自建锁，避免残留死锁
-    shouldUnlink = Date.now() - lock.acquiredAt < lock.staleMs;
-  }
-  if (!shouldUnlink) return;
-  try {
-    fs.unlinkSync(lock.lockFile);
-  } catch (err) {
-    if (!err || err.code !== "ENOENT") {
-      console.warn(
-        `[dataStats] 释放 works-daily.json 锁失败 (${lock.lockFile}):`,
-        (err && err.message) || err
-      );
-    }
-  }
-}
-
-function backupCorruptWorksDaily(file) {
-  const backupFile = path.join(
-    path.dirname(file),
-    `works-daily.corrupt-${Date.now()}.json`
-  );
-  try {
-    fs.copyFileSync(file, backupFile);
-    console.warn(`[dataStats] 检测到损坏的 works-daily.json，已备份至 ${backupFile}`);
-    return backupFile;
-  } catch (err) {
-    console.warn(
-      `[dataStats] 备份损坏的 works-daily.json 失败 (${backupFile}):`,
-      (err && err.message) || err
-    );
+    console.warn(`[dataStats] 作品日快照 JSON 损坏 (${file}):`, (err && err.message) || err);
     return null;
   }
+  if (!isPlainObject(parsed) || !isPlainObject(parsed.works)) {
+    console.warn(`[dataStats] 作品日快照结构无效 (${file})`);
+    return null;
+  }
+  const works = Object.create(null);
+  for (const workId of Object.keys(parsed.works)) {
+    const desc = Object.getOwnPropertyDescriptor(parsed.works, workId);
+    if (desc && isPlainObject(desc.value)) {
+      works[workId] = pickWorkDailyStats(desc.value);
+    }
+  }
+  return works;
 }
 
-function pickWorkDailyStats(w) {
-  const out = {};
-  for (const k of WORK_STAT_KEYS) {
-    out[k] = normalizeMetric(w[k]);
+/** 兼容读取旧版单文件 works-daily.json 作为补充来源（不删除、不迁移写入） */
+function mergeLegacyWorksDaily(result, group, platform) {
+  const file = legacyWorksDailyFile(group, platform);
+  let raw;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch (err) {
+    if (err && err.code === "ENOENT") return;
+    console.warn(`[dataStats] 读取旧 works-daily.json 失败 (${file}):`, (err && err.message) || err);
+    return;
   }
-  return out;
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    console.warn(`[dataStats] 旧 works-daily.json JSON 损坏，已跳过 (${file}):`, (err && err.message) || err);
+    return;
+  }
+  if (!isPlainObject(parsed)) {
+    console.warn(`[dataStats] 旧 works-daily.json 结构无效，已跳过 (${file})`);
+    return;
+  }
+  for (const workId of Object.keys(parsed)) {
+    const desc = Object.getOwnPropertyDescriptor(parsed, workId);
+    const dateMap = desc ? desc.value : null;
+    if (!isPlainObject(dateMap)) continue;
+    for (const date of Object.keys(dateMap)) {
+      if (!WORKS_DAILY_DATE_RE.test(date)) continue;
+      const snapDesc = Object.getOwnPropertyDescriptor(dateMap, date);
+      if (!snapDesc || !isPlainObject(snapDesc.value)) continue;
+      if (!result[workId]) result[workId] = {};
+      result[workId][date] = pickWorkDailyStats(snapDesc.value);
+    }
+  }
 }
 
 /**
- * 写入作品当日累计快照（日期按 UTC+8；同日多次采集覆盖为最后一次）。
- * 跨进程持锁 → 锁内重读 → 合并 → 原子写；读/写/锁失败仅告警跳过，不得影响主流程（mergeWorks）。
+ * 读取作品日快照，返回无原型字典 `{ workId: { "YYYY-MM-DD": stats } }`。
+ * 遍历 works-daily/ 下 YYYY-MM-DD.json（以文件名日期为准），单文件损坏/读失败 warn 并跳过；
+ * 若存在旧单文件 works-daily.json，作为补充来源合并（目录文件优先）。
+ */
+function readWorksDaily(group, platform) {
+  const result = Object.create(null);
+  mergeLegacyWorksDaily(result, group, platform);
+
+  const dir = worksDailyDir(group, platform);
+  let entries;
+  try {
+    entries = fs.readdirSync(dir);
+  } catch (err) {
+    if (err && err.code === "ENOENT") return result;
+    console.warn(`[dataStats] 读取 works-daily 目录失败 (${dir}):`, (err && err.message) || err);
+    return result;
+  }
+
+  entries.sort();
+  for (const name of entries) {
+    const match = WORKS_DAILY_FILE_RE.exec(name);
+    if (!match) continue;
+    const date = match[1];
+    const file = path.join(dir, name);
+    let dayWorks;
+    try {
+      dayWorks = parseDayWorksFile(file);
+    } catch (err) {
+      console.warn(`[dataStats] 读取作品日快照失败，已跳过 (${file}):`, (err && err.message) || err);
+      continue;
+    }
+    if (!dayWorks) continue;
+    for (const workId of Object.keys(dayWorks)) {
+      if (!result[workId]) result[workId] = {};
+      result[workId][date] = dayWorks[workId];
+    }
+  }
+  return result;
+}
+
+/**
+ * 写入作品当日累计快照（UTC+8，只读写当天 YYYY-MM-DD.json，不加锁、不写非当天文件）。
+ * 读当天文件（不存在/损坏视为空，损坏时 warn）→ 按 workId 合并 → 原子写；失败仅 warn，不影响 mergeWorks。
  */
 function recordWorksDaily(group, platform, works, now = Date.now()) {
   if (!works || !works.length) return;
@@ -488,46 +385,23 @@ function recordWorksDaily(group, platform, works, now = Date.now()) {
   }
   if (!validWorks.length) return;
 
-  const file = worksDailyFile(group, platform);
-  const lockFile = `${file}.lock`;
-  let lock = null;
+  const today = todayStr(now);
+  const file = path.join(worksDailyDir(group, platform), `${today}.json`);
   try {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    lock = acquireWorksDailyLock(lockFile);
-
-    let daily;
-    try {
-      daily = readWorksDaily(group, platform);
-    } catch (readErr) {
-      if (readErr instanceof SyntaxError) {
-        backupCorruptWorksDaily(file);
-      }
-      throw readErr;
-    }
-
-    const today = todayStr(now);
+    const dayWorks = parseDayWorksFile(file) || Object.create(null);
     for (const w of validWorks) {
-      const id = String(w.workId);
-      const existingDates = daily[id];
-      if (
-        !Object.prototype.hasOwnProperty.call(daily, id) ||
-        !existingDates ||
-        typeof existingDates !== "object" ||
-        Array.isArray(existingDates)
-      ) {
-        daily[id] = {};
-      }
-      daily[id][today] = pickWorkDailyStats(w);
+      dayWorks[String(w.workId)] = pickWorkDailyStats(w);
     }
-
-    writeWorksDailyAtomic(file, daily);
+    writeWorksDailyAtomic(file, {
+      date: today,
+      updatedAt: now,
+      works: dayWorks,
+    });
   } catch (err) {
     console.warn(
-      `[dataStats] 写入 works-daily.json 失败 (${group}/${platform}):`,
+      `[dataStats] 写入 works-daily/${today}.json 失败 (${group}/${platform}):`,
       (err && err.message) || err
     );
-  } finally {
-    releaseWorksDailyLock(lock);
   }
 }
 
