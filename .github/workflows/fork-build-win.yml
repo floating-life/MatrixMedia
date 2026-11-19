@@ -1,0 +1,34 @@
+name: Fork Windows Build
+
+# fork 自用：手动触发或推送 fork/* feat/stats-* 分支时只打 Windows 安装包，产物在 Actions → Artifacts，不发 Release
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "fork/**"
+      - "feat/stats-**"
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "20.15.1"
+      - name: Rewrite lockfile to official registry
+        shell: bash
+        run: sed -i.bak 's|https://registry.npmmirror.com|https://registry.npmjs.org|g' yarn.lock
+      - name: Install dependencies
+        env:
+          ELECTRON_MIRROR: https://github.com/electron/electron/releases/download/
+        run: yarn
+      - name: Unit tests (stats)
+        run: yarn test:data-stats
+      - name: Build Electron app (Windows)
+        run: yarn build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer-${{ github.run_number }}
+          path: build/MatrixMedia-*-win-*.exe
+          retention-days: 14
