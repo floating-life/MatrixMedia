@@ -65,9 +65,6 @@ const WORD_INTERNAL_HASH_STICKY_RE =
 const HASH_PLACEHOLDER = "\u0000";
 const XHS_TOPIC_BODY_SOURCE =
   "(?:[^\\s#]|(?<![A-Za-z0-9])(?:[CcFfJjQq]#|[A-Ga-g]#(?=[.,!?;:)\\]}\\-/]|\\[话题\\]#|大调|小调|和弦|调|音|major|minor|m(?![A-Za-z]))))+";
-const XHS_TOPIC_TAIL_RE = new RegExp(
-  `(?:^|\\s)#(?:(?:${XHS_TOPIC_BODY_SOURCE}|[^\\s#]+#[^\\s#]*)\\[话题\\]#|[^\\s#]+)$`
-);
 const XHS_TOPIC_STICKY_RE = new RegExp(`#${XHS_TOPIC_BODY_SOURCE}\\[话题\\]#`, "y");
 // 兜底：若 #…[话题]# 内部仅含 1 个非词内 #（如 #2025#年度计划[话题]#），避免提前按 #2025# 闭合后残留孤立 [话题]# 吞掉后续集数；
 // 仍不会跨过 #美食#中间正文#摄影[话题]#（含 2 个非词内 #）吞掉中间正文
@@ -180,7 +177,8 @@ function normalizeTitle(s) {
   while (out) {
     // 仅剥离尾部、且 # 前为字符串开头或空白的话题标签（保留 C#入门 等词内 #）；
     // 结尾 # 只在小红书 `#xx[话题]#` 格式下允许（含内部 C#/F#），避免把 `#2025#` 这类编号剥掉
-    const next = out.replace(XHS_TOPIC_TAIL_RE, "").trim();
+    // 唯一标题阶段沿用原有尾部话题规则（不识别话题内 C#/F#），新增的话题识别只用于集数提取与模糊匹配
+    const next = out.replace(/(?:^|\s)#(?:[^\s#]+\[话题\]#|[^\s#]+)$/, "").trim();
     if (next === out) break;
     out = next;
   }
@@ -338,7 +336,15 @@ const SECTION_UNIT_RE = /(上|中|下)(?:集|篇|部|卷|半场|半部)/g;
 const SECTION_TAIL_RE = /(?:[\s\-_|·:/])(上|中|下)(?=$|[\s\-_|·:/)])/g;
 
 function collectSeriesSets(rawTitle, seasons, episodes, sections) {
-  const clean = stripTopicsForFuzzy(rawTitle);
+  // 集数标记取「剥话题后文本」与「仅把 # / [话题] 当空白的原文」两份的并集：
+  // 话题边界识别（C#、#…[话题]# 嵌套等）出错时也不会吞掉正文集数，宁可多拒绝不误合
+  const stripped = stripTopicsForFuzzy(rawTitle);
+  const loose = toSafeString(rawTitle).replace(/\[话题\]/g, " ").replace(/#/g, " ");
+  if (stripped) collectSeriesSetsFromText(stripped, seasons, episodes, sections);
+  if (loose && loose !== stripped) collectSeriesSetsFromText(loose, seasons, episodes, sections);
+}
+
+function collectSeriesSetsFromText(clean, seasons, episodes, sections) {
   if (!clean) return;
   let m;
 

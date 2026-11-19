@@ -3362,11 +3362,37 @@ async function testMatchWorksIpcAmbiguity() {
     assert.strictEqual(extractCoreTitle("零基础教程#美食#中间正文#摄影[话题]#第1集"), "零基础教程中间正文第1集");
     assert.strictEqual(extractCoreTitle("学C#入门#美食[话题]#第1集"), "学c#入门第1集");
     assert.strictEqual(extractCoreTitle("C#教程#学C#入门[话题]#第1集"), "c#教程第1集");
-    assert.strictEqual(normalizeTitle("零基础学习编程完整实战教程 #学C#入门[话题]#"), "零基础学习编程完整实战教程");
+    // r5：唯一标题键沿用原尾部话题规则（不识别话题内 C#），避免剥掉 C#/F# 话题后唯一标题误配
+    assert.strictEqual(normalizeTitle("零基础学习编程完整实战教程 #学C#入门[话题]#"), "零基础学习编程完整实战教程 #学C#入门[话题]#");
     assert.strictEqual(extractCoreTitle("零基础教程#C#第1集"), "零基础教程第1集");
     assert.strictEqual(computeTitleSimilarity("零基础教程#C#第1集", "零基础教程#C#第2集"), 0);
   }
   testS6r4XhsTopicWithInternalCSharp();
+
+  function testS6r5ReviewRegressions() {
+    const day = "2026-11-18";
+    const pubTs = Date.parse(`${day}T04:00:00Z`);
+    // r4 评审 #1：连续话题之间的正文集数不得被吞掉
+    const a = "零基础学习编程完整实战教程#C#第1集：认识C#编程[话题]#";
+    const b = "零基础学习编程完整实战教程第2集";
+    assert.strictEqual(computeTitleSimilarity(a, b), 0, "r5#1: 话题间的第1集仍须与第2集冲突");
+    const r1 = linkWorks({
+      contents: [],
+      accounts: [
+        { group: "G", platform: "小红书", works: [{ workId: "x1", title: a, publishTime: pubTs }] },
+        { group: "G", platform: "抖音", works: [{ workId: "d2", title: b, publishTime: pubTs }] },
+      ],
+      date: day,
+    });
+    assert.deepStrictEqual(r1.get("G|小红书|x1"), { contentKey: null, matchedBy: null }, "r5#1: 不得合并");
+    assert.deepStrictEqual(r1.get("G|抖音|d2"), { contentKey: null, matchedBy: null });
+    // r4 评审 #2：剥掉 C#/F# 话题后唯一标题不得抢占七天前的 F# 素材
+    const fTitle = "每日编程学习记录 #学F#入门[话题]#";
+    const cTitle = "每日编程学习记录 #学C#入门[话题]#";
+    assert.notStrictEqual(normalizeTitle(fTitle), normalizeTitle(cTitle), "r5#2: C#/F# 话题标题键必须不同");
+  }
+  testS6r5ReviewRegressions();
+  console.log("✓ S6-r5: 话题间集数并集提取 + 唯一标题键沿用原尾部规则通过");
   console.log("✓ S6-r4#2(testS6r4XhsTopicWithInternalCSharp): 先 #…[话题]# 再 #…# 后保护话题外 C#/F# 通过");
 
   // S6-r4#3(testS6r4ExcludedAutoWithAssignInLinkWorks):
