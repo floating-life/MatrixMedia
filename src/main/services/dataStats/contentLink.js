@@ -26,10 +26,24 @@ const UTC8_MS = 8 * 3600e3;
 const FUZZY_SIM_THRESHOLD = 0.6;
 const FUZZY_MISSING_TIME_PENALTY = 0.1;
 const FUZZY_MARGIN_MIN = 0.1;
-const FUZZY_MAX_DAY_DIFF = 2;
+const FUZZY_MAX_DAY_DIFF = 2; // 按 UTC+8 日历日相差 ≤2 天
 const FUZZY_SUBSTRING_MIN_LEN = 6;
 const FUZZY_SUBSTRING_SCORE = 0.95;
+const FUZZY_MIN_CORE_LEN = 4;
 const FUZZY_EPS = 1e-9;
+const FUZZY_PLACEHOLDER_TITLES = Object.freeze([
+  "(无标题)",
+  "无标题",
+  "暂无标题",
+  "未命名",
+  "默认标题",
+  DELETED_WORK_TITLE,
+  "untitled",
+  "none",
+  "null",
+  "undefined",
+  "n/a",
+]);
 const FUZZY_THRESHOLDS = Object.freeze({
   simThreshold: FUZZY_SIM_THRESHOLD,
   missingTimePenalty: FUZZY_MISSING_TIME_PENALTY,
@@ -37,14 +51,30 @@ const FUZZY_THRESHOLDS = Object.freeze({
   maxDayDiff: FUZZY_MAX_DAY_DIFF,
   substringMinLen: FUZZY_SUBSTRING_MIN_LEN,
   substringScore: FUZZY_SUBSTRING_SCORE,
+  minCoreLen: FUZZY_MIN_CORE_LEN,
 });
 
-const XHS_TOPIC_RE = /#[^\s#]+\[话题\]#/g;
-const WRAPPED_TOPIC_RE = /(?<![A-Za-z0-9])#[\p{L}\p{N}_-]+#(?=$|[\s\p{P}\p{S}])/gu;
-const SINGLE_TOPIC_RE = /(?<![A-Za-z0-9])#[\p{L}\p{N}_-]+/gu;
 const KEYCAP_EMOJI_RE = /[#*0-9]\uFE0F?\u20E3/g;
+// 保护词内 #（如 C#、F#、J#、Q#，以及后接空白/标点/音调词的乐理音名 D#、G#、A# 等）
+const WORD_INTERNAL_HASH_RE =
+  /(?<![A-Za-z0-9])(?:([CcFfJjQq])#(?!\[话题\]#)|([A-Ga-g])#(?=$|[\s.,!?;:)\]}\-/]|大调|小调|和弦|调|音|major|minor|m(?![A-Za-z])))/g;
+const HASH_PLACEHOLDER = "\u0000";
+const XHS_TOPIC_RE = /#[^\s#]+\[话题\]#/g;
+const WRAPPED_TOPIC_RE = /#[^\s#]+#/g;
+const SINGLE_TOPIC_RE = /#[^\s#]+/g;
 const EXT_PICTOGRAPHIC_RE = /\p{Extended_Pictographic}/gu;
-const NON_LETTER_NUM_RE = /[^\p{L}\p{N}]/gu;
+const NON_LETTER_NUM_OR_PH_RE = /[^\p{L}\p{N}\u0000]/gu;
+const UNSTABLE_RECORD_KEY_RE = /^record:[^:]*:(?:.*:)?pos:\d+$/;
+const DAY_BUCKET_INDEX_THRESHOLD = 32;
+
+const ZH_DIGIT_MAP = {
+  零: 0, 〇: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9,
+};
+const ROMAN_NUM_MAP = {
+  i: 1, ii: 2, iii: 3, iv: 4, v: 5, vi: 6, vii: 7, viii: 8, ix: 9, x: 10,
+};
+// 记录 linkWorks 返回 Map 的输入身份指纹，供 buildContentSummaryRows 同数据集同 cutoff 零重算复用
+const LINK_RESULT_META = new WeakMap();
 
 const CJK_PUNCT_MAP = {
   "。": ".", "、": ",", "“": '"', "”": '"', "‘": "'", "’": "'",
@@ -149,45 +179,259 @@ function normalizeStatusTitle(s) {
   return toSafeString(s).replace(ZERO_WIDTH_RE, "").trim();
 }
 
+function protectWordInternalHash(text) {
+  return text.replace(WORD_INTERNAL_HASH_RE, (_, g1, g2) => `${g1 || g2}${HASH_PLACEHOLDER}`);
+}
+
+/**
+ * 模糊匹配用话题剥离（保留括号、标点与空白，供集数解析与核心标题提取共用）：
+ * 1. 先去键帽 emoji 并保护 C#/F# 等词内 #
+ * 2. 先剥完整闭合话题（#xx[话题]#、#xx#）
+ * 3. 再剥单 #xx（遇到空白或下一个 # 截止，不吞后续正文）
+ * 4. 还原词内 #
+ */
+function stripTopicsForFuzzy(s) {
+  const normalized = normalizeTitle(s);
+  if (!normalized) return "";
+  return protectWordInternalHash(
+    normalized.replace(/\u0000/g, "").replace(KEYCAP_EMOJI_RE, "")
+  )
+    .replace(XHS_TOPIC_RE, " ")
+    .replace(WRAPPED_TOPIC_RE, " ")
+    .replace(SINGLE_TOPIC_RE, " ")
+    .replace(/\u0000/g, "#")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 /**
  * 提取模糊匹配核心标题：
- * normalizeTitle 后再去掉所有 #话题（含中间的）、emoji、标点与空白，并转小写。
+ * normalizeTitle 后先剥完整闭合话题（#xx[话题]#、#xx#）再剥单 #xx，
+ * 保留 C#/F# 等词内 #，再去 emoji、标点与空白，并转小写。
  */
 function extractCoreTitle(s) {
   const normalized = normalizeTitle(s);
   if (!normalized) return "";
-  return normalized
+  return protectWordInternalHash(
+    normalized.replace(/\u0000/g, "").replace(KEYCAP_EMOJI_RE, "")
+  )
     .replace(XHS_TOPIC_RE, " ")
     .replace(WRAPPED_TOPIC_RE, " ")
     .replace(SINGLE_TOPIC_RE, " ")
-    .replace(KEYCAP_EMOJI_RE, "")
     .replace(EXT_PICTOGRAPHIC_RE, "")
-    .replace(NON_LETTER_NUM_RE, "")
+    .replace(NON_LETTER_NUM_OR_PH_RE, "")
+    .replace(/\u0000/g, "#")
     .toLowerCase();
 }
 
+const FUZZY_PLACEHOLDER_CORE_SET = new Set(
+  FUZZY_PLACEHOLDER_TITLES.map((t) => extractCoreTitle(t)).filter(Boolean)
+);
+
+/** 判断标题是否属于占位/无效标题（空、纯符号、(无标题)、core 长度 < FUZZY_MIN_CORE_LEN 等） */
+function isPlaceholderTitle(rawTitle) {
+  const trimmed = toSafeTrimmed(rawTitle);
+  if (!trimmed) return true;
+  const core = extractCoreTitle(trimmed);
+  if (!core) return true;
+  if (FUZZY_PLACEHOLDER_CORE_SET.has(core)) return true;
+  return Array.from(core).length < FUZZY_MIN_CORE_LEN;
+}
+
+function parseZhOrArabicInt(raw) {
+  if (!raw) return null;
+  if (/^\d+$/.test(raw)) {
+    const n = Number(raw);
+    return Number.isSafeInteger(n) && n > 0 ? n : null;
+  }
+  const lower = raw.toLowerCase();
+  if (hasOwn(ROMAN_NUM_MAP, lower)) return ROMAN_NUM_MAP[lower];
+  let total = 0;
+  let cur = 0;
+  let hasValid = false;
+  for (const ch of raw) {
+    if (hasOwn(ZH_DIGIT_MAP, ch)) {
+      cur = ZH_DIGIT_MAP[ch];
+      hasValid = true;
+    } else if (ch === "十") {
+      total += (cur === 0 ? 1 : cur) * 10;
+      cur = 0;
+      hasValid = true;
+    } else if (ch === "百") {
+      total += (cur === 0 ? 1 : cur) * 100;
+      cur = 0;
+      hasValid = true;
+    } else {
+      return null;
+    }
+  }
+  total += cur;
+  return hasValid && total > 0 ? total : null;
+}
+
+const SEASON_ZH_RE = /第\s*(\d+|[一二两三四五六七八九十百零〇]+)\s*季/g;
+const SEASON_EN_RE = /(?<![A-Za-z0-9])season\s*[.#:\-_]?\s*0*(\d{1,3})(?![A-Za-z0-9])/gi;
+const SEASON_EP_SE_RE = /(?<![A-Za-z0-9])s0*(\d{1,2})\s*e0*(\d{1,3})(?![A-Za-z0-9])/gi;
+const EP_ZH_RE = /第\s*(\d+|[一二两三四五六七八九十百零〇]+)\s*(?:集|期|话|课|部|讲|节|章|回|弹|篇|辑)/g;
+const EP_EN_RE = /(?<![A-Za-z0-9])(?:ep(?:isode)?|part|pt|vol\.?|no\.?)\s*[.#:\-_]?\s*0*(\d{1,4})(?![A-Za-z0-9])/gi;
+const EP_PART_ROMAN_RE = /(?<![A-Za-z0-9])part\s+(i|ii|iii|iv|v|vi|vii|viii|ix|x)(?![A-Za-z0-9])/gi;
+const EP_P_RE = /(?<![A-Za-z0-9])p0*(\d{1,3})(?![A-Za-z0-9])/gi;
+const EP_BRACKET_RE = /[(\[]\s*(\d{1,3}|[一二两三四五六七八九十]+)\s*[)\]]/g;
+const SECTION_BRACKET_RE = /[(\[]\s*(上|中|下)\s*(?:集|篇|部|卷|期|半场|半部)?\s*[)\]]/g;
+const SECTION_UNIT_RE = /(上|中|下)(?:集|篇|部|卷|半场|半部)/g;
+const SECTION_TAIL_RE = /(?:[\s\-_|·:/])(上|中|下)(?=$|[\s\-_|·:/)])/g;
+
+/**
+ * 提取标题中的系列序号标记（季/集期话课部/EP/Part/(N)/上中下）。
+ * 无法提取返回 null；否则返回规范化字符串签名 `{ seasonKey, episodeKey, sectionKey }`。
+ */
+function extractSeriesMarkers(rawTitle) {
+  const clean = stripTopicsForFuzzy(rawTitle);
+  if (!clean) return null;
+
+  const seasons = new Set();
+  const episodes = new Set();
+  const sections = new Set();
+  let m;
+
+  SEASON_ZH_RE.lastIndex = 0;
+  while ((m = SEASON_ZH_RE.exec(clean)) !== null) {
+    const n = parseZhOrArabicInt(m[1]);
+    if (n !== null) seasons.add(n);
+  }
+  SEASON_EN_RE.lastIndex = 0;
+  while ((m = SEASON_EN_RE.exec(clean)) !== null) {
+    const n = parseZhOrArabicInt(m[1]);
+    if (n !== null) seasons.add(n);
+  }
+  SEASON_EP_SE_RE.lastIndex = 0;
+  while ((m = SEASON_EP_SE_RE.exec(clean)) !== null) {
+    const s = parseZhOrArabicInt(m[1]);
+    const e = parseZhOrArabicInt(m[2]);
+    if (s !== null) seasons.add(s);
+    if (e !== null) episodes.add(e);
+  }
+  EP_ZH_RE.lastIndex = 0;
+  while ((m = EP_ZH_RE.exec(clean)) !== null) {
+    const n = parseZhOrArabicInt(m[1]);
+    if (n !== null) episodes.add(n);
+  }
+  EP_EN_RE.lastIndex = 0;
+  while ((m = EP_EN_RE.exec(clean)) !== null) {
+    const n = parseZhOrArabicInt(m[1]);
+    if (n !== null) episodes.add(n);
+  }
+  EP_PART_ROMAN_RE.lastIndex = 0;
+  while ((m = EP_PART_ROMAN_RE.exec(clean)) !== null) {
+    const n = parseZhOrArabicInt(m[1]);
+    if (n !== null) episodes.add(n);
+  }
+  EP_P_RE.lastIndex = 0;
+  while ((m = EP_P_RE.exec(clean)) !== null) {
+    const n = parseZhOrArabicInt(m[1]);
+    if (n !== null) episodes.add(n);
+  }
+  EP_BRACKET_RE.lastIndex = 0;
+  while ((m = EP_BRACKET_RE.exec(clean)) !== null) {
+    const n = parseZhOrArabicInt(m[1]);
+    if (n !== null && n <= 999) episodes.add(n);
+  }
+  SECTION_BRACKET_RE.lastIndex = 0;
+  while ((m = SECTION_BRACKET_RE.exec(clean)) !== null) {
+    sections.add(m[1]);
+  }
+  SECTION_UNIT_RE.lastIndex = 0;
+  while ((m = SECTION_UNIT_RE.exec(clean)) !== null) {
+    sections.add(m[1]);
+  }
+  SECTION_TAIL_RE.lastIndex = 0;
+  while ((m = SECTION_TAIL_RE.exec(clean)) !== null) {
+    sections.add(m[1]);
+  }
+
+  if (seasons.size === 0 && episodes.size === 0 && sections.size === 0) {
+    return null;
+  }
+  const sortNums = (set) => [...set].sort((a, b) => a - b).join(",");
+  const sectionOrder = { 上: 1, 中: 2, 下: 3 };
+  const sectionKey = [...sections]
+    .sort((a, b) => (sectionOrder[a] || 9) - (sectionOrder[b] || 9))
+    .join(",");
+  return {
+    seasonKey: sortNums(seasons),
+    episodeKey: sortNums(episodes),
+    sectionKey,
+  };
+}
+
+function hasConflictingSeries(sa, sb) {
+  if (!sa || !sb) return false;
+  if (sa.seasonKey && sb.seasonKey && sa.seasonKey !== sb.seasonKey) return true;
+  if (sa.episodeKey && sb.episodeKey && sa.episodeKey !== sb.episodeKey) return true;
+  if (sa.sectionKey && sb.sectionKey && sa.sectionKey !== sb.sectionKey) return true;
+  return false;
+}
+
+const EMPTY_INT32 = new Int32Array(0);
+
 function prepareCore(rawTitle) {
   const core = extractCoreTitle(rawTitle);
-  if (!core) {
-    return { core: "", len: 0, bigrams: [], uniqueBigrams: [] };
+  if (!core || FUZZY_PLACEHOLDER_CORE_SET.has(core)) {
+    return {
+      core: "",
+      len: 0,
+      eligible: false,
+      series: null,
+      bigrams: EMPTY_INT32,
+      uniqueBigrams: EMPTY_INT32,
+      uniqueCounts: EMPTY_INT32,
+    };
   }
   const chars = Array.from(core);
   const len = chars.length;
-  if (len < 2) {
-    return { core, len, bigrams: [], uniqueBigrams: [] };
+  if (len < FUZZY_MIN_CORE_LEN) {
+    return {
+      core,
+      len,
+      eligible: false,
+      series: null,
+      bigrams: EMPTY_INT32,
+      uniqueBigrams: EMPTY_INT32,
+      uniqueCounts: EMPTY_INT32,
+    };
   }
-  const bigrams = new Array(len - 1);
-  for (let i = 0; i < len - 1; i++) {
+  const bgLen = len - 1;
+  const bigrams = new Int32Array(bgLen);
+  for (let i = 0; i < bgLen; i++) {
     bigrams[i] = chars[i].codePointAt(0) * 0x110000 + chars[i + 1].codePointAt(0);
   }
-  bigrams.sort((a, b) => a - b);
-  const uniqueBigrams = [];
-  for (let i = 0; i < bigrams.length; i++) {
+  bigrams.sort();
+
+  let uniqueCount = 0;
+  for (let i = 0; i < bgLen; i++) {
+    if (i === 0 || bigrams[i] !== bigrams[i - 1]) uniqueCount++;
+  }
+  const uniqueBigrams = new Int32Array(uniqueCount);
+  const uniqueCounts = new Int32Array(uniqueCount);
+  let uIdx = -1;
+  for (let i = 0; i < bgLen; i++) {
     if (i === 0 || bigrams[i] !== bigrams[i - 1]) {
-      uniqueBigrams.push(bigrams[i]);
+      uIdx++;
+      uniqueBigrams[uIdx] = bigrams[i];
+      uniqueCounts[uIdx] = 1;
+    } else {
+      uniqueCounts[uIdx]++;
     }
   }
-  return { core, len, bigrams, uniqueBigrams };
+  return {
+    core,
+    len,
+    eligible: true,
+    series: extractSeriesMarkers(rawTitle),
+    bigrams,
+    uniqueBigrams,
+    uniqueCounts,
+  };
 }
 
 function countSortedOverlap(a, b) {
@@ -212,12 +456,10 @@ function countSortedOverlap(a, b) {
   return overlap;
 }
 
-function computePreparedSimilarity(pa, pb) {
-  if (!pa || !pb || pa.len === 0 || pb.len === 0) return 0;
-  if (pa.core === pb.core) return 1;
-  if (pa.bigrams.length === 0 || pb.bigrams.length === 0) return 0;
-  const overlap = countSortedOverlap(pa.bigrams, pb.bigrams);
-  if (overlap === 0) return 0;
+function computeSimilarityFromOverlap(pa, pb, overlap) {
+  if (overlap <= 0) return 0;
+  if (hasConflictingSeries(pa.series, pb.series)) return 0;
+  if (pa.len === pb.len && overlap === pa.bigrams.length && pa.core === pb.core) return 1;
   const shorter = pa.len <= pb.len ? pa : pb;
   const longer = pa.len <= pb.len ? pb : pa;
   // 若 shorter 是 longer 的子串，其全部二元组必然被 longer 覆盖（overlap === shorter.bigrams.length）
@@ -231,7 +473,15 @@ function computePreparedSimilarity(pa, pb) {
   return (2 * overlap) / (pa.bigrams.length + pb.bigrams.length);
 }
 
-/** 计算两个标题的模糊相似度 ∈ [0, 1] */
+function computePreparedSimilarity(pa, pb) {
+  if (!pa || !pb || !pa.eligible || !pb.eligible) return 0;
+  if (hasConflictingSeries(pa.series, pb.series)) return 0;
+  if (pa.core === pb.core) return 1;
+  const overlap = countSortedOverlap(pa.bigrams, pb.bigrams);
+  return computeSimilarityFromOverlap(pa, pb, overlap);
+}
+
+/** 计算两个标题的模糊相似度 ∈ [0, 1]（占位/短标题及不同系列集数直接返回 0） */
 function computeTitleSimilarity(titleA, titleB) {
   return computePreparedSimilarity(prepareCore(titleA), prepareCore(titleB));
 }
@@ -245,6 +495,7 @@ function dateStrToDayNum(dateStr) {
   return Math.floor(Date.parse(`${dateStr}T00:00:00Z`) / DAY_MS);
 }
 
+/** 模糊匹配时间窗判定：按 UTC+8 日历日相差 ≤ FUZZY_MAX_DAY_DIFF（2 天），缺时间门槛 +0.1 */
 function checkFuzzyTimeWindow(dayA, dayB) {
   if (dayA !== null && dayB !== null) {
     if (Math.abs(dayA - dayB) > FUZZY_MAX_DAY_DIFF) {
@@ -270,42 +521,65 @@ function isValidAutoContentKey(key) {
   return typeof key === "string" && key.startsWith("auto:") && key.length > "auto:".length;
 }
 
-function computeAutoClusterKey(sortedWorkKeys) {
+function isValidSyntheticContentKey(key) {
+  return isValidManualContentKey(key) || isValidAutoContentKey(key);
+}
+
+function isUnstableRecordKey(key) {
+  return typeof key === "string" && UNSTABLE_RECORD_KEY_RE.test(key);
+}
+
+/**
+ * 基于簇内排序后的成员身份（platform|workId，不含 group）计算确定性 auto:<hash>。
+ * 同一组作品在多个分组重复出现时生成同一键，避免跨组去重判冲突。
+ */
+function computeAutoClusterKey(sortedMemberKeys) {
   const hash = crypto
     .createHash("sha256")
-    .update(JSON.stringify(sortedWorkKeys))
+    .update(JSON.stringify(sortedMemberKeys))
     .digest("hex")
     .slice(0, 16);
   return `auto:${hash}`;
 }
 
 /**
- * 清洗手工矫正表，兼容传入 `{ version, updatedAt, overrides }` 或直接传入 overrides 字典。
- * 返回 Map<workKey, { action: "assign", contentKey } | { action: "detach" }>。
+ * 清洗手工矫正配置，兼容传入 `{ version, updatedAt, contents?, overrides }` 或直接传入 overrides 字典。
+ * 返回 `{ overrides: Map<workKey, entry>, contents: Map<contentKey, { title, createdAt }> }`。
  */
-function normalizeOverridesInput(raw) {
-  const map = new Map();
-  if (!isPlainObject(raw)) return map;
-  const source =
-    hasOwn(raw, "overrides") && isPlainObject(raw.overrides) && typeof raw.action !== "string"
-      ? raw.overrides
-      : raw;
+function normalizeOverridesDoc(raw) {
+  const overrides = new Map();
+  const contents = new Map();
+  if (!isPlainObject(raw)) return { overrides, contents };
+  const isDoc =
+    hasOwn(raw, "overrides") && isPlainObject(raw.overrides) && typeof raw.action !== "string";
+  const source = isDoc ? raw.overrides : raw;
   for (const workKey of Object.keys(source)) {
     if (!workKey) continue;
     const desc = Object.getOwnPropertyDescriptor(source, workKey);
     const entry = desc ? desc.value : null;
     if (!isPlainObject(entry)) continue;
-    const action = toSafeTrimmed(entry.action);
+    const action = typeof entry.action === "string" ? entry.action.trim() : "";
     if (action === "detach") {
-      map.set(workKey, { action: "detach" });
+      overrides.set(workKey, { action: "detach" });
     } else if (action === "assign") {
-      const contentKey = toSafeTrimmed(entry.contentKey);
+      const contentKey = typeof entry.contentKey === "string" ? entry.contentKey.trim() : "";
       if (contentKey && !contentKey.startsWith("unlinked:")) {
-        map.set(workKey, { action: "assign", contentKey });
+        overrides.set(workKey, { action: "assign", contentKey });
       }
     }
   }
-  return map;
+  if (isDoc && hasOwn(raw, "contents") && isPlainObject(raw.contents)) {
+    for (const ck of Object.keys(raw.contents)) {
+      if (!isValidSyntheticContentKey(ck)) continue;
+      const desc = Object.getOwnPropertyDescriptor(raw.contents, ck);
+      const meta = desc ? desc.value : null;
+      if (!isPlainObject(meta)) continue;
+      if (typeof meta.title !== "string") continue;
+      if (typeof meta.createdAt !== "number" || !Number.isFinite(meta.createdAt)) continue;
+      contents.set(ck, { title: meta.title, createdAt: meta.createdAt });
+    }
+  }
+  return { overrides, contents };
 }
 
 function buildPreparedCores(titles) {
@@ -313,59 +587,367 @@ function buildPreparedCores(titles) {
   const seen = new Set();
   for (const t of titles) {
     const p = prepareCore(t);
-    if (!p.core || seen.has(p.core)) continue;
-    seen.add(p.core);
+    if (!p.eligible) continue;
+    const sig = p.series
+      ? `${p.core}\0${p.series.seasonKey}|${p.series.episodeKey}|${p.series.sectionKey}`
+      : p.core;
+    if (seen.has(sig)) continue;
+    seen.add(sig);
     list.push(p);
   }
   return list;
 }
 
-function computeWorkTargetSimilarity(workPrepared, targetPreparedList) {
-  let best = 0;
-  for (let i = 0; i < targetPreparedList.length; i++) {
-    const sim = computePreparedSimilarity(workPrepared, targetPreparedList[i]);
-    if (sim > best) {
-      best = sim;
-      if (best >= 1) return 1;
-    }
+/**
+ * 构建按 UTC+8 日历日（dayNum | null）分桶的候选索引：
+ * - 小桶（alias 数 ≤ 32）直接扫描，避免建索引开销
+ * - 大桶对高频 bigram（超过半数 alias 恰好出现 1 次）采用补集倒排，
+ *   将密集共享前缀场景从 O(L·M) 降为 O(L + M)，且数学结果 100% 精确等价。
+ */
+function buildDayBucketedIndex(items) {
+  const grouped = new Map();
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    const cores = it.cores;
+    if (!cores || cores.length === 0) continue;
+    pushToMap(grouped, it.dayNum, { itemIdx: it.itemIdx, cores });
   }
-  return best;
+
+  const bucketsByDay = new Map();
+  for (const [dayNum, dayItems] of grouped.entries()) {
+    const itemCount = dayItems.length;
+    const itemIndices = new Int32Array(itemCount);
+    const aliasCoreList = [];
+    const aliasLocalTiList = [];
+
+    for (let li = 0; li < itemCount; li++) {
+      itemIndices[li] = dayItems[li].itemIdx;
+      const cores = dayItems[li].cores;
+      for (let ci = 0; ci < cores.length; ci++) {
+        aliasCoreList.push(cores[ci]);
+        aliasLocalTiList.push(li);
+      }
+    }
+
+    const aliasCount = aliasCoreList.length;
+    const aliasLocalTi = Int32Array.from(aliasLocalTiList);
+    const aliasLen = new Int32Array(aliasCount);
+    const aliasBigramLen = new Int32Array(aliasCount);
+    for (let ai = 0; ai < aliasCount; ai++) {
+      aliasLen[ai] = aliasCoreList[ai].len;
+      aliasBigramLen[ai] = aliasCoreList[ai].bigrams.length;
+    }
+
+    let invIndex = null;
+    if (aliasCount > DAY_BUCKET_INDEX_THRESHOLD) {
+      const postings = new Map();
+      for (let ai = 0; ai < aliasCount; ai++) {
+        const p = aliasCoreList[ai];
+        const ub = p.uniqueBigrams;
+        const uc = p.uniqueCounts;
+        for (let bi = 0; bi < ub.length; bi++) {
+          const g = ub[bi];
+          let arr = postings.get(g);
+          if (!arr) {
+            arr = [];
+            postings.set(g, arr);
+          }
+          arr.push(ai, uc[bi]);
+        }
+      }
+
+      invIndex = new Map();
+      const halfAliases = aliasCount >>> 1;
+      const presentMark = new Uint8Array(aliasCount);
+
+      for (const [g, arr] of postings.entries()) {
+        const df = arr.length >>> 1;
+        let onesCount = 0;
+        let allOne = true;
+        for (let k = 1; k < arr.length; k += 2) {
+          if (arr[k] === 1) onesCount++;
+          else allOne = false;
+        }
+        if (onesCount > halfAliases) {
+          // 高频补集编码：默认全部 alias 出现 1 次，仅记录缺席者与出现 >=2 次者
+          presentMark.fill(0);
+          const multiTmp = [];
+          for (let k = 0; k < arr.length; k += 2) {
+            const aIdx = arr[k];
+            const cnt = arr[k + 1];
+            presentMark[aIdx] = 1;
+            if (cnt !== 1) multiTmp.push(aIdx, cnt);
+          }
+          const absentCount = aliasCount - df;
+          const absent = new Int32Array(absentCount);
+          if (absentCount > 0) {
+            let w = 0;
+            for (let ai = 0; ai < aliasCount; ai++) {
+              if (presentMark[ai] === 0) absent[w++] = ai;
+            }
+          }
+          invIndex.set(g, {
+            complement: true,
+            absent,
+            multi: multiTmp.length > 0 ? Int32Array.from(multiTmp) : EMPTY_INT32,
+          });
+        } else if (allOne) {
+          const ids = new Int32Array(df);
+          for (let k = 0, w = 0; k < arr.length; k += 2) ids[w++] = arr[k];
+          invIndex.set(g, { complement: false, allOne: true, ids });
+        } else {
+          invIndex.set(g, { complement: false, allOne: false, pairs: Int32Array.from(arr) });
+        }
+      }
+    }
+
+    bucketsByDay.set(dayNum, {
+      dayNum,
+      itemCount,
+      itemIndices,
+      aliasCount,
+      aliasCores: aliasCoreList,
+      aliasLocalTi,
+      aliasLen,
+      aliasBigramLen,
+      invIndex,
+      aliasOverlap: new Int32Array(aliasCount),
+      aliasStamp: new Int32Array(aliasCount),
+      touchedAliases: new Int32Array(aliasCount),
+      itemMaxSim: new Float64Array(itemCount),
+      itemStamp: new Int32Array(itemCount),
+      touchedItems: new Int32Array(itemCount),
+      stamp: 0,
+    });
+  }
+
+  return bucketsByDay;
 }
 
-/**
- * ③ 同 group+platform 内对未关联作品与未占用 target 做模糊匹配。
- * 利用倒排索引将非零相似度候选检索降到接近线性，最坏 O(n·m) 且数学结果与两两全比完全等价。
- */
-function matchFuzzyGroupTargets(freeWorks, freeTargets, result, matchedWorks, occupiedTargets) {
-  if (!freeWorks.length || !freeTargets.length) return;
+/** 在单个日桶内为 queryCore 评分并回调所有相似度 > 0 的 (itemIdx, sim) */
+function scoreDayBucket(bucket, queryCore, onHit) {
+  const { itemCount, itemIndices, aliasCount, aliasCores, aliasLocalTi } = bucket;
+  let stamp = ++bucket.stamp;
+  if (stamp >= 0x7fffffff) {
+    bucket.aliasStamp.fill(0);
+    bucket.itemStamp.fill(0);
+    bucket.stamp = 1;
+    stamp = 1;
+  }
 
-  const bigramIndex = new Map();
-  const singleCharIndex = new Map();
+  const itemMaxSim = bucket.itemMaxSim;
+  const itemStamp = bucket.itemStamp;
+  const touchedItems = bucket.touchedItems;
+  let touchedItemCount = 0;
 
-  for (let ti = 0; ti < freeTargets.length; ti++) {
-    const t = freeTargets[ti];
-    const seenBg = new Set();
-    const seenSingle = new Set();
-    for (const p of t.preparedCores) {
-      if (p.len === 1) {
-        if (!seenSingle.has(p.core)) {
-          seenSingle.add(p.core);
-          pushToMap(singleCharIndex, p.core, ti);
+  if (!bucket.invIndex) {
+    for (let ai = 0; ai < aliasCount; ai++) {
+      const sim = computePreparedSimilarity(queryCore, aliasCores[ai]);
+      if (sim <= 0) continue;
+      const li = aliasLocalTi[ai];
+      if (itemStamp[li] !== stamp) {
+        itemStamp[li] = stamp;
+        itemMaxSim[li] = sim;
+        touchedItems[touchedItemCount++] = li;
+      } else if (sim > itemMaxSim[li]) {
+        itemMaxSim[li] = sim;
+      }
+    }
+    for (let k = 0; k < touchedItemCount; k++) {
+      const li = touchedItems[k];
+      onHit(itemIndices[li], itemMaxSim[li]);
+    }
+    return;
+  }
+
+  const invIndex = bucket.invIndex;
+  const aliasOverlap = bucket.aliasOverlap;
+  const aliasStamp = bucket.aliasStamp;
+  const touchedAliases = bucket.touchedAliases;
+  let touchedAliasCount = 0;
+  let baseOverlap = 0;
+
+  const qUb = queryCore.uniqueBigrams;
+  const qUc = queryCore.uniqueCounts;
+  for (let bi = 0; bi < qUb.length; bi++) {
+    const entry = invIndex.get(qUb[bi]);
+    if (!entry) continue;
+    const ca = qUc[bi];
+    if (entry.complement) {
+      baseOverlap += 1;
+      const absent = entry.absent;
+      for (let k = 0; k < absent.length; k++) {
+        const aIdx = absent[k];
+        if (aliasStamp[aIdx] !== stamp) {
+          aliasStamp[aIdx] = stamp;
+          aliasOverlap[aIdx] = -1;
+        } else {
+          aliasOverlap[aIdx] -= 1;
         }
-      } else {
-        for (let bi = 0; bi < p.uniqueBigrams.length; bi++) {
-          const g = p.uniqueBigrams[bi];
-          if (!seenBg.has(g)) {
-            seenBg.add(g);
-            pushToMap(bigramIndex, g, ti);
+      }
+      if (ca > 1 && entry.multi.length > 0) {
+        const multi = entry.multi;
+        for (let k = 0; k < multi.length; k += 2) {
+          const aIdx = multi[k];
+          const cb = multi[k + 1];
+          const delta = (ca < cb ? ca : cb) - 1;
+          if (delta === 0) continue;
+          if (aliasStamp[aIdx] !== stamp) {
+            aliasStamp[aIdx] = stamp;
+            aliasOverlap[aIdx] = delta;
+          } else {
+            aliasOverlap[aIdx] += delta;
           }
+        }
+      }
+    } else if (entry.allOne) {
+      const ids = entry.ids;
+      for (let k = 0; k < ids.length; k++) {
+        const aIdx = ids[k];
+        if (aliasStamp[aIdx] !== stamp) {
+          aliasStamp[aIdx] = stamp;
+          aliasOverlap[aIdx] = 1;
+          if (baseOverlap === 0) touchedAliases[touchedAliasCount++] = aIdx;
+        } else {
+          aliasOverlap[aIdx] += 1;
+        }
+      }
+    } else {
+      const pairs = entry.pairs;
+      for (let k = 0; k < pairs.length; k += 2) {
+        const aIdx = pairs[k];
+        const cb = pairs[k + 1];
+        const inc = ca < cb ? ca : cb;
+        if (aliasStamp[aIdx] !== stamp) {
+          aliasStamp[aIdx] = stamp;
+          aliasOverlap[aIdx] = inc;
+          if (baseOverlap === 0) touchedAliases[touchedAliasCount++] = aIdx;
+        } else {
+          aliasOverlap[aIdx] += inc;
         }
       }
     }
   }
 
+  const qLen = queryCore.len;
+  const qBgLen = queryCore.bigrams.length;
+  const qCore = queryCore.core;
+  const qSeries = queryCore.series;
+  const aliasLen = bucket.aliasLen;
+  const aliasBigramLen = bucket.aliasBigramLen;
+
+  if (baseOverlap > 0) {
+    for (let ai = 0; ai < aliasCount; ai++) {
+      const ov = baseOverlap + (aliasStamp[ai] === stamp ? aliasOverlap[ai] : 0);
+      if (ov <= 0) continue;
+      const ac = aliasCores[ai];
+      if (qSeries && ac.series && hasConflictingSeries(qSeries, ac.series)) continue;
+
+      const aLen = aliasLen[ai];
+      const aBgLen = aliasBigramLen[ai];
+      let sim;
+      if (qLen === aLen && ov === qBgLen && qCore === ac.core) {
+        sim = 1;
+      } else {
+        const minLen = qLen <= aLen ? qLen : aLen;
+        const minBgLen = qBgLen <= aBgLen ? qBgLen : aBgLen;
+        if (
+          minLen >= FUZZY_SUBSTRING_MIN_LEN &&
+          ov === minBgLen &&
+          (qLen <= aLen ? ac.core.includes(qCore) : qCore.includes(ac.core))
+        ) {
+          sim = FUZZY_SUBSTRING_SCORE;
+        } else {
+          sim = (2 * ov) / (qBgLen + aBgLen);
+        }
+      }
+      const li = aliasLocalTi[ai];
+      if (itemStamp[li] !== stamp) {
+        itemStamp[li] = stamp;
+        itemMaxSim[li] = sim;
+        touchedItems[touchedItemCount++] = li;
+      } else if (sim > itemMaxSim[li]) {
+        itemMaxSim[li] = sim;
+      }
+    }
+  } else {
+    for (let k = 0; k < touchedAliasCount; k++) {
+      const ai = touchedAliases[k];
+      const ov = aliasOverlap[ai];
+      if (ov <= 0) continue;
+      const ac = aliasCores[ai];
+      if (qSeries && ac.series && hasConflictingSeries(qSeries, ac.series)) continue;
+
+      const aLen = aliasLen[ai];
+      const aBgLen = aliasBigramLen[ai];
+      let sim;
+      if (qLen === aLen && ov === qBgLen && qCore === ac.core) {
+        sim = 1;
+      } else {
+        const minLen = qLen <= aLen ? qLen : aLen;
+        const minBgLen = qBgLen <= aBgLen ? qBgLen : aBgLen;
+        if (
+          minLen >= FUZZY_SUBSTRING_MIN_LEN &&
+          ov === minBgLen &&
+          (qLen <= aLen ? ac.core.includes(qCore) : qCore.includes(ac.core))
+        ) {
+          sim = FUZZY_SUBSTRING_SCORE;
+        } else {
+          sim = (2 * ov) / (qBgLen + aBgLen);
+        }
+      }
+      const li = aliasLocalTi[ai];
+      if (itemStamp[li] !== stamp) {
+        itemStamp[li] = stamp;
+        itemMaxSim[li] = sim;
+        touchedItems[touchedItemCount++] = li;
+      } else if (sim > itemMaxSim[li]) {
+        itemMaxSim[li] = sim;
+      }
+    }
+  }
+
+  for (let k = 0; k < touchedItemCount; k++) {
+    const li = touchedItems[k];
+    onHit(itemIndices[li], itemMaxSim[li]);
+  }
+}
+
+/** 收集与 queryDay 满足 ±FUZZY_MAX_DAY_DIFF（含缺时间 null 桶）的全部候选日桶 */
+function collectWindowBuckets(bucketsByDay, queryDay, outBuckets) {
+  outBuckets.length = 0;
+  if (queryDay === null) {
+    for (const b of bucketsByDay.values()) outBuckets.push(b);
+    return;
+  }
+  for (let d = queryDay - FUZZY_MAX_DAY_DIFF; d <= queryDay + FUZZY_MAX_DAY_DIFF; d++) {
+    const b = bucketsByDay.get(d);
+    if (b) outBuckets.push(b);
+  }
+  const nullBucket = bucketsByDay.get(null);
+  if (nullBucket) outBuckets.push(nullBucket);
+}
+
+/**
+ * ③ 同 group+platform 内对未关联作品与未占用 target 做模糊匹配。
+ * 先按 UTC+8 日历日时间窗（±2 天 + 缺时间桶）分桶，再在桶内用高频补集倒排一次打分并按 (core, day) 缓存。
+ */
+function matchFuzzyGroupTargets(freeWorks, freeTargets, result, matchedWorks, occupiedTargets) {
+  if (!freeWorks.length || !freeTargets.length) return;
+
+  const targetItems = [];
+  for (let ti = 0; ti < freeTargets.length; ti++) {
+    const t = freeTargets[ti];
+    if (t.preparedCores && t.preparedCores.length > 0) {
+      targetItems.push({ itemIdx: ti, dayNum: t.dayNum, cores: t.preparedCores });
+    }
+  }
+  if (!targetItems.length) return;
+
+  const bucketsByDay = buildDayBucketedIndex(targetItems);
   const wCount = freeWorks.length;
   const tCount = freeTargets.length;
+
   const wBestSim = new Float64Array(wCount);
   const wSecondSim = new Float64Array(wCount);
   const wBestTarget = new Int32Array(wCount).fill(-1);
@@ -376,79 +958,97 @@ function matchFuzzyGroupTargets(freeWorks, freeTargets, result, matchedWorks, oc
   const tBestWork = new Int32Array(tCount).fill(-1);
   const tBestTied = new Uint8Array(tCount);
 
-  const seenStamp = new Int32Array(tCount);
-  let stamp = 0;
-  const touched = [];
+  // 仅对出现 ≥2 次的相同标题签名启用日桶打分缓存，唯一标题直接走零分配回调
+  const coreSigCounts = new Map();
+  const workCoreSigs = new Array(wCount);
+  for (let wi = 0; wi < wCount; wi++) {
+    const wp = freeWorks[wi].preparedCore;
+    if (!wp || !wp.eligible) continue;
+    const sig = wp.series
+      ? `${wp.core}\0${wp.series.seasonKey}|${wp.series.episodeKey}|${wp.series.sectionKey}`
+      : wp.core;
+    workCoreSigs[wi] = sig;
+    coreSigCounts.set(sig, (coreSigCounts.get(sig) || 0) + 1);
+  }
+
+  const bucketScoreCache = new Map();
+  const windowBuckets = [];
 
   for (let wi = 0; wi < wCount; wi++) {
     const w = freeWorks[wi];
     const wp = w.preparedCore;
-    if (!wp || wp.len === 0) continue;
+    if (!wp || !wp.eligible) continue;
 
-    stamp++;
-    touched.length = 0;
-    if (wp.len === 1) {
-      const list = singleCharIndex.get(wp.core);
-      if (list) {
-        for (let k = 0; k < list.length; k++) {
-          const ti = list[k];
-          if (seenStamp[ti] !== stamp) {
-            seenStamp[ti] = stamp;
-            touched.push(ti);
-          }
-        }
-      }
-    } else {
-      for (let bi = 0; bi < wp.uniqueBigrams.length; bi++) {
-        const list = bigramIndex.get(wp.uniqueBigrams[bi]);
-        if (!list) continue;
-        for (let k = 0; k < list.length; k++) {
-          const ti = list[k];
-          if (seenStamp[ti] !== stamp) {
-            seenStamp[ti] = stamp;
-            touched.push(ti);
-          }
-        }
-      }
-    }
+    collectWindowBuckets(bucketsByDay, w.dayNum, windowBuckets);
+    if (!windowBuckets.length) continue;
+
+    const coreSig = workCoreSigs[wi];
+    const shouldCache = coreSigCounts.get(coreSig) > 1;
 
     let bestSim = 0;
     let secondSim = 0;
     let bestTi = -1;
     let bestThreshold = Infinity;
 
-    for (let k = 0; k < touched.length; k++) {
-      const ti = touched[k];
-      const t = freeTargets[ti];
-      // 保留直链冲突排除：target 已有明确直链且与作品直链不同时禁止模糊关联
-      if (t.normUrl && t.normUrl !== w.normUrl) continue;
-      const tw = checkFuzzyTimeWindow(w.dayNum, t.dayNum);
-      if (!tw.eligible) continue;
+    for (let bi = 0; bi < windowBuckets.length; bi++) {
+      const bucket = windowBuckets[bi];
+      const threshold =
+        w.dayNum !== null && bucket.dayNum !== null
+          ? FUZZY_SIM_THRESHOLD
+          : FUZZY_SIM_THRESHOLD + FUZZY_MISSING_TIME_PENALTY;
 
-      const sim = computeWorkTargetSimilarity(wp, t.preparedCores);
-      if (sim <= 0) continue;
+      const applyHit = (ti, sim) => {
+        const t = freeTargets[ti];
+        // 保留直链冲突排除：target 已有明确直链且与作品直链不同时禁止模糊关联
+        if (t.normUrl && t.normUrl !== w.normUrl) return;
 
-      if (sim > bestSim + FUZZY_EPS) {
-        secondSim = bestSim;
-        bestSim = sim;
-        bestTi = ti;
-        bestThreshold = tw.threshold;
-      } else if (Math.abs(sim - bestSim) <= FUZZY_EPS) {
-        secondSim = sim;
-      } else if (sim > secondSim) {
-        secondSim = sim;
-      }
+        if (sim > bestSim + FUZZY_EPS) {
+          secondSim = bestSim;
+          bestSim = sim;
+          bestTi = ti;
+          bestThreshold = threshold;
+        } else if (Math.abs(sim - bestSim) <= FUZZY_EPS) {
+          secondSim = sim;
+        } else if (sim > secondSim) {
+          secondSim = sim;
+        }
 
-      if (sim > tBestSim[ti] + FUZZY_EPS) {
-        tSecondSim[ti] = tBestSim[ti];
-        tBestSim[ti] = sim;
-        tBestWork[ti] = wi;
-        tBestTied[ti] = 0;
-      } else if (Math.abs(sim - tBestSim[ti]) <= FUZZY_EPS) {
-        tSecondSim[ti] = sim;
-        tBestTied[ti] = 1;
-      } else if (sim > tSecondSim[ti]) {
-        tSecondSim[ti] = sim;
+        if (sim > tBestSim[ti] + FUZZY_EPS) {
+          tSecondSim[ti] = tBestSim[ti];
+          tBestSim[ti] = sim;
+          tBestWork[ti] = wi;
+          tBestTied[ti] = 0;
+        } else if (Math.abs(sim - tBestSim[ti]) <= FUZZY_EPS) {
+          tSecondSim[ti] = sim;
+          tBestTied[ti] = 1;
+        } else if (sim > tSecondSim[ti]) {
+          tSecondSim[ti] = sim;
+        }
+      };
+
+      if (!shouldCache) {
+        scoreDayBucket(bucket, wp, applyHit);
+      } else {
+        const cacheKey = `${bucket.dayNum === null ? "null" : bucket.dayNum}\0${coreSig}`;
+        let cachedHits = bucketScoreCache.get(cacheKey);
+        if (!cachedHits) {
+          const hitIndices = [];
+          const hitSims = [];
+          scoreDayBucket(bucket, wp, (ti, sim) => {
+            hitIndices.push(ti);
+            hitSims.push(sim);
+            applyHit(ti, sim);
+          });
+          cachedHits = { hitIndices, hitSims };
+          if (bucketScoreCache.size < 4096) {
+            bucketScoreCache.set(cacheKey, cachedHits);
+          }
+        } else {
+          const { hitIndices, hitSims } = cachedHits;
+          for (let k = 0; k < hitIndices.length; k++) {
+            applyHit(hitIndices[k], hitSims[k]);
+          }
+        }
       }
     }
 
@@ -481,9 +1081,10 @@ function matchFuzzyGroupTargets(freeWorks, freeTargets, result, matchedWorks, oc
 
 /**
  * ④ 无发布记录作品跨平台聚类（同 group，不同 platform）。
- * - 每对平台 (P1, P2) 做对称互为最佳 + 差值 ≥0.1 + 时间窗 ≤2 天（缺时间 +0.1）成边
- * - 按 (sim desc, minWorkKey asc, maxWorkKey asc) 全序做 Kruskal 合并，保证每平台每簇最多 1 条且 100% 确定性
- * - 簇大小 ≥2 才成立，生成稳定 auto:<hash>
+ * - 每对平台 (P1, P2) 按时间窗分桶做对称互为最佳 + 差值 ≥0.1 + 时间窗 ≤2 天（缺时间 +0.1）成边
+ * - 按 (sim desc, minMemberKey asc, maxMemberKey asc) 全序做 Kruskal 合并：
+ *   合簇前检查平台不冲突，且两簇所有跨簇成员对均满足时间窗与标题相似度 ≥ 阈值（禁止链式传递）
+ * - 簇大小 ≥2 才成立，基于排序后的 `platform|workId`（不含 group）生成稳定 auto:<hash>
  */
 function clusterUnlinkedAcrossPlatforms(unlinkedWorks, result) {
   const autoKeys = new Set();
@@ -491,6 +1092,7 @@ function clusterUnlinkedAcrossPlatforms(unlinkedWorks, result) {
 
   const byGroup = new Map();
   for (const w of unlinkedWorks) {
+    if (!w.preparedCore || !w.preparedCore.eligible) continue;
     pushToMap(byGroup, w.groupKey, w);
   }
 
@@ -502,8 +1104,11 @@ function clusterUnlinkedAcrossPlatforms(unlinkedWorks, result) {
     const platforms = [...byPlatform.keys()].sort(compareText);
     if (platforms.length < 2) continue;
 
-    // 统一按 workKey 升序赋局部节点编号，保证全流程确定性
-    const nodes = [...groupWorks].sort((a, b) => compareText(a.workKey, b.workKey));
+    // 统一按不含 group 的 memberKey（platform|workId）升序赋局部节点编号，保证跨组等价簇确定性一致
+    const nodes = [...groupWorks].sort((a, b) => {
+      const cm = compareText(a.memberKey, b.memberKey);
+      return cm !== 0 ? cm : compareText(a.workKey, b.workKey);
+    });
     const nodeIdxByWorkKey = new Map();
     for (let i = 0; i < nodes.length; i++) {
       nodeIdxByWorkKey.set(nodes[i].workKey, i);
@@ -529,9 +1134,11 @@ function clusterUnlinkedAcrossPlatforms(unlinkedWorks, result) {
     const n = nodes.length;
     const parent = new Int32Array(n);
     const clusterPlatforms = new Array(n);
+    const clusterMembers = new Array(n);
     for (let i = 0; i < n; i++) {
       parent[i] = i;
       clusterPlatforms[i] = new Set([nodes[i].platformKey]);
+      clusterMembers[i] = [i];
     }
     const find = (x) => {
       while (parent[x] !== x) {
@@ -539,6 +1146,23 @@ function clusterUnlinkedAcrossPlatforms(unlinkedWorks, result) {
         x = parent[x];
       }
       return x;
+    };
+
+    // 缓存已确认边及合簇校验中计算过的成员对相似度
+    const pairSimCache = new Map();
+    const pairKey = (a, b) => (a < b ? a * n + b : b * n + a);
+    for (let ei = 0; ei < edges.length; ei++) {
+      const e = edges[ei];
+      pairSimCache.set(pairKey(e.u, e.v), e.sim);
+    }
+    const getPairSim = (a, b) => {
+      const pk = pairKey(a, b);
+      let s = pairSimCache.get(pk);
+      if (s === undefined) {
+        s = computePreparedSimilarity(nodes[a].preparedCore, nodes[b].preparedCore);
+        pairSimCache.set(pk, s);
+      }
+      return s;
     };
 
     const acceptedEdges = [];
@@ -563,12 +1187,40 @@ function clusterUnlinkedAcrossPlatforms(unlinkedWorks, result) {
       }
       if (conflict) continue;
 
+      // 全对相容检查：两簇所有跨簇成员对必须两两满足时间窗且标题相似度 ≥ 对应阈值（禁止链式传递）
+      const membersU = clusterMembers[ru];
+      const membersV = clusterMembers[rv];
+      let compatible = true;
+      for (let i = 0; i < membersU.length && compatible; i++) {
+        const aIdx = membersU[i];
+        const wa = nodes[aIdx];
+        for (let j = 0; j < membersV.length; j++) {
+          const bIdx = membersV[j];
+          const wb = nodes[bIdx];
+          const tw = checkFuzzyTimeWindow(wa.dayNum, wb.dayNum);
+          if (!tw.eligible) {
+            compatible = false;
+            break;
+          }
+          const pairSim = getPairSim(aIdx, bIdx);
+          if (pairSim < tw.threshold - FUZZY_EPS) {
+            compatible = false;
+            break;
+          }
+        }
+      }
+      if (!compatible) continue;
+
       // 按节点编号小的为根合并
       const root = ru < rv ? ru : rv;
       const child = ru < rv ? rv : ru;
       parent[child] = root;
       for (const pt of clusterPlatforms[child]) clusterPlatforms[root].add(pt);
+      for (let k = 0; k < clusterMembers[child].length; k++) {
+        clusterMembers[root].push(clusterMembers[child][k]);
+      }
       clusterPlatforms[child] = null;
+      clusterMembers[child] = null;
       acceptedEdges.push(e);
     }
 
@@ -586,8 +1238,9 @@ function clusterUnlinkedAcrossPlatforms(unlinkedWorks, result) {
 
     for (const memberIndices of clusters.values()) {
       if (memberIndices.length < 2) continue;
-      const sortedWorkKeys = memberIndices.map((idx) => nodes[idx].workKey).sort(compareText);
-      const contentKey = computeAutoClusterKey(sortedWorkKeys);
+      // 按不含 group 的 platform|workId 排序计算哈希，确保跨组等价成员簇键完全一致
+      const sortedMemberKeys = memberIndices.map((idx) => nodes[idx].memberKey).sort(compareText);
+      const contentKey = computeAutoClusterKey(sortedMemberKeys);
       autoKeys.add(contentKey);
       for (const idx of memberIndices) {
         const w = nodes[idx];
@@ -606,20 +1259,16 @@ function clusterUnlinkedAcrossPlatforms(unlinkedWorks, result) {
 function findCrossPlatformPairEdges(listA, listB, nodeIdxByWorkKey, edgesOut) {
   if (!listA.length || !listB.length) return;
 
-  const bigramIndex = new Map();
-  const singleCharIndex = new Map();
+  const bItems = [];
   for (let bi = 0; bi < listB.length; bi++) {
     const p = listB[bi].preparedCore;
-    if (!p || p.len === 0) continue;
-    if (p.len === 1) {
-      pushToMap(singleCharIndex, p.core, bi);
-    } else {
-      for (let k = 0; k < p.uniqueBigrams.length; k++) {
-        pushToMap(bigramIndex, p.uniqueBigrams[k], bi);
-      }
+    if (p && p.eligible) {
+      bItems.push({ itemIdx: bi, dayNum: listB[bi].dayNum, cores: [p] });
     }
   }
+  if (!bItems.length) return;
 
+  const bucketsByDay = buildDayBucketedIndex(bItems);
   const aCount = listA.length;
   const bCount = listB.length;
   const aBestSim = new Float64Array(aCount);
@@ -632,76 +1281,91 @@ function findCrossPlatformPairEdges(listA, listB, nodeIdxByWorkKey, edgesOut) {
   const bBestA = new Int32Array(bCount).fill(-1);
   const bBestThreshold = new Float64Array(bCount).fill(Infinity);
 
-  const seenStamp = new Int32Array(bCount);
-  let stamp = 0;
-  const touched = [];
+  const coreSigCounts = new Map();
+  const aCoreSigs = new Array(aCount);
+  for (let ai = 0; ai < aCount; ai++) {
+    const pa = listA[ai].preparedCore;
+    if (!pa || !pa.eligible) continue;
+    const sig = pa.series
+      ? `${pa.core}\0${pa.series.seasonKey}|${pa.series.episodeKey}|${pa.series.sectionKey}`
+      : pa.core;
+    aCoreSigs[ai] = sig;
+    coreSigCounts.set(sig, (coreSigCounts.get(sig) || 0) + 1);
+  }
+
+  const bucketScoreCache = new Map();
+  const windowBuckets = [];
 
   for (let ai = 0; ai < aCount; ai++) {
     const wa = listA[ai];
     const pa = wa.preparedCore;
-    if (!pa || pa.len === 0) continue;
+    if (!pa || !pa.eligible) continue;
 
-    stamp++;
-    touched.length = 0;
-    if (pa.len === 1) {
-      const list = singleCharIndex.get(pa.core);
-      if (list) {
-        for (let k = 0; k < list.length; k++) {
-          const bi = list[k];
-          if (seenStamp[bi] !== stamp) {
-            seenStamp[bi] = stamp;
-            touched.push(bi);
-          }
-        }
-      }
-    } else {
-      for (let k = 0; k < pa.uniqueBigrams.length; k++) {
-        const list = bigramIndex.get(pa.uniqueBigrams[k]);
-        if (!list) continue;
-        for (let m = 0; m < list.length; m++) {
-          const bi = list[m];
-          if (seenStamp[bi] !== stamp) {
-            seenStamp[bi] = stamp;
-            touched.push(bi);
-          }
-        }
-      }
-    }
+    collectWindowBuckets(bucketsByDay, wa.dayNum, windowBuckets);
+    if (!windowBuckets.length) continue;
+
+    const coreSig = aCoreSigs[ai];
+    const shouldCache = coreSigCounts.get(coreSig) > 1;
 
     let bestSim = 0;
     let secondSim = 0;
     let bestBi = -1;
     let bestThreshold = Infinity;
 
-    for (let k = 0; k < touched.length; k++) {
-      const bi = touched[k];
-      const wb = listB[bi];
-      const tw = checkFuzzyTimeWindow(wa.dayNum, wb.dayNum);
-      if (!tw.eligible) continue;
+    for (let bk = 0; bk < windowBuckets.length; bk++) {
+      const bucket = windowBuckets[bk];
+      const threshold =
+        wa.dayNum !== null && bucket.dayNum !== null
+          ? FUZZY_SIM_THRESHOLD
+          : FUZZY_SIM_THRESHOLD + FUZZY_MISSING_TIME_PENALTY;
 
-      const sim = computePreparedSimilarity(pa, wb.preparedCore);
-      if (sim <= 0) continue;
+      const applyHit = (bi, sim) => {
+        if (sim > bestSim + FUZZY_EPS) {
+          secondSim = bestSim;
+          bestSim = sim;
+          bestBi = bi;
+          bestThreshold = threshold;
+        } else if (Math.abs(sim - bestSim) <= FUZZY_EPS) {
+          secondSim = sim;
+        } else if (sim > secondSim) {
+          secondSim = sim;
+        }
 
-      if (sim > bestSim + FUZZY_EPS) {
-        secondSim = bestSim;
-        bestSim = sim;
-        bestBi = bi;
-        bestThreshold = tw.threshold;
-      } else if (Math.abs(sim - bestSim) <= FUZZY_EPS) {
-        secondSim = sim;
-      } else if (sim > secondSim) {
-        secondSim = sim;
-      }
+        if (sim > bBestSim[bi] + FUZZY_EPS) {
+          bSecondSim[bi] = bBestSim[bi];
+          bBestSim[bi] = sim;
+          bBestA[bi] = ai;
+          bBestThreshold[bi] = threshold;
+        } else if (Math.abs(sim - bBestSim[bi]) <= FUZZY_EPS) {
+          bSecondSim[bi] = sim;
+        } else if (sim > bSecondSim[bi]) {
+          bSecondSim[bi] = sim;
+        }
+      };
 
-      if (sim > bBestSim[bi] + FUZZY_EPS) {
-        bSecondSim[bi] = bBestSim[bi];
-        bBestSim[bi] = sim;
-        bBestA[bi] = ai;
-        bBestThreshold[bi] = tw.threshold;
-      } else if (Math.abs(sim - bBestSim[bi]) <= FUZZY_EPS) {
-        bSecondSim[bi] = sim;
-      } else if (sim > bSecondSim[bi]) {
-        bSecondSim[bi] = sim;
+      if (!shouldCache) {
+        scoreDayBucket(bucket, pa, applyHit);
+      } else {
+        const cacheKey = `${bucket.dayNum === null ? "null" : bucket.dayNum}\0${coreSig}`;
+        let cachedHits = bucketScoreCache.get(cacheKey);
+        if (!cachedHits) {
+          const hitIndices = [];
+          const hitSims = [];
+          scoreDayBucket(bucket, pa, (bi, sim) => {
+            hitIndices.push(bi);
+            hitSims.push(sim);
+            applyHit(bi, sim);
+          });
+          cachedHits = { hitIndices, hitSims };
+          if (bucketScoreCache.size < 4096) {
+            bucketScoreCache.set(cacheKey, cachedHits);
+          }
+        } else {
+          const { hitIndices, hitSims } = cachedHits;
+          for (let k = 0; k < hitIndices.length; k++) {
+            applyHit(hitIndices[k], hitSims[k]);
+          }
+        }
       }
     }
 
@@ -725,8 +1389,8 @@ function findCrossPlatformPairEdges(listA, listB, nodeIdxByWorkKey, edgesOut) {
     const wb = listB[bi];
     const u = nodeIdxByWorkKey.get(wa.workKey);
     const v = nodeIdxByWorkKey.get(wb.workKey);
-    const key1 = wa.workKey < wb.workKey ? wa.workKey : wb.workKey;
-    const key2 = wa.workKey < wb.workKey ? wb.workKey : wa.workKey;
+    const key1 = wa.memberKey < wb.memberKey ? wa.memberKey : wb.memberKey;
+    const key2 = wa.memberKey < wb.memberKey ? wb.memberKey : wa.memberKey;
     edgesOut.push({ u, v, sim, key1, key2 });
   }
 }
@@ -848,12 +1512,15 @@ function collectMatchTitles(values) {
  * - publishStatus 存在且不是 success → 直接排除（即使有 videoLink）；
  *   仅 publishStatus 缺失的历史记录允许凭有效非管理页直链纳入；
  *   republishCount > 0 时其 videoLink 不作为直链证据（仅走唯一标题规则）
- * - 仅按完整路径归桶（小写、/ 分隔）；无完整路径各自独立为 `record:<日期>:<id或序号>`
+ * - 仅按完整路径归桶（小写、/ 分隔）；无完整路径优先用记录 id，其次用
+ *   filePath/selectedFile + 平台 + 分组 + 发布时间 + 标题 + 链接 的稳定 sha256 哈希；
+ *   无足够身份字段或同日指纹碰撞时退化为 `record:<日期>:...:pos:<idx>`（assignable=false，禁止手工 assign）
  * - 每条平台记录独立成 target，不再按文件+平台折叠
  */
 function buildContentIndex(pushRecords) {
   if (!Array.isArray(pushRecords)) return [];
-  const buckets = new Map();
+  const parsedRecords = [];
+  const recordKeyCounts = new Map();
 
   for (let idx = 0; idx < pushRecords.length; idx++) {
     const rec = pushRecords[idx];
@@ -882,6 +1549,7 @@ function buildContentIndex(pushRecords) {
     const recordDate = extractRecordDate(rec, status);
     // 真实 pushData 完整路径在 filePath（LocalVideoPublish.vue:2095），兼容完整路径写入 selectedFile
     const fullPath = normalizeFullPath(rec.filePath) || normalizeFullPath(rec.selectedFile);
+    const rawFileHint = toSafeTrimmed(rec.filePath) || toSafeTrimmed(rec.selectedFile);
     const title = [rec.title, rec.bt, rec.textOtherName, rec.bookName]
       .map(toSafeTrimmed)
       .find(Boolean) || "";
@@ -889,55 +1557,111 @@ function buildContentIndex(pushRecords) {
       ? [rec.title, rec.bt, rec.textOtherName, rec.shortTitle, rec.bt2Filled]
       : [rec.title, rec.bt, rec.textOtherName];
 
+    let stableCandidateKey = "";
+    if (!fullPath) {
+      const recId = toSafeTrimmed(rec.id);
+      if (recId) {
+        stableCandidateKey = `record:${recordDate || "unknown"}:${recId}`;
+      } else {
+        const exactPubTime = toSafeTrimmed(rec.lastPublishAt) || toSafeTrimmed(rec.createTime);
+        if (rawFileHint || title || rawVideoLink || exactPubTime) {
+          const fp = JSON.stringify([
+            rawFileHint.toLowerCase(),
+            platform,
+            group,
+            exactPubTime || recordDate,
+            title,
+            rawVideoLink,
+          ]);
+          const hash = crypto.createHash("sha256").update(fp).digest("hex").slice(0, 16);
+          stableCandidateKey = `record:${recordDate || "unknown"}:h_${hash}`;
+        }
+      }
+      if (stableCandidateKey) {
+        recordKeyCounts.set(stableCandidateKey, (recordKeyCounts.get(stableCandidateKey) || 0) + 1);
+      }
+    }
+
+    parsedRecords.push({
+      idx,
+      platform,
+      group,
+      recordDate,
+      fullPath,
+      selectedFile: toSafeTrimmed(rec.selectedFile),
+      title,
+      matchRaw,
+      status,
+      directVideoLink,
+      stableCandidateKey,
+    });
+  }
+
+  const buckets = new Map();
+  for (let i = 0; i < parsedRecords.length; i++) {
+    const item = parsedRecords[i];
     let contentKey;
-    if (fullPath) {
-      contentKey = `file:${fullPath.toLowerCase()}`;
+    let assignable = true;
+    if (item.fullPath) {
+      contentKey = `file:${item.fullPath.toLowerCase()}`;
+    } else if (
+      item.stableCandidateKey &&
+      recordKeyCounts.get(item.stableCandidateKey) === 1 &&
+      !isUnstableRecordKey(item.stableCandidateKey)
+    ) {
+      contentKey = item.stableCandidateKey;
     } else {
-      const idPart = toSafeTrimmed(rec.id) || String(idx);
-      const baseKey = `record:${recordDate || "unknown"}:${idPart}`;
-      contentKey = buckets.has(baseKey) ? `${baseKey}:${idx}` : baseKey;
+      assignable = false;
+      contentKey = item.stableCandidateKey
+        ? `${item.stableCandidateKey}:pos:${item.idx}`
+        : `record:${item.recordDate || "unknown"}:pos:${item.idx}`;
     }
 
     let bucket = buckets.get(contentKey);
     if (!bucket) {
       bucket = {
         contentKey,
+        assignable,
         displayTitle: "",
         displayTitleDate: "",
-        file: fullPath || toSafeTrimmed(rec.selectedFile),
-        fileDate: recordDate,
+        file: item.fullPath || item.selectedFile,
+        fileDate: item.recordDate,
         firstPublishDate: "",
         targets: [],
       };
       buckets.set(contentKey, bucket);
     }
 
-    if (fullPath && recordDate && (!bucket.fileDate || recordDate < bucket.fileDate)) {
-      bucket.file = fullPath;
-      bucket.fileDate = recordDate;
+    if (item.fullPath && item.recordDate && (!bucket.fileDate || item.recordDate < bucket.fileDate)) {
+      bucket.file = item.fullPath;
+      bucket.fileDate = item.recordDate;
     }
-    if (recordDate && (!bucket.firstPublishDate || recordDate < bucket.firstPublishDate)) {
-      bucket.firstPublishDate = recordDate;
+    if (item.recordDate && (!bucket.firstPublishDate || item.recordDate < bucket.firstPublishDate)) {
+      bucket.firstPublishDate = item.recordDate;
     }
-    if (title && (!bucket.displayTitle || (recordDate && (!bucket.displayTitleDate || recordDate < bucket.displayTitleDate)))) {
-      bucket.displayTitle = title;
-      bucket.displayTitleDate = recordDate;
+    if (
+      item.title &&
+      (!bucket.displayTitle || (item.recordDate && (!bucket.displayTitleDate || item.recordDate < bucket.displayTitleDate)))
+    ) {
+      bucket.displayTitle = item.title;
+      bucket.displayTitleDate = item.recordDate;
     }
 
     bucket.targets.push({
       contentKey,
-      group,
-      platform,
-      recordDate,
-      status,
-      videoLink: directVideoLink,
-      matchTitles: collectMatchTitles(matchRaw),
+      group: item.group,
+      platform: item.platform,
+      recordDate: item.recordDate,
+      status: item.status,
+      videoLink: item.directVideoLink,
+      matchTitles: collectMatchTitles(item.matchRaw),
     });
   }
 
   return [...buckets.values()]
     .map((b) => ({
       contentKey: b.contentKey,
+      assignable: b.assignable,
       displayTitle: b.displayTitle || (b.file ? b.file.split("/").pop() : "") || "(无标题)",
       file: b.file,
       firstPublishDate: b.firstPublishDate,
@@ -964,22 +1688,26 @@ function parseCutoffDate(date) {
 /**
  * 关联作品与内容，返回 Map<`group|platform|workId`, { contentKey, matchedBy, score? }>。
  * - 可选截止日 date：排除 recordDate > date 的 target 与有效 publishTime > date 的 work
- * - 可选手工矫正 overrides：detach 在 ③④ 之前排除，最终套用（assign 指向不存在 contentKey 时忽略）
+ * - 可选 worksDaily：将截至 date 仅存在于 worksDaily 的作品也纳入 activeWorkKeys（仅接受手工覆盖）
+ * - 可选手工矫正 overrides：只有 detach 在 ③④ 之前排除；①–④ 照常运行（含被 assign 的作品参与占位），
+ *   最后套用 overrides（assign 指向不存在/不稳定 contentKey 或未写入 contents 表的 auto:/manual: 时忽略）
  * ① 有效直链 1:1 唯一匹配（多对一/一对多全部留空且禁止标题兜底）；
  * ② 标题命中且同 group+platform 内唯一 work、唯一未被①占用的 target，且 target 无冲突直链；
- * ③ 模糊匹配（同 group+platform，标题 core 子串≥6=0.95 / 二元组 Dice，时间窗 ≤2 天，缺时间门槛 +0.1，
+ * ③ 模糊匹配（同 group+platform，排除占位/短标题及不同集数，标题 core 子串≥6=0.95 / 二元组 Dice，
+ *    仅取 target 自身 recordDate/lastPublishAt，时间窗按 UTC+8 日历日相差 ≤2 天、缺时间门槛 +0.1，
  *    sim≥0.6、最佳比次佳高≥0.1、互为最佳）；
- * ④ 无发布记录作品跨平台聚类（同 group 不同 platform，同规则互为最佳成边 + Kruskal 合并每平台最多 1 条，
- *    簇大小≥2，生成稳定 auto:<hash>）。
+ * ④ 无发布记录作品跨平台聚类（同 group 不同 platform，同规则互为最佳成边 + Kruskal 全对相容合并每平台最多 1 条，
+ *    簇大小≥2，按不含 group 的 platform|workId 生成稳定 auto:<hash>）。
  */
-function linkWorks({ contents, accounts, date, overrides } = {}) {
+function linkWorks({ contents, accounts, date, overrides, worksDaily } = {}) {
   const result = new Map();
   if (!Array.isArray(accounts)) return result;
   const { ok, cutoffDate } = parseCutoffDate(date);
   if (!ok) return result;
 
-  const overrideMap = normalizeOverridesInput(overrides);
-  const eligibleContentKeys = new Set();
+  const { overrides: overrideMap, contents: overrideContents } = normalizeOverridesDoc(overrides);
+  const dailyByGp = isPlainObject(worksDaily) ? worksDaily : null;
+  const assignableContentKeys = new Set();
   const targetsByGp = new Map();
   let targetSeq = 0;
 
@@ -995,10 +1723,12 @@ function linkWorks({ contents, accounts, date, overrides } = {}) {
 
     for (const t of rawTargets) {
       const rawTargetDate = toSafeTrimmed(t.recordDate);
-      const targetDate = isValidDateStr(rawTargetDate)
+      // target 自身日期仅取 recordDate 或 lastPublishAt，不借素材首发日 contentDate
+      const ownTargetDate = isValidDateStr(rawTargetDate)
         ? rawTargetDate
-        : toUtc8DateStr(t.lastPublishAt) || contentDate;
-      if (cutoffDate && targetDate && targetDate > cutoffDate) continue;
+        : toUtc8DateStr(t.lastPublishAt);
+      const cutoffTargetDate = ownTargetDate || contentDate;
+      if (cutoffDate && cutoffTargetDate && cutoffTargetDate > cutoffDate) continue;
       eligibleTargetCount++;
       const gpKey = `${toSafeTrimmed(t.group)}|${toSafeTrimmed(t.platform)}`;
       const rawTitles = Array.isArray(t.matchTitles) ? t.matchTitles : [t.title];
@@ -1009,22 +1739,23 @@ function linkWorks({ contents, accounts, date, overrides } = {}) {
         normUrl: normalizeDirectUrl(t.videoLink),
         matchTitles,
         preparedCores: buildPreparedCores(rawTitles),
-        dayNum: dateStrToDayNum(targetDate),
+        // ③ 模糊匹配时间窗只看该 target 自身日期，缺则走缺时间门槛 +0.1
+        dayNum: dateStrToDayNum(ownTargetDate),
       });
     }
 
     const contentEligible = hasTargets
       ? eligibleTargetCount > 0
       : !cutoffDate || !contentDate || contentDate <= cutoffDate;
-    if (contentEligible) {
-      eligibleContentKeys.add(contentKey);
+    if (contentEligible && c.assignable !== false && !isUnstableRecordKey(contentKey)) {
+      assignableContentKeys.add(contentKey);
     }
   }
 
   const worksByGp = new Map();
   const activeWorkKeys = new Set();
   const detachedWorkKeys = new Set();
-  const preAssignedWorkKeys = new Set();
+  const gpInfoByKey = new Map();
   let workSeq = 0;
 
   for (const acc of accounts) {
@@ -1034,6 +1765,8 @@ function linkWorks({ contents, accounts, date, overrides } = {}) {
     const groupKey = rawGroup.trim();
     const platformKey = rawPlatform.trim();
     const gpKey = `${groupKey}|${platformKey}`;
+    const rawGpKey = `${rawGroup}|${rawPlatform}`;
+    if (!gpInfoByKey.has(rawGpKey)) gpInfoByKey.set(rawGpKey, { group: rawGroup, platform: rawPlatform });
     for (const w of Array.isArray(acc.works) ? acc.works : []) {
       if (!isPlainObject(w)) continue;
       const workId = toSafeString(w.workId);
@@ -1047,20 +1780,14 @@ function linkWorks({ contents, accounts, date, overrides } = {}) {
 
       activeWorkKeys.add(workKey);
       const ov = overrideMap.get(workKey);
-      if (ov) {
-        if (ov.action === "detach") {
-          detachedWorkKeys.add(workKey);
-        } else if (
-          ov.action === "assign" &&
-          (eligibleContentKeys.has(ov.contentKey) || isValidManualContentKey(ov.contentKey))
-        ) {
-          preAssignedWorkKeys.add(workKey);
-        }
+      if (ov && ov.action === "detach") {
+        detachedWorkKeys.add(workKey);
       }
 
       pushToMap(worksByGp, gpKey, {
         idx: workSeq++,
         workKey,
+        memberKey: `${platformKey}|${workId}`,
         groupKey,
         platformKey,
         normTitle: normalizeTitle(w.title),
@@ -1068,6 +1795,29 @@ function linkWorks({ contents, accounts, date, overrides } = {}) {
         normUrl: normalizeDirectUrl(w.url),
         dayNum: dateStrToDayNum(pubDate),
       });
+    }
+  }
+
+  // 只存在于 works-daily（works.json 已删除/缺失）的作品也纳入 activeWorkKeys，仅接受手工覆盖，不参与自动匹配
+  if (dailyByGp) {
+    for (const [rawGpKey, accWorksDaily] of Object.entries(dailyByGp)) {
+      if (!isPlainObject(accWorksDaily)) continue;
+      let gpInfo = gpInfoByKey.get(rawGpKey);
+      if (!gpInfo) {
+        const sep = rawGpKey.lastIndexOf("|");
+        if (sep === -1) continue;
+        gpInfo = { group: rawGpKey.slice(0, sep), platform: rawGpKey.slice(sep + 1) };
+      }
+      const { group, platform } = gpInfo;
+      for (const workId of Object.keys(accWorksDaily)) {
+        if (!workId) continue;
+        const workKey = makeWorkKey(group, platform, workId);
+        if (result.has(workKey)) continue;
+        const snap = resolveWorkSnapshotAsOf(workId, accWorksDaily, cutoffDate);
+        if (!snap) continue;
+        result.set(workKey, { contentKey: null, matchedBy: null });
+        activeWorkKeys.add(workKey);
+      }
     }
   }
 
@@ -1128,14 +1878,13 @@ function linkWorks({ contents, accounts, date, overrides } = {}) {
         }
       }
 
-      // ③ 作品↔发布记录 target 模糊匹配（排除已匹配/已阻断/manual-detach/已有效手工指定作品）
+      // ③ 作品↔发布记录 target 模糊匹配（只排除已匹配/已阻断/manual-detach；被 assign 的作品照常参与占位）
       const freeWorks = [];
       for (const w of gpWorks) {
         if (
           matchedWorks.has(w.idx) ||
           blockedWorks.has(w.idx) ||
-          detachedWorkKeys.has(w.workKey) ||
-          preAssignedWorkKeys.has(w.workKey)
+          detachedWorkKeys.has(w.workKey)
         ) {
           continue;
         }
@@ -1151,11 +1900,7 @@ function linkWorks({ contents, accounts, date, overrides } = {}) {
     }
 
     for (const w of gpWorks) {
-      if (
-        matchedWorks.has(w.idx) ||
-        detachedWorkKeys.has(w.workKey) ||
-        preAssignedWorkKeys.has(w.workKey)
-      ) {
+      if (matchedWorks.has(w.idx) || detachedWorkKeys.has(w.workKey)) {
         continue;
       }
       unlinkedForCluster.push(w);
@@ -1163,26 +1908,16 @@ function linkWorks({ contents, accounts, date, overrides } = {}) {
   }
 
   // ④ 无发布记录作品跨平台聚类（同 group，不同 platform）
-  const autoKeys = clusterUnlinkedAcrossPlatforms(unlinkedForCluster, result);
+  clusterUnlinkedAcrossPlatforms(unlinkedForCluster, result);
 
-  // 套用手工矫正 overrides（手工结果永远优先于自动结果；指向不存在 contentKey 时忽略）
+  // 最后套用手工矫正 overrides（手工结果永远优先于自动结果；指向不存在或不稳定 contentKey 时忽略）
   if (overrideMap.size > 0) {
-    // 统计指向同一 auto:* key 的现存有效作品数（已固化的自动簇即使成员变动仍可保持有效）
-    const assignedAutoCounts = new Map();
-    for (const [workKey, ov] of overrideMap.entries()) {
-      if (!activeWorkKeys.has(workKey)) continue;
-      if (ov.action === "assign" && isValidAutoContentKey(ov.contentKey)) {
-        assignedAutoCounts.set(ov.contentKey, (assignedAutoCounts.get(ov.contentKey) || 0) + 1);
-      }
-    }
-
     const isValidAssignTarget = (contentKey) => {
-      if (eligibleContentKeys.has(contentKey)) return true;
-      if (isValidManualContentKey(contentKey)) return true;
-      if (isValidAutoContentKey(contentKey)) {
-        return autoKeys.has(contentKey) || (assignedAutoCounts.get(contentKey) || 0) >= 2;
+      if (isValidSyntheticContentKey(contentKey)) {
+        // auto:/manual: 合成内容必须在持久化 contents 表中存在才生效
+        return overrideContents.has(contentKey);
       }
-      return false;
+      return assignableContentKeys.has(contentKey);
     };
 
     for (const [workKey, ov] of overrideMap.entries()) {
@@ -1194,7 +1929,7 @@ function linkWorks({ contents, accounts, date, overrides } = {}) {
       }
     }
 
-    // 清理因部分成员被移走而只剩 1 条纯 fuzzy 作品的孤儿 auto:* 簇
+    // 清理因部分成员被移走/拆出而只剩 1 条纯 fuzzy 作品的孤儿 auto:* 簇（已确认 manual 成员保留）
     const autoMembers = new Map();
     for (const [workKey, entry] of result.entries()) {
       if (entry && isValidAutoContentKey(entry.contentKey)) {
@@ -1210,6 +1945,13 @@ function linkWorks({ contents, accounts, date, overrides } = {}) {
     }
   }
 
+  LINK_RESULT_META.set(result, {
+    contents,
+    accounts,
+    worksDaily: dailyByGp,
+    cutoffDate,
+    overrides,
+  });
   return result;
 }
 
@@ -1332,37 +2074,57 @@ function pickMinValidPubMs(obsList) {
 
 /**
  * 构建跨平台内容级汇总行（截至 date，默认最新快照日）。
- * - link：已忽略（保留参数兼容），关联总按截止日用 linkWorks 重算
+ * - link：仅当由 linkWorks 针对同一数据集与 cutoffDate 产出时复用，否则按截止日重算
  * - overrides：可选手工矫正配置（与 linkWorks 口径一致）
  * - worksDaily：`{ "group|platform": readWorksDaily(group, platform) }`
- * - 按 `platform|workId` 跨组去重：只取一份 ≤date 的最近快照，归入按分组名排序的第一个分组
- * - worksDaily 中出现但 works.json 缺失的作品 ID 保留为未关联行（title "(已删除或未匹配)"）
+ * - 按 `platform|workId` 跨组去重：只取一份 ≤date 的最近快照，归组列沿用按分组名排序的首个匹配分组
+ * - worksDaily 中出现但 works.json 缺失的作品 ID 纳入手工覆盖范围，未关联时保留为未关联行（title "(已删除或未匹配)"）
  */
 function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, overrides } = {}) {
   const { ok, cutoffDate } = parseCutoffDate(date);
   if (!ok) return [];
 
   const accountList = Array.isArray(accounts) ? accounts : [];
-  // 关联总是按同一截止日重算（忽略传入的 link）：预计算关联可能基于不同截止日，复用会绕过唯一性校验
-  void link;
-  const overrideMap = normalizeOverridesInput(overrides);
-  const resolvedLink = linkWorks({
-    contents,
-    accounts: accountList,
-    date: cutoffDate,
-    overrides,
-  });
   const dailyByGp = isPlainObject(worksDaily) ? worksDaily : null;
+  const { overrides: overrideMap, contents: overrideContents } = normalizeOverridesDoc(overrides);
+
+  const cachedMeta = link instanceof Map ? LINK_RESULT_META.get(link) : null;
+  const canReuseLink = Boolean(
+    cachedMeta &&
+      cachedMeta.contents === contents &&
+      cachedMeta.accounts === accountList &&
+      cachedMeta.worksDaily === dailyByGp &&
+      cachedMeta.cutoffDate === cutoffDate &&
+      cachedMeta.overrides === overrides
+  );
+  const resolvedLink = canReuseLink
+    ? link
+    : linkWorks({
+        contents,
+        accounts: accountList,
+        worksDaily: dailyByGp,
+        date: cutoffDate,
+        overrides,
+      });
 
   const contentByKey = new Map();
   const buckets = new Map();
-  const makeBucket = (contentKey, title, file, recordFirstDate, minWorkPublishMs, isUnlinked) => ({
+  const makeBucket = (
+    contentKey,
+    title,
+    file,
+    recordFirstDate,
+    minWorkPublishMs,
+    isUnlinked,
+    canAssignTarget = true
+  ) => ({
     contentKey,
     title: title || "(无标题)",
     file: file || "",
     recordFirstDate: recordFirstDate || "",
     minWorkPublishMs,
     isUnlinked,
+    canAssignTarget: Boolean(!isUnlinked && canAssignTarget && !isUnstableRecordKey(contentKey)),
     platforms: new Set(),
     perPlatform: {},
     workItems: [],
@@ -1404,12 +2166,14 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, o
     const effectiveRecordDate = hasTargets
       ? minEligibleTargetDate || (!cutoffDate || !contentDate || contentDate <= cutoffDate ? contentDate : "")
       : contentDate;
+    const canAssignTarget = c.assignable !== false && !isUnstableRecordKey(contentKey);
 
     contentByKey.set(contentKey, {
       c,
       recordDate: effectiveRecordDate,
       hasTargets,
       eligible,
+      canAssignTarget,
       eligibleTargetsByGp,
     });
 
@@ -1418,7 +2182,15 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, o
     if (!buckets.has(bucketId)) {
       buckets.set(
         bucketId,
-        makeBucket(contentKey, toSafeString(c.displayTitle), toSafeString(c.file), effectiveRecordDate, null, false)
+        makeBucket(
+          contentKey,
+          toSafeString(c.displayTitle),
+          toSafeString(c.file),
+          effectiveRecordDate,
+          null,
+          false,
+          canAssignTarget
+        )
       );
     }
   }
@@ -1487,21 +2259,7 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, o
     }
   }
 
-  // 为 auto:* / manual:* 合成桶确定性地选取簇内最早发布作品的标题（不依赖输入顺序）
-  const syntheticTitleByKey = new Map();
-  for (const [ck, list] of syntheticObsByContentKey.entries()) {
-    const sorted = [...list].sort((a, b) => {
-      const aHas = a.pubMs !== null;
-      const bHas = b.pubMs !== null;
-      if (aHas !== bHas) return aHas ? -1 : 1;
-      if (aHas && a.pubMs !== b.pubMs) return a.pubMs - b.pubMs;
-      return compareText(a.workKey, b.workKey);
-    });
-    const chosen = sorted.find((o) => o.fromWorksJson && o.title) || sorted[0];
-    syntheticTitleByKey.set(ck, (chosen && chosen.title) || "(无标题)");
-  }
-
-  // 2. 遍历 worksDaily 中出现但 works.json 缺失的作品 ID，作为未关联观测保留
+  // 2. 遍历 worksDaily 中出现但 works.json 缺失的作品 ID，纳入手工覆盖范围
   if (dailyByGp) {
     for (const [gpKey, accWorksDaily] of Object.entries(dailyByGp)) {
       if (!isPlainObject(accWorksDaily)) continue;
@@ -1520,8 +2278,13 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, o
 
         const snap = resolveWorkSnapshotAsOf(workId, accWorksDaily, cutoffDate);
         if (!snap) continue;
+        const linkEntry = resolvedLink.get(workKey);
+        const linkedKey = linkEntry ? toSafeString(linkEntry.contentKey) || null : null;
+        const matchedBy = linkEntry ? linkEntry.matchedBy || null : null;
+        const hasOverride = overrideMap.has(workKey);
+
         const pwKey = `${platform}|${workId}`;
-        pushToMap(obsByPw, pwKey, {
+        const obs = {
           workKey,
           group,
           platform,
@@ -1530,18 +2293,41 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, o
           url: "",
           pubMs: null,
           pubDate: "",
-          linkedKey: null,
-          matchedBy: null,
+          linkedKey,
+          matchedBy,
           score: null,
-          hasOverride: false,
+          hasOverride,
           snap,
           fromWorksJson: false,
-        });
+        };
+        pushToMap(obsByPw, pwKey, obs);
+        if (linkedKey && !contentByKey.has(linkedKey)) {
+          pushToMap(syntheticObsByContentKey, linkedKey, obs);
+        }
       }
     }
   }
 
-  // 3. 按 platform|workId 跨组去重：同一作品只取一份 ≤date 最近快照，归入按分组名排序的首个分组
+  // 为 auto:* / manual:* 合成桶确定性地选取标题：优先持久化 contents 表标题，其次簇内最早发布作品标题
+  const syntheticTitleByKey = new Map();
+  for (const [ck, list] of syntheticObsByContentKey.entries()) {
+    const persisted = overrideContents.get(ck);
+    if (persisted && persisted.title) {
+      syntheticTitleByKey.set(ck, persisted.title);
+      continue;
+    }
+    const sorted = [...list].sort((a, b) => {
+      const aHas = a.pubMs !== null;
+      const bHas = b.pubMs !== null;
+      if (aHas !== bHas) return aHas ? -1 : 1;
+      if (aHas && a.pubMs !== b.pubMs) return a.pubMs - b.pubMs;
+      return compareText(a.workKey, b.workKey);
+    });
+    const chosen = sorted.find((o) => o.fromWorksJson && o.title) || sorted[0];
+    syntheticTitleByKey.set(ck, (chosen && chosen.title) || "(无标题)");
+  }
+
+  // 3. 按 platform|workId 跨组去重：关联裁决、既有归组列与操作用 workKey 分离
   for (const [pwKey, obsList] of obsByPw.entries()) {
     if (excludedFuturePwKeys.has(pwKey)) continue;
     obsList.sort((a, b) => compareText(a.group, b.group));
@@ -1549,46 +2335,75 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, o
     const { platform, workId } = obsList[0];
     const manualAssignObs = obsList.filter((o) => o.matchedBy === "manual" && o.linkedKey != null);
     const manualDetachObs = obsList.filter((o) => o.matchedBy === "manual-detach");
-    let linkedObs;
+    const overrideWorkKeys = obsList.filter((o) => o.hasOverride).map((o) => o.workKey);
+
+    let resolvedLinkedKey = null;
+    let resolvedMatchedBy = null;
+    let resolvedScore = null;
+    let actionObs = obsList[0];
+
     if (manualAssignObs.length > 0) {
-      // 手工指定优先于自动结果；若多组手工指定指向不同内容仍视为冲突
-      linkedObs =
-        new Set(manualAssignObs.map((o) => o.linkedKey)).size === 1 ? manualAssignObs : [];
+      if (new Set(manualAssignObs.map((o) => o.linkedKey)).size === 1) {
+        resolvedLinkedKey = manualAssignObs[0].linkedKey;
+        resolvedMatchedBy = "manual";
+        resolvedScore = null;
+        actionObs = manualAssignObs[0];
+      } else {
+        // 多组手工指定指向不同内容：冲突，按未关联处理
+        actionObs = manualAssignObs[0];
+      }
     } else if (manualDetachObs.length > 0) {
-      // 手工拆出优先于自动结果
-      linkedObs = [];
+      resolvedLinkedKey = null;
+      resolvedMatchedBy = "manual-detach";
+      actionObs = manualDetachObs[0];
     } else {
-      linkedObs = obsList.filter((o) => o.linkedKey != null);
-      // 同一平台作品在不同分组关联到不同内容：证据冲突无法裁决，整体作未关联行
-      if (new Set(linkedObs.map((o) => o.linkedKey)).size > 1) linkedObs = [];
+      const autoLinkedObs = obsList.filter((o) => o.linkedKey != null);
+      if (autoLinkedObs.length > 0 && new Set(autoLinkedObs.map((o) => o.linkedKey)).size === 1) {
+        resolvedLinkedKey = autoLinkedObs[0].linkedKey;
+        resolvedMatchedBy = autoLinkedObs[0].matchedBy;
+        resolvedScore = autoLinkedObs[0].score;
+        actionObs = autoLinkedObs[0];
+      }
     }
+
     const bestSnap = pickLatestSnapshot(obsList);
 
-    if (linkedObs.length > 0) {
-      const linkedKey = linkedObs[0].linkedKey;
-      const sameContentObs = linkedObs.filter((o) => o.linkedKey === linkedKey);
-      const primaryObs = sameContentObs[0];
-      const primaryGroup = primaryObs.group;
+    if (resolvedLinkedKey != null) {
+      // 既有归组列：在全部指向 resolvedLinkedKey 的观测（含自动与手工）中取按分组名排序的首组，
+      // 确保给 B 组手工指定同一键时不把原本归在 A 组的指标移到 B 组列
+      const sameContentObs = obsList.filter((o) => o.linkedKey === resolvedLinkedKey);
+      const primaryGroup = (sameContentObs[0] || actionObs).group;
       const bestTitle =
         (sameContentObs.find((o) => o.fromWorksJson && o.title) ||
           obsList.find((o) => o.fromWorksJson && o.title) ||
-          primaryObs).title || "(无标题)";
+          actionObs).title || "(无标题)";
       const bestUrl =
         (sameContentObs.find((o) => o.url) || obsList.find((o) => o.url) || {}).url || "";
       const bestPubMs = pickMinValidPubMs(sameContentObs) ?? pickMinValidPubMs(obsList);
 
-      const bucketId = `linked:${linkedKey}`;
+      const bucketId = `linked:${resolvedLinkedKey}`;
       let bucket = buckets.get(bucketId);
       if (!bucket) {
         if (!bestSnap) continue;
-        const meta = contentByKey.get(linkedKey);
+        const meta = contentByKey.get(resolvedLinkedKey);
+        const persisted = overrideContents.get(resolvedLinkedKey);
         const fallbackTitle =
-          syntheticTitleByKey.get(linkedKey) ||
+          (persisted && persisted.title) ||
+          syntheticTitleByKey.get(resolvedLinkedKey) ||
           (sameContentObs.find((o) => o.fromWorksJson && o.title) || {}).title ||
+          (sameContentObs[0] && sameContentObs[0].title) ||
           "";
         bucket = meta
-          ? makeBucket(linkedKey, toSafeString(meta.c.displayTitle), toSafeString(meta.c.file), meta.recordDate, null, false)
-          : makeBucket(linkedKey, fallbackTitle, "", "", null, false);
+          ? makeBucket(
+              resolvedLinkedKey,
+              toSafeString(meta.c.displayTitle),
+              toSafeString(meta.c.file),
+              meta.recordDate,
+              null,
+              false,
+              meta.canAssignTarget
+            )
+          : makeBucket(resolvedLinkedKey, fallbackTitle, "", "", null, false, true);
         buckets.set(bucketId, bucket);
       }
 
@@ -1601,24 +2416,25 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, o
         addWorkToBucket(
           bucket,
           {
-            workKey: primaryObs.workKey,
+            workKey: actionObs.workKey,
+            overrideWorkKeys,
             workId,
             group: primaryGroup,
             platform,
             title: bestTitle,
             url: bestUrl,
             publishDate: bestPubMs !== null ? toUtc8DateStr(bestPubMs) : "",
-            matchedBy: primaryObs.matchedBy,
-            score: primaryObs.score,
-            hasOverride: primaryObs.hasOverride,
+            matchedBy: resolvedMatchedBy,
+            score: resolvedScore,
+            hasOverride: overrideWorkKeys.length > 0,
             ...bestSnap.metrics,
           },
           bestSnap.metrics
         );
       }
     } else if (bestSnap) {
-      const primaryObs = manualDetachObs.length > 0 ? manualDetachObs[0] : obsList[0];
-      const primaryGroup = primaryObs.group;
+      // 未关联作品归组列始终取按分组名排序的首组（与改前一致）
+      const primaryGroup = obsList[0].group;
       const metaObs = obsList.find((o) => o.fromWorksJson);
       const bestTitle = metaObs
         ? (obsList.find((o) => o.fromWorksJson && o.title) || metaObs).title
@@ -1632,21 +2448,23 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, o
         "",
         "",
         bestPubMs,
-        true
+        true,
+        false
       );
       addWorkToBucket(
         bucket,
         {
-          workKey: primaryObs.workKey,
+          workKey: actionObs.workKey,
+          overrideWorkKeys,
           workId,
           group: primaryGroup,
           platform,
           title: bestTitle || "(无标题)",
           url: bestUrl,
           publishDate: bestPubMs !== null ? toUtc8DateStr(bestPubMs) : "",
-          matchedBy: primaryObs.matchedBy === "manual-detach" ? "manual-detach" : null,
+          matchedBy: resolvedMatchedBy === "manual-detach" ? "manual-detach" : null,
           score: null,
-          hasOverride: primaryObs.hasOverride,
+          hasOverride: overrideWorkKeys.length > 0,
           ...bestSnap.metrics,
         },
         bestSnap.metrics
@@ -1674,6 +2492,7 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, o
       firstPublishDateSource: hasWorkPub || b.isUnlinked ? "work" : "record",
       platformCount: b.platforms.size,
       isUnlinked: b.isUnlinked,
+      canAssignTarget: b.canAssignTarget,
       matchMethod: matchInfo.matchMethod,
       matchScore: matchInfo.matchScore,
       hasFuzzy: matchInfo.hasFuzzy,
@@ -1712,9 +2531,19 @@ module.exports = {
   FUZZY_MAX_DAY_DIFF,
   FUZZY_SUBSTRING_MIN_LEN,
   FUZZY_SUBSTRING_SCORE,
+  FUZZY_MIN_CORE_LEN,
+  FUZZY_PLACEHOLDER_TITLES,
   FUZZY_THRESHOLDS,
   normalizeTitle,
+  stripTopicsForFuzzy,
   extractCoreTitle,
+  isPlaceholderTitle,
+  extractSeriesMarkers,
+  hasConflictingSeries,
+  isValidAutoContentKey,
+  isValidManualContentKey,
+  isValidSyntheticContentKey,
+  isUnstableRecordKey,
   computeTitleSimilarity,
   buildTitleIndex,
   normalizeStatusTitle,

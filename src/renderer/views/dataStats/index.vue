@@ -535,6 +535,7 @@
             class="reassign-search"
           />
           <el-table
+            ref="reassignTable"
             :data="reassignTargetRows"
             size="mini"
             border
@@ -542,6 +543,7 @@
             max-height="320"
             row-key="contentKey"
             @current-change="onSelectReassignTarget"
+            @row-click="onClickReassignTarget"
           >
             <el-table-column prop="title" label="内容标题" min-width="220" show-overflow-tooltip />
             <el-table-column prop="firstPublishDate" label="首发日期" width="106">
@@ -615,6 +617,7 @@ import {
 } from "@/utils/statsScheduler";
 
 const DAY_MS = 86400000;
+const UNSTABLE_RECORD_KEY_RE = /^record:[^:]*:(?:.*:)?pos:\d+$/;
 const PLATFORM_ORDER = [
   "抖音",
   "视频号",
@@ -723,6 +726,9 @@ export default {
       const kw = String(this.reassignKeyword || "").trim().toLowerCase();
       return this.contentSummaryRows.filter((r) => {
         if (this.isRowUnlinked(r)) return false;
+        if (r.canAssignTarget === false || UNSTABLE_RECORD_KEY_RE.test(String(r.contentKey || ""))) {
+          return false;
+        }
         if (this.reassignCurrentKey && r.contentKey === this.reassignCurrentKey) {
           return false;
         }
@@ -745,6 +751,7 @@ export default {
     },
     reassignKeyword() {
       this.reassignTargetKey = "";
+      this.clearReassignTableCurrentRow();
     },
   },
   created() {
@@ -885,6 +892,9 @@ export default {
     },
     canConfirmRow(row) {
       if (!row || this.isRowUnlinked(row)) return false;
+      if (row.canAssignTarget === false || UNSTABLE_RECORD_KEY_RE.test(String(row.contentKey || ""))) {
+        return false;
+      }
       return row.matchMethod === "fuzzy" || Boolean(row.hasFuzzy);
     },
     perPlatformList(row) {
@@ -943,6 +953,15 @@ export default {
     onUnlinkedSelectionChange(selection) {
       this.selectedUnlinkedWorks = Array.isArray(selection) ? selection : [];
     },
+    clearReassignTableCurrentRow() {
+      if (
+        this.$refs &&
+        this.$refs.reassignTable &&
+        typeof this.$refs.reassignTable.setCurrentRow === "function"
+      ) {
+        this.$refs.reassignTable.setCurrentRow();
+      }
+    },
     openReassignDialog(workItem, currentContentKey) {
       if (!workItem || !workItem.workKey) return;
       this.reassignSource = {
@@ -954,16 +973,32 @@ export default {
       this.reassignCurrentKey = currentContentKey || null;
       this.reassignKeyword = "";
       this.reassignTargetKey = "";
+      this.clearReassignTableCurrentRow();
       this.reassignVisible = true;
+      if (typeof this.$nextTick === "function") {
+        this.$nextTick(() => this.clearReassignTableCurrentRow());
+      }
     },
     onSelectReassignTarget(row) {
       this.reassignTargetKey = row && row.contentKey ? row.contentKey : "";
+    },
+    onClickReassignTarget(row) {
+      this.reassignTargetKey = row && row.contentKey ? row.contentKey : "";
+      if (
+        row &&
+        this.$refs &&
+        this.$refs.reassignTable &&
+        typeof this.$refs.reassignTable.setCurrentRow === "function"
+      ) {
+        this.$refs.reassignTable.setCurrentRow(row);
+      }
     },
     resetReassignDialog() {
       this.reassignSource = null;
       this.reassignCurrentKey = null;
       this.reassignKeyword = "";
       this.reassignTargetKey = "";
+      this.clearReassignTableCurrentRow();
     },
     async submitReassign() {
       if (this.mutatingLink || !this.reassignSource || !this.reassignTargetKey) return;
@@ -1009,11 +1044,20 @@ export default {
     },
     async clearWorkOverride(workItem) {
       if (this.mutatingLink || !workItem || !workItem.workKey) return;
+      const keys =
+        Array.isArray(workItem.overrideWorkKeys) && workItem.overrideWorkKeys.length > 0
+          ? workItem.overrideWorkKeys
+          : [workItem.workKey];
       this.mutatingLink = true;
       try {
-        const res = await ipcRenderer.invoke("stats:clear-link-override", {
-          workKey: workItem.workKey,
-        });
+        const res =
+          keys.length > 1
+            ? await ipcRenderer.invoke("stats:apply-link-overrides", {
+                ops: keys.map((workKey) => ({ action: "clear", workKey })),
+              })
+            : await ipcRenderer.invoke("stats:clear-link-override", {
+                workKey: keys[0],
+              });
         if (!res || !res.ok) {
           this.$message.error((res && res.error) || "恢复自动关联失败");
           return;
@@ -1058,19 +1102,18 @@ export default {
         return w.matchedBy === "fuzzy";
       });
       if (!targets.length) return;
+      const ops = targets.map((w) => ({
+        action: "assign",
+        workKey: w.workKey,
+        contentKey: row.contentKey,
+      }));
       this.mutatingLink = true;
       try {
-        for (const w of targets) {
-          const res = await ipcRenderer.invoke("stats:set-link-override", {
-            workKey: w.workKey,
-            action: "assign",
-            contentKey: row.contentKey,
-          });
-          if (!res || !res.ok) {
-            this.$message.error((res && res.error) || "确认关联失败");
-            await this.loadContentSummary();
-            return;
-          }
+        const res = await ipcRenderer.invoke("stats:apply-link-overrides", { ops });
+        if (!res || !res.ok) {
+          this.$message.error((res && res.error) || "确认关联失败");
+          await this.loadContentSummary();
+          return;
         }
         this.$message.success("已确认为手动关联");
         await this.loadContentSummary();
@@ -1092,7 +1135,9 @@ export default {
       }
       this.mutatingLink = true;
       try {
-        const res = await ipcRenderer.invoke("stats:merge-works", { workKeys });
+        const res = await ipcRenderer.invoke("stats:apply-link-overrides", {
+          ops: [{ action: "merge", workKeys }],
+        });
         if (!res || !res.ok) {
           this.$message.error((res && res.error) || "合并作品失败");
           return;

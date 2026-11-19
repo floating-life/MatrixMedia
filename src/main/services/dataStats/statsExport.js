@@ -13,11 +13,14 @@
 const fs = require("fs");
 const path = require("path");
 const xlsx = require("xlsx");
-const { WORK_STAT_KEYS, normalizeMetric, buildWorkDailyRows } = require("./statsTable");
+const { WORK_STAT_KEYS, DELETED_WORK_TITLE, normalizeMetric, buildWorkDailyRows } = require("./statsTable");
 const {
   buildContentIndex,
   linkWorks,
   buildContentSummaryRows,
+  isValidAutoContentKey,
+  isUnstableRecordKey,
+  makeWorkKey,
 } = require("./contentLink");
 
 const UTC8_MS = 8 * 3600e3;
@@ -247,17 +250,8 @@ function resolveIoDeps(options = {}, depsArg) {
       ? options.deps
       : {};
 
-  let defaultStore = null;
-  const getStore = () => {
-    if (!defaultStore) defaultStore = require("./store");
-    return defaultStore;
-  };
-
-  let defaultPushRecords = null;
-  const getPushRecords = () => {
-    if (!defaultPushRecords) defaultPushRecords = require("./pushRecords");
-    return defaultPushRecords;
-  };
+  const getStore = () => require("./store");
+  const getPushRecords = () => require("./pushRecords");
 
   const storeApi = isPlainObject(injected.store) ? injected.store : null;
   const hasInjectedDataSource = Boolean(
@@ -266,7 +260,12 @@ function resolveIoDeps(options = {}, depsArg) {
       typeof injected.readWorks === "function" ||
       typeof injected.readWorksDaily === "function"
   );
-  const emptyOverrides = () => ({ version: 1, updatedAt: 0, overrides: Object.create(null) });
+  const emptyOverrides = () => ({
+    version: 1,
+    updatedAt: 0,
+    contents: Object.create(null),
+    overrides: Object.create(null),
+  });
 
   return {
     listAccounts:
@@ -300,21 +299,20 @@ function resolveIoDeps(options = {}, depsArg) {
             getPushRecords().readPushRecords(
               options.pushDataDir ? { dir: options.pushDataDir } : undefined
             ),
-    readLinkOverrides:
-      typeof injected.readLinkOverrides === "function"
-        ? injected.readLinkOverrides
-        : storeApi && typeof storeApi.readLinkOverrides === "function"
-        ? () => storeApi.readLinkOverrides()
-        : isPlainObject(options.linkOverrides)
-        ? () => options.linkOverrides
-        : hasInjectedDataSource
-        ? emptyOverrides
-        : () => {
-            const s = getStore();
-            return typeof s.readLinkOverrides === "function"
-              ? s.readLinkOverrides()
-              : emptyOverrides();
-          },
+    readLinkOverrides: isPlainObject(options.linkOverrides)
+      ? () => options.linkOverrides
+      : typeof injected.readLinkOverrides === "function"
+      ? injected.readLinkOverrides
+      : storeApi && typeof storeApi.readLinkOverrides === "function"
+      ? () => storeApi.readLinkOverrides()
+      : hasInjectedDataSource
+      ? emptyOverrides
+      : () => {
+          const s = getStore();
+          return typeof s.readLinkOverrides === "function"
+            ? s.readLinkOverrides()
+            : emptyOverrides();
+        },
     now: injected.now !== undefined ? injected.now : options.now,
     appVersion:
       injected.appVersion !== undefined ? injected.appVersion : options.appVersion,
@@ -549,6 +547,89 @@ function reduceWorksDailyAsOf(rawWorksDaily, cutoffDate) {
   return { worksDaily, latestDate };
 }
 
+/**
+ * GUI 与 Excel 共享的默认截止日解析函数：
+ * 优先以作品快照（worksDaily）中的最新有效日期为准；
+ * 仅当所有账号均无作品快照时，才回退取账号日快照（daily）中的最新有效日期。
+ */
+function resolveDefaultCutoffDate(accountsData, getFallbackDaily) {
+  let latestWorksDate = "";
+  for (const acc of Array.isArray(accountsData) ? accountsData : []) {
+    if (!isPlainObject(acc) || !isPlainObject(acc.worksDaily)) continue;
+    for (const dateMap of Object.values(acc.worksDaily)) {
+      if (!isPlainObject(dateMap)) continue;
+      for (const [d, snap] of Object.entries(dateMap)) {
+        if (!isPlainObject(snap) || !isValidDateStr(d)) continue;
+        if (!latestWorksDate || d > latestWorksDate) latestWorksDate = d;
+      }
+    }
+  }
+  if (latestWorksDate) return latestWorksDate;
+
+  let latestDailyDate = "";
+  for (const acc of Array.isArray(accountsData) ? accountsData : []) {
+    if (!isPlainObject(acc)) continue;
+    let daily = isPlainObject(acc.daily) && Object.keys(acc.daily).length > 0 ? acc.daily : null;
+    if (!daily && typeof getFallbackDaily === "function") {
+      const loaded = getFallbackDaily(acc.group, acc.platform);
+      if (isPlainObject(loaded)) daily = loaded;
+    }
+    if (!daily) continue;
+    for (const [d, snap] of Object.entries(daily)) {
+      if (!isPlainObject(snap) || !isValidDateStr(d)) continue;
+      if (!latestDailyDate || d > latestDailyDate) latestDailyDate = d;
+    }
+  }
+  return latestDailyDate;
+}
+
+/**
+ * 在全量分组发布记录上解析完手工引用后，按输出分组集合裁剪跨平台汇总行：
+ * 保留全部未关联作品行、本组有作品关联到的内容行（含跨组手工引用目标）以及本组自有发布记录行，
+ * 裁掉纯属其他分组且未被本组任何作品引用的空内容行。
+ */
+function filterSummaryRowsByGroupScope(summaryRows, allContents, link, groupSet, cutoffDate) {
+  if (!groupSet || groupSet.size === 0) return summaryRows;
+
+  const ownContentKeys = new Set();
+  for (const c of Array.isArray(allContents) ? allContents : []) {
+    if (!isPlainObject(c) || !c.contentKey) continue;
+    const rawContentDate = typeof c.firstPublishDate === "string" ? c.firstPublishDate.trim() : "";
+    const contentDate = isValidDateStr(rawContentDate) ? rawContentDate : "";
+    const targets = Array.isArray(c.targets) ? c.targets.filter(isPlainObject) : [];
+    for (const t of targets) {
+      const rawTDate = typeof t.recordDate === "string" ? t.recordDate.trim() : "";
+      const tDate = isValidDateStr(rawTDate)
+        ? rawTDate
+        : rawTimestampToUtc8Date(t.lastPublishAt) || contentDate;
+      if (cutoffDate && tDate && tDate > cutoffDate) continue;
+      const g = typeof t.group === "string" ? t.group.trim() : "";
+      if (groupSet.has(g)) {
+        ownContentKeys.add(c.contentKey);
+        break;
+      }
+    }
+  }
+
+  const referencedKeys = new Set();
+  if (link instanceof Map) {
+    for (const entry of link.values()) {
+      if (entry && entry.contentKey) {
+        referencedKeys.add(entry.contentKey);
+      }
+    }
+  }
+
+  return summaryRows.filter((row) => {
+    if (!isPlainObject(row)) return false;
+    if (row.isUnlinked) return true;
+    if (isPlainObject(row.perPlatform) && Object.keys(row.perPlatform).length > 0) return true;
+    if (ownContentKeys.has(row.contentKey)) return true;
+    if (referencedKeys.has(row.contentKey)) return true;
+    return false;
+  });
+}
+
 function loadRawDataset(options = {}, depsArg) {
   const io = resolveIoDeps(options, depsArg);
   const groupSet =
@@ -588,19 +669,18 @@ function loadRawDataset(options = {}, depsArg) {
     return compareText(a.group, b.group);
   });
 
-  const rawPushRecords = io.readPushRecords() || [];
-  const filteredPushRecords = groupSet
-    ? rawPushRecords.filter((rec) => groupSet.has(resolveRecordGroup(rec)))
-    : rawPushRecords;
-
-  const latestDataDate = findLatestDataDate(accountsData);
+  // 保留全量发布记录用于解析跨组手工引用，输出阶段再按 groupSet 裁剪
+  const allPushRecords = io.readPushRecords() || [];
+  const latestDataDate = resolveDefaultCutoffDate(accountsData);
   const linkOverrides = io.readLinkOverrides();
 
   return {
     io,
+    groupSet,
     accountsData,
     worksDailyByGp,
-    pushRecords: filteredPushRecords,
+    allPushRecords,
+    pushRecords: allPushRecords,
     linkOverrides,
     latestDataDate,
   };
@@ -621,7 +701,6 @@ function loadSummaryDataset(options = {}, depsArg, explicitCutoffDate = "") {
   const rawAccounts = io.listAccounts() || [];
   const accountsData = [];
   const worksDailyByGp = Object.create(null);
-  let latestWorksDate = "";
   const useFastFs = canUseCutoffFsReader(options, depsArg);
 
   for (const acc of rawAccounts) {
@@ -642,10 +721,6 @@ function loadSummaryDataset(options = {}, depsArg, explicitCutoffDate = "") {
       ? readWorksDailyLatestAsOfFs(group, platform, explicitCutoffDate)
       : reduceWorksDailyAsOf(io.readWorksDaily(group, platform), explicitCutoffDate);
 
-    if (res.latestDate && (!latestWorksDate || res.latestDate > latestWorksDate)) {
-      latestWorksDate = res.latestDate;
-    }
-
     accountsData.push({ group, platform, works, worksDaily: res.worksDaily, daily: {} });
     worksDailyByGp[`${group}|${platform}`] = res.worksDaily;
   }
@@ -656,51 +731,23 @@ function loadSummaryDataset(options = {}, depsArg, explicitCutoffDate = "") {
     return compareText(a.group, b.group);
   });
 
-  const rawPushRecords = io.readPushRecords() || [];
-  const filteredPushRecords = groupSet
-    ? rawPushRecords.filter((rec) => groupSet.has(resolveRecordGroup(rec)))
-    : rawPushRecords;
-
-  let latestDataDate = latestWorksDate;
-  if (!explicitCutoffDate && !latestDataDate) {
-    for (const acc of accountsData) {
-      const rawDaily = io.readDaily(acc.group, acc.platform);
-      if (!isPlainObject(rawDaily)) continue;
-      for (const [d, snap] of Object.entries(rawDaily)) {
-        if (!isPlainObject(snap) || !isValidDateStr(d)) continue;
-        if (!latestDataDate || d > latestDataDate) latestDataDate = d;
-      }
-    }
-  }
-
+  // 保留全量发布记录用于解析跨组手工引用，输出阶段再按 groupSet 裁剪
+  const allPushRecords = io.readPushRecords() || [];
+  const latestDataDate = explicitCutoffDate
+    ? ""
+    : resolveDefaultCutoffDate(accountsData, (g, p) => io.readDaily(g, p));
   const linkOverrides = io.readLinkOverrides();
 
   return {
     io,
+    groupSet,
     accountsData,
     worksDailyByGp,
-    pushRecords: filteredPushRecords,
+    allPushRecords,
+    pushRecords: allPushRecords,
     linkOverrides,
     latestDataDate,
   };
-}
-
-function findLatestDataDate(accountsData) {
-  let latest = "";
-  for (const acc of accountsData) {
-    for (const dateMap of Object.values(acc.worksDaily)) {
-      if (!isPlainObject(dateMap)) continue;
-      for (const [d, snap] of Object.entries(dateMap)) {
-        if (!isPlainObject(snap) || !isValidDateStr(d)) continue;
-        if (!latest || d > latest) latest = d;
-      }
-    }
-    for (const [d, snap] of Object.entries(acc.daily)) {
-      if (!isPlainObject(snap) || !isValidDateStr(d)) continue;
-      if (!latest || d > latest) latest = d;
-    }
-  }
-  return latest;
 }
 
 /**
@@ -815,21 +862,39 @@ function buildDefaultExportFileName(from, to, now = Date.now()) {
 /**
  * 构建跨平台内容汇总数据（供 GUI「作品汇总」tab / IPC stats:get-content-summary 复用）。
  * - 仅读取截止日所需快照（不读全量历史，不排序作品日明细）
- * - 先解析统一 cutoffDate（参数 date，缺省=最新快照日），同一个 cutoff 用于关联、汇总、计数和页面回执
+ * - 先解析统一 cutoffDate（共享 resolveDefaultCutoffDate：以作品快照最新日为准），
+ *   同一个 cutoff 用于关联、汇总、计数和页面回执，单次匹配复用
  */
 function buildContentSummaryData(options = {}, depsArg) {
   const opts = isPlainObject(options) ? options : {};
   const dateStr = validateOptionalDate(opts.date, "date");
   const dataset = loadSummaryDataset(opts, depsArg, dateStr);
   const cutoffDate = dateStr || dataset.latestDataDate || "";
-  const contents = buildContentIndex(dataset.pushRecords);
-  const rows = buildContentSummaryRows({
+  const contents = buildContentIndex(dataset.allPushRecords);
+  const link = linkWorks({
     contents,
     accounts: dataset.accountsData,
     worksDaily: dataset.worksDailyByGp,
     date: cutoffDate || undefined,
     overrides: dataset.linkOverrides,
   });
+  let rows = buildContentSummaryRows({
+    contents,
+    accounts: dataset.accountsData,
+    link,
+    worksDaily: dataset.worksDailyByGp,
+    date: cutoffDate || undefined,
+    overrides: dataset.linkOverrides,
+  });
+  if (dataset.groupSet) {
+    rows = filterSummaryRowsByGroupScope(
+      rows,
+      contents,
+      link,
+      dataset.groupSet,
+      cutoffDate
+    );
+  }
   const workCounts = computeWorkCountsFromSummaryRows(rows);
 
   return {
@@ -841,6 +906,224 @@ function buildContentSummaryData(options = {}, depsArg) {
       contents: rows.length,
       unlinkedWorks: workCounts.unlinkedWorks,
     },
+  };
+}
+
+function parseRawTimestampMs(raw) {
+  if (raw == null || raw === "") return null;
+  let ms = NaN;
+  if (typeof raw === "number") ms = raw;
+  else if (raw instanceof Date) ms = raw.getTime();
+  else if (typeof raw === "string") {
+    const s = raw.trim();
+    if (!s) return null;
+    ms = /^\d+$/.test(s) ? Number(s) : Date.parse(s);
+  }
+  if (!Number.isFinite(ms)) return null;
+  const shifted = new Date(ms + UTC8_MS);
+  if (!Number.isFinite(shifted.getTime())) return null;
+  const y = shifted.getUTCFullYear();
+  return y >= 2000 && y <= 2100 ? ms : null;
+}
+
+/**
+ * 构建手工矫正写入校验上下文（供 dataStats/index.js 串行写入队列使用）：
+ * - 基于全量分组与当前 overrides 单次运行匹配与汇总
+ * - 输出可分配的 file:/record: 目标集合、不稳定位置键集合、当前自动 auto: 簇表、
+ *   现存作品信息（含仅存在于 works-daily 的作品）以及各 platform|workId 的当前关联状态。
+ */
+function resolveLinkValidationContext(options = {}, depsArg) {
+  const opts = isPlainObject(options) ? { ...options, groups: undefined } : {};
+  const dateStr = validateOptionalDate(opts.date, "date");
+  const dataset = loadSummaryDataset(opts, depsArg, dateStr);
+  const cutoffDate = dateStr || dataset.latestDataDate || "";
+  const contents = buildContentIndex(dataset.allPushRecords);
+  const link = linkWorks({
+    contents,
+    accounts: dataset.accountsData,
+    worksDaily: dataset.worksDailyByGp,
+    date: cutoffDate || undefined,
+    overrides: dataset.linkOverrides,
+  });
+  const rows = buildContentSummaryRows({
+    contents,
+    accounts: dataset.accountsData,
+    link,
+    worksDaily: dataset.worksDailyByGp,
+    date: cutoffDate || undefined,
+    overrides: dataset.linkOverrides,
+  });
+
+  const eligibleAssignableKeys = new Set();
+  const unstableRecordKeys = new Set();
+  for (const c of contents) {
+    if (!isPlainObject(c) || !c.contentKey) continue;
+    const rawContentDate = typeof c.firstPublishDate === "string" ? c.firstPublishDate.trim() : "";
+    const contentDate = isValidDateStr(rawContentDate) ? rawContentDate : "";
+    const rawTargets = Array.isArray(c.targets) ? c.targets.filter(isPlainObject) : [];
+    const hasTargets = rawTargets.length > 0;
+    let eligibleTargets = 0;
+    for (const t of rawTargets) {
+      const rawTDate = typeof t.recordDate === "string" ? t.recordDate.trim() : "";
+      const tDate = isValidDateStr(rawTDate)
+        ? rawTDate
+        : rawTimestampToUtc8Date(t.lastPublishAt) || contentDate;
+      if (cutoffDate && tDate && tDate > cutoffDate) continue;
+      eligibleTargets++;
+    }
+    const eligible = hasTargets
+      ? eligibleTargets > 0
+      : !cutoffDate || !contentDate || contentDate <= cutoffDate;
+    if (!eligible) continue;
+    if (c.assignable === false || isUnstableRecordKey(c.contentKey)) {
+      unstableRecordKeys.add(c.contentKey);
+    } else {
+      eligibleAssignableKeys.add(c.contentKey);
+    }
+  }
+
+  const autoClusters = new Map();
+  for (const row of rows) {
+    if (row && !row.isUnlinked && isValidAutoContentKey(row.contentKey)) {
+      autoClusters.set(row.contentKey, { title: row.title || "(无标题)" });
+    }
+  }
+
+  const workInfoByKey = new Map();
+  const obsByPw = new Map();
+  const seenWorkKeys = new Set();
+  const gpInfoByKey = new Map();
+  const autoObsByKey = new Map();
+
+  for (const acc of dataset.accountsData) {
+    const group = acc.group;
+    const platform = acc.platform;
+    const gpKey = `${group}|${platform}`;
+    if (!gpInfoByKey.has(gpKey)) gpInfoByKey.set(gpKey, { group, platform });
+    for (const w of Array.isArray(acc.works) ? acc.works : []) {
+      if (!isPlainObject(w)) continue;
+      const workId = w.workId == null ? "" : String(w.workId);
+      if (!workId) continue;
+      const workKey = makeWorkKey(group, platform, workId);
+      if (seenWorkKeys.has(workKey)) continue;
+      seenWorkKeys.add(workKey);
+
+      const pubMs = parseRawTimestampMs(w.publishTime);
+      const pubDate = pubMs !== null ? formatUtc8Date(pubMs) : "";
+      if (cutoffDate && pubDate && pubDate > cutoffDate) continue;
+
+      const pwKey = `${platform}|${workId}`;
+      const entry = link.get(workKey) || null;
+      const linkedKey = entry && entry.contentKey ? entry.contentKey : null;
+      const matchedBy = entry && entry.matchedBy ? entry.matchedBy : null;
+      const title = typeof w.title === "string" ? w.title : "";
+      const info = {
+        workKey,
+        pwKey,
+        group,
+        platform,
+        workId,
+        title: title || "(无标题)",
+        rawTitle: title,
+        pubMs,
+        linkedKey,
+        matchedBy,
+        fromWorksJson: true,
+      };
+      workInfoByKey.set(workKey, info);
+      if (!obsByPw.has(pwKey)) obsByPw.set(pwKey, []);
+      obsByPw.get(pwKey).push(info);
+      if (linkedKey && isValidAutoContentKey(linkedKey) && !autoClusters.has(linkedKey)) {
+        if (!autoObsByKey.has(linkedKey)) autoObsByKey.set(linkedKey, []);
+        autoObsByKey.get(linkedKey).push(info);
+      }
+    }
+  }
+
+  // 补齐仅存在于 works-daily 的作品（works.json 中已删除/缺失）
+  for (const [gpKey, accWorksDaily] of Object.entries(dataset.worksDailyByGp)) {
+    if (!isPlainObject(accWorksDaily)) continue;
+    let gpInfo = gpInfoByKey.get(gpKey);
+    if (!gpInfo) {
+      const sep = gpKey.lastIndexOf("|");
+      if (sep === -1) continue;
+      gpInfo = { group: gpKey.slice(0, sep), platform: gpKey.slice(sep + 1) };
+    }
+    const { group, platform } = gpInfo;
+    for (const workId of Object.keys(accWorksDaily)) {
+      if (!workId) continue;
+      const workKey = makeWorkKey(group, platform, workId);
+      if (seenWorkKeys.has(workKey)) continue;
+      const dateMap = accWorksDaily[workId];
+      if (!isPlainObject(dateMap)) continue;
+      let hasSnap = false;
+      for (const [d, snap] of Object.entries(dateMap)) {
+        if (!isPlainObject(snap) || !isValidDateStr(d)) continue;
+        if (cutoffDate && d > cutoffDate) continue;
+        hasSnap = true;
+        break;
+      }
+      if (!hasSnap) continue;
+      seenWorkKeys.add(workKey);
+
+      const pwKey = `${platform}|${workId}`;
+      const entry = link.get(workKey) || null;
+      const linkedKey = entry && entry.contentKey ? entry.contentKey : null;
+      const matchedBy = entry && entry.matchedBy ? entry.matchedBy : null;
+      const info = {
+        workKey,
+        pwKey,
+        group,
+        platform,
+        workId,
+        title: DELETED_WORK_TITLE,
+        rawTitle: "",
+        pubMs: null,
+        linkedKey,
+        matchedBy,
+        fromWorksJson: false,
+      };
+      workInfoByKey.set(workKey, info);
+      if (!obsByPw.has(pwKey)) obsByPw.set(pwKey, []);
+      obsByPw.get(pwKey).push(info);
+    }
+  }
+
+  for (const [ck, list] of autoObsByKey.entries()) {
+    const sorted = [...list].sort((a, b) => {
+      const aHas = a.pubMs !== null;
+      const bHas = b.pubMs !== null;
+      if (aHas !== bHas) return aHas ? -1 : 1;
+      if (aHas && a.pubMs !== b.pubMs) return a.pubMs - b.pubMs;
+      return compareText(a.workKey, b.workKey);
+    });
+    const chosen = sorted.find((o) => o.fromWorksJson && o.rawTitle) || sorted[0];
+    autoClusters.set(ck, { title: (chosen && chosen.title) || "(无标题)" });
+  }
+
+  const pwLinkedKey = new Map();
+  for (const [pwKey, list] of obsByPw.entries()) {
+    const manualAssign = list.filter((o) => o.matchedBy === "manual" && o.linkedKey != null);
+    const manualDetach = list.filter((o) => o.matchedBy === "manual-detach");
+    if (manualAssign.length > 0) {
+      const uniq = new Set(manualAssign.map((o) => o.linkedKey));
+      pwLinkedKey.set(pwKey, uniq.size === 1 ? manualAssign[0].linkedKey : null);
+    } else if (manualDetach.length > 0) {
+      pwLinkedKey.set(pwKey, null);
+    } else {
+      const autoLinked = list.filter((o) => o.linkedKey != null);
+      const uniq = new Set(autoLinked.map((o) => o.linkedKey));
+      pwLinkedKey.set(pwKey, uniq.size === 1 ? autoLinked[0].linkedKey : null);
+    }
+  }
+
+  return {
+    cutoffDate,
+    eligibleAssignableKeys,
+    unstableRecordKeys,
+    autoClusters,
+    workInfoByKey,
+    pwLinkedKey,
   };
 }
 
@@ -1194,7 +1477,7 @@ function buildSchemaSheet(dynamicSchemaEntries) {
       "作品日明细",
       "关联方式",
       "matchedBy",
-      "跨平台关联依据：link（直链严格 1:1 匹配）、title（同组同平台唯一标题匹配）、fuzzy（标题模糊+时间窗口自动匹配或无发布记录跨平台聚类）、manual（手工指定/合并/确认）；未关联为空。注意：模糊匹配可能合错，已手工确认的标 manual。",
+      "跨平台关联依据：link（直链严格 1:1 匹配）、title（同组同平台唯一标题匹配）、fuzzy（标题模糊+时间窗自动匹配或无发布记录跨平台聚类；时间窗统一按 UTC+8 日历日相差 ≤2 天，缺时间时相似度门槛 +0.1）、manual（手工指定/合并/确认）；未关联为空。注意：模糊匹配可能合错，已手工确认的标 manual。",
     ],
     [
       "作品日明细",
@@ -1601,20 +1884,32 @@ function buildStatsWorkbookData(options = {}, deps) {
     throw createRowLimitError(estAccountDailyRows, maxRows, "账号日快照");
   }
 
-  const contents = buildContentIndex(dataset.pushRecords);
+  // 先在全量发布记录上解析手工引用，且单次匹配同时供作品日明细与跨平台汇总复用
+  const allContents = buildContentIndex(dataset.allPushRecords);
   const link = linkWorks({
-    contents,
-    accounts: dataset.accountsData,
-    date: resolvedTo,
-    overrides: dataset.linkOverrides,
-  });
-  const summaryRows = buildContentSummaryRows({
-    contents,
+    contents: allContents,
     accounts: dataset.accountsData,
     worksDaily: dataset.worksDailyByGp,
     date: resolvedTo,
     overrides: dataset.linkOverrides,
   });
+  let summaryRows = buildContentSummaryRows({
+    contents: allContents,
+    accounts: dataset.accountsData,
+    link,
+    worksDaily: dataset.worksDailyByGp,
+    date: resolvedTo,
+    overrides: dataset.linkOverrides,
+  });
+  if (dataset.groupSet) {
+    summaryRows = filterSummaryRowsByGroupScope(
+      summaryRows,
+      allContents,
+      link,
+      dataset.groupSet,
+      resolvedTo
+    );
+  }
   if (summaryRows.length > maxRows) {
     throw createRowLimitError(summaryRows.length, maxRows, "作品跨平台汇总");
   }
@@ -1772,6 +2067,8 @@ module.exports = {
   sanitizeNumberCell,
   validateExportDateRange,
   buildDefaultExportFileName,
+  resolveDefaultCutoffDate,
+  resolveLinkValidationContext,
   countWorkDailyRows,
   computeWorkCountsFromSummaryRows,
   buildContentSummaryData,

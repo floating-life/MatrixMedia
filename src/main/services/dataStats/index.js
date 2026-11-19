@@ -12,21 +12,30 @@
  * - stats:set-link-override    设置单条作品手工关联（assign / detach）
  * - stats:merge-works          合并多条未关联作品为同一 manual 内容
  * - stats:clear-link-override  清除单条作品手工矫正，恢复自动匹配
+ * - stats:apply-link-overrides 批量原子应用多条手工矫正操作（assign / detach / clear / merge），一次写盘
  * - stats:export-xlsx          导出统计 Excel 工作簿（含本地页面校验与保存对话框）
  * - stats:match-works          发布状态匹配（与采集共享 collecting 互斥锁）
  *
  * 采集全程使用平台页面上下文 fetch（复用分组 partition 登录态），不做任何签名构造。
  */
 
+const crypto = require("crypto");
 const path = require("path");
 const electron = require("electron");
 const { ipcMain } = electron;
 const { collectAccount } = require("./collector");
 const store = require("./store");
-const { normalizeStatusTitle, buildTitleIndex } = require("./contentLink");
+const {
+  normalizeStatusTitle,
+  buildTitleIndex,
+  isValidAutoContentKey,
+  isValidManualContentKey,
+  isUnstableRecordKey,
+} = require("./contentLink");
 const {
   validateExportDateRange,
   buildDefaultExportFileName,
+  resolveLinkValidationContext,
   buildContentSummaryData,
   buildStatsWorkbookData,
   writeStatsXlsx,
@@ -66,6 +75,172 @@ function toPlainOverrides(raw) {
     }
   }
   return out;
+}
+
+function cloneNoProtoMap(raw) {
+  const out = Object.create(null);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const key of Object.keys(raw)) {
+    const desc = Object.getOwnPropertyDescriptor(raw, key);
+    if (desc && desc.value && typeof desc.value === "object" && !Array.isArray(desc.value)) {
+      out[key] = { ...desc.value };
+    }
+  }
+  return out;
+}
+
+function normalizeOverrideOps(rawOps) {
+  if (!Array.isArray(rawOps) || rawOps.length === 0) {
+    throw new Error("ops 必须为非空数组");
+  }
+  const normalized = [];
+  for (let i = 0; i < rawOps.length; i++) {
+    const op = rawOps[i];
+    if (!op || typeof op !== "object" || Array.isArray(op)) {
+      throw new Error(`第 ${i + 1} 条操作参数无效`);
+    }
+    const kind =
+      typeof op.action === "string"
+        ? op.action.trim()
+        : typeof op.type === "string"
+        ? op.type.trim()
+        : "";
+    if (kind === "assign") {
+      const workKey = typeof op.workKey === "string" ? op.workKey : "";
+      const contentKey = typeof op.contentKey === "string" ? op.contentKey.trim() : "";
+      if (!workKey) throw new Error("workKey 不能为空");
+      if (!contentKey || contentKey.startsWith("unlinked:")) {
+        throw new Error("assign 操作需提供有效的 contentKey");
+      }
+      normalized.push({ action: "assign", workKey, contentKey });
+    } else if (kind === "detach") {
+      const workKey = typeof op.workKey === "string" ? op.workKey : "";
+      if (!workKey) throw new Error("workKey 不能为空");
+      normalized.push({ action: "detach", workKey });
+    } else if (kind === "clear") {
+      const workKey = typeof op.workKey === "string" ? op.workKey : "";
+      if (!workKey) throw new Error("workKey 不能为空");
+      normalized.push({ action: "clear", workKey });
+    } else if (kind === "merge") {
+      if (!Array.isArray(op.workKeys)) {
+        throw new Error("workKeys 必须为数组");
+      }
+      const uniqueKeys = [];
+      const seen = new Set();
+      for (const k of op.workKeys) {
+        if (typeof k !== "string" || !k) continue;
+        if (seen.has(k)) continue;
+        seen.add(k);
+        uniqueKeys.push(k);
+      }
+      if (uniqueKeys.length < 2) {
+        throw new Error("至少需要选择 2 条作品才能合并");
+      }
+      const title = typeof op.title === "string" ? op.title.trim() : "";
+      normalized.push({ action: "merge", workKeys: uniqueKeys, title });
+    } else {
+      throw new Error("不支持的手工矫正操作类型（仅支持 assign/detach/clear/merge）");
+    }
+  }
+  return normalized;
+}
+
+function pickMergedWorksTitle(workKeys, workInfoByKey, explicitTitle) {
+  if (explicitTitle) return explicitTitle;
+  const list = workKeys
+    .map((wk) => workInfoByKey.get(wk))
+    .filter(Boolean)
+    .sort((a, b) => {
+      const aHas = a.pubMs !== null;
+      const bHas = b.pubMs !== null;
+      if (aHas !== bHas) return aHas ? -1 : 1;
+      if (aHas && a.pubMs !== b.pubMs) return a.pubMs - b.pubMs;
+      return a.workKey < b.workKey ? -1 : a.workKey > b.workKey ? 1 : 0;
+    });
+  const chosen = list.find((o) => o.fromWorksJson && o.rawTitle) || list[0];
+  return (chosen && chosen.title) || "(无标题)";
+}
+
+function applyOverrideOpsSync(rawOps, exportDeps) {
+  const ops = normalizeOverrideOps(rawOps);
+  const current = store.readLinkOverrides();
+  const nextOverrides = cloneNoProtoMap(current.overrides);
+  const nextContents = cloneNoProtoMap(current.contents);
+
+  const needsValidation = ops.some((o) => o.action === "assign" || o.action === "merge");
+  const ctx = needsValidation
+    ? resolveLinkValidationContext({ linkOverrides: current }, exportDeps || { store })
+    : null;
+  const pwLinkedKey = ctx ? new Map(ctx.pwLinkedKey) : null;
+  const now = Date.now();
+  const createdContentKeys = [];
+
+  for (const op of ops) {
+    if (op.action === "detach") {
+      nextOverrides[op.workKey] = { action: "detach" };
+      if (ctx) {
+        const info = ctx.workInfoByKey.get(op.workKey);
+        if (info) pwLinkedKey.set(info.pwKey, null);
+      }
+    } else if (op.action === "clear") {
+      delete nextOverrides[op.workKey];
+    } else if (op.action === "assign") {
+      const ck = op.contentKey;
+      if (isUnstableRecordKey(ck) || ctx.unstableRecordKeys.has(ck)) {
+        throw new Error("该记录缺少稳定标识，不能作为手工合并目标");
+      }
+      if (isValidAutoContentKey(ck)) {
+        if (!nextContents[ck]) {
+          const cluster = ctx.autoClusters.get(ck);
+          if (!cluster) {
+            throw new Error(`目标自动聚类内容不存在或已失效：${ck}`);
+          }
+          nextContents[ck] = {
+            title: cluster.title || "(无标题)",
+            createdAt: now,
+          };
+        }
+      } else if (isValidManualContentKey(ck)) {
+        if (!nextContents[ck]) {
+          throw new Error(`目标手工合并内容不存在：${ck}`);
+        }
+      } else if (!ctx.eligibleAssignableKeys.has(ck)) {
+        throw new Error(`目标内容不存在或不可用：${ck}`);
+      }
+      nextOverrides[op.workKey] = { action: "assign", contentKey: ck };
+      const info = ctx.workInfoByKey.get(op.workKey);
+      if (info) pwLinkedKey.set(info.pwKey, ck);
+    } else if (op.action === "merge") {
+      for (const wk of op.workKeys) {
+        const info = ctx.workInfoByKey.get(wk);
+        if (!info) {
+          throw new Error(`待合并作品不存在或未纳入当前统计范围：${wk}`);
+        }
+        if (pwLinkedKey.get(info.pwKey) != null) {
+          throw new Error(`待合并作品已关联其他内容，请刷新后重试：${wk}`);
+        }
+      }
+      const contentKey = `manual:${crypto.randomBytes(8).toString("hex")}`;
+      const title = pickMergedWorksTitle(op.workKeys, ctx.workInfoByKey, op.title);
+      nextContents[contentKey] = { title, createdAt: now };
+      for (const wk of op.workKeys) {
+        nextOverrides[wk] = { action: "assign", contentKey };
+        const info = ctx.workInfoByKey.get(wk);
+        if (info) pwLinkedKey.set(info.pwKey, contentKey);
+      }
+      createdContentKeys.push({ contentKey, workKeys: op.workKeys, title });
+    }
+  }
+
+  const doc = store.writeLinkOverrides(
+    { overrides: nextOverrides, contents: nextContents },
+    now
+  );
+  return {
+    doc,
+    applied: ops.length,
+    createdContentKeys,
+  };
 }
 
 function getTodayStr(now = Date.now()) {
@@ -347,7 +522,7 @@ function registerDataStatsIpc(options = {}) {
   ipcMain.handle("stats:get-link-overrides", async (event) => {
     try {
       if (!isLocalFrameEvent(event)) {
-        return { ok: false, error: "不允许外部页面读取手动关联配置", overrides: {} };
+        return { ok: false, error: "不允许外部页面读取手动关联配置", contents: {}, overrides: {} };
       }
       await overrideWriteChain;
       const doc = store.readLinkOverrides();
@@ -355,12 +530,14 @@ function registerDataStatsIpc(options = {}) {
         ok: true,
         version: doc.version,
         updatedAt: doc.updatedAt,
+        contents: toPlainOverrides(doc.contents),
         overrides: toPlainOverrides(doc.overrides),
       };
     } catch (err) {
       return {
         ok: false,
         error: (err && err.message) || "读取手动关联配置失败",
+        contents: {},
         overrides: {},
       };
     }
@@ -387,12 +564,14 @@ function registerDataStatsIpc(options = {}) {
         return { ok: false, error: "assign 操作需提供有效的 contentKey" };
       }
       const entry = action === "assign" ? { action: "assign", contentKey } : { action: "detach" };
-      const doc = await enqueueOverrideWrite(() => store.setLinkOverride(workKey, entry));
+      const res = await enqueueOverrideWrite(() =>
+        applyOverrideOpsSync([{ workKey, ...entry }], exportDeps)
+      );
       return {
         ok: true,
         workKey,
         override: entry,
-        updatedAt: doc.updatedAt,
+        updatedAt: res.doc.updatedAt,
       };
     } catch (err) {
       return {
@@ -424,12 +603,16 @@ function registerDataStatsIpc(options = {}) {
       if (uniqueKeys.length < 2) {
         return { ok: false, error: "至少需要选择 2 条作品才能合并" };
       }
-      const merged = await enqueueOverrideWrite(() => store.mergeWorksOverride(uniqueKeys));
+      const title = typeof args.title === "string" ? args.title.trim() : "";
+      const res = await enqueueOverrideWrite(() =>
+        applyOverrideOpsSync([{ action: "merge", workKeys: uniqueKeys, title }], exportDeps)
+      );
+      const created = res.createdContentKeys[0];
       return {
         ok: true,
-        contentKey: merged.contentKey,
-        workKeys: merged.workKeys,
-        updatedAt: merged.doc.updatedAt,
+        contentKey: created.contentKey,
+        workKeys: created.workKeys,
+        updatedAt: res.doc.updatedAt,
       };
     } catch (err) {
       return {
@@ -451,16 +634,50 @@ function registerDataStatsIpc(options = {}) {
       if (!workKey) {
         return { ok: false, error: "workKey 不能为空" };
       }
-      const doc = await enqueueOverrideWrite(() => store.clearLinkOverride(workKey));
+      const res = await enqueueOverrideWrite(() =>
+        applyOverrideOpsSync([{ action: "clear", workKey }], exportDeps)
+      );
       return {
         ok: true,
         workKey,
-        updatedAt: doc.updatedAt,
+        updatedAt: res.doc.updatedAt,
       };
     } catch (err) {
       return {
         ok: false,
         error: (err && err.message) || "恢复自动关联失败",
+      };
+    }
+  });
+
+  ipcMain.handle("stats:apply-link-overrides", async (event, args) => {
+    try {
+      if (!isLocalFrameEvent(event)) {
+        return { ok: false, error: "不允许外部页面修改手动关联配置" };
+      }
+      if (!args || typeof args !== "object" || Array.isArray(args)) {
+        return { ok: false, error: "参数无效" };
+      }
+      if (!Array.isArray(args.ops) || args.ops.length === 0) {
+        return { ok: false, error: "ops 必须为非空数组" };
+      }
+      const res = await enqueueOverrideWrite(() =>
+        applyOverrideOpsSync(args.ops, exportDeps)
+      );
+      const out = {
+        ok: true,
+        applied: res.applied,
+        updatedAt: res.doc.updatedAt,
+        createdContentKeys: res.createdContentKeys,
+      };
+      if (res.createdContentKeys.length === 1) {
+        out.contentKey = res.createdContentKeys[0].contentKey;
+      }
+      return out;
+    } catch (err) {
+      return {
+        ok: false,
+        error: (err && err.message) || "批量保存手动关联失败",
       };
     }
   });

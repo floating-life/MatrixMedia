@@ -22,9 +22,9 @@
 
 ## S6：跨平台作品模糊匹配 + 手工矫正（`feat/stats-fuzzy-link`）
 - **背景**：各平台发布标题常被截断、改写、插中间话题，或作品直接在平台发布而无 MatrixMedia 发布记录，仅靠直链/唯一标题会漏合。
-- **自动匹配四步（`contentLink.js`）**：①直链 1:1 → ②唯一标题 1:1 → ③同组同平台模糊匹配（去话题/emoji/标点空白得 core，长度≥6 子串截断 0.95 否则二元组 Dice；时间窗 ≤2 天、缺时间门槛 +0.1；sim≥0.6、最佳比次佳高 ≥0.1、互为最佳，`matchedBy="fuzzy"` 附两位小数 `score`）→ ④无发布记录作品同组跨平台聚类（同规则互为最佳成边 + Kruskal 合并，每平台每簇最多 1 条，簇大小 ≥2 生成确定性 `auto:<hash>`，标题取最早发布作品、素材为空）。
-- **手工矫正（`store.js` + `dataStats/index.js`）**：`<userData>/data-stats/link-overrides.json`（原子写，读失败/损坏视为空并 warn）；应用顺序为 ①–④ 后套用（`detach` 在 ③④ 前先排除，不再被模糊重合；`assign` 指向不存在 `contentKey` 时忽略并保持自动结果）；支持合并未关联作品为 `manual:<id>`。IPC：`stats:get-link-overrides`、`stats:set-link-override`、`stats:merge-works`、`stats:clear-link-override`（本地页面校验 + 串行写入队列）。
-- **界面与导出一致**：`dataStats/index.vue`「作品汇总」tab 增加匹配方式列、顶部筛选（全部/仅模糊待确认/未关联）、确认/拆出/改合并/恢复自动与未关联多选合并；Excel「作品日明细」扩展 `matchedBy` 为 `link/title/fuzzy/manual` 并新增数值列「匹配分数」，「作品跨平台汇总」新增「匹配方式」列（有手动标 `manual`，否则簇内最弱 `fuzzy>title>link`），「字段说明」同步口径。
+- **自动匹配四步（`contentLink.js`）**：①直链 1:1 → ②唯一标题 1:1 → ③同组同平台模糊匹配（先剥完整闭合话题 `#xx[话题]#`/`#xx#` 再剥单 `#xx`、保留 `C#`/`F#` 等词内 `#`；排除占位标题与 `core` 长度 `<4`，不同集数/期数/序号硬拒绝 `sim=0`；长度≥6 子串截断 0.95 否则二元组 Dice；target 仅取自身 `recordDate`/`lastPublishAt`，时间窗按 UTC+8 日历日相差 ≤2 天、缺时间门槛 +0.1；sim≥0.6、最佳比次佳高 ≥0.1、互为最佳，`matchedBy="fuzzy"` 附两位小数 `score`；按时间窗分桶+高频补集倒排提速）→ ④无发布记录作品同组跨平台聚类（同规则互为最佳成边 + Kruskal 合簇前全对相容检查禁止链式传递，每平台每簇最多 1 条，簇大小 ≥2 按不含组名的 `platform|workId` 生成确定性 `auto:<hash>`，标题取最早发布作品、素材为空）。
+- **手工矫正（`store.js` + `dataStats/index.js`）**：`<userData>/data-stats/link-overrides.json`（严格校验 `version===1`、`updatedAt` 有限数字与条目结构，异常 `console.warn` 并视为空；持久化合成内容 `contents` 表 `{ "<key>": { title, createdAt } }`；原子写）；应用顺序为 ①–④ 照常运行（仅 `detach` 在 ③④ 前排除，被 `assign` 作品照常参与占位）后再套 `overrides`；`auto:`/`manual:` 须存在于 `contents` 表、`file:`/`record:` 须为有效稳定键（无完整路径记录改用稳定 id/内容哈希，旧位置键禁止手工 assign）；仅存在于 `works-daily` 的作品纳入手工覆盖范围。IPC：`stats:get-link-overrides`、`stats:set-link-override`、`stats:merge-works`、`stats:clear-link-override` 与批量原子 `stats:apply-link-overrides`（本地页面校验 + 串行队列内目标/未关联状态复核 + 一次原子写盘）。
+- **界面与导出一致**：`dataStats/index.vue`「作品汇总」tab 增加匹配方式列、顶部筛选（全部/仅模糊待确认/未关联）、确认/拆出/改合并/恢复自动与未关联多选合并（整行确认与合并改用 `stats:apply-link-overrides`，弹窗隐藏不稳定位置键并重开清空当前行）；GUI 与 Excel 共享默认截止日函数（以作品快照最新日为准），导出先在全量分组上解析手工引用再裁剪输出分组且单次匹配复用；Excel「作品日明细」扩展 `matchedBy` 为 `link/title/fuzzy/manual` 并新增数值列「匹配分数」，「作品跨平台汇总」新增「匹配方式」列（有手动标 `manual`，否则簇内最弱 `fuzzy>title>link`），「字段说明」同步口径与 UTC+8 日历日窗说明。
 
 ## 打包
 `.github/workflows/fork-build-win.yml`：推 fork/** 或 feat/stats-** 分支自动打 Windows 安装包（Actions Artifacts，14 天）。
@@ -33,3 +33,4 @@
 - 〔上游，路线 B 候选 PR〕`src/main/services/accountMigration.js:41` 启动迁移会把带连字符的合法分组目录（如 `品牌-A`，且 `品牌` 目录不存在时）整体改名为 `品牌`，导致该分组统计历史读回为空。应改为按账号记录中明确的旧 phone→group 映射迁移。（GPT Pro 评审 S1 时发现，2026-11-19）
 - 适配器把缺失指标写成 0（如抖音 view_count 缺失），会产生「掉 0 再回升」的假增量；需改采集层区分缺失与 0，暂在导出「字段说明」注明。
 - 一次采集的账号快照与作品快照若恰跨零点可能分属两天（影响极小，暂不处理）。
+- `src/main/services/dataStats/index.js` 中各 `stats:*` IPC（含导出、作品汇总与 `link-overrides` 读写接口）沿用 `isLocalFrameEvent` 校验（放行无 host 的 `file:` 与 `localhost`/`127.0.0.1`），授权范围偏宽（生产模式未收紧到受信任应用主窗口 mainFrame 及应用页面路径，开发模式未收紧到配置的开发 server origin）；待后续统一收紧全量 stats IPC 鉴权时一并处理。（Codex 评审 S6 时发现，2026-11-19）

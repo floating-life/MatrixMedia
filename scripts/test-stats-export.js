@@ -55,6 +55,7 @@ const {
   META_HEADERS,
   sanitizeTextCell,
   buildDefaultExportFileName,
+  resolveDefaultCutoffDate,
   buildContentSummaryData,
   buildStatsWorkbookData,
   writeStatsXlsx,
@@ -805,6 +806,7 @@ async function main() {
       "启用本功能当天开始积累",
       "匹配分数",
       "匹配方式",
+      "UTC+8 日历日相差 ≤2 天",
       "模糊匹配可能合错，已手工确认的标 manual",
     ]) {
       assert.ok(s5Text.includes(kw), `字段说明缺少关键口径：${kw}`);
@@ -2087,6 +2089,12 @@ async function main() {
         readLinkOverrides: () => ({
           version: 1,
           updatedAt: dayTs("2026-11-12"),
+          contents: {
+            "manual:s6merge": {
+              title: "人工指定视频抖音版",
+              createdAt: dayTs("2026-11-12"),
+            },
+          },
           overrides: {
             "S6组|抖音|S6_DY_MAN": { action: "assign", contentKey: "manual:s6merge" },
             "S6组|快手|S6_KS_MAN": { action: "assign", contentKey: "manual:s6merge" },
@@ -2133,6 +2141,171 @@ async function main() {
       }
       assert.ok(foundFuzzyCell, "应读回 S6_KS_FUZZY 的 fuzzy 与数值分数");
       console.log("✓ S6 导出新列：作品日明细匹配分数(number)与跨平台汇总匹配方式(fuzzy/manual)校验通过");
+    }
+
+    /* ---------- 11. S6-fix#10 与 S6-fix#7：全量解析跨组手工引用再裁剪 + 共享默认截止日 + 单次匹配复用 ---------- */
+    {
+      // S6-fix#10a: A 组作品手工指向仅由 B 组发布记录提供的内容，只导出 A 组时仍保持 manual 关联，且不混入 B 组无关内容
+      const crossRefDeps = {
+        listAccounts: () => [
+          { group: "A组", platform: "抖音" },
+          { group: "B组", platform: "抖音" },
+        ],
+        readWorks: (group) =>
+          group === "A组"
+            ? {
+                works: [
+                  {
+                    workId: "A_W1",
+                    title: "A组作品手工指向B组素材",
+                    url: "https://www.douyin.com/video/aw1",
+                    publishTime: dayTs("2026-11-18"),
+                  },
+                ],
+              }
+            : {
+                works: [
+                  {
+                    workId: "B_W1",
+                    title: "B组自有作品",
+                    url: "https://www.douyin.com/video/bw1",
+                    publishTime: dayTs("2026-11-18"),
+                  },
+                ],
+              },
+        readWorksDaily: (group) =>
+          group === "A组"
+            ? { A_W1: { "2026-11-18": { play: 500, like: 50 } } }
+            : { B_W1: { "2026-11-18": { play: 900, like: 90 } } },
+        // 故意让账号日快照比作品快照晚一天（11-19），顺带测试 S6-fix#10b 共享默认截止日
+        readDaily: () => ({
+          "2026-11-18": { fans: 100, plays: 500 },
+          "2026-11-19": { fans: 110, plays: 600 },
+        }),
+        readPushRecords: () => [
+          {
+            id: "b-only-1",
+            pt: "抖音",
+            group: "B组",
+            publishStatus: "success",
+            title: "仅B组发布的共享素材",
+            filePath: "/videos/b_shared_target.mp4",
+            lastPublishAt: dayTs("2026-11-18"),
+          },
+          {
+            id: "b-other-1",
+            pt: "抖音",
+            group: "B组",
+            publishStatus: "success",
+            title: "B组无关内容",
+            filePath: "/videos/b_unrelated.mp4",
+            lastPublishAt: dayTs("2026-11-18"),
+          },
+          {
+            id: "a-future-19",
+            pt: "抖音",
+            group: "A组",
+            publishStatus: "success",
+            title: "19日才出现的新目标",
+            filePath: "/videos/only_on_19.mp4",
+            lastPublishAt: dayTs("2026-11-19"),
+          },
+        ],
+        readLinkOverrides: () => ({
+          version: 1,
+          updatedAt: dayTs("2026-11-18"),
+          contents: {},
+          overrides: {
+            "A组|抖音|A_W1": { action: "assign", contentKey: "file:/videos/b_shared_target.mp4" },
+          },
+        }),
+      };
+
+      // S6-fix#10b: 作品快照最新 11-18、账号快照最新 11-19 → GUI 与 Excel 默认截止日一致取 11-18
+      assert.strictEqual(
+        resolveDefaultCutoffDate([
+          {
+            group: "A组",
+            platform: "抖音",
+            worksDaily: { A_W1: { "2026-11-18": { play: 500 } } },
+            daily: { "2026-11-19": { fans: 110 } },
+          },
+        ]),
+        "2026-11-18"
+      );
+      const guiSum = buildContentSummaryData({}, crossRefDeps);
+      const fullWb = buildStatsWorkbookData({ now: dayTs("2026-11-20") }, crossRefDeps);
+      assert.strictEqual(guiSum.date, "2026-11-18", "GUI 默认截止日以作品快照最新日 11-18 为准");
+      assert.strictEqual(
+        fullWb.to,
+        "2026-11-18",
+        "S6-fix#10: Excel 默认截止日必须与 GUI 一致以作品快照最新日 11-18 为准，而非账号快照 11-19"
+      );
+      assert.strictEqual(
+        fullWb.sheets["作品跨平台汇总"].slice(1).some((r) => r[0] === "file:/videos/only_on_19.mp4"),
+        false,
+        "19 日才出现的新目标不得在默认 11-18 导出中生效"
+      );
+
+      // S6-fix#10a: 只导出 A 组时，A_W1 手工指向仅由 B 组提供的 b_shared_target.mp4 必须仍保持 manual
+      const onlyAWb = buildStatsWorkbookData({ groups: ["A组"], now: dayTs("2026-11-20") }, crossRefDeps);
+      assert.strictEqual(onlyAWb.to, "2026-11-18");
+      const onlyAS1 = onlyAWb.sheets["作品日明细"].slice(1);
+      assert.strictEqual(onlyAS1.length, 1);
+      assert.strictEqual(onlyAS1[0][3], "file:/videos/b_shared_target.mp4");
+      assert.strictEqual(onlyAS1[0][4], "manual", "S6-fix#10: 只导出 A 组不得丢掉跨组手工引用");
+      const onlyAS2 = onlyAWb.sheets["作品跨平台汇总"].slice(1);
+      const crossTargetRow = onlyAS2.find((r) => r[0] === "file:/videos/b_shared_target.mp4");
+      assert.ok(crossTargetRow, "S6-fix#10: 只导出 A 组汇总应保留被 A 组手工引用的跨组内容行");
+      assert.strictEqual(crossTargetRow[5], "manual");
+      assert.strictEqual(crossTargetRow[6], 500);
+      assert.strictEqual(
+        onlyAS2.some((r) => r[0] === "file:/videos/b_unrelated.mp4"),
+        false,
+        "S6-fix#10: B 组无关发布记录仍须裁剪掉"
+      );
+
+      // S6-fix#7: 验证同一次 buildStatsWorkbookData 导出内对同一数据集+cutoff 只跑 1 次 linkWorks
+      let titleReadCount = 0;
+      const singlePassDeps = {
+        listAccounts: () => [{ group: "P组", platform: "抖音" }],
+        readWorks: () => ({
+          works: [
+            {
+              workId: "SP1",
+              get title() {
+                titleReadCount++;
+                return "单次匹配复用验证标题完整内容";
+              },
+              url: "",
+              publishTime: dayTs("2026-11-18"),
+            },
+          ],
+        }),
+        readWorksDaily: () => ({ SP1: { "2026-11-18": { play: 100 } } }),
+        readDaily: () => ({}),
+        readPushRecords: () => [
+          {
+            id: "sp-1",
+            pt: "抖音",
+            group: "P组",
+            publishStatus: "success",
+            title: "单次匹配复用验证标题完整内容教学",
+            filePath: "/videos/sp1.mp4",
+            lastPublishAt: dayTs("2026-11-18"),
+          },
+        ],
+      };
+      // 直接对比：若只跑 1 次 linkWorks + 1 次 buildContentSummaryRows(复用) + 1 次 buildWorkDailyRows：
+      // linkWorks 读 title 2 次（normalizeTitle + prepareCore）+ buildContentSummaryRows 读 1 次 + buildWorkDailyRows 读 1 次 = 4 次；
+      // 若 buildContentSummaryRows 重复跑了 linkWorks，则会读 6 次！
+      buildStatsWorkbookData({ now: dayTs("2026-11-18") }, singlePassDeps);
+      assert.strictEqual(
+        titleReadCount,
+        4,
+        `S6-fix#7: 单次导出内对同一数据集+cutoff 应仅跑 1 次 linkWorks（预期读 title 4 次，实际 ${titleReadCount} 次）`
+      );
+      console.log("✓ S6-fix#10(跨组手工引用先解析后裁剪+共享默认截止日) & S6-fix#7(同次导出单次匹配复用) 通过");
     }
 
     // 恢复 require.cache

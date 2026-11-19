@@ -529,18 +529,53 @@ function emptyLinkOverrides() {
   return {
     version: LINK_OVERRIDES_VERSION,
     updatedAt: 0,
+    contents: Object.create(null),
     overrides: Object.create(null),
   };
 }
 
+function isSyntheticContentKey(key) {
+  return (
+    typeof key === "string" &&
+    ((key.startsWith("auto:") && key.length > "auto:".length) ||
+      (key.startsWith("manual:") && key.length > "manual:".length))
+  );
+}
+
+function normalizeLinkContentEntry(entry) {
+  if (!isPlainObject(entry)) return null;
+  if (typeof entry.title !== "string") return null;
+  if (typeof entry.createdAt !== "number" || !Number.isFinite(entry.createdAt)) return null;
+  return {
+    title: entry.title,
+    createdAt: entry.createdAt,
+  };
+}
+
+function normalizeLinkContentsMap(rawMap) {
+  const out = Object.create(null);
+  if (!isPlainObject(rawMap)) return out;
+  for (const contentKey of Object.keys(rawMap)) {
+    if (!isSyntheticContentKey(contentKey)) continue;
+    const desc = Object.getOwnPropertyDescriptor(rawMap, contentKey);
+    const normalized = normalizeLinkContentEntry(desc ? desc.value : null);
+    if (normalized) {
+      out[contentKey] = normalized;
+    }
+  }
+  return out;
+}
+
 function normalizeLinkOverrideEntry(entry) {
   if (!isPlainObject(entry)) return null;
-  const action = typeof entry.action === "string" ? entry.action.trim() : "";
+  if (typeof entry.action !== "string") return null;
+  const action = entry.action;
   if (action === "detach") {
     return { action: "detach" };
   }
   if (action === "assign") {
-    const contentKey = typeof entry.contentKey === "string" ? entry.contentKey.trim() : "";
+    if (typeof entry.contentKey !== "string") return null;
+    const contentKey = entry.contentKey.trim();
     if (!contentKey || contentKey.startsWith("unlinked:")) return null;
     return { action: "assign", contentKey };
   }
@@ -563,54 +598,82 @@ function normalizeLinkOverridesMap(rawMap) {
 
 /**
  * 读取 <userData>/data-stats/link-overrides.json。
- * 不存在静默返回空；读失败/JSON 损坏/结构无效 console.warn 并视为空，不抛错。
+ * 不存在静默返回空；严格校验 version === 1、updatedAt 为有限数字、overrides/contents 结构；
+ * 条目结构不对的逐条丢弃；任何读取/解析/校验异常均 console.warn 并视为空配置，绝不抛错。
  */
 function readLinkOverrides() {
   const file = linkOverridesFile();
-  let raw;
   try {
-    raw = fs.readFileSync(file, "utf8");
+    let raw;
+    try {
+      raw = fs.readFileSync(file, "utf8");
+    } catch (err) {
+      if (err && err.code === "ENOENT") return emptyLinkOverrides();
+      console.warn(`[dataStats] 读取 link-overrides.json 失败 (${file}):`, (err && err.message) || err);
+      return emptyLinkOverrides();
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err) {
+      console.warn(`[dataStats] link-overrides.json JSON 损坏 (${file}):`, (err && err.message) || err);
+      return emptyLinkOverrides();
+    }
+    if (!isPlainObject(parsed)) {
+      console.warn(`[dataStats] link-overrides.json 结构无效 (${file})`);
+      return emptyLinkOverrides();
+    }
+    if (parsed.version !== LINK_OVERRIDES_VERSION) {
+      console.warn(
+        `[dataStats] link-overrides.json version 无效（需 === ${LINK_OVERRIDES_VERSION}）(${file})`
+      );
+      return emptyLinkOverrides();
+    }
+    if (typeof parsed.updatedAt !== "number" || !Number.isFinite(parsed.updatedAt)) {
+      console.warn(`[dataStats] link-overrides.json updatedAt 无效（需有限数字）(${file})`);
+      return emptyLinkOverrides();
+    }
+    if (!isPlainObject(parsed.overrides)) {
+      console.warn(`[dataStats] link-overrides.json overrides 结构无效 (${file})`);
+      return emptyLinkOverrides();
+    }
+    const hasContents =
+      Object.prototype.hasOwnProperty.call(parsed, "contents") && parsed.contents !== undefined;
+    if (hasContents && !isPlainObject(parsed.contents)) {
+      console.warn(`[dataStats] link-overrides.json contents 结构无效 (${file})`);
+      return emptyLinkOverrides();
+    }
+    return {
+      version: LINK_OVERRIDES_VERSION,
+      updatedAt: parsed.updatedAt,
+      contents: hasContents ? normalizeLinkContentsMap(parsed.contents) : Object.create(null),
+      overrides: normalizeLinkOverridesMap(parsed.overrides),
+    };
   } catch (err) {
-    if (err && err.code === "ENOENT") return emptyLinkOverrides();
-    console.warn(`[dataStats] 读取 link-overrides.json 失败 (${file}):`, (err && err.message) || err);
+    console.warn(`[dataStats] 解析 link-overrides.json 异常 (${file}):`, (err && err.message) || err);
     return emptyLinkOverrides();
   }
-  let parsed;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (err) {
-    console.warn(`[dataStats] link-overrides.json JSON 损坏 (${file}):`, (err && err.message) || err);
-    return emptyLinkOverrides();
-  }
-  if (!isPlainObject(parsed) || !isPlainObject(parsed.overrides)) {
-    console.warn(`[dataStats] link-overrides.json 结构无效 (${file})`);
-    return emptyLinkOverrides();
-  }
-  const updatedAt = Number.isFinite(Number(parsed.updatedAt)) ? Number(parsed.updatedAt) : 0;
-  return {
-    version: LINK_OVERRIDES_VERSION,
-    updatedAt,
-    overrides: normalizeLinkOverridesMap(parsed.overrides),
-  };
 }
 
 /** 原子写入 <userData>/data-stats/link-overrides.json（复用 tmp + fsync + rename） */
 function writeLinkOverrides(docOrMap, now = Date.now()) {
-  const rawMap =
-    isPlainObject(docOrMap) && isPlainObject(docOrMap.overrides)
-      ? docOrMap.overrides
-      : docOrMap;
+  const isDoc = isPlainObject(docOrMap) && isPlainObject(docOrMap.overrides);
+  const rawMap = isDoc ? docOrMap.overrides : docOrMap;
+  const rawContents = isDoc && isPlainObject(docOrMap.contents) ? docOrMap.contents : null;
   const overrides = normalizeLinkOverridesMap(rawMap);
+  const contents = normalizeLinkContentsMap(rawContents);
+  const ts = typeof now === "number" && Number.isFinite(now) ? now : Date.now();
   const payload = {
     version: LINK_OVERRIDES_VERSION,
-    updatedAt: Number.isFinite(Number(now)) ? Number(now) : Date.now(),
+    updatedAt: ts,
+    contents,
     overrides,
   };
   writeWorksDailyAtomic(linkOverridesFile(), payload);
   return payload;
 }
 
-function setLinkOverride(workKey, entry, now = Date.now()) {
+function setLinkOverride(workKey, entry, now = Date.now(), contentMeta) {
   if (typeof workKey !== "string" || !workKey) {
     throw new Error("workKey 不能为空");
   }
@@ -618,9 +681,27 @@ function setLinkOverride(workKey, entry, now = Date.now()) {
   if (!normalized) {
     throw new Error("无效的手动关联操作（需为 assign+contentKey 或 detach）");
   }
+  const ts = typeof now === "number" && Number.isFinite(now) ? now : Date.now();
   const current = readLinkOverrides();
   current.overrides[workKey] = normalized;
-  return writeLinkOverrides(current.overrides, now);
+  if (
+    normalized.action === "assign" &&
+    isSyntheticContentKey(normalized.contentKey) &&
+    contentMeta &&
+    !current.contents[normalized.contentKey]
+  ) {
+    const normMeta = normalizeLinkContentEntry({
+      title: typeof contentMeta.title === "string" ? contentMeta.title : "",
+      createdAt:
+        typeof contentMeta.createdAt === "number" && Number.isFinite(contentMeta.createdAt)
+          ? contentMeta.createdAt
+          : ts,
+    });
+    if (normMeta) {
+      current.contents[normalized.contentKey] = normMeta;
+    }
+  }
+  return writeLinkOverrides(current, ts);
 }
 
 function clearLinkOverride(workKey, now = Date.now()) {
@@ -629,10 +710,10 @@ function clearLinkOverride(workKey, now = Date.now()) {
   }
   const current = readLinkOverrides();
   delete current.overrides[workKey];
-  return writeLinkOverrides(current.overrides, now);
+  return writeLinkOverrides(current, now);
 }
 
-function mergeWorksOverride(workKeys, now = Date.now()) {
+function mergeWorksOverride(workKeys, now = Date.now(), title = "") {
   if (!Array.isArray(workKeys)) {
     throw new Error("workKeys 必须为数组");
   }
@@ -647,12 +728,17 @@ function mergeWorksOverride(workKeys, now = Date.now()) {
   if (uniqueKeys.length < 2) {
     throw new Error("至少需要选择 2 条作品才能合并");
   }
+  const ts = typeof now === "number" && Number.isFinite(now) ? now : Date.now();
   const current = readLinkOverrides();
   const contentKey = `manual:${crypto.randomBytes(8).toString("hex")}`;
+  current.contents[contentKey] = {
+    title: typeof title === "string" ? title : "",
+    createdAt: ts,
+  };
   for (const k of uniqueKeys) {
     current.overrides[k] = { action: "assign", contentKey };
   }
-  const doc = writeLinkOverrides(current.overrides, now);
+  const doc = writeLinkOverrides(current, ts);
   return { contentKey, workKeys: uniqueKeys, doc };
 }
 
