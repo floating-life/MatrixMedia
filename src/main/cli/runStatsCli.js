@@ -5,8 +5,10 @@
  * 输出 JSON 到 stdout（MCP runner 与脚本可直接消费）。
  */
 
+import path from "path";
 import { collectAccount } from "../services/dataStats/collector.js";
 import store from "../services/dataStats/store.js";
+import statsExport from "../services/dataStats/statsExport.js";
 import { resolveTaskPartition } from "../services/accountLookup.js";
 
 const normalizeTitle = (s) =>
@@ -16,7 +18,41 @@ function print(data) {
   console.log(JSON.stringify(data, null, 2));
 }
 
-export async function runStatsCli({ action, platform, phone, title }) {
+export async function runStatsCli({ action, platform, phone, title, out, from, to }) {
+  if (action === "export") {
+    const trimmedOut = String(out || "").trim();
+    if (!trimmedOut) {
+      print({ success: false, error: "缺少 --out <路径.xlsx>" });
+      return 2;
+    }
+    const outPath = path.resolve(trimmedOut);
+    try {
+      const data = statsExport.buildStatsWorkbookData({
+        from: from || undefined,
+        to: to || undefined,
+      });
+      statsExport.writeStatsXlsx(data, outPath);
+      print({
+        success: true,
+        out: outPath,
+        from: data.from,
+        to: data.to,
+        counts: data.counts,
+      });
+      return 0;
+    } catch (err) {
+      const message = (err && err.message) || String(err);
+      print({
+        success: false,
+        out: outPath,
+        from: from || null,
+        to: to || null,
+        error: message,
+      });
+      return 1;
+    }
+  }
+
   // 与登录窗口同一套 partition 规则：优先按账号记录的 accountKey（新分组模型），
   // 未命中记录时回退历史「phone "-" 前缀」，否则带 "-" 的账号读不到登录态
   const partition = resolveTaskPartition({ phone, pt: platform });

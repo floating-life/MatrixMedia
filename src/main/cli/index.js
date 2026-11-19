@@ -581,7 +581,7 @@ export async function runCliMain(argv = process.argv) {
   ensureAccountRecordsMigrated();
   if (!sub || sub.length === 0) {
     console.error(
-      "用法: <应用> cli <publish|publish-article|login|accounts|history|stats|stats-sync|stats-work|comments|comments-reply|comments-probe> ..."
+      "用法: <应用> cli <publish|publish-article|login|accounts|history|stats|stats-sync|stats-work|stats-export|comments|comments-reply|comments-probe> ..."
     );
     console.error("  cli publish --help");
     console.error("  cli publish-article --help");
@@ -1023,9 +1023,14 @@ export async function runCliMain(argv = process.argv) {
     }
   }
 
-  // 数据统计：stats 读本地快照 / stats-sync 主动采集 / stats-work 查单视频
-  const STATS_CMDS = { stats: "get", "stats-sync": "sync", "stats-work": "work" };
-  if (STATS_CMDS[cmd]) {
+  // 数据统计：stats 读本地快照 / stats-sync 主动采集 / stats-work 查单视频 / stats-export 导出 Excel
+  const STATS_CMDS = {
+    stats: "get",
+    "stats-sync": "sync",
+    "stats-work": "work",
+    "stats-export": "export",
+  };
+  if (Object.prototype.hasOwnProperty.call(STATS_CMDS, cmd)) {
     const parsed = parseStatsArgs(sub.slice(1), STATS_CMDS[cmd]);
     if (!parsed.ok) {
       console.error(parsed.error);
@@ -1069,7 +1074,7 @@ export async function runCliMain(argv = process.argv) {
 
   if (cmd === "--help" || cmd === "-h") {
     console.log(
-      "可用子命令: publish | publish-article | login | accounts | history | stats | stats-sync | stats-work | comments | comments-reply | comments-probe"
+      "可用子命令: publish | publish-article | login | accounts | history | stats | stats-sync | stats-work | stats-export | comments | comments-reply | comments-probe"
     );
     console.log("各自 --help 查看详细参数。");
     return 0;
@@ -1077,7 +1082,7 @@ export async function runCliMain(argv = process.argv) {
 
   console.error("未知子命令:", cmd);
   console.error(
-    "支持: publish | publish-article | login | accounts | history | stats | stats-sync | stats-work | comments | comments-reply | comments-probe"
+    "支持: publish | publish-article | login | accounts | history | stats | stats-sync | stats-work | stats-export | comments | comments-reply | comments-probe"
   );
   return 2;
 }

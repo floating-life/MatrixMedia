@@ -3,19 +3,28 @@
 /**
  * 数据统计 IPC 入口。
  *
- * - stats:collect       采集一组账号（串行队列，账号间间隔防风控），进度经 stats:progress 推送
- * - stats:auto-run      每日定时自动采集单一操作（检查 auto-run.json → 互斥 → 采集 → 落盘日期）
- * - stats:get-data      读取单账号本地数据（daily + works + meta）
- * - stats:get-overview  全账号按日聚合（所有账号总览页）
- * - stats:match-works   发布状态匹配（与采集共享 collecting 互斥锁）
+ * - stats:collect              采集一组账号（串行队列，账号间间隔防风控），进度经 stats:progress 推送
+ * - stats:auto-run             每日定时自动采集单一操作（检查 auto-run.json → 互斥 → 采集 → 落盘日期）
+ * - stats:get-data             读取单账号本地数据（daily + works + meta）
+ * - stats:get-overview         全账号按日聚合（所有账号总览页）
+ * - stats:get-content-summary  跨平台作品汇总（作品汇总 tab）
+ * - stats:export-xlsx          导出统计 Excel 工作簿（含本地页面校验与保存对话框）
+ * - stats:match-works          发布状态匹配（与采集共享 collecting 互斥锁）
  *
  * 采集全程使用平台页面上下文 fetch（复用分组 partition 登录态），不做任何签名构造。
  */
 
-const { ipcMain } = require("electron");
+const path = require("path");
+const electron = require("electron");
+const { ipcMain } = electron;
 const { collectAccount } = require("./collector");
 const store = require("./store");
 const { normalizeStatusTitle, buildTitleIndex } = require("./contentLink");
+const {
+  buildContentSummaryData,
+  buildStatsWorkbookData,
+  writeStatsXlsx,
+} = require("./statsExport");
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -261,6 +270,78 @@ function registerDataStatsIpc() {
 
   ipcMain.handle("stats:get-logs", async () => {
     return store.readCollectLogs();
+  });
+
+  ipcMain.handle("stats:get-content-summary", async (_event, args) => {
+    try {
+      if (args != null && (typeof args !== "object" || Array.isArray(args))) {
+        return { rows: [], date: "", error: "查询参数无效" };
+      }
+      const date = args && args.date !== undefined ? args.date : undefined;
+      return buildContentSummaryData({ date });
+    } catch (err) {
+      return {
+        rows: [],
+        date: "",
+        error: (err && err.message) || "读取作品汇总失败",
+      };
+    }
+  });
+
+  ipcMain.handle("stats:export-xlsx", async (event, args = {}) => {
+    try {
+      let localFrame = false;
+      try {
+        const frame = new URL(
+          String((event && event.senderFrame && event.senderFrame.url) || "")
+        );
+        localFrame =
+          (frame.protocol === "file:" && !frame.hostname) ||
+          (["http:", "https:"].includes(frame.protocol) &&
+            ["localhost", "127.0.0.1"].includes(frame.hostname));
+      } catch (_) {
+        localFrame = false;
+      }
+      if (!localFrame) {
+        return { ok: false, message: "不允许外部页面导出数据" };
+      }
+      if (args != null && (typeof args !== "object" || Array.isArray(args))) {
+        return { ok: false, message: "导出参数无效" };
+      }
+      const { BrowserWindow, dialog, app } = electron;
+      const win =
+        BrowserWindow && typeof BrowserWindow.fromWebContents === "function"
+          ? BrowserWindow.fromWebContents(event && event.sender)
+          : null;
+      if (!win) return { ok: false, message: "窗口已关闭" };
+
+      const payload = args || {};
+      const data = buildStatsWorkbookData({
+        from: payload.from,
+        to: payload.to,
+        groups: payload.groups,
+      });
+
+      const defaultName = `MatrixMedia-作品数据-${data.from}_${data.to}.xlsx`;
+      const result = await dialog.showSaveDialog(win, {
+        title: "导出作品数据 Excel",
+        defaultPath: path.join(app.getPath("documents"), defaultName),
+        filters: [{ name: "Excel 工作簿", extensions: ["xlsx"] }],
+      });
+      if (result.canceled || !result.filePath) {
+        return { ok: false, canceled: true };
+      }
+      writeStatsXlsx(data, result.filePath);
+      return {
+        ok: true,
+        filePath: result.filePath,
+        from: data.from,
+        to: data.to,
+        counts: data.counts,
+      };
+    } catch (err) {
+      return { ok: false, message: (err && err.message) || "导出失败" };
+    }
   });
 
   /**

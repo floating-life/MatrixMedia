@@ -13,12 +13,90 @@ const STATS_CANONICAL = [
   "小红书",
 ];
 
-const ACTIONS = new Set(["get", "sync", "work"]);
+const ACTIONS = new Set(["get", "sync", "work", "export"]);
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function isValidYmd(s) {
+  if (typeof s !== "string" || !DATE_RE.test(s)) return false;
+  const ms = Date.parse(`${s}T00:00:00Z`);
+  if (!Number.isFinite(ms)) return false;
+  return new Date(ms).toISOString().slice(0, 10) === s;
+}
+
+function readValue(args, i, flag) {
+  const v = args[i + 1];
+  if (v === undefined || (typeof v === "string" && /^-/.test(v))) {
+    return { ok: false, error: `${flag} 需要一个值，例如 ${flag} <值>` };
+  }
+  return { ok: true, value: v, next: i + 1 };
+}
+
+function parseStatsExportArgs(args) {
+  const out = { action: "export", out: null, from: null, to: null, json: false };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--out" || a === "-o") {
+      const v = readValue(args, i, a);
+      if (!v.ok) return v;
+      out.out = String(v.value).trim();
+      i = v.next;
+    } else if (typeof a === "string" && a.startsWith("--out=")) {
+      const val = a.slice("--out=".length).trim();
+      if (!val) return { ok: false, error: "--out 需要一个非空路径" };
+      out.out = val;
+    } else if (a === "--from") {
+      const v = readValue(args, i, a);
+      if (!v.ok) return v;
+      out.from = String(v.value).trim();
+      i = v.next;
+    } else if (typeof a === "string" && a.startsWith("--from=")) {
+      const val = a.slice("--from=".length).trim();
+      if (!val) return { ok: false, error: "--from 需要 YYYY-MM-DD 日期" };
+      out.from = val;
+    } else if (a === "--to") {
+      const v = readValue(args, i, a);
+      if (!v.ok) return v;
+      out.to = String(v.value).trim();
+      i = v.next;
+    } else if (typeof a === "string" && a.startsWith("--to=")) {
+      const val = a.slice("--to=".length).trim();
+      if (!val) return { ok: false, error: "--to 需要 YYYY-MM-DD 日期" };
+      out.to = val;
+    } else if (a === "--json") {
+      out.json = true;
+    } else {
+      return {
+        ok: false,
+        error: `未知参数: ${a}（可用: --out、--from、--to、--json）`,
+      };
+    }
+  }
+
+  if (!out.out) {
+    return { ok: false, error: "缺少 --out <路径.xlsx>" };
+  }
+  if (out.from !== null && !isValidYmd(out.from)) {
+    return { ok: false, error: `--from 不是合法日期（需 YYYY-MM-DD）：${out.from}` };
+  }
+  if (out.to !== null && !isValidYmd(out.to)) {
+    return { ok: false, error: `--to 不是合法日期（需 YYYY-MM-DD）：${out.to}` };
+  }
+  if (out.from && out.to && out.from > out.to) {
+    return { ok: false, error: `--from 不能晚于 --to（${out.from} > ${out.to}）` };
+  }
+  return { ok: true, value: out };
+}
 
 export function parseStatsArgs(subArgv, action) {
   const args = Array.isArray(subArgv) ? subArgv : [];
   if (args.includes("--help") || args.includes("-h")) {
     return { ok: true, value: { help: true } };
+  }
+  if (!ACTIONS.has(action)) {
+    return { ok: false, error: `未知统计动作: ${action}` };
+  }
+  if (action === "export") {
+    return parseStatsExportArgs(args);
   }
   const out = { action, platform: null, phone: null, title: null, json: false };
   for (let i = 0; i < args.length; i++) {
@@ -60,9 +138,32 @@ export function parseStatsArgs(subArgv, action) {
 }
 
 export function statsHelpText(cmd) {
+  if (cmd === "stats-export" || cmd === "export") {
+    return `
+用法: <应用> cli stats-export --out <路径.xlsx> [--from YYYY-MM-DD] [--to YYYY-MM-DD]
+
+将本地作品日明细、跨平台汇总、平台日汇总与账号日快照导出为 Excel（.xlsx）
+
+选项:
+  -o, --out <路径>      输出 .xlsx 文件路径（必填）
+      --from <日期>     起始日期（含），YYYY-MM-DD，默认结束日期往前 29 天
+      --to <日期>       结束日期（含），YYYY-MM-DD，默认最新有数据日期
+      --json            以 JSON 输出（默认即 JSON，便于脚本消费）
+  -h, --help            显示本帮助
+
+退出码: 0 成功, 1 异常, 2 参数错误
+
+示例:
+  matrixmedia cli stats-export --out ./stats.xlsx
+  matrixmedia cli stats-export --out ./stats.xlsx --from 2026-11-01 --to 2026-11-30
+`.trim();
+  }
   const usage = {
+    stats: "读取本地快照中的账号粉丝数据（粉丝/播放/点赞/评论/收藏）",
     get: "读取本地快照中的账号粉丝数据（粉丝/播放/点赞/评论/收藏）",
+    "stats-sync": "立即采集该账号最新数据并写入本地快照（需该分组此平台已在 GUI 登录）",
     sync: "立即采集该账号最新数据并写入本地快照（需该分组此平台已在 GUI 登录）",
+    "stats-work": "按标题查询某个视频的发布数据（播放/赞/评/收藏/分享/发布时间）",
     work: "按标题查询某个视频的发布数据（播放/赞/评/收藏/分享/发布时间）",
   }[cmd];
   return `
@@ -83,5 +184,6 @@ ${usage}
   matrixmedia cli stats -p sph --phone 123
   matrixmedia cli stats-sync -p dy --phone 123
   matrixmedia cli stats-work -p ks --phone 123 --title "你家猫也这样睡？"
+  matrixmedia cli stats-export --out ./stats.xlsx --from 2026-11-01 --to 2026-11-30
 `.trim();
 }
