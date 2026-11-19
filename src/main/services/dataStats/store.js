@@ -10,9 +10,11 @@
  * 日趋势口径：所有平台统一为「当日总量快照」；抖音/视频号额外回填粉丝历史（只补缺日期）。
  */
 
+const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const { app } = require("electron");
+const { WORK_STAT_KEYS, normalizeMetric } = require("./statsTable");
 
 const METRIC_KEYS = ["fans", "plays", "likes", "comments", "favorites", "shares"];
 
@@ -91,8 +93,6 @@ function writeWorks(group, platform, data) {
   writeJson(path.join(accountDir(group, platform), "works.json"), data);
 }
 
-const WORK_STAT_KEYS = ["play", "like", "comment", "share", "favorite", "fansDelta"];
-
 function pickStats(w) {
   const out = {};
   for (const k of WORK_STAT_KEYS) out[k] = w[k] == null ? null : w[k];
@@ -160,61 +160,374 @@ function mergeWorks(group, platform, newWorks, now = Date.now()) {
 
 /* ---------------- works-daily（作品日快照） ---------------- */
 
-function readWorksDaily(group, platform) {
-  const data = readJson(path.join(accountDir(group, platform), "works-daily.json"), {});
-  return data && typeof data === "object" && !Array.isArray(data) ? data : {};
+const WORKS_DAILY_LOCK_TIMEOUT_MS = 5000;
+const WORKS_DAILY_LOCK_STALE_MS = 30000;
+const WORKS_DAILY_LOCK_RETRY_MS = 25;
+const WORKS_DAILY_RENAME_MAX_RETRIES = 3;
+const WORKS_DAILY_RENAME_RETRY_DELAY_MS = 50;
+
+const SLEEP_VIEW =
+  typeof SharedArrayBuffer === "function"
+    ? new Int32Array(new SharedArrayBuffer(4))
+    : null;
+
+function sleepSync(ms) {
+  if (!ms || ms <= 0) return;
+  if (SLEEP_VIEW) {
+    try {
+      Atomics.wait(SLEEP_VIEW, 0, 0, ms);
+      return;
+    } catch (_) {
+      // 环境不支持 Atomics.wait 时退回短忙等
+    }
+  }
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    // busy wait fallback
+  }
 }
 
-function writeWorksDaily(group, platform, daily) {
-  writeJson(path.join(accountDir(group, platform), "works-daily.json"), daily);
+function worksDailyFile(group, platform) {
+  return path.join(accountDir(group, platform), "works-daily.json");
+}
+
+function toNullProtoDict(obj) {
+  const dict = Object.create(null);
+  for (const key of Object.keys(obj)) {
+    const desc = Object.getOwnPropertyDescriptor(obj, key);
+    if (desc) dict[key] = desc.value;
+  }
+  return dict;
+}
+
+/**
+ * 读取作品日快照。
+ * 仅 ENOENT 返回空无原型字典；EIO / JSON 损坏 / 根结构非对象一律抛错，避免误把异常当空库覆写历史。
+ */
+function readWorksDaily(group, platform) {
+  const file = worksDailyFile(group, platform);
+  let raw;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch (err) {
+    if (err && err.code === "ENOENT") {
+      return Object.create(null);
+    }
+    throw err;
+  }
+  const parsed = JSON.parse(raw);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    const err = new Error("works-daily.json 根结构必须为对象");
+    err.code = "EINVALID_WORKS_DAILY";
+    throw err;
+  }
+  return toNullProtoDict(parsed);
+}
+
+function writeAllSync(fd, buf) {
+  let offset = 0;
+  while (offset < buf.length) {
+    const written = fs.writeSync(fd, buf, offset, buf.length - offset);
+    if (written <= 0) {
+      const err = new Error("短写入：未能写入字节");
+      err.code = "EIO";
+      throw err;
+    }
+    offset += written;
+  }
+}
+
+function renameWithRetrySync(src, dest) {
+  for (let attempt = 0; attempt <= WORKS_DAILY_RENAME_MAX_RETRIES; attempt++) {
+    try {
+      fs.renameSync(src, dest);
+      return;
+    } catch (err) {
+      const retryable = err && (err.code === "EPERM" || err.code === "EBUSY");
+      if (!retryable || attempt === WORKS_DAILY_RENAME_MAX_RETRIES) {
+        throw err;
+      }
+      sleepSync(WORKS_DAILY_RENAME_RETRY_DELAY_MS);
+    }
+  }
+}
+
+/**
+ * 原子写入 works-daily.json：同目录唯一临时文件 → 写全 → fsync → renameSync 覆盖。
+ * 任何步骤失败都删除临时文件并保留旧文件完整。
+ */
+function writeWorksDailyAtomic(file, daily) {
+  const dir = path.dirname(file);
+  const base = path.basename(file);
+  const buf = Buffer.from(JSON.stringify(daily, null, 2), "utf8");
+  fs.mkdirSync(dir, { recursive: true });
+  const rand = crypto.randomBytes(6).toString("hex");
+  const tmpFile = path.join(dir, `.${base}.${process.pid}.${Date.now()}.${rand}.tmp`);
+  let fd = null;
+  let tmpCreated = false;
+  try {
+    fd = fs.openSync(tmpFile, "wx");
+    tmpCreated = true;
+    writeAllSync(fd, buf);
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = null;
+    renameWithRetrySync(tmpFile, file);
+    tmpCreated = false;
+  } catch (err) {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch (_) {}
+      fd = null;
+    }
+    if (tmpCreated) {
+      try {
+        fs.unlinkSync(tmpFile);
+      } catch (_) {}
+    }
+    throw err;
+  }
+}
+
+function tryCreateLock(lockFile, token) {
+  const fd = fs.openSync(lockFile, "wx");
+  let closed = false;
+  try {
+    const payload = JSON.stringify({
+      pid: process.pid,
+      createdAt: Date.now(),
+      token,
+    });
+    writeAllSync(fd, Buffer.from(payload, "utf8"));
+    fs.closeSync(fd);
+    closed = true;
+  } catch (err) {
+    if (!closed) {
+      try {
+        fs.closeSync(fd);
+      } catch (_) {}
+    }
+    try {
+      fs.unlinkSync(lockFile);
+    } catch (_) {}
+    throw err;
+  }
+}
+
+function isLockStale(lockFile, nowMs, staleMs = WORKS_DAILY_LOCK_STALE_MS) {
+  let stat;
+  try {
+    stat = fs.statSync(lockFile);
+  } catch (_) {
+    return false;
+  }
+  if (nowMs - stat.mtimeMs > staleMs) {
+    return true;
+  }
+  try {
+    const raw = fs.readFileSync(lockFile, "utf8");
+    if (raw) {
+      const info = JSON.parse(raw);
+      const ts = info && (info.createdAt ?? info.time ?? info.timestamp);
+      if (typeof ts === "number" && Number.isFinite(ts) && nowMs - ts > staleMs) {
+        return true;
+      }
+    }
+  } catch (_) {
+    // 锁文件可能正在写入中或非 JSON，以 mtime 为准
+  }
+  return false;
+}
+
+function tryPreemptStaleLock(lockFile, token, staleMs) {
+  const reapLock = `${lockFile}.reap`;
+  let reapFd = null;
+  try {
+    reapFd = fs.openSync(reapLock, "wx");
+    fs.closeSync(reapFd);
+    reapFd = null;
+  } catch (err) {
+    if (reapFd !== null) {
+      try {
+        fs.closeSync(reapFd);
+      } catch (_) {}
+    }
+    if (err && err.code === "EEXIST") {
+      try {
+        const st = fs.statSync(reapLock);
+        if (Date.now() - st.mtimeMs > staleMs) {
+          fs.unlinkSync(reapLock);
+        }
+      } catch (_) {}
+      return false;
+    }
+    throw err;
+  }
+
+  try {
+    if (!isLockStale(lockFile, Date.now(), staleMs)) {
+      return false;
+    }
+    try {
+      fs.unlinkSync(lockFile);
+    } catch (err) {
+      if (!err || err.code !== "ENOENT") {
+        throw err;
+      }
+    }
+    try {
+      tryCreateLock(lockFile, token);
+      return true;
+    } catch (err) {
+      if (err && err.code === "EEXIST") {
+        return false;
+      }
+      throw err;
+    }
+  } finally {
+    try {
+      fs.unlinkSync(reapLock);
+    } catch (_) {}
+  }
+}
+
+function acquireWorksDailyLock(lockFile, options = {}) {
+  const timeoutMs = options.timeoutMs ?? WORKS_DAILY_LOCK_TIMEOUT_MS;
+  const staleMs = options.staleMs ?? WORKS_DAILY_LOCK_STALE_MS;
+  const retryMs = options.retryMs ?? WORKS_DAILY_LOCK_RETRY_MS;
+  const token = `${process.pid}-${Date.now()}-${crypto.randomBytes(6).toString("hex")}`;
+  const deadline = Date.now() + timeoutMs;
+
+  while (true) {
+    try {
+      tryCreateLock(lockFile, token);
+      return { lockFile, token, acquiredAt: Date.now(), staleMs };
+    } catch (err) {
+      if (!err || err.code !== "EEXIST") {
+        throw err;
+      }
+    }
+
+    if (isLockStale(lockFile, Date.now(), staleMs)) {
+      if (tryPreemptStaleLock(lockFile, token, staleMs)) {
+        return { lockFile, token, acquiredAt: Date.now(), staleMs };
+      }
+    }
+
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      const err = new Error(`获取 works-daily.json 锁超时 (${timeoutMs}ms): ${lockFile}`);
+      err.code = "ELOCK_TIMEOUT";
+      throw err;
+    }
+    sleepSync(Math.min(retryMs, remaining));
+  }
+}
+
+function releaseWorksDailyLock(lock) {
+  if (!lock) return;
+  let shouldUnlink = false;
+  try {
+    const raw = fs.readFileSync(lock.lockFile, "utf8");
+    const info = JSON.parse(raw);
+    shouldUnlink = Boolean(info && info.token === lock.token);
+  } catch (err) {
+    if (err && err.code === "ENOENT") return;
+    // 自身持锁未超陈旧阈值时，遇临时读失败仍清理自建锁，避免残留死锁
+    shouldUnlink = Date.now() - lock.acquiredAt < lock.staleMs;
+  }
+  if (!shouldUnlink) return;
+  try {
+    fs.unlinkSync(lock.lockFile);
+  } catch (err) {
+    if (!err || err.code !== "ENOENT") {
+      console.warn(
+        `[dataStats] 释放 works-daily.json 锁失败 (${lock.lockFile}):`,
+        (err && err.message) || err
+      );
+    }
+  }
+}
+
+function backupCorruptWorksDaily(file) {
+  const backupFile = path.join(
+    path.dirname(file),
+    `works-daily.corrupt-${Date.now()}.json`
+  );
+  try {
+    fs.copyFileSync(file, backupFile);
+    console.warn(`[dataStats] 检测到损坏的 works-daily.json，已备份至 ${backupFile}`);
+    return backupFile;
+  } catch (err) {
+    console.warn(
+      `[dataStats] 备份损坏的 works-daily.json 失败 (${backupFile}):`,
+      (err && err.message) || err
+    );
+    return null;
+  }
 }
 
 function pickWorkDailyStats(w) {
   const out = {};
   for (const k of WORK_STAT_KEYS) {
-    const raw = w[k];
-    if (raw == null || raw === "" || typeof raw === "boolean") {
-      out[k] = null;
-    } else {
-      const v = Number(raw);
-      out[k] = Number.isFinite(v) ? v : null;
-    }
+    out[k] = normalizeMetric(w[k]);
   }
   return out;
 }
 
 /**
  * 写入作品当日累计快照（日期按 UTC+8；同日多次采集覆盖为最后一次）。
- * 写入失败只打警告，不得影响主流程（mergeWorks）。
+ * 跨进程持锁 → 锁内重读 → 合并 → 原子写；读/写/锁失败仅告警跳过，不得影响主流程（mergeWorks）。
  */
 function recordWorksDaily(group, platform, works, now = Date.now()) {
   if (!works || !works.length) return;
+  const validWorks = [];
+  for (const w of works) {
+    if (w && w.workId) validWorks.push(w);
+  }
+  if (!validWorks.length) return;
+
+  const file = worksDailyFile(group, platform);
+  const lockFile = `${file}.lock`;
+  let lock = null;
   try {
-    const daily = readWorksDaily(group, platform);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    lock = acquireWorksDailyLock(lockFile);
+
+    let daily;
+    try {
+      daily = readWorksDaily(group, platform);
+    } catch (readErr) {
+      if (readErr instanceof SyntaxError) {
+        backupCorruptWorksDaily(file);
+      }
+      throw readErr;
+    }
+
     const today = todayStr(now);
-    let updated = false;
-    for (const w of works) {
-      if (!w || !w.workId) continue;
+    for (const w of validWorks) {
       const id = String(w.workId);
+      const existingDates = daily[id];
       if (
         !Object.prototype.hasOwnProperty.call(daily, id) ||
-        !daily[id] ||
-        typeof daily[id] !== "object" ||
-        Array.isArray(daily[id])
+        !existingDates ||
+        typeof existingDates !== "object" ||
+        Array.isArray(existingDates)
       ) {
         daily[id] = {};
       }
       daily[id][today] = pickWorkDailyStats(w);
-      updated = true;
     }
-    if (updated) {
-      writeWorksDaily(group, platform, daily);
-    }
+
+    writeWorksDailyAtomic(file, daily);
   } catch (err) {
     console.warn(
       `[dataStats] 写入 works-daily.json 失败 (${group}/${platform}):`,
       (err && err.message) || err
     );
+  } finally {
+    releaseWorksDailyLock(lock);
   }
 }
 

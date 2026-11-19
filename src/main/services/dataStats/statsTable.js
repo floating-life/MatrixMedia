@@ -11,6 +11,7 @@ const WORK_STAT_KEYS = ["play", "like", "comment", "share", "favorite", "fansDel
 const DELETED_WORK_TITLE = "(已删除或未匹配)";
 const DAY_MS = 86400000;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const DECIMAL_NUM_RE = /^[+-]?(?:\d+(?:\.\d+)?|\.\d+)$/;
 
 /** 解析 YYYY-MM-DD 为 UTC 零点毫秒时间戳，非法日期返回 null */
 function parseDateDayMs(dateStr) {
@@ -41,10 +42,23 @@ function parsePublishTime(raw) {
   return { ms: t, iso: d.toISOString() };
 }
 
-function toMetricOrNull(v) {
-  if (v == null || v === "" || typeof v === "boolean") return null;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
+/**
+ * 统一指标校验：仅接受有限 number，或去空白后非空且为合法十进制数字的字符串；
+ * 其余值（空白串、数组、对象、布尔、NaN、Infinity 等）一律归为 null。
+ */
+function normalizeMetric(v) {
+  if (typeof v === "number") {
+    if (!Number.isFinite(v)) return null;
+    return v === 0 ? 0 : v;
+  }
+  if (typeof v === "string") {
+    const trimmed = v.trim();
+    if (!trimmed || !DECIMAL_NUM_RE.test(trimmed)) return null;
+    const n = Number(trimmed);
+    if (!Number.isFinite(n)) return null;
+    return n === 0 ? 0 : n;
+  }
+  return null;
 }
 
 /**
@@ -107,7 +121,10 @@ function buildWorkDailyRows({ group, platform, works, worksDaily, from, to } = {
       const values = {};
       const deltas = {};
       for (const k of WORK_STAT_KEYS) {
-        const curr = toMetricOrNull(point.snap[k]);
+        const rawVal = Object.prototype.hasOwnProperty.call(point.snap, k)
+          ? point.snap[k]
+          : null;
+        const curr = normalizeMetric(rawVal);
         values[k] = curr;
         if (!prevValues || curr === null || prevValues[k] === null) {
           deltas[`${k}Delta`] = null;
@@ -174,5 +191,6 @@ function buildWorkDailyRows({ group, platform, works, worksDaily, from, to } = {
 module.exports = {
   WORK_STAT_KEYS,
   DELETED_WORK_TITLE,
+  normalizeMetric,
   buildWorkDailyRows,
 };
