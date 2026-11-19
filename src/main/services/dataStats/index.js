@@ -8,6 +8,10 @@
  * - stats:get-data             读取单账号本地数据（daily + works + meta）
  * - stats:get-overview         全账号按日聚合（所有账号总览页）
  * - stats:get-content-summary  跨平台作品汇总（作品汇总 tab）
+ * - stats:get-link-overrides   读取作品关联手工矫正配置
+ * - stats:set-link-override    设置单条作品手工关联（assign / detach）
+ * - stats:merge-works          合并多条未关联作品为同一 manual 内容
+ * - stats:clear-link-override  清除单条作品手工矫正，恢复自动匹配
  * - stats:export-xlsx          导出统计 Excel 工作簿（含本地页面校验与保存对话框）
  * - stats:match-works          发布状态匹配（与采集共享 collecting 互斥锁）
  *
@@ -37,6 +41,32 @@ let cancelled = false;
 let collectedToday = { date: "", partitions: new Set() };
 // auto-run.json 读写失败时的兜底：本进程内已自动跑过的日期（防止持久化失败导致每分钟重采）
 const autoRanInMemory = new Set();
+// link-overrides.json 串行写入队列：保证并发 set/merge/clear 顺序执行不丢写
+let overrideWriteChain = Promise.resolve();
+
+function enqueueOverrideWrite(fn) {
+  const run = () => Promise.resolve().then(fn);
+  const next = overrideWriteChain.then(run, run);
+  overrideWriteChain = next.catch(() => {});
+  return next;
+}
+
+function toPlainOverrides(raw) {
+  const out = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const key of Object.keys(raw)) {
+    const desc = Object.getOwnPropertyDescriptor(raw, key);
+    if (desc && desc.value && typeof desc.value === "object") {
+      Object.defineProperty(out, key, {
+        value: { ...desc.value },
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+    }
+  }
+  return out;
+}
 
 function getTodayStr(now = Date.now()) {
   if (typeof store.todayStr === "function") {
@@ -302,6 +332,7 @@ function registerDataStatsIpc(options = {}) {
       if (args != null && (typeof args !== "object" || Array.isArray(args))) {
         return { rows: [], date: "", error: "查询参数无效" };
       }
+      await overrideWriteChain;
       const date = args && args.date !== undefined ? args.date : undefined;
       return buildContentSummaryData({ date }, exportDeps);
     } catch (err) {
@@ -309,6 +340,127 @@ function registerDataStatsIpc(options = {}) {
         rows: [],
         date: "",
         error: (err && err.message) || "读取作品汇总失败",
+      };
+    }
+  });
+
+  ipcMain.handle("stats:get-link-overrides", async (event) => {
+    try {
+      if (!isLocalFrameEvent(event)) {
+        return { ok: false, error: "不允许外部页面读取手动关联配置", overrides: {} };
+      }
+      await overrideWriteChain;
+      const doc = store.readLinkOverrides();
+      return {
+        ok: true,
+        version: doc.version,
+        updatedAt: doc.updatedAt,
+        overrides: toPlainOverrides(doc.overrides),
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        error: (err && err.message) || "读取手动关联配置失败",
+        overrides: {},
+      };
+    }
+  });
+
+  ipcMain.handle("stats:set-link-override", async (event, args) => {
+    try {
+      if (!isLocalFrameEvent(event)) {
+        return { ok: false, error: "不允许外部页面修改手动关联配置" };
+      }
+      if (!args || typeof args !== "object" || Array.isArray(args)) {
+        return { ok: false, error: "参数无效" };
+      }
+      const workKey = typeof args.workKey === "string" ? args.workKey : "";
+      const action = typeof args.action === "string" ? args.action.trim() : "";
+      const contentKey = typeof args.contentKey === "string" ? args.contentKey.trim() : "";
+      if (!workKey) {
+        return { ok: false, error: "workKey 不能为空" };
+      }
+      if (action !== "assign" && action !== "detach") {
+        return { ok: false, error: "action 必须为 assign 或 detach" };
+      }
+      if (action === "assign" && (!contentKey || contentKey.startsWith("unlinked:"))) {
+        return { ok: false, error: "assign 操作需提供有效的 contentKey" };
+      }
+      const entry = action === "assign" ? { action: "assign", contentKey } : { action: "detach" };
+      const doc = await enqueueOverrideWrite(() => store.setLinkOverride(workKey, entry));
+      return {
+        ok: true,
+        workKey,
+        override: entry,
+        updatedAt: doc.updatedAt,
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        error: (err && err.message) || "保存手动关联失败",
+      };
+    }
+  });
+
+  ipcMain.handle("stats:merge-works", async (event, args) => {
+    try {
+      if (!isLocalFrameEvent(event)) {
+        return { ok: false, error: "不允许外部页面合并作品" };
+      }
+      if (!args || typeof args !== "object" || Array.isArray(args)) {
+        return { ok: false, error: "参数无效" };
+      }
+      if (!Array.isArray(args.workKeys)) {
+        return { ok: false, error: "workKeys 必须为数组" };
+      }
+      const uniqueKeys = [];
+      const seen = new Set();
+      for (const k of args.workKeys) {
+        if (typeof k !== "string" || !k) continue;
+        if (seen.has(k)) continue;
+        seen.add(k);
+        uniqueKeys.push(k);
+      }
+      if (uniqueKeys.length < 2) {
+        return { ok: false, error: "至少需要选择 2 条作品才能合并" };
+      }
+      const merged = await enqueueOverrideWrite(() => store.mergeWorksOverride(uniqueKeys));
+      return {
+        ok: true,
+        contentKey: merged.contentKey,
+        workKeys: merged.workKeys,
+        updatedAt: merged.doc.updatedAt,
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        error: (err && err.message) || "合并作品失败",
+      };
+    }
+  });
+
+  ipcMain.handle("stats:clear-link-override", async (event, args) => {
+    try {
+      if (!isLocalFrameEvent(event)) {
+        return { ok: false, error: "不允许外部页面清除手动关联配置" };
+      }
+      if (!args || typeof args !== "object" || Array.isArray(args)) {
+        return { ok: false, error: "参数无效" };
+      }
+      const workKey = typeof args.workKey === "string" ? args.workKey : "";
+      if (!workKey) {
+        return { ok: false, error: "workKey 不能为空" };
+      }
+      const doc = await enqueueOverrideWrite(() => store.clearLinkOverride(workKey));
+      return {
+        ok: true,
+        workKey,
+        updatedAt: doc.updatedAt,
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        error: (err && err.message) || "恢复自动关联失败",
       };
     }
   });
@@ -353,6 +505,7 @@ function registerDataStatsIpc(options = {}) {
       };
       if (exportMaxRows !== undefined) buildOpts.maxRows = exportMaxRows;
 
+      await overrideWriteChain;
       const data = buildStatsWorkbookData(buildOpts, exportDeps);
       // 原样使用对话框返回路径（不做 trim）
       writeStatsXlsx(

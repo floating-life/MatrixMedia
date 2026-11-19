@@ -566,65 +566,70 @@ async function main() {
     // 验证 Sheet 1：作品日明细
     const s1 = wbData.sheets["作品日明细"];
     assert.deepStrictEqual(s1[0], WORK_DAILY_HEADERS);
+    assert.strictEqual(s1[0][4], "关联方式");
+    assert.strictEqual(s1[0][5], "匹配分数");
     const s1Rows = s1.slice(1);
     const findS1 = (date, platform, group, workId) =>
       s1Rows.find(
-        (r) => r[0] === date && r[1] === platform && r[2] === group && r[5] === workId
+        (r) => r[0] === date && r[1] === platform && r[2] === group && r[6] === workId
       );
 
-    // DY1 Day1 (2026-11-10)：关联 link，首次记录日增与断档均为空，公式标题前置单引号
+    // DY1 Day1 (2026-11-10)：关联 link，匹配分数为空，首次记录日增与断档均为空，公式标题前置单引号
     const dy1d1 = findS1("2026-11-10", "抖音", "A组", "DY1");
     assert.ok(dy1d1, "应含 DY1 11-10 行");
     assert.strictEqual(dy1d1[3], "file:/videos/dish1.mp4");
     assert.strictEqual(dy1d1[4], "link");
-    assert.strictEqual(dy1d1[6], "'=SUM(A1:A2) 红烧肉教程", "= 开头标题应前置单引号");
-    assert.strictEqual(dy1d1[8], "2026-11-09", "发布日期应为 YYYY-MM-DD");
-    assert.strictEqual(dy1d1[9], 100);
-    assert.strictEqual(dy1d1[13], null, "抖音收藏为空单元格");
-    assert.strictEqual(dy1d1[15], null, "首次记录播放日增应为空");
-    assert.strictEqual(dy1d1[21], null, "首次记录断档天数应为空");
+    assert.strictEqual(dy1d1[5], null, "link 关联匹配分数应为空");
+    assert.strictEqual(dy1d1[7], "'=SUM(A1:A2) 红烧肉教程", "= 开头标题应前置单引号");
+    assert.strictEqual(dy1d1[9], "2026-11-09", "发布日期应为 YYYY-MM-DD");
+    assert.strictEqual(dy1d1[10], 100);
+    assert.strictEqual(dy1d1[14], null, "抖音收藏为空单元格");
+    assert.strictEqual(dy1d1[16], null, "首次记录播放日增应为空");
+    assert.strictEqual(dy1d1[22], null, "首次记录断档天数应为空");
 
     // DY1 Day2 (2026-11-11)：连续一天 gapDays=0，playDelta=160，fansDeltaDelta=-2（负数 number）
     const dy1d2 = findS1("2026-11-11", "抖音", "A组", "DY1");
     assert.ok(dy1d2);
-    assert.strictEqual(dy1d2[15], 160);
-    assert.strictEqual(dy1d2[16], 15);
-    assert.strictEqual(dy1d2[17], 3);
-    assert.strictEqual(dy1d2[18], 2);
-    assert.strictEqual(dy1d2[19], null);
-    assert.strictEqual(typeof dy1d2[20], "number");
-    assert.strictEqual(dy1d2[20], -2, "负日增必须保持数字类型且不前置单引号");
-    assert.strictEqual(dy1d2[21], 0, "连续两天断档天数应为 0");
+    assert.strictEqual(dy1d2[16], 160);
+    assert.strictEqual(dy1d2[17], 15);
+    assert.strictEqual(dy1d2[18], 3);
+    assert.strictEqual(dy1d2[19], 2);
+    assert.strictEqual(dy1d2[20], null);
+    assert.strictEqual(typeof dy1d2[21], "number");
+    assert.strictEqual(dy1d2[21], -2, "负日增必须保持数字类型且不前置单引号");
+    assert.strictEqual(dy1d2[22], 0, "连续两天断档天数应为 0");
 
     // DY1 Day5 (2026-11-14)：断档 2 天，playDelta = 500 - 260 = 240
     const dy1d5 = findS1("2026-11-14", "抖音", "A组", "DY1");
     assert.ok(dy1d5);
-    assert.strictEqual(dy1d5[15], 240);
-    assert.strictEqual(dy1d5[20], 7);
-    assert.strictEqual(dy1d5[21], 2, "11-11 到 11-14 断档天数应为 2");
+    assert.strictEqual(dy1d5[16], 240);
+    assert.strictEqual(dy1d5[21], 7);
+    assert.strictEqual(dy1d5[22], 2, "11-11 到 11-14 断档天数应为 2");
 
-    // 未关联作品 DY2 / KS2：内容ID 与 关联方式为空，+ / @ 开头标题前置单引号，真实 0 保持 number
+    // 未关联作品 DY2 / KS2：内容ID、关联方式、匹配分数为空，+ / @ 开头标题前置单引号，真实 0 保持 number
     const dy2d1 = findS1("2026-11-10", "抖音", "A组", "DY2");
     assert.strictEqual(dy2d1[3], null, "未关联作品内容ID应为空");
     assert.strictEqual(dy2d1[4], null, "未关联作品关联方式应为空");
-    assert.strictEqual(dy2d1[6], "'+123 独立视频");
-    assert.strictEqual(dy2d1[12], 0, "真实 0 应保留为 number 0");
+    assert.strictEqual(dy2d1[5], null, "未关联作品匹配分数应为空");
+    assert.strictEqual(dy2d1[7], "'+123 独立视频");
+    assert.strictEqual(dy2d1[13], 0, "真实 0 应保留为 number 0");
 
     const dy3d1 = findS1("2026-11-10", "抖音", "B组", "DY3");
-    assert.strictEqual(dy3d1[6], "'-测试视频");
+    assert.strictEqual(dy3d1[7], "'-测试视频");
 
     const ks2d2 = findS1("2026-11-11", "快手", "B组", "KS2");
-    assert.strictEqual(ks2d2[6], "'@用户 独立视频");
-    assert.strictEqual(ks2d2[9], 0, "快手 play=0 应为数字 0");
-    assert.strictEqual(ks2d2[12], null, "快手分享缺项为空");
-    assert.strictEqual(ks2d2[13], null, "快手收藏缺项为空");
-    assert.strictEqual(ks2d2[14], null, "快手涨粉缺项为空");
+    assert.strictEqual(ks2d2[7], "'@用户 独立视频");
+    assert.strictEqual(ks2d2[10], 0, "快手 play=0 应为数字 0");
+    assert.strictEqual(ks2d2[13], null, "快手分享缺项为空");
+    assert.strictEqual(ks2d2[14], null, "快手收藏缺项为空");
+    assert.strictEqual(ks2d2[15], null, "快手涨粉缺项为空");
 
     // KS1 通过标题归一化关联到 dish1
     const ks1d2 = findS1("2026-11-11", "快手", "A组", "KS1");
     assert.strictEqual(ks1d2[3], "file:/videos/dish1.mp4");
     assert.strictEqual(ks1d2[4], "title");
-    assert.strictEqual(ks1d2[15], 120);
+    assert.strictEqual(ks1d2[5], null, "title 关联匹配分数应为空");
+    assert.strictEqual(ks1d2[16], 120);
 
     // 验证 Sheet 2：作品跨平台汇总（截至 2026-11-14）
     const s2 = wbData.sheets["作品跨平台汇总"];
@@ -634,6 +639,7 @@ async function main() {
       "素材文件",
       "首发日期",
       "覆盖平台数",
+      "匹配方式",
       "总播放",
       "总点赞",
       "总评论",
@@ -659,30 +665,34 @@ async function main() {
     assert.strictEqual(dish1Row[2], "/videos/dish1.mp4");
     assert.strictEqual(dish1Row[3], "2026-11-09");
     assert.strictEqual(dish1Row[4], 2, "覆盖平台数应为 2");
-    assert.strictEqual(dish1Row[5], 500 + 700, "总播放 = DY1(500) + KS1(700)");
-    assert.strictEqual(dish1Row[6], 60 + 55);
-    assert.strictEqual(dish1Row[7], 12 + 11);
-    assert.strictEqual(dish1Row[8], 8, "总分享仅抖音有值 8");
-    assert.strictEqual(dish1Row[9], null, "总收藏两平台全空应为空单元格");
-    assert.strictEqual(dish1Row[10], 10, "总涨粉仅抖音有值 10");
-    assert.strictEqual(dish1Row[11], 500, "抖音·A组·播放");
-    assert.strictEqual(dish1Row[12], 60, "抖音·A组·点赞");
-    assert.strictEqual(dish1Row[13], 12, "抖音·A组·评论");
-    assert.strictEqual(dish1Row[14], null, "抖音·B组 无此作品应为空");
-    assert.strictEqual(dish1Row[17], 700, "快手·A组·播放");
-    assert.strictEqual(dish1Row[18], 55, "快手·A组·点赞");
-    assert.strictEqual(dish1Row[19], 11, "快手·A组·评论");
+    assert.strictEqual(dish1Row[5], "title", "dish1 含 link+title，簇内最弱方式应为 title");
+    assert.strictEqual(dish1Row[6], 500 + 700, "总播放 = DY1(500) + KS1(700)");
+    assert.strictEqual(dish1Row[7], 60 + 55);
+    assert.strictEqual(dish1Row[8], 12 + 11);
+    assert.strictEqual(dish1Row[9], 8, "总分享仅抖音有值 8");
+    assert.strictEqual(dish1Row[10], null, "总收藏两平台全空应为空单元格");
+    assert.strictEqual(dish1Row[11], 10, "总涨粉仅抖音有值 10");
+    assert.strictEqual(dish1Row[12], 500, "抖音·A组·播放");
+    assert.strictEqual(dish1Row[13], 60, "抖音·A组·点赞");
+    assert.strictEqual(dish1Row[14], 12, "抖音·A组·评论");
+    assert.strictEqual(dish1Row[15], null, "抖音·B组 无此作品应为空");
+    assert.strictEqual(dish1Row[18], 700, "快手·A组·播放");
+    assert.strictEqual(dish1Row[19], 55, "快手·A组·点赞");
+    assert.strictEqual(dish1Row[20], 11, "快手·A组·评论");
     assert.strictEqual(
-      dish1Row[23],
+      dish1Row[24],
       "https://www.douyin.com/video/1001\nhttps://www.kuaishou.com/short-video/ks1",
       "多条作品链接应用换行连接"
     );
     const b1Row = s2.slice(1).find((r) => r[0] === "file:/videos/b1.mp4");
     assert.strictEqual(b1Row[1], "'-测试视频", "跨平台汇总标题应同样防公式注入");
+    assert.strictEqual(b1Row[5], "link", "b1 仅直链匹配应标 link");
     const unlinkedDy2 = s2.slice(1).find((r) => r[0] === "unlinked:抖音:DY2");
     assert.strictEqual(unlinkedDy2[1], "'+123 独立视频");
+    assert.strictEqual(unlinkedDy2[5], null, "未关联行匹配方式应为空");
     const unlinkedKs2 = s2.slice(1).find((r) => r[0] === "unlinked:快手:KS2");
     assert.strictEqual(unlinkedKs2[1], "'@用户 独立视频");
+    assert.strictEqual(unlinkedKs2[5], null);
 
     // 验证 Sheet 3：平台日汇总
     const s3 = wbData.sheets["平台日汇总"];
@@ -793,6 +803,9 @@ async function main() {
       "适配器可能把缺失指标写成 0",
       "同组同平台",
       "启用本功能当天开始积累",
+      "匹配分数",
+      "匹配方式",
+      "模糊匹配可能合错，已手工确认的标 manual",
     ]) {
       assert.ok(s5Text.includes(kw), `字段说明缺少关键口径：${kw}`);
     }
@@ -858,30 +871,32 @@ async function main() {
       const cell = (c) => ws1[xlsx.utils.encode_cell({ r, c })];
       assert.strictEqual(cell(0).t, "s", "日期单元格必须为字符串类型");
       assert.ok(/^\d{4}-\d{2}-\d{2}$/.test(cell(0).v), "日期格式必须为 YYYY-MM-DD");
-      if (cell(0).v === "2026-11-11" && cell(1).v === "抖音" && cell(5).v === "DY1") {
+      if (cell(0).v === "2026-11-11" && cell(1).v === "抖音" && cell(6).v === "DY1") {
         checkedDy1D2 = true;
-        assert.strictEqual(cell(6).t, "s");
-        assert.strictEqual(cell(6).v, "'=SUM(A1:A2) 红烧肉教程");
-        assert.strictEqual(cell(8).t, "s");
-        assert.strictEqual(cell(8).v, "2026-11-09");
-        assert.strictEqual(cell(9).t, "n");
-        assert.strictEqual(cell(9).v, 260);
-        assert.strictEqual(cell(13), undefined, "抖音收藏空值必须为空单元格");
-        assert.strictEqual(cell(15).t, "n");
-        assert.strictEqual(cell(15).v, 160);
-        assert.strictEqual(cell(20).t, "n");
-        assert.strictEqual(cell(20).v, -2);
+        assert.strictEqual(cell(5), undefined, "link 关联匹配分数必须为空单元格");
+        assert.strictEqual(cell(7).t, "s");
+        assert.strictEqual(cell(7).v, "'=SUM(A1:A2) 红烧肉教程");
+        assert.strictEqual(cell(9).t, "s");
+        assert.strictEqual(cell(9).v, "2026-11-09");
+        assert.strictEqual(cell(10).t, "n");
+        assert.strictEqual(cell(10).v, 260);
+        assert.strictEqual(cell(14), undefined, "抖音收藏空值必须为空单元格");
+        assert.strictEqual(cell(16).t, "n");
+        assert.strictEqual(cell(16).v, 160);
         assert.strictEqual(cell(21).t, "n");
-        assert.strictEqual(cell(21).v, 0);
+        assert.strictEqual(cell(21).v, -2);
+        assert.strictEqual(cell(22).t, "n");
+        assert.strictEqual(cell(22).v, 0);
       }
-      if (cell(0).v === "2026-11-11" && cell(1).v === "快手" && cell(5).v === "KS2") {
+      if (cell(0).v === "2026-11-11" && cell(1).v === "快手" && cell(6).v === "KS2") {
         checkedKs2D2 = true;
         assert.strictEqual(cell(3), undefined, "未关联内容ID为空单元格");
         assert.strictEqual(cell(4), undefined, "未关联方式为空单元格");
-        assert.strictEqual(cell(6).v, "'@用户 独立视频");
-        assert.strictEqual(cell(9).t, "n");
-        assert.strictEqual(cell(9).v, 0, "真实 0 读回必须为数字 0");
-        assert.strictEqual(cell(12), undefined, "快手分享为空单元格");
+        assert.strictEqual(cell(5), undefined, "未关联匹配分数为空单元格");
+        assert.strictEqual(cell(7).v, "'@用户 独立视频");
+        assert.strictEqual(cell(10).t, "n");
+        assert.strictEqual(cell(10).v, 0, "真实 0 读回必须为数字 0");
+        assert.strictEqual(cell(13), undefined, "快手分享为空单元格");
       }
     }
     assert.ok(checkedDy1D2 && checkedKs2D2, "读回校验应命中目标行");
@@ -903,13 +918,13 @@ async function main() {
     const fS1Rows = filtered.sheets["作品日明细"].slice(1);
     assert.ok(fS1Rows.length > 0);
     assert.ok(fS1Rows.every((r) => r[0] === "2026-11-11"), "Sheet 1 应仅保留 11-11 行");
-    const fDy1 = fS1Rows.find((r) => r[5] === "DY1");
-    assert.strictEqual(fDy1[15], 160, "过滤 from 后首日仍应相对 11-10 计算日增");
+    const fDy1 = fS1Rows.find((r) => r[6] === "DY1");
+    assert.strictEqual(fDy1[16], 160, "过滤 from 后首日仍应相对 11-10 计算日增");
     const fDish1 = filtered.sheets["作品跨平台汇总"]
       .slice(1)
       .find((r) => r[0] === "file:/videos/dish1.mp4");
     assert.strictEqual(
-      fDish1[5],
+      fDish1[6],
       260 + 420,
       "跨平台汇总应截至 to=11-11（不泄漏 11-14 数据）"
     );
@@ -1993,6 +2008,131 @@ async function main() {
         "作品汇总 tab 不应使用 v-if 销毁表格实例，应交由 el-tab-pane 控制显隐"
       );
       console.log("✓ P3 dataStats/index.vue 模板编译通过且 el-tab-pane 保留组件状态");
+    }
+
+    /* ---------- 10. S6 导出新列：作品日明细「匹配分数」与跨平台汇总「匹配方式」 ---------- */
+    {
+      const s6Deps = {
+        listAccounts: () => [
+          { group: "S6组", platform: "抖音" },
+          { group: "S6组", platform: "快手" },
+        ],
+        readWorks: (_g, p) =>
+          p === "抖音"
+            ? {
+                works: [
+                  {
+                    workId: "S6_DY_LINK",
+                    title: "秘制红烧肉教程完整详细步骤",
+                    url: "https://www.douyin.com/video/s601",
+                    publishTime: dayTs("2026-11-10"),
+                  },
+                  {
+                    workId: "S6_DY_MAN",
+                    title: "人工指定视频抖音版",
+                    url: "https://www.douyin.com/video/s602",
+                    publishTime: dayTs("2026-11-10"),
+                  },
+                ],
+              }
+            : {
+                works: [
+                  {
+                    workId: "S6_KS_FUZZY",
+                    title: "秘制红烧肉教程完整详细", // 截断 0.95 模糊匹配
+                    url: "https://www.kuaishou.com/short-video/s601",
+                    publishTime: dayTs("2026-11-11"),
+                  },
+                  {
+                    workId: "S6_KS_MAN",
+                    title: "完全改写标题快手版",
+                    url: "https://www.kuaishou.com/short-video/s602",
+                    publishTime: dayTs("2026-11-11"),
+                  },
+                ],
+              },
+        readWorksDaily: (_g, p) =>
+          p === "抖音"
+            ? {
+                S6_DY_LINK: { "2026-11-12": { play: 100, like: 10 } },
+                S6_DY_MAN: { "2026-11-12": { play: 200, like: 20 } },
+              }
+            : {
+                S6_KS_FUZZY: { "2026-11-12": { play: 300, like: 30 } },
+                S6_KS_MAN: { "2026-11-12": { play: 400, like: 40 } },
+              },
+        readDaily: () => ({}),
+        readPushRecords: () => [
+          {
+            id: "s6-1",
+            pt: "抖音",
+            group: "S6组",
+            publishStatus: "success",
+            title: "秘制红烧肉教程完整详细步骤",
+            filePath: "/videos/s6_hsr.mp4",
+            videoLink: "https://www.douyin.com/video/s601",
+            lastPublishAt: dayTs("2026-11-10"),
+          },
+          {
+            id: "s6-2",
+            pt: "快手",
+            group: "S6组",
+            publishStatus: "success",
+            title: "秘制红烧肉教程完整详细步骤",
+            filePath: "/videos/s6_hsr.mp4",
+            videoLink: "",
+            lastPublishAt: dayTs("2026-11-10"),
+          },
+        ],
+        readLinkOverrides: () => ({
+          version: 1,
+          updatedAt: dayTs("2026-11-12"),
+          overrides: {
+            "S6组|抖音|S6_DY_MAN": { action: "assign", contentKey: "manual:s6merge" },
+            "S6组|快手|S6_KS_MAN": { action: "assign", contentKey: "manual:s6merge" },
+          },
+        }),
+      };
+
+      const s6Wb = buildStatsWorkbookData({ now: dayTs("2026-11-12") }, s6Deps);
+      const s6Daily = s6Wb.sheets["作品日明细"].slice(1);
+      const rLink = s6Daily.find((r) => r[6] === "S6_DY_LINK");
+      const rFuzzy = s6Daily.find((r) => r[6] === "S6_KS_FUZZY");
+      const rMan = s6Daily.find((r) => r[6] === "S6_KS_MAN");
+      assert.strictEqual(rLink[4], "link");
+      assert.strictEqual(rLink[5], null);
+      assert.strictEqual(rFuzzy[4], "fuzzy");
+      assert.strictEqual(typeof rFuzzy[5], "number");
+      assert.strictEqual(rFuzzy[5], 0.95);
+      assert.strictEqual(rMan[4], "manual");
+      assert.strictEqual(rMan[5], null);
+
+      const s6Sum = s6Wb.sheets["作品跨平台汇总"].slice(1);
+      const sumHsr = s6Sum.find((r) => r[0] === "file:/videos/s6_hsr.mp4");
+      const sumMan = s6Sum.find((r) => r[0] === "manual:s6merge");
+      assert.strictEqual(sumHsr[5], "fuzzy", "含 link+fuzzy 的簇汇总匹配方式应取最弱 fuzzy");
+      assert.strictEqual(sumMan[5], "manual", "含手动矫正的簇汇总匹配方式应标 manual");
+
+      const s6File = path.join(tmpRoot, "s6-new-cols.xlsx");
+      writeStatsXlsx(s6Wb, s6File);
+      const s6Read = xlsx.readFile(s6File);
+      const ws1S6 = s6Read.Sheets["作品日明细"];
+      const rangeS6 = xlsx.utils.decode_range(ws1S6["!ref"]);
+      let foundFuzzyCell = false;
+      for (let r = 1; r <= rangeS6.e.r; r++) {
+        const widCell = ws1S6[xlsx.utils.encode_cell({ r, c: 6 })];
+        if (widCell && widCell.v === "S6_KS_FUZZY") {
+          foundFuzzyCell = true;
+          const mCell = ws1S6[xlsx.utils.encode_cell({ r, c: 4 })];
+          const scCell = ws1S6[xlsx.utils.encode_cell({ r, c: 5 })];
+          assert.strictEqual(mCell.t, "s");
+          assert.strictEqual(mCell.v, "fuzzy");
+          assert.strictEqual(scCell.t, "n", "匹配分数读回必须为 number 类型");
+          assert.strictEqual(scCell.v, 0.95);
+        }
+      }
+      assert.ok(foundFuzzyCell, "应读回 S6_KS_FUZZY 的 fuzzy 与数值分数");
+      console.log("✓ S6 导出新列：作品日明细匹配分数(number)与跨平台汇总匹配方式(fuzzy/manual)校验通过");
     }
 
     // 恢复 require.cache

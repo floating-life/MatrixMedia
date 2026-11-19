@@ -85,12 +85,37 @@
           <div class="card-head">
             <span class="card-title">作品跨平台汇总</span>
             <span class="card-tip">
-              共 {{ contentSummaryRows.length }} 条内容<template v-if="contentSummaryDate"> · 截至 {{ contentSummaryDate }}</template> · 点击行左侧箭头展开各平台明细与链接
+              共 {{ contentSummaryRows.length }} 条内容<template v-if="contentSummaryDate"> · 截至 {{ contentSummaryDate }}</template> · 点击行左侧箭头展开各平台明细与矫正操作
             </span>
           </div>
+          <div class="works-filter-bar">
+            <el-radio-group v-model="summaryFilter" size="mini">
+              <el-radio-button label="all">
+                全部（{{ contentSummaryRows.length }}）
+              </el-radio-button>
+              <el-radio-button label="fuzzy">
+                仅模糊匹配（待确认）（{{ fuzzySummaryRows.length }}）
+              </el-radio-button>
+              <el-radio-button label="unlinked">
+                未关联作品（{{ unlinkedWorkRows.length }}）
+              </el-radio-button>
+            </el-radio-group>
+            <div v-if="summaryFilter === 'unlinked'" class="unlinked-actions">
+              <el-button
+                type="primary"
+                size="mini"
+                :loading="mutatingLink"
+                :disabled="selectedUnlinkedWorks.length < 2 || mutatingLink"
+                @click="mergeSelectedUnlinked"
+              >
+                合并为同一视频（已选 {{ selectedUnlinkedWorks.length }} 条）
+              </el-button>
+            </div>
+          </div>
           <el-table
+            v-if="summaryFilter !== 'unlinked'"
             v-loading="loadingSummary"
-            :data="contentSummaryRows"
+            :data="displayedSummaryRows"
             row-key="contentKey"
             border
             stripe
@@ -103,40 +128,53 @@
                     素材文件：{{ row.file }}
                   </div>
                   <el-table
-                    v-if="perPlatformList(row).length"
-                    :data="perPlatformList(row)"
+                    v-if="perPlatformWorkList(row).length"
+                    :data="perPlatformWorkList(row)"
                     size="mini"
                     border
                     class="expand-table"
                   >
-                    <el-table-column prop="platform" label="平台" width="90" />
-                    <el-table-column prop="group" label="分组" width="110" show-overflow-tooltip />
-                    <el-table-column label="播放" width="90" align="right">
+                    <el-table-column prop="platform" label="平台" width="84" />
+                    <el-table-column prop="group" label="分组" width="96" show-overflow-tooltip />
+                    <el-table-column prop="title" label="作品标题" min-width="150" show-overflow-tooltip />
+                    <el-table-column label="匹配方式" width="98">
+                      <template #default="{ row: p }">
+                        <el-tag
+                          v-if="workMatchTagInfo(p)"
+                          :type="workMatchTagInfo(p).type"
+                          size="mini"
+                        >
+                          {{ workMatchTagInfo(p).label }}
+                        </el-tag>
+                        <span v-else class="num muted">-</span>
+                      </template>
+                    </el-table-column>
+                    <el-table-column label="播放" width="88" align="right">
                       <template #default="{ row: p }">
                         <span class="num" :class="{ muted: p.play == null }">{{ showNum(p.play) }}</span>
                       </template>
                     </el-table-column>
-                    <el-table-column label="点赞" width="84" align="right">
+                    <el-table-column label="点赞" width="80" align="right">
                       <template #default="{ row: p }">
                         <span class="num" :class="{ muted: p.like == null }">{{ showNum(p.like) }}</span>
                       </template>
                     </el-table-column>
-                    <el-table-column label="评论" width="84" align="right">
+                    <el-table-column label="评论" width="80" align="right">
                       <template #default="{ row: p }">
                         <span class="num" :class="{ muted: p.comment == null }">{{ showNum(p.comment) }}</span>
                       </template>
                     </el-table-column>
-                    <el-table-column label="分享" width="84" align="right">
+                    <el-table-column label="分享" width="80" align="right">
                       <template #default="{ row: p }">
                         <span class="num" :class="{ muted: p.share == null }">{{ showNum(p.share) }}</span>
                       </template>
                     </el-table-column>
-                    <el-table-column label="收藏" width="84" align="right">
+                    <el-table-column label="收藏" width="80" align="right">
                       <template #default="{ row: p }">
                         <span class="num" :class="{ muted: p.favorite == null }">{{ showNum(p.favorite) }}</span>
                       </template>
                     </el-table-column>
-                    <el-table-column label="涨粉" width="84" align="right">
+                    <el-table-column label="涨粉" width="80" align="right">
                       <template #default="{ row: p }">
                         <span
                           v-if="p.fansDelta != null"
@@ -148,7 +186,7 @@
                         <span v-else class="num muted">-</span>
                       </template>
                     </el-table-column>
-                    <el-table-column label="作品链接" min-width="220">
+                    <el-table-column label="作品链接" min-width="180">
                       <template #default="{ row: p }">
                         <div v-if="p.urls && p.urls.length" class="work-links">
                           <template v-for="(u, idx) in p.urls">
@@ -164,6 +202,68 @@
                               {{ u }}
                             </el-link>
                             <span v-else :key="'t-' + idx" class="work-link-text">{{ u }}</span>
+                          </template>
+                        </div>
+                        <span v-else class="num muted">-</span>
+                      </template>
+                    </el-table-column>
+                    <el-table-column label="操作" width="215">
+                      <template #default="{ row: p }">
+                        <div v-if="p.workKey" class="work-row-actions">
+                          <template v-if="!isRowUnlinked(row)">
+                            <el-button
+                              v-if="p.matchedBy === 'fuzzy'"
+                              type="text"
+                              size="mini"
+                              :disabled="mutatingLink"
+                              @click="confirmSingleWork(p, row.contentKey)"
+                            >
+                              确认
+                            </el-button>
+                            <el-button
+                              type="text"
+                              size="mini"
+                              :disabled="mutatingLink"
+                              @click="detachWork(p)"
+                            >
+                              拆出
+                            </el-button>
+                            <el-button
+                              type="text"
+                              size="mini"
+                              :disabled="mutatingLink"
+                              @click="openReassignDialog(p, row.contentKey)"
+                            >
+                              改合并到…
+                            </el-button>
+                            <el-button
+                              v-if="p.matchedBy === 'manual' || p.hasOverride"
+                              type="text"
+                              size="mini"
+                              :disabled="mutatingLink"
+                              @click="clearWorkOverride(p)"
+                            >
+                              恢复自动
+                            </el-button>
+                          </template>
+                          <template v-else>
+                            <el-button
+                              type="text"
+                              size="mini"
+                              :disabled="mutatingLink"
+                              @click="openReassignDialog(p, null)"
+                            >
+                              合并到…
+                            </el-button>
+                            <el-button
+                              v-if="p.matchedBy === 'manual-detach' || p.hasOverride"
+                              type="text"
+                              size="mini"
+                              :disabled="mutatingLink"
+                              @click="clearWorkOverride(p)"
+                            >
+                              恢复自动
+                            </el-button>
                           </template>
                         </div>
                         <span v-else class="num muted">-</span>
@@ -193,12 +293,36 @@
             <el-table-column
               prop="platformCount"
               label="平台数"
-              width="90"
+              width="86"
               align="right"
               sortable
             >
               <template #default="{ row }">
                 <span class="num">{{ row.platformCount }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="匹配方式" width="150">
+              <template #default="{ row }">
+                <div class="match-cell">
+                  <el-tag
+                    v-if="rowMatchTagInfo(row)"
+                    :type="rowMatchTagInfo(row).type"
+                    size="mini"
+                  >
+                    {{ rowMatchTagInfo(row).label }}
+                  </el-tag>
+                  <span v-else class="num muted">-</span>
+                  <el-button
+                    v-if="canConfirmRow(row)"
+                    type="text"
+                    size="mini"
+                    class="inline-confirm-btn"
+                    :disabled="mutatingLink"
+                    @click.stop="confirmFuzzyRow(row)"
+                  >
+                    确认
+                  </el-button>
+                </div>
               </template>
             </el-table-column>
             <el-table-column
@@ -292,11 +416,178 @@
             </el-table-column>
             <template #empty>
               <span class="card-empty-inline">
-                暂无作品汇总数据，请先点击右上角「同步全部数据」采集作品日快照
+                {{ summaryFilter === 'fuzzy' ? '暂无待确认的模糊匹配内容' : '暂无作品汇总数据，请先点击右上角「同步全部数据」采集作品日快照' }}
+              </span>
+            </template>
+          </el-table>
+          <el-table
+            v-else
+            ref="unlinkedTable"
+            v-loading="loadingSummary"
+            :data="unlinkedWorkRows"
+            row-key="workKey"
+            border
+            stripe
+            class="works-summary-table"
+            @selection-change="onUnlinkedSelectionChange"
+          >
+            <el-table-column type="selection" width="46" />
+            <el-table-column prop="platform" label="平台" width="88" sortable />
+            <el-table-column prop="group" label="分组" width="104" show-overflow-tooltip sortable />
+            <el-table-column prop="title" label="标题" min-width="220" show-overflow-tooltip sortable />
+            <el-table-column prop="publishDate" label="发布日期" width="110" sortable>
+              <template #default="{ row }">
+                <span class="num" :class="{ muted: !row.publishDate }">
+                  {{ row.publishDate || "-" }}
+                </span>
+              </template>
+            </el-table-column>
+            <el-table-column label="状态" width="90">
+              <template #default="{ row }">
+                <el-tag
+                  v-if="row.matchedBy === 'manual-detach'"
+                  type="warning"
+                  size="mini"
+                >
+                  已拆出
+                </el-tag>
+                <el-tag v-else type="info" size="mini">未关联</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="播放" width="96" align="right" prop="play" sortable>
+              <template #default="{ row }">
+                <span class="num" :class="{ muted: row.play == null }">
+                  {{ showNum(row.play) }}
+                </span>
+              </template>
+            </el-table-column>
+            <el-table-column label="点赞" width="86" align="right" prop="like" sortable>
+              <template #default="{ row }">
+                <span class="num" :class="{ muted: row.like == null }">
+                  {{ showNum(row.like) }}
+                </span>
+              </template>
+            </el-table-column>
+            <el-table-column label="作品链接" min-width="180">
+              <template #default="{ row }">
+                <el-link
+                  v-if="parseSafeHttpUrl(row.url)"
+                  type="primary"
+                  :underline="false"
+                  class="work-link"
+                  :title="row.url"
+                  @click.prevent="openWorkUrl(row.url)"
+                >
+                  {{ row.url }}
+                </el-link>
+                <span v-else-if="row.url" class="work-link-text">{{ row.url }}</span>
+                <span v-else class="num muted">-</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="操作" width="160">
+              <template #default="{ row }">
+                <div class="work-row-actions">
+                  <el-button
+                    type="text"
+                    size="mini"
+                    :disabled="mutatingLink"
+                    @click="openReassignDialog(row, null)"
+                  >
+                    合并到…
+                  </el-button>
+                  <el-button
+                    v-if="row.matchedBy === 'manual-detach' || row.hasOverride"
+                    type="text"
+                    size="mini"
+                    :disabled="mutatingLink"
+                    @click="clearWorkOverride(row)"
+                  >
+                    恢复自动
+                  </el-button>
+                </div>
+              </template>
+            </el-table-column>
+            <template #empty>
+              <span class="card-empty-inline">
+                暂无未关联作品
               </span>
             </template>
           </el-table>
         </div>
+        <el-dialog
+          :title="reassignCurrentKey ? '改合并到已有内容' : '合并到已有内容'"
+          :visible.sync="reassignVisible"
+          width="700px"
+          append-to-body
+          @closed="resetReassignDialog"
+        >
+          <div v-if="reassignSource" class="reassign-source">
+            当前作品：<strong>{{ reassignSource.platform }}</strong>
+            <span v-if="reassignSource.group"> · {{ reassignSource.group }}</span>
+            · {{ reassignSource.title }}
+          </div>
+          <el-input
+            v-model="reassignKeyword"
+            size="small"
+            clearable
+            prefix-icon="el-icon-search"
+            placeholder="按内容标题、素材文件或内容 ID 搜索"
+            class="reassign-search"
+          />
+          <el-table
+            :data="reassignTargetRows"
+            size="mini"
+            border
+            highlight-current-row
+            max-height="320"
+            row-key="contentKey"
+            @current-change="onSelectReassignTarget"
+          >
+            <el-table-column prop="title" label="内容标题" min-width="220" show-overflow-tooltip />
+            <el-table-column prop="firstPublishDate" label="首发日期" width="106">
+              <template #default="{ row }">
+                <span class="num" :class="{ muted: !row.firstPublishDate }">
+                  {{ row.firstPublishDate || "-" }}
+                </span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="platformCount" label="平台数" width="70" align="right" />
+            <el-table-column label="匹配方式" width="96">
+              <template #default="{ row }">
+                <el-tag
+                  v-if="rowMatchTagInfo(row)"
+                  :type="rowMatchTagInfo(row).type"
+                  size="mini"
+                >
+                  {{ rowMatchTagInfo(row).label }}
+                </el-tag>
+                <span v-else class="num muted">-</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="总播放" width="96" align="right">
+              <template #default="{ row }">
+                <span class="num" :class="{ muted: row.totalPlay == null }">
+                  {{ showNum(row.totalPlay) }}
+                </span>
+              </template>
+            </el-table-column>
+            <template #empty>
+              <span class="card-empty-inline">未找到匹配的目标内容</span>
+            </template>
+          </el-table>
+          <template #footer>
+            <el-button size="small" @click="reassignVisible = false">取消</el-button>
+            <el-button
+              type="primary"
+              size="small"
+              :loading="mutatingLink"
+              :disabled="!reassignTargetKey || mutatingLink"
+              @click="submitReassign"
+            >
+              确定合并
+            </el-button>
+          </template>
+        </el-dialog>
       </el-tab-pane>
     </el-tabs>
   </div>
@@ -366,6 +657,14 @@ export default {
       contentSummaryRows: [],
       contentSummaryDate: "",
       loadingSummary: false,
+      summaryFilter: "all",
+      selectedUnlinkedWorks: [],
+      mutatingLink: false,
+      reassignVisible: false,
+      reassignSource: null,
+      reassignCurrentKey: null,
+      reassignKeyword: "",
+      reassignTargetKey: "",
       progressText: "",
       logVisible: false,
       logs: [],
@@ -394,12 +693,58 @@ export default {
       }
       return [...byPt.values()];
     },
+    fuzzySummaryRows() {
+      return this.contentSummaryRows.filter(
+        (r) => !this.isRowUnlinked(r) && (r.matchMethod === "fuzzy" || r.hasFuzzy)
+      );
+    },
+    displayedSummaryRows() {
+      if (this.summaryFilter === "fuzzy") return this.fuzzySummaryRows;
+      return this.contentSummaryRows;
+    },
+    unlinkedWorkRows() {
+      const out = [];
+      for (const row of this.contentSummaryRows) {
+        if (!this.isRowUnlinked(row)) continue;
+        const works = this.perPlatformWorkList(row);
+        for (const w of works) {
+          if (!w.workKey) continue;
+          out.push({
+            ...w,
+            title: w.title || row.title || "(无标题)",
+            publishDate: w.publishDate || row.firstPublishDate || "",
+            url: w.url || (Array.isArray(w.urls) && w.urls[0]) || "",
+          });
+        }
+      }
+      return out;
+    },
+    reassignTargetRows() {
+      const kw = String(this.reassignKeyword || "").trim().toLowerCase();
+      return this.contentSummaryRows.filter((r) => {
+        if (this.isRowUnlinked(r)) return false;
+        if (this.reassignCurrentKey && r.contentKey === this.reassignCurrentKey) {
+          return false;
+        }
+        if (!kw) return true;
+        const title = String(r.title || "").toLowerCase();
+        const file = String(r.file || "").toLowerCase();
+        const ck = String(r.contentKey || "").toLowerCase();
+        return title.includes(kw) || file.includes(kw) || ck.includes(kw);
+      });
+    },
   },
   watch: {
     activeTab(val) {
       if (val === "works") {
         this.loadContentSummary();
       }
+    },
+    summaryFilter() {
+      this.selectedUnlinkedWorks = [];
+    },
+    reassignKeyword() {
+      this.reassignTargetKey = "";
     },
   },
   created() {
@@ -466,6 +811,10 @@ export default {
         }
         this.contentSummaryRows = Array.isArray(res && res.rows) ? res.rows : [];
         this.contentSummaryDate = (res && res.date) || "";
+        this.selectedUnlinkedWorks = [];
+        if (this.$refs.unlinkedTable && typeof this.$refs.unlinkedTable.clearSelection === "function") {
+          this.$refs.unlinkedTable.clearSelection();
+        }
       } catch (err) {
         if (reqId !== this._summaryReqId) return;
         this.$message.error(`读取作品汇总失败：${(err && err.message) || err}`);
@@ -498,6 +847,46 @@ export default {
         this.exporting = false;
       }
     },
+    isRowUnlinked(row) {
+      if (!row) return false;
+      if (typeof row.isUnlinked === "boolean") return row.isUnlinked;
+      return typeof row.contentKey === "string" && row.contentKey.startsWith("unlinked:");
+    },
+    formatScorePct(score) {
+      if (typeof score !== "number" || !Number.isFinite(score)) return "";
+      return `${Math.round(score * 100)}%`;
+    },
+    rowMatchTagInfo(row) {
+      if (!row) return null;
+      if (this.isRowUnlinked(row)) {
+        if (row.isManualDetach) return { label: "已拆出", type: "warning" };
+        return { label: "未关联", type: "info" };
+      }
+      if (row.matchMethod === "link") return { label: "链接", type: "success" };
+      if (row.matchMethod === "title") return { label: "标题", type: "info" };
+      if (row.matchMethod === "fuzzy") {
+        const pct = this.formatScorePct(row.matchScore);
+        return { label: pct ? `模糊 ${pct}` : "模糊", type: "warning" };
+      }
+      if (row.matchMethod === "manual") return { label: "手动", type: "primary" };
+      return null;
+    },
+    workMatchTagInfo(item) {
+      if (!item) return null;
+      if (item.matchedBy === "link") return { label: "链接", type: "success" };
+      if (item.matchedBy === "title") return { label: "标题", type: "info" };
+      if (item.matchedBy === "fuzzy") {
+        const pct = this.formatScorePct(item.score);
+        return { label: pct ? `模糊 ${pct}` : "模糊", type: "warning" };
+      }
+      if (item.matchedBy === "manual") return { label: "手动", type: "primary" };
+      if (item.matchedBy === "manual-detach") return { label: "已拆出", type: "warning" };
+      return null;
+    },
+    canConfirmRow(row) {
+      if (!row || this.isRowUnlinked(row)) return false;
+      return row.matchMethod === "fuzzy" || Boolean(row.hasFuzzy);
+    },
     perPlatformList(row) {
       const map = (row && row.perPlatform) || {};
       return Object.entries(map)
@@ -521,6 +910,200 @@ export default {
           if (a.platform !== b.platform) return a.platform < b.platform ? -1 : 1;
           return a.group < b.group ? -1 : a.group > b.group ? 1 : 0;
         });
+    },
+    perPlatformWorkList(row) {
+      const cells = this.perPlatformList(row);
+      const out = [];
+      for (const cell of cells) {
+        if (Array.isArray(cell.works) && cell.works.length) {
+          for (const w of cell.works) {
+            out.push({
+              ...w,
+              platform: w.platform || cell.platform,
+              group: w.group != null ? w.group : cell.group,
+              urls: w.url ? [w.url] : [],
+            });
+          }
+        } else {
+          const fallbackId = Array.isArray(cell.workIds) && cell.workIds[0] ? cell.workIds[0] : "";
+          out.push({
+            ...cell,
+            workId: fallbackId,
+            workKey: fallbackId ? `${cell.group}|${cell.platform}|${fallbackId}` : "",
+            title: (row && row.title) || "(无标题)",
+            url: Array.isArray(cell.urls) && cell.urls[0] ? cell.urls[0] : "",
+            matchedBy: null,
+            score: null,
+            hasOverride: false,
+          });
+        }
+      }
+      return out;
+    },
+    onUnlinkedSelectionChange(selection) {
+      this.selectedUnlinkedWorks = Array.isArray(selection) ? selection : [];
+    },
+    openReassignDialog(workItem, currentContentKey) {
+      if (!workItem || !workItem.workKey) return;
+      this.reassignSource = {
+        workKey: workItem.workKey,
+        platform: workItem.platform || "",
+        group: workItem.group || "",
+        title: workItem.title || "(无标题)",
+      };
+      this.reassignCurrentKey = currentContentKey || null;
+      this.reassignKeyword = "";
+      this.reassignTargetKey = "";
+      this.reassignVisible = true;
+    },
+    onSelectReassignTarget(row) {
+      this.reassignTargetKey = row && row.contentKey ? row.contentKey : "";
+    },
+    resetReassignDialog() {
+      this.reassignSource = null;
+      this.reassignCurrentKey = null;
+      this.reassignKeyword = "";
+      this.reassignTargetKey = "";
+    },
+    async submitReassign() {
+      if (this.mutatingLink || !this.reassignSource || !this.reassignTargetKey) return;
+      this.mutatingLink = true;
+      try {
+        const res = await ipcRenderer.invoke("stats:set-link-override", {
+          workKey: this.reassignSource.workKey,
+          action: "assign",
+          contentKey: this.reassignTargetKey,
+        });
+        if (!res || !res.ok) {
+          this.$message.error((res && res.error) || "合并失败");
+          return;
+        }
+        this.reassignVisible = false;
+        this.$message.success("已更新作品归属");
+        await this.loadContentSummary();
+      } catch (err) {
+        this.$message.error(`合并失败：${(err && err.message) || err}`);
+      } finally {
+        this.mutatingLink = false;
+      }
+    },
+    async detachWork(workItem) {
+      if (this.mutatingLink || !workItem || !workItem.workKey) return;
+      this.mutatingLink = true;
+      try {
+        const res = await ipcRenderer.invoke("stats:set-link-override", {
+          workKey: workItem.workKey,
+          action: "detach",
+        });
+        if (!res || !res.ok) {
+          this.$message.error((res && res.error) || "拆出作品失败");
+          return;
+        }
+        this.$message.success("已拆出为未关联作品");
+        await this.loadContentSummary();
+      } catch (err) {
+        this.$message.error(`拆出作品失败：${(err && err.message) || err}`);
+      } finally {
+        this.mutatingLink = false;
+      }
+    },
+    async clearWorkOverride(workItem) {
+      if (this.mutatingLink || !workItem || !workItem.workKey) return;
+      this.mutatingLink = true;
+      try {
+        const res = await ipcRenderer.invoke("stats:clear-link-override", {
+          workKey: workItem.workKey,
+        });
+        if (!res || !res.ok) {
+          this.$message.error((res && res.error) || "恢复自动关联失败");
+          return;
+        }
+        this.$message.success("已恢复自动关联");
+        await this.loadContentSummary();
+      } catch (err) {
+        this.$message.error(`恢复自动关联失败：${(err && err.message) || err}`);
+      } finally {
+        this.mutatingLink = false;
+      }
+    },
+    async confirmSingleWork(workItem, contentKey) {
+      if (this.mutatingLink || !workItem || !workItem.workKey || !contentKey) return;
+      this.mutatingLink = true;
+      try {
+        const res = await ipcRenderer.invoke("stats:set-link-override", {
+          workKey: workItem.workKey,
+          action: "assign",
+          contentKey,
+        });
+        if (!res || !res.ok) {
+          this.$message.error((res && res.error) || "确认关联失败");
+          return;
+        }
+        this.$message.success("已确认为手动关联");
+        await this.loadContentSummary();
+      } catch (err) {
+        this.$message.error(`确认关联失败：${(err && err.message) || err}`);
+      } finally {
+        this.mutatingLink = false;
+      }
+    },
+    async confirmFuzzyRow(row) {
+      if (this.mutatingLink || !row || !row.contentKey) return;
+      const works = this.perPlatformWorkList(row);
+      const isAutoCluster =
+        typeof row.contentKey === "string" && row.contentKey.startsWith("auto:");
+      const targets = works.filter((w) => {
+        if (!w.workKey) return false;
+        if (isAutoCluster) return w.matchedBy !== "manual";
+        return w.matchedBy === "fuzzy";
+      });
+      if (!targets.length) return;
+      this.mutatingLink = true;
+      try {
+        for (const w of targets) {
+          const res = await ipcRenderer.invoke("stats:set-link-override", {
+            workKey: w.workKey,
+            action: "assign",
+            contentKey: row.contentKey,
+          });
+          if (!res || !res.ok) {
+            this.$message.error((res && res.error) || "确认关联失败");
+            await this.loadContentSummary();
+            return;
+          }
+        }
+        this.$message.success("已确认为手动关联");
+        await this.loadContentSummary();
+      } catch (err) {
+        this.$message.error(`确认关联失败：${(err && err.message) || err}`);
+        await this.loadContentSummary();
+      } finally {
+        this.mutatingLink = false;
+      }
+    },
+    async mergeSelectedUnlinked() {
+      if (this.mutatingLink) return;
+      const workKeys = this.selectedUnlinkedWorks
+        .map((w) => w && w.workKey)
+        .filter(Boolean);
+      if (workKeys.length < 2) {
+        this.$message.warning("请至少选择 2 条未关联作品");
+        return;
+      }
+      this.mutatingLink = true;
+      try {
+        const res = await ipcRenderer.invoke("stats:merge-works", { workKeys });
+        if (!res || !res.ok) {
+          this.$message.error((res && res.error) || "合并作品失败");
+          return;
+        }
+        this.$message.success(`已将 ${workKeys.length} 条作品合并为同一视频`);
+        await this.loadContentSummary();
+      } catch (err) {
+        this.$message.error(`合并作品失败：${(err && err.message) || err}`);
+      } finally {
+        this.mutatingLink = false;
+      }
     },
     showNum(v) {
       return v == null ? "-" : Number(v).toLocaleString("zh-CN");
@@ -772,5 +1355,49 @@ export default {
 .card-empty-inline {
   font-size: 13px;
   color: #909399;
+}
+
+.works-filter-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.unlinked-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.match-cell {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.inline-confirm-btn {
+  padding: 0 4px;
+}
+
+.work-row-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.reassign-source {
+  margin-bottom: 10px;
+  font-size: 13px;
+  color: #606266;
+  line-height: 1.5;
+  word-break: break-all;
+}
+
+.reassign-search {
+  margin-bottom: 10px;
 }
 </style>

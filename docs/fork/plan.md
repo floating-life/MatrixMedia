@@ -18,6 +18,13 @@
 | S2 | feat/stats-cross-link | 跨平台作品关联（发布记录优先，标题归一化兜底）+ 汇总行 + 单测 |
 | S3 | feat/stats-daily-schedule | 软件开着时每日定点（默认 10:00）串行采集全部已登录账号，可配置/关闭，写采集日志 |
 | S4 | feat/stats-xlsx-export | 导出 .xlsx（作品日明细/作品跨平台汇总/平台日汇总/账号日快照/字段说明），GUI 按钮 + `cli stats-export`，「作品汇总」tab |
+| S6 | feat/stats-fuzzy-link | 跨平台作品模糊匹配自动合并（作品↔target + 无发布记录跨平台聚类）+ 手工矫正持久化（link-overrides.json）+ 界面矫正交互 + 导出新列 |
+
+## S6：跨平台作品模糊匹配 + 手工矫正（`feat/stats-fuzzy-link`）
+- **背景**：各平台发布标题常被截断、改写、插中间话题，或作品直接在平台发布而无 MatrixMedia 发布记录，仅靠直链/唯一标题会漏合。
+- **自动匹配四步（`contentLink.js`）**：①直链 1:1 → ②唯一标题 1:1 → ③同组同平台模糊匹配（去话题/emoji/标点空白得 core，长度≥6 子串截断 0.95 否则二元组 Dice；时间窗 ≤2 天、缺时间门槛 +0.1；sim≥0.6、最佳比次佳高 ≥0.1、互为最佳，`matchedBy="fuzzy"` 附两位小数 `score`）→ ④无发布记录作品同组跨平台聚类（同规则互为最佳成边 + Kruskal 合并，每平台每簇最多 1 条，簇大小 ≥2 生成确定性 `auto:<hash>`，标题取最早发布作品、素材为空）。
+- **手工矫正（`store.js` + `dataStats/index.js`）**：`<userData>/data-stats/link-overrides.json`（原子写，读失败/损坏视为空并 warn）；应用顺序为 ①–④ 后套用（`detach` 在 ③④ 前先排除，不再被模糊重合；`assign` 指向不存在 `contentKey` 时忽略并保持自动结果）；支持合并未关联作品为 `manual:<id>`。IPC：`stats:get-link-overrides`、`stats:set-link-override`、`stats:merge-works`、`stats:clear-link-override`（本地页面校验 + 串行写入队列）。
+- **界面与导出一致**：`dataStats/index.vue`「作品汇总」tab 增加匹配方式列、顶部筛选（全部/仅模糊待确认/未关联）、确认/拆出/改合并/恢复自动与未关联多选合并；Excel「作品日明细」扩展 `matchedBy` 为 `link/title/fuzzy/manual` 并新增数值列「匹配分数」，「作品跨平台汇总」新增「匹配方式」列（有手动标 `manual`，否则簇内最弱 `fuzzy>title>link`），「字段说明」同步口径。
 
 ## 打包
 `.github/workflows/fork-build-win.yml`：推 fork/** 或 feat/stats-** 分支自动打 Windows 安装包（Actions Artifacts，14 天）。

@@ -65,12 +65,15 @@ const WORK_DELTA_KEYS = [
   "fansDeltaDelta",
 ];
 
+const VALID_EXPORT_MATCH_METHODS = new Set(["link", "title", "fuzzy", "manual"]);
+
 const WORK_DAILY_HEADERS = [
   "日期",
   "平台",
   "分组",
   "内容ID",
   "关联方式",
+  "匹配分数",
   "作品ID",
   "标题",
   "作品链接",
@@ -96,6 +99,7 @@ const SUMMARY_BASE_HEADERS = [
   "素材文件",
   "首发日期",
   "覆盖平台数",
+  "匹配方式",
   "总播放",
   "总点赞",
   "总评论",
@@ -256,6 +260,13 @@ function resolveIoDeps(options = {}, depsArg) {
   };
 
   const storeApi = isPlainObject(injected.store) ? injected.store : null;
+  const hasInjectedDataSource = Boolean(
+    storeApi ||
+      typeof injected.listAccounts === "function" ||
+      typeof injected.readWorks === "function" ||
+      typeof injected.readWorksDaily === "function"
+  );
+  const emptyOverrides = () => ({ version: 1, updatedAt: 0, overrides: Object.create(null) });
 
   return {
     listAccounts:
@@ -289,6 +300,21 @@ function resolveIoDeps(options = {}, depsArg) {
             getPushRecords().readPushRecords(
               options.pushDataDir ? { dir: options.pushDataDir } : undefined
             ),
+    readLinkOverrides:
+      typeof injected.readLinkOverrides === "function"
+        ? injected.readLinkOverrides
+        : storeApi && typeof storeApi.readLinkOverrides === "function"
+        ? () => storeApi.readLinkOverrides()
+        : isPlainObject(options.linkOverrides)
+        ? () => options.linkOverrides
+        : hasInjectedDataSource
+        ? emptyOverrides
+        : () => {
+            const s = getStore();
+            return typeof s.readLinkOverrides === "function"
+              ? s.readLinkOverrides()
+              : emptyOverrides();
+          },
     now: injected.now !== undefined ? injected.now : options.now,
     appVersion:
       injected.appVersion !== undefined ? injected.appVersion : options.appVersion,
@@ -568,12 +594,14 @@ function loadRawDataset(options = {}, depsArg) {
     : rawPushRecords;
 
   const latestDataDate = findLatestDataDate(accountsData);
+  const linkOverrides = io.readLinkOverrides();
 
   return {
     io,
     accountsData,
     worksDailyByGp,
     pushRecords: filteredPushRecords,
+    linkOverrides,
     latestDataDate,
   };
 }
@@ -645,11 +673,14 @@ function loadSummaryDataset(options = {}, depsArg, explicitCutoffDate = "") {
     }
   }
 
+  const linkOverrides = io.readLinkOverrides();
+
   return {
     io,
     accountsData,
     worksDailyByGp,
     pushRecords: filteredPushRecords,
+    linkOverrides,
     latestDataDate,
   };
 }
@@ -797,6 +828,7 @@ function buildContentSummaryData(options = {}, depsArg) {
     accounts: dataset.accountsData,
     worksDaily: dataset.worksDailyByGp,
     date: cutoffDate || undefined,
+    overrides: dataset.linkOverrides,
   });
   const workCounts = computeWorkCountsFromSummaryRows(rows);
 
@@ -844,12 +876,21 @@ function buildWorkDailySheet(accountsData, link, from, to) {
 
   const aoa = [WORK_DAILY_HEADERS.map(sanitizeTextCell)];
   for (const r of allRows) {
+    const matchedByExport =
+      r.contentKey != null && VALID_EXPORT_MATCH_METHODS.has(r.matchedBy)
+        ? sanitizeTextCell(r.matchedBy)
+        : null;
+    const matchScoreExport =
+      r.contentKey != null && r.matchedBy === "fuzzy"
+        ? sanitizeNumberCell(r.matchScore)
+        : null;
     aoa.push([
       sanitizeTextCell(r.date),
       sanitizeTextCell(r.platform),
       sanitizeTextCell(r.group),
       sanitizeTextCell(r.contentKey),
-      sanitizeTextCell(r.matchedBy),
+      matchedByExport,
+      matchScoreExport,
       sanitizeTextCell(r.workId),
       sanitizeTextCell(r.title),
       sanitizeTextCell(r.url),
@@ -922,12 +963,16 @@ function buildContentSummarySheet(summaryRows) {
   const aoa = [headers.map(sanitizeTextCell)];
 
   for (const row of summaryRows) {
+    const matchMethodExport = VALID_EXPORT_MATCH_METHODS.has(row.matchMethod)
+      ? sanitizeTextCell(row.matchMethod)
+      : null;
     const cells = [
       sanitizeTextCell(row.contentKey),
       sanitizeTextCell(row.title),
       sanitizeTextCell(row.file),
       sanitizeTextCell(row.firstPublishDate),
       sanitizeNumberCell(row.platformCount),
+      matchMethodExport,
       sanitizeNumberCell(row.totalPlay),
       sanitizeNumberCell(row.totalLike),
       sanitizeNumberCell(row.totalComment),
@@ -1143,13 +1188,19 @@ function buildSchemaSheet(dynamicSchemaEntries) {
       "作品日明细",
       "内容ID",
       "contentKey",
-      "跨平台关联后的内容唯一键（file:<完整路径> 或 record:<日期>:<id>）；未关联作品为空单元格。",
+      "跨平台关联后的内容唯一键（file:<完整路径>、record:<日期>:<id>、auto:<哈希> 或 manual:<id>）；未关联作品为空单元格。",
     ],
     [
       "作品日明细",
       "关联方式",
       "matchedBy",
-      "与本地发布记录的匹配依据：link（直链严格 1:1 匹配）或 title（同组同平台唯一标题匹配）；未关联为空。",
+      "跨平台关联依据：link（直链严格 1:1 匹配）、title（同组同平台唯一标题匹配）、fuzzy（标题模糊+时间窗口自动匹配或无发布记录跨平台聚类）、manual（手工指定/合并/确认）；未关联为空。注意：模糊匹配可能合错，已手工确认的标 manual。",
+    ],
+    [
+      "作品日明细",
+      "匹配分数",
+      "matchScore",
+      "标题模糊匹配相似度分数（0~1 两位小数，数值类型）；仅关联方式为 fuzzy 时有值，其余方式及未关联为空单元格。模糊匹配可能合错，已手工确认的标 manual。",
     ],
     [
       "作品日明细",
@@ -1259,13 +1310,13 @@ function buildSchemaSheet(dynamicSchemaEntries) {
       "作品跨平台汇总",
       "内容ID",
       "contentKey",
-      "内容唯一键（file:<路径> / record:<日期>:<id>）；未关联作品各自独立成行，键为 unlinked:<平台>:<作品ID>。",
+      "内容唯一键（file:<路径> / record:<日期>:<id> / auto:<哈希> / manual:<id>）；未关联作品各自独立成行，键为 unlinked:<平台>:<作品ID>。",
     ],
     [
       "作品跨平台汇总",
       "标题",
       "title",
-      "内容展示标题（已关联优先取最早发布记录标题，未关联取作品标题）。",
+      "内容展示标题（已关联优先取最早发布记录标题，自动聚类/手工合并取簇内最早发布作品标题，未关联取作品标题）。",
     ],
     [
       "作品跨平台汇总",
@@ -1284,6 +1335,12 @@ function buildSchemaSheet(dynamicSchemaEntries) {
       "覆盖平台数",
       "platformCount",
       "截至结束日期（to）已采集到快照的去重平台数量。",
+    ],
+    [
+      "作品跨平台汇总",
+      "匹配方式",
+      "matchMethod",
+      "簇内跨平台关联方式汇总：有手工矫正或确认则标 manual，否则取簇内最弱的自动方式（fuzzy > title > link）；未关联或无已匹配作品为空。模糊匹配可能合错，已手工确认的标 manual。",
     ],
     [
       "作品跨平台汇总",
@@ -1549,12 +1606,14 @@ function buildStatsWorkbookData(options = {}, deps) {
     contents,
     accounts: dataset.accountsData,
     date: resolvedTo,
+    overrides: dataset.linkOverrides,
   });
   const summaryRows = buildContentSummaryRows({
     contents,
     accounts: dataset.accountsData,
     worksDaily: dataset.worksDailyByGp,
     date: resolvedTo,
+    overrides: dataset.linkOverrides,
   });
   if (summaryRows.length > maxRows) {
     throw createRowLimitError(summaryRows.length, maxRows, "作品跨平台汇总");

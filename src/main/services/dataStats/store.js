@@ -517,6 +517,145 @@ function appendAutoRun(date) {
   return normalized;
 }
 
+/* ---------------- link-overrides（跨平台关联手工矫正） ---------------- */
+
+const LINK_OVERRIDES_VERSION = 1;
+
+function linkOverridesFile() {
+  return path.join(baseDir(), "link-overrides.json");
+}
+
+function emptyLinkOverrides() {
+  return {
+    version: LINK_OVERRIDES_VERSION,
+    updatedAt: 0,
+    overrides: Object.create(null),
+  };
+}
+
+function normalizeLinkOverrideEntry(entry) {
+  if (!isPlainObject(entry)) return null;
+  const action = typeof entry.action === "string" ? entry.action.trim() : "";
+  if (action === "detach") {
+    return { action: "detach" };
+  }
+  if (action === "assign") {
+    const contentKey = typeof entry.contentKey === "string" ? entry.contentKey.trim() : "";
+    if (!contentKey || contentKey.startsWith("unlinked:")) return null;
+    return { action: "assign", contentKey };
+  }
+  return null;
+}
+
+function normalizeLinkOverridesMap(rawMap) {
+  const out = Object.create(null);
+  if (!isPlainObject(rawMap)) return out;
+  for (const workKey of Object.keys(rawMap)) {
+    if (!workKey) continue;
+    const desc = Object.getOwnPropertyDescriptor(rawMap, workKey);
+    const normalized = normalizeLinkOverrideEntry(desc ? desc.value : null);
+    if (normalized) {
+      out[workKey] = normalized;
+    }
+  }
+  return out;
+}
+
+/**
+ * 读取 <userData>/data-stats/link-overrides.json。
+ * 不存在静默返回空；读失败/JSON 损坏/结构无效 console.warn 并视为空，不抛错。
+ */
+function readLinkOverrides() {
+  const file = linkOverridesFile();
+  let raw;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch (err) {
+    if (err && err.code === "ENOENT") return emptyLinkOverrides();
+    console.warn(`[dataStats] 读取 link-overrides.json 失败 (${file}):`, (err && err.message) || err);
+    return emptyLinkOverrides();
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    console.warn(`[dataStats] link-overrides.json JSON 损坏 (${file}):`, (err && err.message) || err);
+    return emptyLinkOverrides();
+  }
+  if (!isPlainObject(parsed) || !isPlainObject(parsed.overrides)) {
+    console.warn(`[dataStats] link-overrides.json 结构无效 (${file})`);
+    return emptyLinkOverrides();
+  }
+  const updatedAt = Number.isFinite(Number(parsed.updatedAt)) ? Number(parsed.updatedAt) : 0;
+  return {
+    version: LINK_OVERRIDES_VERSION,
+    updatedAt,
+    overrides: normalizeLinkOverridesMap(parsed.overrides),
+  };
+}
+
+/** 原子写入 <userData>/data-stats/link-overrides.json（复用 tmp + fsync + rename） */
+function writeLinkOverrides(docOrMap, now = Date.now()) {
+  const rawMap =
+    isPlainObject(docOrMap) && isPlainObject(docOrMap.overrides)
+      ? docOrMap.overrides
+      : docOrMap;
+  const overrides = normalizeLinkOverridesMap(rawMap);
+  const payload = {
+    version: LINK_OVERRIDES_VERSION,
+    updatedAt: Number.isFinite(Number(now)) ? Number(now) : Date.now(),
+    overrides,
+  };
+  writeWorksDailyAtomic(linkOverridesFile(), payload);
+  return payload;
+}
+
+function setLinkOverride(workKey, entry, now = Date.now()) {
+  if (typeof workKey !== "string" || !workKey) {
+    throw new Error("workKey 不能为空");
+  }
+  const normalized = normalizeLinkOverrideEntry(entry);
+  if (!normalized) {
+    throw new Error("无效的手动关联操作（需为 assign+contentKey 或 detach）");
+  }
+  const current = readLinkOverrides();
+  current.overrides[workKey] = normalized;
+  return writeLinkOverrides(current.overrides, now);
+}
+
+function clearLinkOverride(workKey, now = Date.now()) {
+  if (typeof workKey !== "string" || !workKey) {
+    throw new Error("workKey 不能为空");
+  }
+  const current = readLinkOverrides();
+  delete current.overrides[workKey];
+  return writeLinkOverrides(current.overrides, now);
+}
+
+function mergeWorksOverride(workKeys, now = Date.now()) {
+  if (!Array.isArray(workKeys)) {
+    throw new Error("workKeys 必须为数组");
+  }
+  const uniqueKeys = [];
+  const seen = new Set();
+  for (const k of workKeys) {
+    if (typeof k !== "string" || !k) continue;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    uniqueKeys.push(k);
+  }
+  if (uniqueKeys.length < 2) {
+    throw new Error("至少需要选择 2 条作品才能合并");
+  }
+  const current = readLinkOverrides();
+  const contentKey = `manual:${crypto.randomBytes(8).toString("hex")}`;
+  for (const k of uniqueKeys) {
+    current.overrides[k] = { action: "assign", contentKey };
+  }
+  const doc = writeLinkOverrides(current.overrides, now);
+  return { contentKey, workKeys: uniqueKeys, doc };
+}
+
 /* ---------------- 读取与聚合 ---------------- */
 
 /** 单账号完整数据（平台页用） */
@@ -588,5 +727,11 @@ module.exports = {
   MAX_AUTO_RUN_DATES,
   readAutoRuns,
   appendAutoRun,
+  LINK_OVERRIDES_VERSION,
+  readLinkOverrides,
+  writeLinkOverrides,
+  setLinkOverride,
+  clearLinkOverride,
+  mergeWorksOverride,
   todayStr,
 };

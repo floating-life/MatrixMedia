@@ -71,7 +71,7 @@ function normalizeMetric(v) {
  * @param {object} [params.worksDaily]         作品日快照对象（works-daily.json）
  * @param {string} [params.from]               起始日期 YYYY-MM-DD（含），可省
  * @param {string} [params.to]                 截止日期 YYYY-MM-DD（含），可省
- * @param {Map} [params.link]                  可选，linkWorks 返回的 Map；传入时行增加 contentKey / matchedBy
+ * @param {Map} [params.link]                  可选，linkWorks 返回的 Map；传入时行增加 contentKey / matchedBy / matchScore
  * @returns {Array<object>}
  */
 function buildWorkDailyRows({ group, platform, works, worksDaily, from, to, link } = {}) {
@@ -175,6 +175,13 @@ function buildWorkDailyRows({ group, platform, works, worksDaily, from, to, link
           linkInfo && linkInfo.contentKey != null ? linkInfo.contentKey : null;
         row.matchedBy =
           linkInfo && linkInfo.matchedBy != null ? linkInfo.matchedBy : null;
+        row.matchScore =
+          linkInfo &&
+          linkInfo.matchedBy === "fuzzy" &&
+          typeof linkInfo.score === "number" &&
+          Number.isFinite(linkInfo.score)
+            ? linkInfo.score
+            : null;
       }
 
       entries.push({

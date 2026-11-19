@@ -28,7 +28,16 @@ const path = require("path");
 
 // 先加载纯函数模块与 pushRecords（在 mock electron 之前），验证不强依赖 electron
 const {
+  FUZZY_SIM_THRESHOLD,
+  FUZZY_MISSING_TIME_PENALTY,
+  FUZZY_MARGIN_MIN,
+  FUZZY_MAX_DAY_DIFF,
+  FUZZY_SUBSTRING_MIN_LEN,
+  FUZZY_SUBSTRING_SCORE,
+  FUZZY_THRESHOLDS,
   normalizeTitle,
+  extractCoreTitle,
+  computeTitleSimilarity,
   buildTitleIndex,
   normalizeUrl,
   isManagementUrl,
@@ -1805,6 +1814,517 @@ async function testMatchWorksIpcAmbiguity() {
   assert.strictEqual(withPlay.length, 1, "同一作品只计一次");
   assert.ok(String(withPlay[0].contentKey).startsWith("unlinked:"), "证据冲突应作未关联行");
   console.log("✓ Claude 精修回归：尾部#、精确状态键、状态字段存在、重发日期、跨组冲突");
+}
+
+/* ---------- 11. S6 模糊匹配（③ 作品↔target + ④ 无发布记录跨平台聚类 + 确定性） ---------- */
+{
+  // 11a. 阈值常量导出与核心标题/相似度函数
+  assert.strictEqual(FUZZY_SIM_THRESHOLD, 0.6);
+  assert.strictEqual(FUZZY_MISSING_TIME_PENALTY, 0.1);
+  assert.strictEqual(FUZZY_MARGIN_MIN, 0.1);
+  assert.strictEqual(FUZZY_MAX_DAY_DIFF, 2);
+  assert.strictEqual(FUZZY_SUBSTRING_MIN_LEN, 6);
+  assert.strictEqual(FUZZY_SUBSTRING_SCORE, 0.95);
+  assert.deepStrictEqual(FUZZY_THRESHOLDS, {
+    simThreshold: 0.6,
+    missingTimePenalty: 0.1,
+    marginMin: 0.1,
+    maxDayDiff: 2,
+    substringMinLen: 6,
+    substringScore: 0.95,
+  });
+
+  assert.strictEqual(
+    extractCoreTitle("今天教大家做 #美食教程 红烧肉！🔥超下饭 #家常菜"),
+    "今天教大家做红烧肉超下饭"
+  );
+  assert.strictEqual(
+    extractCoreTitle("今天教大家做#美食[话题]#红烧肉（超下饭）1️⃣"),
+    "今天教大家做红烧肉超下饭"
+  );
+  assert.strictEqual(
+    computeTitleSimilarity("手把手教你做正宗红烧肉软烂入味超下饭", "手把手教你做正宗红烧肉"),
+    0.95,
+    "长度≥6的前缀/子串截断应得 0.95"
+  );
+  assert.strictEqual(
+    computeTitleSimilarity("今天教大家做 #美食 红烧肉超下饭", "今天教大家做红烧肉超下饭"),
+    1,
+    "去掉中间话题后完全一致应得 1"
+  );
+  assert.ok(
+    computeTitleSimilarity("红烧肉做法", "红烧肉做法超详细完整教程") < 0.95,
+    "短于 6 字的子串不走 0.95 截断规则，走二元组 Dice"
+  );
+
+  // 11b. ③ 截断标题合并 + 话题插中间合并 + buildWorkDailyRows 透传 matchScore
+  const fuzzyContents = buildContentIndex([
+    {
+      pt: "抖音",
+      group: "G1",
+      title: "手把手教你做正宗秘制红烧肉软烂入味超级下饭完整版",
+      filePath: "D:\\cook\\hsr_long.mp4",
+      publishStatus: "success",
+      date: "2026-11-10",
+    },
+    {
+      pt: "快手",
+      group: "G1",
+      title: "零基础三步学会煎牛排外焦里嫩秘诀",
+      filePath: "D:\\cook\\steak.mp4",
+      publishStatus: "success",
+      date: "2026-11-10",
+    },
+  ]);
+  const fuzzyAccounts = [
+    {
+      group: "G1",
+      platform: "抖音",
+      works: [
+        {
+          workId: "trunc1",
+          title: "手把手教你做正宗秘制红烧肉",
+          url: "https://www.douyin.com/video/trunc1",
+          publishTime: Date.parse("2026-11-11T04:00:00Z"), // 差 1 天 ≤ 2
+        },
+      ],
+    },
+    {
+      group: "G1",
+      platform: "快手",
+      works: [
+        {
+          workId: "midtopic1",
+          title: "零基础 #西餐教学 三步学会🔥煎牛排！#美食 外焦里嫩秘诀",
+          url: "https://www.kuaishou.com/short-video/mid1",
+          publishTime: Date.parse("2026-11-12T04:00:00Z"), // 差 2 天 ≤ 2
+        },
+      ],
+    },
+  ];
+  const fuzzyLink = linkWorks({ contents: fuzzyContents, accounts: fuzzyAccounts });
+  assert.deepStrictEqual(fuzzyLink.get("G1|抖音|trunc1"), {
+    contentKey: "file:d:/cook/hsr_long.mp4",
+    matchedBy: "fuzzy",
+    score: 0.95,
+  });
+  assert.deepStrictEqual(fuzzyLink.get("G1|快手|midtopic1"), {
+    contentKey: "file:d:/cook/steak.mp4",
+    matchedBy: "fuzzy",
+    score: 1,
+  });
+
+  const dailyWithScore = buildWorkDailyRows({
+    group: "G1",
+    platform: "抖音",
+    works: fuzzyAccounts[0].works,
+    worksDaily: { trunc1: { "2026-11-12": { play: 500, like: 30 } } },
+    link: fuzzyLink,
+  });
+  assert.strictEqual(dailyWithScore[0].matchedBy, "fuzzy");
+  assert.strictEqual(dailyWithScore[0].matchScore, 0.95);
+
+  // 11c. 时间差 3 天不合 + 缺时间门槛 +0.1
+  const timeContents = buildContentIndex([
+    {
+      pt: "抖音",
+      group: "G1",
+      title: "秋冬季节护肤保湿全攻略完整版教程",
+      filePath: "D:\\beauty\\skincare.mp4",
+      publishStatus: "success",
+      date: "2026-11-10",
+    },
+    {
+      pt: "快手",
+      group: "G1",
+      title: "十个职场高效沟通的核心方法总结",
+      filePath: "D:\\work\\comm.mp4",
+      publishStatus: "success",
+      date: "2026-11-10",
+    },
+  ]);
+  const timeDiff3Link = linkWorks({
+    contents: timeContents,
+    accounts: [
+      {
+        group: "G1",
+        platform: "抖音",
+        works: [
+          {
+            workId: "late3",
+            title: "秋冬季节护肤保湿全攻略",
+            url: "",
+            publishTime: Date.parse("2026-11-13T04:00:00Z"), // 差 3 天 > 2
+          },
+        ],
+      },
+    ],
+  });
+  assert.deepStrictEqual(
+    timeDiff3Link.get("G1|抖音|late3"),
+    { contentKey: null, matchedBy: null },
+    "发布日期相差 3 天（>2 天）不得模糊合并"
+  );
+
+  // 缺时间门槛 +0.1：构造 Dice 约 0.64（≥0.6 但 <0.7），有时间时合并，缺时间时不合
+  const simCheck = computeTitleSimilarity("人工智能大模型应用实践课程指南", "人工智能大模型应用实操方法汇总");
+  assert.ok(simCheck >= 0.6 && simCheck < 0.7, `测试样例相似度应在 [0.6, 0.7) 内，实际=${simCheck}`);
+  const missingTimeContents = buildContentIndex([
+    {
+      pt: "抖音",
+      group: "G1",
+      title: "人工智能大模型应用实践课程指南",
+      filePath: "D:\\ai\\llm.mp4",
+      publishStatus: "success",
+      date: "2026-11-10",
+    },
+  ]);
+  const withTimeRes = linkWorks({
+    contents: missingTimeContents,
+    accounts: [
+      {
+        group: "G1",
+        platform: "抖音",
+        works: [
+          {
+            workId: "has_t",
+            title: "人工智能大模型应用实操方法汇总",
+            publishTime: Date.parse("2026-11-10T04:00:00Z"),
+          },
+        ],
+      },
+    ],
+  });
+  assert.strictEqual(withTimeRes.get("G1|抖音|has_t").matchedBy, "fuzzy", "有时间且 sim>=0.6 应合并");
+
+  const noTimeRes = linkWorks({
+    contents: missingTimeContents,
+    accounts: [
+      {
+        group: "G1",
+        platform: "抖音",
+        works: [
+          {
+            workId: "no_t",
+            title: "人工智能大模型应用实操方法汇总",
+            // 缺 publishTime -> 门槛提升为 0.7
+          },
+        ],
+      },
+    ],
+  });
+  assert.deepStrictEqual(
+    noTimeRes.get("G1|抖音|no_t"),
+    { contentKey: null, matchedBy: null },
+    "缺时间时 sim 门槛 +0.1（需 ≥0.7），0.6x 不得合并"
+  );
+
+  // 11d. 两个系列视频（「第1集」「第2集」）不互相误合（互为最佳 + 差值规则）
+  const seriesContents = buildContentIndex([
+    {
+      pt: "抖音",
+      group: "G1",
+      title: "Python零基础入门第1集",
+      filePath: "D:\\py\\ep1.mp4",
+      publishStatus: "success",
+      date: "2026-11-10",
+    },
+    {
+      pt: "抖音",
+      group: "G1",
+      title: "Python零基础入门第2集",
+      filePath: "D:\\py\\ep2.mp4",
+      publishStatus: "success",
+      date: "2026-11-10",
+    },
+  ]);
+  // 场景1：第1集/第2集各自截断或增补 → 精确一一对应，互不交叉
+  const seriesPairLink = linkWorks({
+    contents: seriesContents,
+    accounts: [
+      {
+        group: "G1",
+        platform: "抖音",
+        works: [
+          { workId: "ep1_w", title: "Python零基础入门第1集完整精讲", publishTime: Date.parse("2026-11-10T04:00:00Z") },
+          { workId: "ep2_w", title: "Python零基础入门第2集完整精讲", publishTime: Date.parse("2026-11-10T05:00:00Z") },
+        ],
+      },
+    ],
+  });
+  assert.strictEqual(seriesPairLink.get("G1|抖音|ep1_w").contentKey, "file:d:/py/ep1.mp4");
+  assert.strictEqual(seriesPairLink.get("G1|抖音|ep1_w").matchedBy, "fuzzy");
+  assert.strictEqual(seriesPairLink.get("G1|抖音|ep2_w").contentKey, "file:d:/py/ep2.mp4");
+  assert.strictEqual(seriesPairLink.get("G1|抖音|ep2_w").matchedBy, "fuzzy");
+
+  // 场景2：已有第1集/第2集 target，来了第3集作品 → 与第1/2集同分（差值 0 < 0.1），绝不误合
+  const seriesEp3Link = linkWorks({
+    contents: seriesContents,
+    accounts: [
+      {
+        group: "G1",
+        platform: "抖音",
+        works: [
+          { workId: "ep3_w", title: "Python零基础入门第3集", publishTime: Date.parse("2026-11-10T06:00:00Z") },
+        ],
+      },
+    ],
+  });
+  assert.deepStrictEqual(
+    seriesEp3Link.get("G1|抖音|ep3_w"),
+    { contentKey: null, matchedBy: null },
+    "系列视频第3集对第1/2集同分（差值<0.1），不得误合"
+  );
+
+  // 场景3：只有第2集 target，但有第1集+第2集两条作品 → 仅第2集互为最佳匹配，第1集不误合进第2集
+  const onlyEp2Link = linkWorks({
+    contents: [seriesContents[1]],
+    accounts: [
+      {
+        group: "G1",
+        platform: "抖音",
+        works: [
+          { workId: "ep1_only", title: "Python零基础入门第1集详讲", publishTime: Date.parse("2026-11-10T04:00:00Z") },
+          { workId: "ep2_only", title: "Python零基础入门第2集详讲", publishTime: Date.parse("2026-11-10T05:00:00Z") },
+        ],
+      },
+    ],
+  });
+  assert.deepStrictEqual(onlyEp2Link.get("G1|抖音|ep1_only"), { contentKey: null, matchedBy: null });
+  assert.strictEqual(onlyEp2Link.get("G1|抖音|ep2_only").contentKey, "file:d:/py/ep2.mp4");
+
+  // 11e. 次佳差 < 0.1 不合（非并列但分差 < 0.1）
+  const candWorkTitle = "深度解析人工智能办公效率提升全套实战方法";
+  const candT1 = "深度解析人工智能办公效率提升实战指南";
+  const candT2 = "深度解析人工智能办公效率提升实用教程";
+  const s1 = computeTitleSimilarity(candWorkTitle, candT1);
+  const s2 = computeTitleSimilarity(candWorkTitle, candT2);
+  assert.ok(
+    s1 >= 0.6 && s2 >= 0.6 && s1 > s2 && s1 - s2 < 0.1,
+    `构造次佳差 <0.1 失败: s1=${s1}, s2=${s2}`
+  );
+  const closeMarginLink = linkWorks({
+    contents: buildContentIndex([
+      { pt: "抖音", group: "G1", title: candT1, filePath: "D:\\m\\c1.mp4", publishStatus: "success", date: "2026-11-10" },
+      { pt: "抖音", group: "G1", title: candT2, filePath: "D:\\m\\c2.mp4", publishStatus: "success", date: "2026-11-10" },
+    ]),
+    accounts: [
+      {
+        group: "G1",
+        platform: "抖音",
+        works: [{ workId: "close1", title: candWorkTitle, publishTime: Date.parse("2026-11-10T04:00:00Z") }],
+      },
+    ],
+  });
+  assert.deepStrictEqual(
+    closeMarginLink.get("G1|抖音|close1"),
+    { contentKey: null, matchedBy: null },
+    "最佳与次佳分差 < 0.1 时不得合并"
+  );
+
+  // 11f. ④ 无发布记录跨平台聚类：auto:<hash> 稳定可重现、标题取最早发布、素材为空、3平台成簇
+  const clusterAccounts = [
+    {
+      group: "运营组",
+      platform: "快手",
+      works: [
+        {
+          workId: "ks_c1",
+          title: "秋季露营装备清单推荐 #户外露营 完整避坑",
+          url: "https://www.kuaishou.com/short-video/c1",
+          publishTime: Date.parse("2026-11-11T04:00:00Z"), // 晚于抖音
+        },
+      ],
+    },
+    {
+      group: "运营组",
+      platform: "抖音",
+      works: [
+        {
+          workId: "dy_c1",
+          title: "秋季露营装备清单推荐完整避坑指南（最早发布原标题）",
+          url: "https://www.douyin.com/video/c1",
+          publishTime: Date.parse("2026-11-10T02:00:00Z"), // 最早发布
+        },
+      ],
+    },
+    {
+      group: "运营组",
+      platform: "小红书",
+      works: [
+        {
+          workId: "xhs_c1",
+          title: "秋季露营装备清单推荐完整避坑🔥",
+          url: "https://www.xiaohongshu.com/explore/c1",
+          publishTime: Date.parse("2026-11-12T03:00:00Z"), // 距抖音 2 天 ≤ 2
+        },
+      ],
+    },
+  ];
+  const clusterLink1 = linkWorks({ contents: [], accounts: clusterAccounts });
+  const clusterLink2 = linkWorks({ contents: [], accounts: [...clusterAccounts].reverse() });
+  const ckDy = clusterLink1.get("运营组|抖音|dy_c1");
+  const ckKs = clusterLink1.get("运营组|快手|ks_c1");
+  const ckXhs = clusterLink1.get("运营组|小红书|xhs_c1");
+  assert.ok(ckDy && ckDy.contentKey && ckDy.contentKey.startsWith("auto:"), "无发布记录跨平台应生成 auto: key");
+  assert.strictEqual(ckKs.contentKey, ckDy.contentKey);
+  assert.strictEqual(ckXhs.contentKey, ckDy.contentKey);
+  assert.strictEqual(ckDy.matchedBy, "fuzzy");
+  assert.strictEqual(typeof ckDy.score, "number");
+  assert.strictEqual(
+    clusterLink2.get("运营组|抖音|dy_c1").contentKey,
+    ckDy.contentKey,
+    "auto: key 必须稳定可重现（不依赖输入顺序）"
+  );
+
+  const clusterSummary = buildContentSummaryRows({
+    contents: [],
+    accounts: clusterAccounts,
+    worksDaily: {
+      "运营组|抖音": { dy_c1: { "2026-11-12": { play: 1000, like: 50 } } },
+      "运营组|快手": { ks_c1: { "2026-11-12": { play: 600, like: 20 } } },
+      "运营组|小红书": { xhs_c1: { "2026-11-12": { play: 400, like: 30 } } },
+    },
+  });
+  assert.strictEqual(clusterSummary.length, 1);
+  assert.strictEqual(clusterSummary[0].contentKey, ckDy.contentKey);
+  assert.strictEqual(clusterSummary[0].title, "秋季露营装备清单推荐完整避坑指南（最早发布原标题）");
+  assert.strictEqual(clusterSummary[0].file, "");
+  assert.strictEqual(clusterSummary[0].platformCount, 3);
+  assert.strictEqual(clusterSummary[0].totalPlay, 2000);
+  assert.strictEqual(clusterSummary[0].matchMethod, "fuzzy");
+  assert.strictEqual(clusterSummary[0].hasFuzzy, true);
+
+  // 11g. 同平台两条作品绝不进同一簇（含单平台两条 & 跨平台传递冲突守卫）
+  const samePlatOnlyLink = linkWorks({
+    contents: [],
+    accounts: [
+      {
+        group: "G1",
+        platform: "抖音",
+        works: [
+          { workId: "sp1", title: "居家健身十分钟燃脂操完整版", publishTime: Date.parse("2026-11-10T04:00:00Z") },
+          { workId: "sp2", title: "居家健身十分钟燃脂操", publishTime: Date.parse("2026-11-10T05:00:00Z") },
+        ],
+      },
+    ],
+  });
+  assert.deepStrictEqual(samePlatOnlyLink.get("G1|抖音|sp1"), { contentKey: null, matchedBy: null });
+  assert.deepStrictEqual(samePlatOnlyLink.get("G1|抖音|sp2"), { contentKey: null, matchedBy: null });
+
+  // 跨平台传递冲突：A1(抖) — B1(快) — C1(小) — A2(抖)，检查任何簇内同平台最多 1 条
+  const transitiveAccounts = [
+    {
+      group: "G1",
+      platform: "抖音",
+      works: [
+        { workId: "dy_a1", title: "甲乙丙丁戊己庚辛壬癸子丑", publishTime: Date.parse("2026-11-10T04:00:00Z") },
+        { workId: "dy_a2", title: "寅卯辰巳午未申酉戌亥乾坤", publishTime: Date.parse("2026-11-10T04:00:00Z") },
+      ],
+    },
+    {
+      group: "G1",
+      platform: "快手",
+      works: [
+        { workId: "ks_b1", title: "甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳", publishTime: Date.parse("2026-11-10T04:00:00Z") },
+      ],
+    },
+    {
+      group: "G1",
+      platform: "小红书",
+      works: [
+        { workId: "xhs_c1", title: "壬癸子丑寅卯辰巳午未申酉戌亥乾坤", publishTime: Date.parse("2026-11-10T04:00:00Z") },
+      ],
+    },
+  ];
+  const transLink = linkWorks({ contents: [], accounts: transitiveAccounts });
+  const transByCk = new Map();
+  for (const [wk, v] of transLink.entries()) {
+    if (!v.contentKey) continue;
+    const pt = wk.split("|")[1];
+    const pts = transByCk.get(v.contentKey) || [];
+    assert.strictEqual(pts.includes(pt), false, `同一簇 ${v.contentKey} 不得包含同平台 ${pt} 多条作品`);
+    pts.push(pt);
+    transByCk.set(v.contentKey, pts);
+  }
+
+  // 11h. 确定性测试：多轮打乱 contents / accounts / works 输入顺序，结果必须 100% 一致
+  const detContentsBase = buildContentIndex([
+    { pt: "抖音", group: "G1", title: "高效学习英语听力的五个核心技巧完整版", filePath: "D:\\det\\e1.mp4", publishStatus: "success", date: "2026-11-10" },
+    { pt: "抖音", group: "G1", title: "零基础剪辑调色实战入门指南完整版", filePath: "D:\\det\\e2.mp4", publishStatus: "success", date: "2026-11-10" },
+  ]);
+  const detAccountsBase = [
+    {
+      group: "G1",
+      platform: "抖音",
+      works: [
+        { workId: "d1", title: "高效学习英语听力的五个核心技巧", publishTime: Date.parse("2026-11-10T04:00:00Z") },
+        { workId: "d2", title: "零基础剪辑调色实战入门指南", publishTime: Date.parse("2026-11-10T05:00:00Z") },
+        { workId: "d3", title: "家庭咖啡手冲水温粉水比实测分享", publishTime: Date.parse("2026-11-10T06:00:00Z") },
+      ],
+    },
+    {
+      group: "G1",
+      platform: "快手",
+      works: [
+        { workId: "k1", title: "家庭咖啡手冲 #咖啡 水温粉水比实测", publishTime: Date.parse("2026-11-11T04:00:00Z") },
+        { workId: "k2", title: "无匹配快手独有视频", publishTime: Date.parse("2026-11-11T05:00:00Z") },
+      ],
+    },
+    {
+      group: "G1",
+      platform: "小红书",
+      works: [
+        { workId: "x1", title: "家庭咖啡手冲水温粉水比实测分享！", publishTime: Date.parse("2026-11-11T08:00:00Z") },
+      ],
+    },
+  ];
+  const detDaily = {
+    "G1|抖音": {
+      d1: { "2026-11-12": { play: 100 } },
+      d2: { "2026-11-12": { play: 200 } },
+      d3: { "2026-11-12": { play: 300 } },
+    },
+    "G1|快手": {
+      k1: { "2026-11-12": { play: 400 } },
+      k2: { "2026-11-12": { play: 50 } },
+    },
+    "G1|小红书": {
+      x1: { "2026-11-12": { play: 500 } },
+    },
+  };
+  const baselineEntries = [...linkWorks({ contents: detContentsBase, accounts: detAccountsBase }).entries()].sort(
+    (a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)
+  );
+  const baselineSummary = buildContentSummaryRows({
+    contents: detContentsBase,
+    accounts: detAccountsBase,
+    worksDaily: detDaily,
+  });
+
+  // 倒序 + 轮换打乱多次验证
+  for (let round = 0; round < 5; round++) {
+    const shuffledContents = [...detContentsBase].reverse();
+    const shuffledAccounts = detAccountsBase
+      .map((a, idx) => ({
+        ...a,
+        works: a.works.slice((idx + round) % a.works.length).concat(a.works.slice(0, (idx + round) % a.works.length)).reverse(),
+      }))
+      .slice(round % detAccountsBase.length)
+      .concat(detAccountsBase.slice(0, round % detAccountsBase.length).map((a) => ({ ...a, works: [...a.works].reverse() })));
+    const curEntries = [...linkWorks({ contents: shuffledContents, accounts: shuffledAccounts }).entries()].sort(
+      (a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)
+    );
+    const curSummary = buildContentSummaryRows({
+      contents: shuffledContents,
+      accounts: shuffledAccounts,
+      worksDaily: detDaily,
+    });
+    assert.deepStrictEqual(curEntries, baselineEntries, `第 ${round + 1} 轮打乱顺序 linkWorks 必须确定一致`);
+    assert.deepStrictEqual(curSummary, baselineSummary, `第 ${round + 1} 轮打乱顺序 buildContentSummaryRows 必须确定一致`);
+  }
+
+  console.log("✓ S6 模糊匹配：截断/中间话题/时间窗/缺时间门槛/系列第1-2集/次佳差/跨平台聚类/同平台隔离/确定性全通过");
 }
 
 testMatchWorksIpcAmbiguity()
