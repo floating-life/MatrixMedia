@@ -52,9 +52,11 @@ const {
   buildRankingTop10Option,
   buildNewWorksTrajectoryOption,
   buildNewWorksCategoryPieOption,
+  buildNewWorksFirst24hOption,
   buildPublishTimeHeatmapOption,
   buildFansTrendOption,
   buildContentTrendOption,
+  buildContentIntradayOption,
 } = statsChartOptions;
 
 const DAY_MS = 86400000;
@@ -1985,6 +1987,215 @@ function createDataStatsCtx(compDef, analysis) {
   return ctx;
 }
 
+async function testS9_IntradayAndFirst24hCharts() {
+  // 1. buildContentIntradayOption：空数据占位 + 正常多平台折线/增量柱/平台色 + LTTB
+  assert.strictEqual(isEmptyChartOption(buildContentIntradayOption(null)), true);
+  assert.strictEqual(
+    isEmptyChartOption(buildContentIntradayOption({ timePoints: [], platforms: [] })),
+    true
+  );
+
+  const intraOpt = buildContentIntradayOption({
+    timePoints: ["2026-11-19 10:00", "2026-11-19 12:00", "2026-11-20 08:00"],
+    platforms: [
+      { platform: "快手", play: [null, 80, 180], playDelta: [null, null, 100] },
+      { platform: "抖音", play: [100, 220, 400], playDelta: [null, 120, 180] },
+    ],
+    totalPlay: [100, 300, 580],
+    totalPlayDelta: [null, 120, 280],
+  });
+  assert.strictEqual(isEmptyChartOption(intraOpt), false);
+  assert.deepStrictEqual(intraOpt.xAxis.data, [
+    "2026-11-19 10:00",
+    "2026-11-19 12:00",
+    "2026-11-20 08:00",
+  ]);
+  assert.strictEqual(intraOpt.xAxis.axisLabel.formatter("2026-11-19 10:00"), "11-19 10:00");
+  assert.strictEqual(intraOpt.series.length, 3, "2 个平台折线 + 1 条较上次增量柱");
+  assert.strictEqual(intraOpt.series[0].name, "抖音");
+  assert.strictEqual(intraOpt.series[0].type, "line");
+  assert.strictEqual(intraOpt.series[0].connectNulls, false);
+  assert.strictEqual(intraOpt.series[0].itemStyle.color, PLATFORM_COLORS["抖音"]);
+  assert.strictEqual(intraOpt.series[1].name, "快手");
+  assert.strictEqual(intraOpt.series[1].itemStyle.color, PLATFORM_COLORS["快手"]);
+  assert.strictEqual(intraOpt.series[2].name, "较上次增量");
+  assert.strictEqual(intraOpt.series[2].type, "bar");
+  assert.strictEqual(intraOpt.series[2].yAxisIndex, 1);
+  assert.deepStrictEqual(intraOpt.series[2].data, [null, 120, 280]);
+
+  const tipHtml = intraOpt.tooltip.formatter([
+    { dataIndex: 2, seriesType: "line", seriesName: "抖音", value: 400, marker: "*" },
+    { dataIndex: 2, seriesType: "bar", seriesName: "较上次增量", value: 280, marker: "#" },
+  ]);
+  assert.ok(tipHtml.includes("2026-11-20 08:00") && tipHtml.includes("+180") && tipHtml.includes("+280"));
+
+  // LTTB (> 2000 点自动开启)
+  const manyPts = [];
+  const manyPlay = [];
+  const manyDelta = [];
+  for (let i = 0; i < 1100; i++) {
+    manyPts.push(`2026-11-01 ${String(i % 24).padStart(2, "0")}:${String(i % 60).padStart(2, "0")}`);
+    manyPlay.push(i * 10);
+    manyDelta.push(10);
+  }
+  const lttbIntra = buildContentIntradayOption({
+    timePoints: manyPts,
+    platforms: [
+      { platform: "抖音", play: manyPlay, playDelta: manyDelta },
+      { platform: "快手", play: manyPlay, playDelta: manyDelta },
+    ],
+    totalPlayDelta: manyDelta,
+  });
+  assert.strictEqual(lttbIntra.series[0].sampling, "lttb");
+
+  // 2. buildNewWorksFirst24hOption + buildStatsAnalysis(intradayRows)：近 7 天过滤、24h 截断、最多 10 条、平台色与筛选
+  const cnMs = (d, hh, mm = 0) => Date.parse(`${d}T${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}:00+08:00`);
+  const intradayRows = [];
+  // 12 条近 7 天内发布的新作品（验证最多 10 条上限），其中第 1 条同时有抖音+快手
+  for (let i = 1; i <= 12; i++) {
+    const day = `2026-11-${String(14 + (i % 7)).padStart(2, "0")}`;
+    const pubMs = cnMs(day, 8, 0);
+    const plat = i % 2 === 1 ? "抖音" : "快手";
+    intradayRows.push(
+      {
+        date: day,
+        slot: "10:00",
+        collectedAt: cnMs(day, 10, 0),
+        group: "G1",
+        platform: plat,
+        workId: `NW_${i}`,
+        title: `新作品 ${i}`,
+        publishTime: pubMs,
+        publishTimeMs: pubMs,
+        publishDate: day,
+        contentKey: `file:/v/nw_${i}.mp4`,
+        play: 100 * i,
+      },
+      {
+        date: day,
+        slot: "14:00",
+        collectedAt: cnMs(day, 14, 0),
+        group: "G1",
+        platform: plat,
+        workId: `NW_${i}`,
+        title: `新作品 ${i}`,
+        publishTime: pubMs,
+        publishTimeMs: pubMs,
+        publishDate: day,
+        contentKey: `file:/v/nw_${i}.mp4`,
+        play: 250 * i,
+      }
+    );
+    // 给第 1 条增加一个 > 24h 的点（应被截断排除）
+    if (i === 1) {
+      intradayRows.push({
+        date: "2026-11-16",
+        slot: "12:00",
+        collectedAt: cnMs("2026-11-16", 12, 0),
+        group: "G1",
+        platform: plat,
+        workId: "NW_1",
+        title: "新作品 1",
+        publishTime: pubMs,
+        publishTimeMs: pubMs,
+        publishDate: day,
+        contentKey: "file:/v/nw_1.mp4",
+        play: 99999,
+      });
+    }
+  }
+  // 8 天前发布的旧作品（2026-11-13，不在 [11-14, 11-20] 7 天窗口内，应排除）
+  const oldPubMs = cnMs("2026-11-13", 8, 0);
+  intradayRows.push({
+    date: "2026-11-13",
+    slot: "10:00",
+    collectedAt: cnMs("2026-11-13", 10, 0),
+    group: "G1",
+    platform: "视频号",
+    workId: "OLD_1",
+    title: "超7天旧作品",
+    publishTime: oldPubMs,
+    publishTimeMs: oldPubMs,
+    publishDate: "2026-11-13",
+    contentKey: "file:/v/old_1.mp4",
+    play: 5000,
+  });
+
+  const s9Analysis = buildStatsAnalysis({
+    intradayRows,
+    to: "2026-11-20",
+    now: cnMs("2026-11-20", 20, 0),
+  });
+  assert.strictEqual(s9Analysis.newWorksFirst24h.from, "2026-11-14");
+  assert.strictEqual(s9Analysis.newWorksFirst24h.to, "2026-11-20");
+  assert.strictEqual(s9Analysis.newWorksFirst24h.items.length, 12, "应过滤掉超过 7 天的旧作品");
+  const nw1 = s9Analysis.newWorksFirst24h.items.find((x) => x.contentKey === "file:/v/nw_1.mp4");
+  assert.ok(nw1);
+  assert.deepStrictEqual(
+    nw1.points.map((p) => p.hours),
+    [2, 6],
+    "> 24h 的采集点必须排除"
+  );
+
+  const first24hOpt = buildNewWorksFirst24hOption(s9Analysis);
+  assert.strictEqual(isEmptyChartOption(first24hOpt), false);
+  assert.strictEqual(first24hOpt.series.length, 10, "新作品前 24 小时最多显示 10 条折线");
+  assert.strictEqual(first24hOpt.xAxis.type, "value");
+  assert.strictEqual(first24hOpt.xAxis.min, 0);
+  assert.strictEqual(first24hOpt.xAxis.max, 24);
+  for (const s of first24hOpt.series) {
+    assert.strictEqual(s.itemStyle.color, PLATFORM_COLORS[s.platform], "折线颜色必须复用平台色");
+    for (const pt of s.data) {
+      assert.ok(pt.value[0] >= 0 && pt.value[0] <= 24);
+    }
+  }
+  // 按平台筛选
+  const dyOnly24h = buildNewWorksFirst24hOption(s9Analysis, { platform: "抖音" });
+  assert.strictEqual(dyOnly24h.series.length, 6);
+  assert.ok(dyOnly24h.series.every((s) => s.platform === "抖音" && s.itemStyle.color === PLATFORM_COLORS["抖音"]));
+  // 空数据占位
+  assert.strictEqual(isEmptyChartOption(buildNewWorksFirst24hOption({})), true);
+  assert.strictEqual(
+    isEmptyChartOption(buildNewWorksFirst24hOption(s9Analysis, { platform: "百家号" })),
+    true
+  );
+
+  // 3. dataStats/index.vue：弹窗按天/按时段切换、1/3/7 天区间、新作品前 24 小时与设置栏风险提示
+  const { compDef, template, invokeLog, cleanup } = await loadDataStatsIndexComponent();
+  try {
+    assert.ok(
+      template.includes("采集越频繁越容易触发平台风控；部分平台作品数据本身每天才更新，分时段曲线可能是平的"),
+      "设置栏在 interval 模式必须包含风控与平曲线提示"
+    );
+    assert.ok(template.includes("最近采集"), "作品汇总表必须含「最近采集」列");
+    assert.ok(template.includes("按时段"), "趋势弹窗必须含「按天 / 按时段」切换");
+    assert.ok(template.includes("新作品前 24 小时"), "数据分析必须含「新作品前 24 小时」节");
+    assert.ok(template.includes("chartNewWorksFirst24h"), "应复用 StatsChart 渲染前 24 小时图");
+
+    const ctx = createDataStatsCtx(compDef, s9Analysis);
+    assert.strictEqual(isEmptyChartOption(ctx.newWorksFirst24hOption), false);
+    assert.strictEqual(ctx.newWorksFirst24hOption.series.length, 10);
+
+    await ctx.openContentTrend({ contentKey: "file:/v/nw_1.mp4", title: "新作品 1" });
+    assert.strictEqual(ctx.contentTrendMode, "daily");
+    assert.strictEqual(invokeLog[0].ch, "stats:get-content-trend");
+
+    ctx.contentTrendMode = "intraday";
+    await ctx.onContentTrendModeChange("intraday");
+    assert.strictEqual(invokeLog[1].ch, "stats:get-content-intraday");
+    assert.strictEqual(invokeLog[1].payload.contentKey, "file:/v/nw_1.mp4");
+    assert.strictEqual(invokeLog[1].payload.days, 3);
+
+    ctx.contentIntradayDays = 7;
+    await ctx.loadContentIntraday();
+    assert.strictEqual(invokeLog[2].ch, "stats:get-content-intraday");
+    assert.strictEqual(invokeLog[2].payload.days, 7);
+  } finally {
+    cleanup();
+  }
+  console.log("✓ [S9] 分时段趋势 option、新作品前 24 小时 option 与 dataStats/index.vue 联动通过");
+}
+
 async function runS8FixRegressions(analysis) {
   testFix1_ContentTrendCumulativeSumAcrossSamePlatformWorks();
   await testFix2_StatsChartPendingOptionWhenHiddenAppliesBeforeResize(analysis);
@@ -1995,6 +2206,7 @@ async function runS8FixRegressions(analysis) {
   await testFix7_StackedAreaRecomputesMarkPointsOnLegendSelectChanged();
   testFix8_EngagementRankingStacksRawContribAndRoundsOnDisplay();
   await testFix9_SaveChartImageUsesOwnCutoffDate(analysis);
+  await testS9_IntradayAndFirst24hCharts();
 }
 
 main().catch((err) => {

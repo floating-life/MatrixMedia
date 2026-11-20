@@ -4,11 +4,12 @@
  * 数据统计 IPC 入口。
  *
  * - stats:collect              采集一组账号（串行队列，账号间间隔防风控），进度经 stats:progress 推送
- * - stats:auto-run             每日定时自动采集单一操作（检查 auto-run.json → 互斥 → 采集 → 落盘日期）
+ * - stats:auto-run             定时自动采集单一操作（支持 daily 按日 / interval 按槽；检查 auto-run.json → 互斥 → 采集 → 落盘）
  * - stats:get-data             读取单账号本地数据（daily + works + meta）
  * - stats:get-overview         全账号按日聚合（所有账号总览页）
  * - stats:get-content-summary  跨平台作品汇总（作品汇总 tab）
- * - stats:get-content-trend    单条内容各平台播放走势（作品汇总 tab 趋势弹窗）
+ * - stats:get-content-trend    单条内容各平台播放走势（作品汇总 tab 趋势弹窗-按天）
+ * - stats:get-content-intraday 单条内容各平台分时段播放走势（作品汇总 tab 趋势弹窗-按时段）
  * - stats:get-analysis         规则数据分析（数据分析 tab，与 Excel「分析」sheet 共用计算函数）
  * - stats:save-chart-image     保存单张图表 PNG 图片（含 dataUrl 与大小校验、保存对话框）
  * - stats:save-chart-images-batch 批量导出全部图表 PNG 到选定目录（一次目录选择对话框）
@@ -45,6 +46,7 @@ const {
   resolveLinkValidationContext,
   buildContentSummaryData,
   buildContentTrendData,
+  buildContentIntradayData,
   buildStatsAnalysisData,
   buildStatsWorkbookData,
   writeStatsXlsx,
@@ -63,7 +65,11 @@ const BASE64_BODY_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 let collecting = false;
 let cancelled = false;
 let collectedToday = { date: "", partitions: new Set() };
-// auto-run.json 读写失败时的兜底：本进程内已自动跑过的日期（防止持久化失败导致每分钟重采）
+// 按时段槽记录本进程内已采集分区（slot -> Set<partition>，保留最近 128 个槽防无限增长）
+const collectedBySlot = new Map();
+const MAX_COLLECTED_SLOTS = 128;
+let lastRetentionDays = store.DEFAULT_INTRADAY_RETENTION_DAYS || 60;
+// auto-run.json 读写失败时的兜底：本进程内已自动跑过的日期/时段槽（防止持久化失败导致每分钟重采）
 const autoRanInMemory = new Set();
 // link-overrides.json 串行写入队列：保证并发 set/merge/clear 顺序执行不丢写
 let overrideWriteChain = Promise.resolve();
@@ -433,11 +439,24 @@ function syncCollectedToday(date) {
   }
 }
 
-function markPartitionCollected(partition, date = getTodayStr()) {
+function markPartitionCollected(partition, date = getTodayStr(), slot = "") {
   const key = normalizePartition(partition);
   if (!key) return;
   syncCollectedToday(date);
   collectedToday.partitions.add(key);
+  if (typeof slot === "string" && slot.trim()) {
+    const slotKey = slot.trim();
+    let set = collectedBySlot.get(slotKey);
+    if (!set) {
+      set = new Set();
+      collectedBySlot.set(slotKey, set);
+      if (collectedBySlot.size > MAX_COLLECTED_SLOTS) {
+        const oldestKey = collectedBySlot.keys().next().value;
+        if (oldestKey !== undefined) collectedBySlot.delete(oldestKey);
+      }
+    }
+    set.add(key);
+  }
 }
 
 function hasPartitionCollected(partition, date = getTodayStr()) {
@@ -447,11 +466,30 @@ function hasPartitionCollected(partition, date = getTodayStr()) {
   return collectedToday.partitions.has(key);
 }
 
+function hasPartitionCollectedForSlot(partition, slot) {
+  const key = normalizePartition(partition);
+  const slotKey = typeof slot === "string" ? slot.trim() : "";
+  if (!key || !slotKey) return false;
+  const set = collectedBySlot.get(slotKey);
+  return Boolean(set && set.has(key));
+}
+
+function normalizeRetentionDaysArg(raw) {
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (Number.isInteger(n) && n >= 1 && n <= 3650) return n;
+  return null;
+}
+
 async function collectAccounts(accounts, sender, options = {}) {
   const results = [];
   const total = accounts.length;
   const startedAt = Date.now();
-  const skipCollected = Boolean(options && options.skipCollectedToday);
+  const skipCollectedToday = Boolean(options && options.skipCollectedToday);
+  const slot =
+    options && typeof options.slot === "string" ? options.slot.trim() : "";
+  const skipCollectedSlot = Boolean(options && options.skipCollectedSlot && slot);
+  const retentionDays =
+    normalizeRetentionDaysArg(options && options.retentionDays) || lastRetentionDays;
   let hasCollectedAny = false;
 
   for (let i = 0; i < total; i++) {
@@ -476,7 +514,12 @@ async function collectAccounts(accounts, sender, options = {}) {
       }
     };
 
-    if (skipCollected && hasPartitionCollected(acc.partition)) {
+    const shouldSkip = skipCollectedSlot
+      ? hasPartitionCollectedForSlot(acc.partition, slot)
+      : skipCollectedToday
+      ? hasPartitionCollected(acc.partition)
+      : false;
+    if (shouldSkip) {
       results.push({
         group: acc.group,
         platform: acc.platform,
@@ -499,14 +542,23 @@ async function collectAccounts(accounts, sender, options = {}) {
         partition: acc.partition,
         platform: acc.platform,
       });
+      const collectNow = Date.now();
       store.mergeDaily(acc.group, acc.platform, data.overview, data.fansHistory);
-      store.mergeWorks(acc.group, acc.platform, data.works);
+      store.mergeWorks(acc.group, acc.platform, data.works, collectNow, {
+        slot: slot || undefined,
+        retentionDays,
+      });
       store.writeMeta(acc.group, acc.platform, {
-        lastCollectAt: Date.now(),
+        lastCollectAt: collectNow,
         lastError: "",
         workCount: data.works.length,
       });
-      markPartitionCollected(acc.partition);
+      const effectiveSlot =
+        slot ||
+        (typeof store.formatManualSlotKey === "function"
+          ? store.formatManualSlotKey(collectNow)
+          : "");
+      markPartitionCollected(acc.partition, getTodayStr(collectNow), effectiveSlot);
       results.push({
         group: acc.group,
         platform: acc.platform,
@@ -545,6 +597,9 @@ async function collectAccounts(accounts, sender, options = {}) {
   };
   if (options && VALID_TRIGGERS.has(options.trigger)) {
     logEntry.trigger = options.trigger;
+  }
+  if (slot) {
+    logEntry.slot = slot;
   }
   try {
     store.appendCollectLog(logEntry);
@@ -683,24 +738,110 @@ function registerDataStatsIpc(options = {}) {
     if (!accounts.length) return { results: [], error: "没有可采集的账号" };
     const trigger =
       args && VALID_TRIGGERS.has(args.trigger) ? args.trigger : undefined;
+    const reqRetention = normalizeRetentionDaysArg(args && args.retentionDays);
+    if (reqRetention !== null) lastRetentionDays = reqRetention;
     collecting = true;
     cancelled = false;
     try {
-      return await collectAccounts(accounts, event && event.sender, { trigger });
+      return await collectAccounts(accounts, event && event.sender, {
+        trigger,
+        retentionDays: lastRetentionDays,
+      });
     } finally {
       collecting = false;
     }
   });
 
   /**
-   * 每日自动采集单一操作（认领与采集合并）：
-   * - today = store.todayStr()（UTC+8，由主进程计算）
-   * - auto-run.json 已含 today → 立即返回 { status: "already-ran", date: today }
-   * - collecting 中 → 返回 { status: "busy" }，不写入任何内容
-   * - 否则同步置位 collecting=true，执行采集（复用 collectAccounts，trigger:"auto"），
-   *   开跑前原子追加 today 到 runs（写失败返回 store-failed、不采集），结束后复位 collecting
+   * 定时自动采集单一操作（认领与采集合并）：
+   * - interval 模式（传入 args.slot = "YYYY-MM-DD HH:mm"）：
+   *   按槽去重与落盘 auto-run.json，支持 slotEndMs 过槽放弃，跳过本槽已采分区
+   * - daily 模式（未传 slot，兼容旧调用）：
+   *   today = store.todayStr()（UTC+8，由主进程计算），行为与历史完全一致
+   * - 均遵守：auto-run.json 已含目标 → already-ran；collecting 中 → busy（不写入）；
+   *   开跑前原子追加目标到 runs（写失败返回 store-failed、不采集），结束后复位 collecting
    */
   ipcMain.handle("stats:auto-run", async (event, args) => {
+    const reqRetention = normalizeRetentionDaysArg(args && args.retentionDays);
+    if (reqRetention !== null) lastRetentionDays = reqRetention;
+
+    const hasSlotArg =
+      args &&
+      Object.prototype.hasOwnProperty.call(args, "slot") &&
+      args.slot !== undefined &&
+      args.slot !== null &&
+      args.slot !== "";
+
+    if (hasSlotArg) {
+      const slot = typeof args.slot === "string" ? args.slot.trim() : "";
+      const validSlot =
+        typeof store.isValidAutoRunSlot === "function"
+          ? store.isValidAutoRunSlot(slot)
+          : /^\d{4}-\d{2}-\d{2} ([01]\d|2[0-3]):([0-5]\d)$/.test(slot);
+      if (!validSlot) {
+        return { status: "invalid-slot", error: "非法时段槽" };
+      }
+      const slotDate = slot.slice(0, 10);
+      if (autoRanInMemory.has(slot)) {
+        return { status: "already-ran", date: slotDate, slot };
+      }
+      let runs = [];
+      try {
+        runs = store.readAutoRuns();
+      } catch (err) {
+        console.warn("[dataStats] 读取 auto-run.json 失败:", (err && err.message) || err);
+        return { status: "busy" };
+      }
+      if (runs.includes(slot)) {
+        autoRanInMemory.add(slot);
+        return { status: "already-ran", date: slotDate, slot };
+      }
+      if (
+        args.slotEndMs !== undefined &&
+        args.slotEndMs !== null &&
+        Number.isFinite(Number(args.slotEndMs)) &&
+        Date.now() >= Number(args.slotEndMs)
+      ) {
+        return { status: "expired", date: slotDate, slot };
+      }
+      if (collecting) {
+        return { status: "busy" };
+      }
+      const accounts = Array.isArray(args && args.accounts) ? args.accounts : [];
+      if (!accounts.length) {
+        return { status: "empty", date: slotDate, slot, results: [] };
+      }
+      try {
+        store.appendAutoRun(slot);
+      } catch (err) {
+        console.warn(
+          "[dataStats] 写入 auto-run.json 失败，本轮不自动采集:",
+          (err && err.message) || err
+        );
+        return { status: "store-failed" };
+      }
+      autoRanInMemory.add(slot);
+      collecting = true;
+      cancelled = false;
+      try {
+        const out = await collectAccounts(accounts, event && event.sender, {
+          trigger: "auto",
+          skipCollectedSlot: true,
+          slot,
+          retentionDays: lastRetentionDays,
+        });
+        return {
+          status: "done",
+          date: slotDate,
+          slot,
+          results: out.results,
+          cancelled: Boolean(out.cancelled),
+        };
+      } finally {
+        collecting = false;
+      }
+    }
+
     const today = getTodayStr();
     if (autoRanInMemory.has(today)) {
       return { status: "already-ran", date: today };
@@ -738,6 +879,7 @@ function registerDataStatsIpc(options = {}) {
       const out = await collectAccounts(accounts, event && event.sender, {
         trigger: "auto",
         skipCollectedToday: true,
+        retentionDays: lastRetentionDays,
       });
       return {
         status: "done",
@@ -815,6 +957,37 @@ function registerDataStatsIpc(options = {}) {
       return {
         ok: false,
         error: (err && err.message) || "读取作品趋势失败",
+      };
+    }
+  });
+
+  ipcMain.handle("stats:get-content-intraday", async (event, args) => {
+    try {
+      if (!isLocalFrameEvent(event)) {
+        return { ok: false, error: "不允许外部页面读取作品分时段趋势" };
+      }
+      if (!args || typeof args !== "object" || Array.isArray(args)) {
+        return { ok: false, error: "查询参数无效" };
+      }
+      const contentKey = typeof args.contentKey === "string" ? args.contentKey.trim() : "";
+      if (!contentKey) {
+        return { ok: false, error: "contentKey 不能为空" };
+      }
+      await overrideWriteChain;
+      const data = buildContentIntradayData(
+        {
+          contentKey,
+          days: args.days !== undefined ? args.days : undefined,
+          to: args.to !== undefined ? args.to : undefined,
+          groups: args.groups,
+        },
+        exportDeps
+      );
+      return { ok: true, ...data };
+    } catch (err) {
+      return {
+        ok: false,
+        error: (err && err.message) || "读取作品分时段趋势失败",
       };
     }
   });
@@ -1266,15 +1439,22 @@ function registerDataStatsIpc(options = {}) {
         const { partition, platform, group, tasks: groupTasks } = entries[i];
         try {
           const data = await collectAccount({ partition, platform });
+          const collectNow = Date.now();
           // 顺带落库（与「同步数据」同效果）
           store.mergeDaily(group, platform, data.overview, data.fansHistory);
-          store.mergeWorks(group, platform, data.works);
+          store.mergeWorks(group, platform, data.works, collectNow, {
+            retentionDays: lastRetentionDays,
+          });
           store.writeMeta(group, platform, {
-            lastCollectAt: Date.now(),
+            lastCollectAt: collectNow,
             lastError: "",
             workCount: data.works.length,
           });
-          markPartitionCollected(partition);
+          const effectiveSlot =
+            typeof store.formatManualSlotKey === "function"
+              ? store.formatManualSlotKey(collectNow)
+              : "";
+          markPartitionCollected(partition, getTodayStr(collectNow), effectiveSlot);
           const byTitle = buildTitleIndex(data.works, normalizeStatusTitle);
           for (const t of groupTasks) {
             const key = normalizeStatusTitle(t.title);

@@ -47,8 +47,13 @@ const {
   STORAGE_KEY,
   DEFAULT_SETTINGS,
   STARTUP_DELAY_MS,
+  VALID_INTERVAL_HOURS,
+  DEFAULT_RETENTION_DAYS,
   formatLocalDate,
+  formatUtc8Date,
   normalizeSettings,
+  buildScheduleSlots,
+  getCurrentSlot,
   isMainWindowLocation,
   shouldRun,
   buildNotifyPayload,
@@ -241,15 +246,15 @@ async function main() {
     }
     assert.deepStrictEqual(
       normalizeSettings({ enabled: false, time: "25:00", lastRunDate: "2026-11-18" }),
-      { enabled: false, time: "10:00", lastRunDate: "2026-11-18" }
+      { ...DEFAULT_SETTINGS, enabled: false, time: "10:00", lastRunDate: "2026-11-18" }
     );
     assert.deepStrictEqual(
       normalizeSettings({ enabled: "false", time: "10:60", lastRunDate: "2026-02-30" }),
-      { enabled: true, time: "10:00", lastRunDate: "" }
+      { ...DEFAULT_SETTINGS, enabled: true, time: "10:00", lastRunDate: "" }
     );
     assert.deepStrictEqual(
       normalizeSettings({ enabled: true, time: "08:30", lastRunDate: "2024-02-29" }),
-      { enabled: true, time: "08:30", lastRunDate: "2024-02-29" }
+      { ...DEFAULT_SETTINGS, enabled: true, time: "08:30", lastRunDate: "2024-02-29" }
     );
     for (const badRaw of ["", "{broken", "null", "[]", "123", '"hello"', "true"]) {
       assert.deepStrictEqual(
@@ -278,6 +283,7 @@ async function main() {
       assert.strictEqual(saveFail.ok, false);
       assert.ok(saveFail.error.includes("QuotaExceededError"));
       assert.deepStrictEqual(saveFail.settings, {
+        ...DEFAULT_SETTINGS,
         enabled: true,
         time: "10:00",
         lastRunDate: "2026-11-18",
@@ -306,6 +312,7 @@ async function main() {
     const updated = updateSettings({ time: "14:30", lastRunDate: undefined }, storage);
     assert.strictEqual(updated.ok, true);
     assert.deepStrictEqual(updated.settings, {
+      ...DEFAULT_SETTINGS,
       enabled: true,
       time: "14:30",
       lastRunDate: "2026-11-18",
@@ -1411,6 +1418,317 @@ async function main() {
           else process.env.TZ = origTZ;
         }
         console.log("✓ UTC 时区 23:30 设置连续多天（含重启）均正常调用，不混用本地与 UTC+8 日期");
+      }
+
+      /* ---- 7. S9 分时段自动采集：槽计算、旧设置迁移、跳槽不补采、按槽 auto-run.json 与分区跳重 ---- */
+      {
+        // 7a. 旧设置迁移为 mode=daily，不擅自提高采集频率
+        assert.deepStrictEqual(VALID_INTERVAL_HOURS, [1, 2, 3, 4, 6]);
+        assert.strictEqual(DEFAULT_RETENTION_DAYS, 60);
+        const migrated = normalizeSettings({ enabled: true, time: "09:30" });
+        assert.strictEqual(migrated.mode, "daily", "旧设置 {enabled, time} 应自动迁移为 mode=daily");
+        assert.strictEqual(migrated.time, "09:30");
+        assert.strictEqual(migrated.startTime, "08:00");
+        assert.strictEqual(migrated.endTime, "22:00");
+        assert.strictEqual(migrated.intervalHours, 2);
+        assert.strictEqual(migrated.retentionDays, 60);
+        // 非法 intervalHours / mode / retentionDays 回落默认
+        const badInterval = normalizeSettings({
+          enabled: true,
+          mode: "interval",
+          startTime: "08:00",
+          endTime: "22:00",
+          intervalHours: 5,
+          retentionDays: -1,
+        });
+        assert.strictEqual(badInterval.mode, "interval");
+        assert.strictEqual(badInterval.intervalHours, 2);
+        assert.strictEqual(badInterval.retentionDays, 60);
+
+        // 7b. 槽计算（默认 08:00-22:00 每 2 小时，endTime 落在槽上）
+        const slots2h = buildScheduleSlots("2026-11-20", {
+          mode: "interval",
+          startTime: "08:00",
+          endTime: "22:00",
+          intervalHours: 2,
+        });
+        assert.deepStrictEqual(
+          slots2h.map((s) => s.slot),
+          [
+            "2026-11-20 08:00",
+            "2026-11-20 10:00",
+            "2026-11-20 12:00",
+            "2026-11-20 14:00",
+            "2026-11-20 16:00",
+            "2026-11-20 18:00",
+            "2026-11-20 20:00",
+            "2026-11-20 22:00",
+          ],
+          "endTime 落在槽上应包含 22:00"
+        );
+
+        // endTime 不落在槽上（08:00-21:00 每 2 小时 → 最后一个槽为 20:00）
+        const slotsOff = buildScheduleSlots("2026-11-20", {
+          mode: "interval",
+          startTime: "08:00",
+          endTime: "21:00",
+          intervalHours: 2,
+        });
+        assert.deepStrictEqual(
+          slotsOff.map((s) => s.slot),
+          [
+            "2026-11-20 08:00",
+            "2026-11-20 10:00",
+            "2026-11-20 12:00",
+            "2026-11-20 14:00",
+            "2026-11-20 16:00",
+            "2026-11-20 18:00",
+            "2026-11-20 20:00",
+          ],
+          "endTime 不落在槽上时最后一个槽应为 20:00"
+        );
+
+        // 间隔 1 / 3 / 6 小时
+        const slots1h = buildScheduleSlots("2026-11-20", {
+          mode: "interval",
+          startTime: "09:00",
+          endTime: "12:00",
+          intervalHours: 1,
+        });
+        assert.deepStrictEqual(
+          slots1h.map((s) => s.slot),
+          ["2026-11-20 09:00", "2026-11-20 10:00", "2026-11-20 11:00", "2026-11-20 12:00"]
+        );
+        const slots3h = buildScheduleSlots("2026-11-20", {
+          mode: "interval",
+          startTime: "08:00",
+          endTime: "20:00",
+          intervalHours: 3,
+        });
+        assert.deepStrictEqual(
+          slots3h.map((s) => s.slot),
+          ["2026-11-20 08:00", "2026-11-20 11:00", "2026-11-20 14:00", "2026-11-20 17:00", "2026-11-20 20:00"]
+        );
+        const slots6h = buildScheduleSlots("2026-11-20", {
+          mode: "interval",
+          startTime: "06:00",
+          endTime: "23:00",
+          intervalHours: 6,
+        });
+        assert.deepStrictEqual(
+          slots6h.map((s) => s.slot),
+          ["2026-11-20 06:00", "2026-11-20 12:00", "2026-11-20 18:00"]
+        );
+
+        // 跨零点（endTime < startTime：22:00-04:00 每 2 小时，槽日期按槽开始时刻 UTC+8 日历日）
+        const slotsCross = buildScheduleSlots("2026-11-20", {
+          mode: "interval",
+          startTime: "22:00",
+          endTime: "04:00",
+          intervalHours: 2,
+        });
+        assert.deepStrictEqual(
+          slotsCross.map((s) => s.slot),
+          ["2026-11-20 22:00", "2026-11-21 00:00", "2026-11-21 02:00", "2026-11-21 04:00"]
+        );
+        // 跨零点实时槽匹配：UTC+8 2026-11-21 01:30 应命中 "2026-11-21 00:00"
+        const crossCfg = {
+          enabled: true,
+          mode: "interval",
+          startTime: "22:00",
+          endTime: "04:00",
+          intervalHours: 2,
+        };
+        const activeCross = getCurrentSlot(cnTime(2026, 11, 21, 1, 30, 0), crossCfg);
+        assert.ok(activeCross && activeCross.slot === "2026-11-21 00:00");
+        assert.strictEqual(getCurrentSlot(cnTime(2026, 11, 21, 6, 0, 0), crossCfg), null, "超出最后一个槽窗口应返回 null");
+        assert.strictEqual(formatUtc8Date(cnTime(2026, 11, 21, 0, 1, 0)), "2026-11-21");
+
+        // 7c. 渲染层调度：同槽只跑一次 + busy 过槽放弃 + 休眠跳槽不补采
+        {
+          const ivStorage = createMemoryStorage();
+          saveSettings(
+            {
+              enabled: true,
+              mode: "interval",
+              startTime: "08:00",
+              endTime: "22:00",
+              intervalHours: 2,
+            },
+            ivStorage
+          );
+          let curNow = cnTime(2026, 11, 20, 7, 59, 0);
+          let nextStatus = "done";
+          const seenCalls = [];
+          const ivNotifies = [];
+          const sIv = createStatsScheduler({
+            storage: ivStorage,
+            now: () => curNow,
+            monotonicNow: () => STARTUP_DELAY_MS,
+            startupDelayMs: 0,
+            getAccounts: () => [{ group: "IvG", platform: "抖音", partition: "persist:IvG-抖音" }],
+            autoRun: async (_accs, meta) => {
+              seenCalls.push(meta && meta.slot);
+              if (nextStatus === "busy") return { status: "busy" };
+              return { status: "done", date: meta.slot.slice(0, 10), slot: meta.slot, results: [{ success: true }] };
+            },
+            notify: (p) => ivNotifies.push(p),
+            setIntervalFn: () => 1,
+            clearIntervalFn: () => {},
+          });
+          sIv.start();
+
+          // 07:59 未到 08:00 槽
+          assert.deepStrictEqual(await sIv.tick(), { ran: false, reason: "not-due" });
+
+          // 08:05 命中 08:00 槽并执行一次
+          curNow = cnTime(2026, 11, 20, 8, 5, 0);
+          const r08 = await sIv.tick();
+          assert.strictEqual(r08.ran, true);
+          assert.strictEqual(r08.slot, "2026-11-20 08:00");
+          assert.strictEqual(loadSettings(ivStorage).lastRunSlot, "2026-11-20 08:00");
+          assert.ok(ivNotifies[0].title.includes("08:00"));
+
+          // 同槽 09:59 不再重跑
+          curNow = cnTime(2026, 11, 20, 9, 59, 0);
+          assert.deepStrictEqual(await sIv.tick(), { ran: false, reason: "not-due" });
+
+          // 10:05 遇到 busy，11:50 再试仍 busy，12:01 已过下一槽 → 直接跑 12:00 放弃 10:00（绝不补采）
+          nextStatus = "busy";
+          curNow = cnTime(2026, 11, 20, 10, 5, 0);
+          assert.strictEqual((await sIv.tick()).reason, "busy");
+          curNow = cnTime(2026, 11, 20, 11, 50, 0);
+          assert.strictEqual((await sIv.tick()).reason, "busy");
+          nextStatus = "done";
+          curNow = cnTime(2026, 11, 20, 12, 1, 0);
+          const r12 = await sIv.tick();
+          assert.strictEqual(r12.ran, true);
+          assert.strictEqual(r12.slot, "2026-11-20 12:00");
+
+          // 休眠跳过 14:00 / 16:00，唤醒在 18:10 → 只跑 18:00，不补采 14:00/16:00
+          curNow = cnTime(2026, 11, 20, 18, 10, 0);
+          const r18 = await sIv.tick();
+          assert.strictEqual(r18.ran, true);
+          assert.strictEqual(r18.slot, "2026-11-20 18:00");
+
+          assert.deepStrictEqual(seenCalls, [
+            "2026-11-20 08:00",
+            "2026-11-20 10:00",
+            "2026-11-20 10:00",
+            "2026-11-20 12:00",
+            "2026-11-20 18:00",
+          ]);
+          sIv.stop();
+        }
+
+        // 7d. 主进程按槽 auto-run.json（兼容旧按日期记录、14 天保留、expired 拒绝）与按槽分区跳重
+        {
+          // 预置旧按日期记录 + 多天槽记录验证兼容与 14 天保留
+          const autoFile = store.autoRunFile();
+          const legacyPlusSlots = ["2026-12-01"];
+          for (let d = 2; d <= 16; d++) {
+            const ds = `2026-12-${String(d).padStart(2, "0")}`;
+            legacyPlusSlots.push(`${ds} 08:00`, `${ds} 10:00`);
+          }
+          fs.writeFileSync(autoFile, JSON.stringify({ runs: legacyPlusSlots }));
+          const normalizedRuns = store.readAutoRuns();
+          const keptDaySet = new Set(normalizedRuns.map((x) => x.slice(0, 10)));
+          assert.strictEqual(keptDaySet.size, 14, "按槽 auto-run.json 应按日历日保留最近 14 天");
+          assert.strictEqual(keptDaySet.has("2026-12-01"), false, "超 14 天的旧日期记录应被淘汰");
+          assert.strictEqual(keptDaySet.has("2026-12-03"), true);
+          assert.strictEqual(keptDaySet.has("2026-12-16"), true);
+
+          // 旧记录与新槽同文件共存
+          fs.writeFileSync(autoFile, JSON.stringify({ runs: ["2026-12-28", "2026-12-29 08:00"] }));
+          const mergedRuns = store.appendAutoRun("2026-12-29 10:00");
+          assert.deepStrictEqual(mergedRuns, ["2026-12-28", "2026-12-29 08:00", "2026-12-29 10:00"]);
+
+          // 主进程非法槽 & 过期槽拦截（不落盘不采集）
+          const badSlotRes = await autoRunHandler(fakeEvent, {
+            slot: "not-a-slot",
+            accounts: [{ group: "SlotG", platform: "抖音", partition: "persist:slot-a" }],
+          });
+          assert.strictEqual(badSlotRes.status, "invalid-slot");
+
+          await withMockDateNow(
+            () => cnTime(2026, 12, 30, 12, 0, 5),
+            async () => {
+              const expRes = await autoRunHandler(fakeEvent, {
+                slot: "2026-12-30 10:00",
+                slotEndMs: cnTime(2026, 12, 30, 12, 0, 0),
+                accounts: [{ group: "SlotG", platform: "抖音", partition: "persist:slot-a" }],
+              });
+              assert.strictEqual(expRes.status, "expired", "已过下一槽时刻必须放弃");
+              assert.strictEqual(
+                store.readAutoRuns().includes("2026-12-30 10:00"),
+                false,
+                "过期槽不得写入 auto-run.json"
+              );
+            }
+          );
+
+          // 按槽分区跳重：10:15 手动采集 persist:slot-p1（取整到 10:00）→ 10:00 自动槽跳过 p1、采集 p2；12:00 下一槽 p1 不再跳过
+          await withImmediateTimers(async () => {
+            await withMockDateNow(
+              () => cnTime(2026, 12, 30, 10, 15, 0),
+              async () => {
+                await collectHandler(fakeEvent, {
+                  accounts: [{ group: "SlotG", platform: "抖音", partition: "persist:slot-p1" }],
+                  trigger: "manual",
+                });
+
+                const before10 = collectedBatches.length;
+                const res10 = await autoRunHandler(fakeEvent, {
+                  slot: "2026-12-30 10:00",
+                  slotEndMs: cnTime(2026, 12, 30, 12, 0, 0),
+                  accounts: [
+                    { group: "SlotG", platform: "抖音", partition: "persist:slot-p1" },
+                    { group: "SlotG", platform: "快手", partition: "persist:slot-p2" },
+                  ],
+                });
+                assert.strictEqual(res10.status, "done");
+                assert.strictEqual(res10.slot, "2026-12-30 10:00");
+                assert.strictEqual(res10.results[0].skipped, true, "同槽手动采集过的分区应跳过");
+                assert.strictEqual(res10.results[1].skipped, undefined);
+                assert.deepStrictEqual(
+                  collectedBatches.slice(before10).map((x) => x.partition),
+                  ["persist:slot-p2"]
+                );
+
+                // 同槽再次触发 → already-ran
+                const dup10 = await autoRunHandler(fakeEvent, {
+                  slot: "2026-12-30 10:00",
+                  slotEndMs: cnTime(2026, 12, 30, 12, 0, 0),
+                  accounts: [{ group: "SlotG", platform: "抖音", partition: "persist:slot-p1" }],
+                });
+                assert.strictEqual(dup10.status, "already-ran");
+              }
+            );
+
+            await withMockDateNow(
+              () => cnTime(2026, 12, 30, 12, 2, 0),
+              async () => {
+                const before12 = collectedBatches.length;
+                const res12 = await autoRunHandler(fakeEvent, {
+                  slot: "2026-12-30 12:00",
+                  slotEndMs: cnTime(2026, 12, 30, 14, 0, 0),
+                  accounts: [
+                    { group: "SlotG", platform: "抖音", partition: "persist:slot-p1" },
+                    { group: "SlotG", platform: "快手", partition: "persist:slot-p2" },
+                  ],
+                });
+                assert.strictEqual(res12.status, "done");
+                assert.strictEqual(res12.slot, "2026-12-30 12:00");
+                assert.deepStrictEqual(
+                  collectedBatches.slice(before12).map((x) => x.partition),
+                  ["persist:slot-p1", "persist:slot-p2"],
+                  "进入下一槽 12:00 后，10:00 槽采过的分区应重新采集"
+                );
+              }
+            );
+          });
+        }
+        console.log("✓ S9 分时段自动采集（槽计算/跨零点/旧设置迁移/跳槽不补采/按槽 auto-run.json/按槽跳重）通过");
       }
     } finally {
       if (origGlobalLS === undefined) delete global.localStorage;

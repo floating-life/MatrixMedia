@@ -13,7 +13,12 @@
 const fs = require("fs");
 const path = require("path");
 const xlsx = require("xlsx");
-const { WORK_STAT_KEYS, DELETED_WORK_TITLE, normalizeMetric } = require("./statsTable");
+const {
+  WORK_STAT_KEYS,
+  DELETED_WORK_TITLE,
+  normalizeMetric,
+  buildWorkIntradayRows,
+} = require("./statsTable");
 const {
   buildContentIndex,
   linkWorks,
@@ -28,19 +33,24 @@ const {
 } = require("./contentLink");
 const {
   DEFAULT_ANALYSIS_PERIOD,
+  NEW_WORKS_FIRST_24H_DAYS,
   buildStatsAnalysis,
 } = require("./statsAnalysis");
 
 const UTC8_MS = 8 * 3600e3;
 const DAY_MS = 86400000;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const SLOT_TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
 const DEFAULT_RANGE_DAYS = 29; // 含起止日共 30 天
+const DEFAULT_INTRADAY_DAYS = 3;
+const MAX_INTRADAY_DAYS = 60;
 const MAX_SHEET_ROWS = 200000;
 const ROW_LIMIT_EXCEEDED_CODE = "ROW_LIMIT_EXCEEDED";
 const FUTURE_DATE_RANGE_ERROR = "所选日期都在未来";
 
 const SHEET_NAMES = [
   "作品日明细",
+  "作品时段明细",
   "作品跨平台汇总",
   "平台日汇总",
   "账号日快照",
@@ -108,6 +118,28 @@ const WORK_DAILY_HEADERS = [
   "收藏日增",
   "涨粉日增",
   "断档天数",
+];
+
+const WORK_INTRADAY_HEADERS = [
+  "日期",
+  "时段",
+  "采集时间",
+  "平台",
+  "分组",
+  "内容ID",
+  "关联方式",
+  "作品ID",
+  "标题",
+  "播放",
+  "点赞",
+  "评论",
+  "分享",
+  "收藏",
+  "涨粉",
+  "播放较上次增量",
+  "点赞较上次增量",
+  "评论较上次增量",
+  "距上次小时数",
 ];
 
 const SUMMARY_BASE_HEADERS = [
@@ -323,7 +355,8 @@ function resolveIoDeps(options = {}, depsArg) {
     storeApi ||
       typeof injected.listAccounts === "function" ||
       typeof injected.readWorks === "function" ||
-      typeof injected.readWorksDaily === "function"
+      typeof injected.readWorksDaily === "function" ||
+      typeof injected.readWorksIntraday === "function"
   );
   const emptyOverrides = () => ({
     version: 1,
@@ -331,6 +364,7 @@ function resolveIoDeps(options = {}, depsArg) {
     contents: Object.create(null),
     overrides: Object.create(null),
   });
+  const emptyIntraday = () => Object.create(null);
 
   return {
     listAccounts:
@@ -364,6 +398,36 @@ function resolveIoDeps(options = {}, depsArg) {
             const s = getStore();
             return typeof s.readWorksDailyLatestAsOf === "function"
               ? s.readWorksDailyLatestAsOf(g, p, cutoff)
+              : null;
+          },
+    readWorksIntraday:
+      typeof injected.readWorksIntraday === "function"
+        ? injected.readWorksIntraday
+        : storeApi && typeof storeApi.readWorksIntraday === "function"
+        ? (g, p, range) => storeApi.readWorksIntraday(g, p, range)
+        : hasInjectedDataSource
+        ? emptyIntraday
+        : (g, p, range) => {
+            const s = getStore();
+            return typeof s.readWorksIntraday === "function"
+              ? s.readWorksIntraday(g, p, range)
+              : emptyIntraday();
+          },
+    readWorksIntradayLatestCollectedAt:
+      typeof injected.readWorksIntradayLatestCollectedAt === "function"
+        ? injected.readWorksIntradayLatestCollectedAt
+        : typeof injected.readWorksIntraday === "function"
+        ? null
+        : storeApi
+        ? typeof storeApi.readWorksIntradayLatestCollectedAt === "function"
+          ? (g, p, cutoff) => storeApi.readWorksIntradayLatestCollectedAt(g, p, cutoff)
+          : null
+        : hasInjectedDataSource
+        ? emptyIntraday
+        : (g, p, cutoff) => {
+            const s = getStore();
+            return typeof s.readWorksIntradayLatestCollectedAt === "function"
+              ? s.readWorksIntradayLatestCollectedAt(g, p, cutoff)
               : null;
           },
     readDaily:
@@ -760,6 +824,134 @@ function countAccountDailyRows(accountsData, from, to) {
   return count;
 }
 
+function loadAccountsWorksIntraday(accountsData, io, range) {
+  const entries = [];
+  for (const acc of Array.isArray(accountsData) ? accountsData : []) {
+    if (!isPlainObject(acc)) continue;
+    const raw =
+      io && typeof io.readWorksIntraday === "function"
+        ? io.readWorksIntraday(acc.group, acc.platform, range || {})
+        : null;
+    const worksIntraday = isPlainObject(raw) ? raw : Object.create(null);
+    entries.push({ acc, worksIntraday });
+  }
+  return entries;
+}
+
+function countWorkIntradayRows(accountsWithIntraday, from, to) {
+  let count = 0;
+  for (const entry of Array.isArray(accountsWithIntraday) ? accountsWithIntraday : []) {
+    const map = entry && isPlainObject(entry.worksIntraday) ? entry.worksIntraday : null;
+    if (!map) continue;
+    const workIds = Object.keys(map);
+    for (let wi = 0; wi < workIds.length; wi++) {
+      const list = safeOwnGet(map, workIds[wi]);
+      if (!Array.isArray(list) || !list.length) continue;
+      const seenSlots = new Set();
+      for (let pi = 0; pi < list.length; pi++) {
+        const pt = list[pi];
+        if (!isPlainObject(pt)) continue;
+        const d = typeof pt.date === "string" ? pt.date.trim() : "";
+        const s = typeof pt.slot === "string" ? pt.slot.trim() : "";
+        if (!isValidDateStr(d) || !SLOT_TIME_RE.test(s)) continue;
+        if (from && d < from) continue;
+        if (to && d > to) continue;
+        const slotKey = `${d} ${s}`;
+        if (!seenSlots.has(slotKey)) {
+          seenSlots.add(slotKey);
+          count += 1;
+        }
+      }
+    }
+  }
+  return count;
+}
+
+function loadLatestCollectedAtByPwKey(accountsData, io, cutoffDate) {
+  const latestByPwKey = new Map();
+  if (!Array.isArray(accountsData) || !accountsData.length || !io) return latestByPwKey;
+  for (const acc of accountsData) {
+    if (!isPlainObject(acc)) continue;
+    const platform = acc.platform == null ? "" : String(acc.platform);
+    let perWork = null;
+    if (typeof io.readWorksIntradayLatestCollectedAt === "function") {
+      perWork = io.readWorksIntradayLatestCollectedAt(acc.group, acc.platform, cutoffDate);
+    }
+    if (isPlainObject(perWork)) {
+      for (const workId of Object.keys(perWork)) {
+        const ts = safeOwnGet(perWork, workId);
+        if (typeof ts !== "number" || !Number.isFinite(ts) || ts <= 0) continue;
+        const pwKey = `${platform}|${workId}`;
+        const prev = latestByPwKey.get(pwKey);
+        if (prev === undefined || ts > prev) latestByPwKey.set(pwKey, ts);
+      }
+      continue;
+    }
+    if (typeof io.readWorksIntraday !== "function") continue;
+    const intraday = io.readWorksIntraday(
+      acc.group,
+      acc.platform,
+      cutoffDate ? { to: cutoffDate } : {}
+    );
+    if (!isPlainObject(intraday)) continue;
+    for (const workId of Object.keys(intraday)) {
+      const list = safeOwnGet(intraday, workId);
+      if (!Array.isArray(list)) continue;
+      const pwKey = `${platform}|${workId}`;
+      for (let i = 0; i < list.length; i++) {
+        const pt = list[i];
+        if (!isPlainObject(pt)) continue;
+        const d = typeof pt.date === "string" ? pt.date.trim() : "";
+        if (cutoffDate && d && d > cutoffDate) continue;
+        const ts = parseRawTimestampMs(pt.collectedAt);
+        if (ts === null) continue;
+        const prev = latestByPwKey.get(pwKey);
+        if (prev === undefined || ts > prev) latestByPwKey.set(pwKey, ts);
+      }
+    }
+  }
+  return latestByPwKey;
+}
+
+function enrichSummaryRowsLastCollectedAt(rows, latestByPwKey) {
+  if (!Array.isArray(rows)) return;
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    if (!isPlainObject(row)) continue;
+    let maxTs = null;
+    if (isPlainObject(row.perPlatform)) {
+      for (const [pgKey, cell] of Object.entries(row.perPlatform)) {
+        if (!isPlainObject(cell)) continue;
+        const { platform } = parsePgKey(pgKey);
+        if (Array.isArray(cell.workIds)) {
+          for (const wid of cell.workIds) {
+            if (wid == null || wid === "") continue;
+            const ts = latestByPwKey.get(`${platform}|${String(wid).trim()}`);
+            if (ts !== undefined && (maxTs === null || ts > maxTs)) {
+              maxTs = ts;
+            }
+          }
+        }
+        if (Array.isArray(cell.works)) {
+          for (const w of cell.works) {
+            if (!isPlainObject(w) || w.workId == null || w.workId === "") continue;
+            const p =
+              typeof w.platform === "string" && w.platform.trim()
+                ? w.platform.trim()
+                : platform;
+            const ts = latestByPwKey.get(`${p}|${String(w.workId).trim()}`);
+            w.lastCollectedAt = ts !== undefined ? ts : null;
+            if (ts !== undefined && (maxTs === null || ts > maxTs)) {
+              maxTs = ts;
+            }
+          }
+        }
+      }
+    }
+    row.lastCollectedAt = maxTs;
+  }
+}
+
 function resolveMaxRows(raw) {
   if (raw === undefined || raw === null) return MAX_SHEET_ROWS;
   if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) {
@@ -878,6 +1070,12 @@ function buildContentSummaryData(options = {}, depsArg) {
       cutoffDate
     );
   }
+  const latestCollectedByPwKey = loadLatestCollectedAtByPwKey(
+    dataset.outputAccountsData,
+    dataset.io,
+    cutoffDate
+  );
+  enrichSummaryRowsLastCollectedAt(rows, latestCollectedByPwKey);
   const workCounts = computeWorkCountsFromSummaryRows(rows);
 
   return {
@@ -1374,6 +1572,169 @@ function formatWorkDailyAoa(rows) {
       sanitizeNumberCell(r.favoriteDelta),
       sanitizeNumberCell(r.fansDeltaDelta),
       sanitizeNumberCell(r.gapDays),
+    ]);
+  }
+  return aoa;
+}
+
+/**
+ * 作品分时段明细结构化收集：
+ * - worksIntraday 为空的账号立即跳过（不读取 acc.works 标题等元数据）
+ * - sheetRows 复用 buildWorkIntradayRows（保留跨 from 边界增量与距上次小时数），跨账号按日期/时段/平台/分组排序
+ * - analysisRows 仅保留 [analysisFrom, analysisTo] 区间（近 7 天），供「新作品前 24 小时」分析使用
+ */
+function collectWorkIntradayStructured(
+  accountsWithIntraday,
+  link,
+  {
+    from = "",
+    to = "",
+    needSheetRows = false,
+    needAnalysisRows = false,
+    analysisFrom = "",
+    analysisTo = "",
+  } = {}
+) {
+  const hasLink = link instanceof Map;
+  const sheetRows = needSheetRows ? [] : null;
+  const analysisRows = needAnalysisRows ? [] : null;
+
+  for (const entry of Array.isArray(accountsWithIntraday) ? accountsWithIntraday : []) {
+    if (!entry || !isPlainObject(entry.acc) || !isPlainObject(entry.worksIntraday)) continue;
+    const workIds = Object.keys(entry.worksIntraday);
+    if (!workIds.length) continue;
+
+    const acc = entry.acc;
+    const groupStr = acc.group == null ? "" : String(acc.group);
+    const platformStr = acc.platform == null ? "" : String(acc.platform);
+    const platformRankVal = PLATFORM_RANK_MAP.get(platformStr);
+    const platformRank = platformRankVal !== undefined ? platformRankVal : 999;
+
+    if (needSheetRows) {
+      const accRows = buildWorkIntradayRows({
+        group: groupStr,
+        platform: platformStr,
+        works: acc.works,
+        worksIntraday: entry.worksIntraday,
+        from,
+        to,
+        link: hasLink ? link : undefined,
+      });
+      for (let i = 0; i < accRows.length; i++) {
+        const r = accRows[i];
+        sheetRows.push({ ...r, platformRank });
+      }
+    }
+
+    if (needAnalysisRows) {
+      const workById = new Map();
+      if (Array.isArray(acc.works)) {
+        for (let i = 0; i < acc.works.length; i++) {
+          const w = acc.works[i];
+          if (w && w.workId != null && w.workId !== "") {
+            workById.set(String(w.workId), w);
+          }
+        }
+      }
+      for (let wi = 0; wi < workIds.length; wi++) {
+        const workId = workIds[wi];
+        const list = safeOwnGet(entry.worksIntraday, workId);
+        if (!Array.isArray(list) || !list.length) continue;
+
+        const linkInfo = hasLink
+          ? link.get(`${groupStr}|${platformStr}|${workId}`) ||
+            link.get(`${platformStr}|${workId}`) ||
+            null
+          : null;
+        const contentKey =
+          hasLink && linkInfo && linkInfo.contentKey != null ? linkInfo.contentKey : null;
+        const meta = workById.get(workId);
+        const title = meta ? meta.title || "(无标题)" : DELETED_WORK_TITLE;
+        const { ms: publishTimeMs, utc8Date: publishDateStr } = meta
+          ? parsePublishTimeForTable(meta.publishTime)
+          : { ms: 0, utc8Date: null };
+
+        for (let pi = 0; pi < list.length; pi++) {
+          const pt = list[pi];
+          if (!isPlainObject(pt)) continue;
+          const date = typeof pt.date === "string" ? pt.date.trim() : "";
+          const slot = typeof pt.slot === "string" ? pt.slot.trim() : "";
+          if (!isValidDateStr(date) || !SLOT_TIME_RE.test(slot)) continue;
+          if (analysisFrom && date < analysisFrom) continue;
+          if (analysisTo && date > analysisTo) continue;
+          const play = hasOwn(pt, "play") ? fastNormalizeMetric(pt.play) : null;
+          if (play === null) continue;
+          analysisRows.push({
+            date,
+            slot,
+            collectedAt: parseRawTimestampMs(pt.collectedAt),
+            group: groupStr,
+            platform: platformStr,
+            workId,
+            title,
+            publishTime: publishTimeMs || "",
+            publishTimeMs,
+            publishDate: publishDateStr || "",
+            contentKey,
+            play,
+          });
+        }
+      }
+    }
+  }
+
+  if (needSheetRows && sheetRows.length > 1) {
+    sheetRows.sort((a, b) => {
+      if (a.date !== b.date) return compareText(a.date, b.date);
+      if (a.slot !== b.slot) return compareText(a.slot, b.slot);
+      if (a.platformRank !== b.platformRank) return a.platformRank - b.platformRank;
+      if (a.platform !== b.platform) return compareText(a.platform, b.platform);
+      if (a.group !== b.group) return compareText(a.group, b.group);
+      if (a.publishTime !== b.publishTime) {
+        if (!a.publishTime) return 1;
+        if (!b.publishTime) return -1;
+        return a.publishTime > b.publishTime ? -1 : 1;
+      }
+      return compareText(a.workId, b.workId);
+    });
+  }
+
+  return { sheetRows, analysisRows };
+}
+
+/** Sheet 2: 作品时段明细 Excel 二维表格式化 */
+function formatWorkIntradayAoa(rows) {
+  const aoa = [WORK_INTRADAY_HEADERS.map(sanitizeTextCell)];
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    const matchedByExport =
+      r.contentKey != null && VALID_EXPORT_MATCH_METHODS.has(r.matchedBy)
+        ? sanitizeTextCell(r.matchedBy)
+        : null;
+    const collectedAtText =
+      typeof r.collectedAt === "number" && Number.isFinite(r.collectedAt) && r.collectedAt > 0
+        ? formatUtc8DateTime(r.collectedAt)
+        : null;
+    aoa.push([
+      sanitizeTextCell(r.date),
+      sanitizeTextCell(r.slot),
+      sanitizeTextCell(collectedAtText),
+      sanitizeTextCell(r.platform),
+      sanitizeTextCell(r.group),
+      sanitizeTextCell(r.contentKey),
+      matchedByExport,
+      sanitizeTextCell(r.workId),
+      sanitizeTextCell(r.title),
+      sanitizeNumberCell(r.play),
+      sanitizeNumberCell(r.like),
+      sanitizeNumberCell(r.comment),
+      sanitizeNumberCell(r.share),
+      sanitizeNumberCell(r.favorite),
+      sanitizeNumberCell(r.fansDelta),
+      sanitizeNumberCell(r.playDelta),
+      sanitizeNumberCell(r.likeDelta),
+      sanitizeNumberCell(r.commentDelta),
+      sanitizeNumberCell(r.hoursSincePrev),
     ]);
   }
   return aoa;
@@ -2458,7 +2819,123 @@ function buildSchemaSheet(dynamicSchemaEntries) {
       "与该作品上一次有记录日期之间间隔的缺失天数（连续两天为 0；首次记录为空；断档天数 > 0 时同行的各项日增跨多天）。",
     ],
 
-    // 2. 作品跨平台汇总
+    // 2. 作品时段明细
+    [
+      "作品时段明细",
+      "日期",
+      "date",
+      "分时段快照所属日期（YYYY-MM-DD，UTC+8）。自动采集按时段槽开始时刻所在日历日，手动采集按实际采集日历日。",
+    ],
+    [
+      "作品时段明细",
+      "时段",
+      "slot",
+      "分时段槽键（HH:mm，UTC+8）。自动采集为定时槽时刻，手动采集按实际采集时刻向下取整到整点（HH:00），同槽重复采集覆盖。",
+    ],
+    [
+      "作品时段明细",
+      "采集时间",
+      "collectedAt",
+      "实际落库采集时间戳（YYYY-MM-DD HH:mm:ss，UTC+8）；旧记录缺省时为空单元格。",
+    ],
+    [
+      "作品时段明细",
+      "平台",
+      "platform",
+      "发布平台中文名（抖音/视频号/快手/哔哩哔哩/小红书/百家号/头条）。",
+    ],
+    [
+      "作品时段明细",
+      "分组",
+      "group",
+      "账号分组名。本表保留分组明细不去重，同一账号挂多个分组时会出现重复行。",
+    ],
+    [
+      "作品时段明细",
+      "内容ID",
+      "contentKey",
+      "跨平台关联后的内容唯一键（file:<完整路径>、record:id:<id>、auto:<哈希> 或 manual:<id>）；未关联作品为空单元格。",
+    ],
+    [
+      "作品时段明细",
+      "关联方式",
+      "matchedBy",
+      "跨平台关联依据：link / title / fuzzy / manual；未关联为空单元格。",
+    ],
+    [
+      "作品时段明细",
+      "作品ID",
+      "workId",
+      "平台侧作品唯一 ID（文本格式，避免长整数丢精度）。",
+    ],
+    [
+      "作品时段明细",
+      "标题",
+      "title",
+      "作品标题；若 works.json 中已删除或未匹配则记为「(已删除或未匹配)」。",
+    ],
+    [
+      "作品时段明细",
+      "播放",
+      "play",
+      "该采集时点的累计播放/阅读量（累计值，非增量）；缺失为空单元格而非 0。",
+    ],
+    [
+      "作品时段明细",
+      "点赞",
+      "like",
+      "该采集时点的累计点赞/推荐数（累计值）；缺失为空单元格而非 0。",
+    ],
+    [
+      "作品时段明细",
+      "评论",
+      "comment",
+      "该采集时点的累计评论数（累计值）；缺失为空单元格而非 0。",
+    ],
+    [
+      "作品时段明细",
+      "分享",
+      "share",
+      "该采集时点的累计分享/转发数（累计值）；平台缺项（快手、头条无分享）为空单元格。",
+    ],
+    [
+      "作品时段明细",
+      "收藏",
+      "favorite",
+      "该采集时点的累计收藏数（累计值）；平台缺项（仅快手无收藏）为空单元格。",
+    ],
+    [
+      "作品时段明细",
+      "涨粉",
+      "fansDelta",
+      "该采集时点该作品带来的累计涨粉数（累计值）；仅抖音、视频号有单作品涨粉，其余平台为空单元格。",
+    ],
+    [
+      "作品时段明细",
+      "播放较上次增量",
+      "playDelta",
+      "当前时段累计播放 − 该作品上一次有效分时段快照的累计播放；首次记录或任一端缺失为空。",
+    ],
+    [
+      "作品时段明细",
+      "点赞较上次增量",
+      "likeDelta",
+      "当前时段累计点赞 − 该作品上一次有效分时段快照的累计点赞；首次记录或任一端缺失为空。",
+    ],
+    [
+      "作品时段明细",
+      "评论较上次增量",
+      "commentDelta",
+      "当前时段累计评论 − 该作品上一次有效分时段快照的累计评论；首次记录或任一端缺失为空。",
+    ],
+    [
+      "作品时段明细",
+      "距上次小时数",
+      "hoursSincePrev",
+      "本次采集时间与该作品上一次分时段快照采集时间的间隔小时数（保留 2 位小数）；首次记录或时间缺失/倒退为空。",
+    ],
+
+    // 3. 作品跨平台汇总
     [
       "作品跨平台汇总",
       "内容ID",
@@ -2841,10 +3318,29 @@ function buildStatsAnalysisData(options = {}, depsArg) {
   );
   applyWorkFallbackPublishTimes(analysisRows, workFallbackByPwKey);
 
+  // 读取近 7 天分时段快照供「新作品前 24 小时」起量曲线分析
+  const recent7From = shiftDateStr(resolvedTo, -(NEW_WORKS_FIRST_24H_DAYS - 1));
+  const intradayEntries = loadAccountsWorksIntraday(dataset.outputAccountsData, dataset.io, {
+    from: recent7From,
+    to: resolvedTo,
+  });
+  const { analysisRows: intradayAnalysisRows } = collectWorkIntradayStructured(
+    intradayEntries,
+    link,
+    {
+      needSheetRows: false,
+      needAnalysisRows: true,
+      analysisFrom: recent7From,
+      analysisTo: resolvedTo,
+    }
+  );
+  applyWorkFallbackPublishTimes(intradayAnalysisRows, workFallbackByPwKey);
+
   const analysis = buildStatsAnalysis({
     dailyRows: analysisRows,
     summaryRows: analysisSummaryRows,
     accountRows: accountDaily.allRows,
+    intradayRows: intradayAnalysisRows,
     to: resolvedTo,
     period,
     now: nowVal,
@@ -2910,7 +3406,7 @@ function buildStatsWorkbookData(options = {}, deps) {
     throw new Error(FUTURE_DATE_RANGE_ERROR);
   }
 
-  // 构建前先计数「作品日明细」与「账号日快照」行数，超限直接拒绝，避免无谓排序与高内存占用
+  // 构建前先计数「作品日明细」「作品时段明细」与「账号日快照」行数，超限直接拒绝，避免无谓排序与高内存占用
   const estWorkDailyRows = countWorkDailyRows(
     dataset.outputAccountsData,
     resolvedFrom,
@@ -2918,6 +3414,17 @@ function buildStatsWorkbookData(options = {}, deps) {
   );
   if (estWorkDailyRows > maxRows) {
     throw createRowLimitError(estWorkDailyRows, maxRows, "作品日明细");
+  }
+  const outputIntradayEntries = loadAccountsWorksIntraday(dataset.outputAccountsData, dataset.io, {
+    to: resolvedTo,
+  });
+  const estWorkIntradayRows = countWorkIntradayRows(
+    outputIntradayEntries,
+    resolvedFrom,
+    resolvedTo
+  );
+  if (estWorkIntradayRows > maxRows) {
+    throw createRowLimitError(estWorkIntradayRows, maxRows, "作品时段明细");
   }
   const estAccountDailyRows = countAccountDailyRows(
     dataset.outputAccountsData,
@@ -2977,6 +3484,17 @@ function buildStatsWorkbookData(options = {}, deps) {
     }
   );
   const workDailyAoa = formatWorkDailyAoa(workDailyRows);
+  const recent7From = shiftDateStr(resolvedTo, -(NEW_WORKS_FIRST_24H_DAYS - 1));
+  const { sheetRows: workIntradayRows, analysisRows: intradayAnalysisRows } =
+    collectWorkIntradayStructured(outputIntradayEntries, link, {
+      from: resolvedFrom,
+      to: resolvedTo,
+      needSheetRows: true,
+      needAnalysisRows: true,
+      analysisFrom: recent7From,
+      analysisTo: resolvedTo,
+    });
+  const workIntradayAoa = formatWorkIntradayAoa(workIntradayRows);
   const contentSummary = buildContentSummarySheet(summaryRows);
   const platformDaily = buildPlatformDailySheet(workDailyRows);
   const accountDaily = collectAccountDailyRows(
@@ -2996,10 +3514,12 @@ function buildStatsWorkbookData(options = {}, deps) {
     dataset.allPushRecords
   );
   applyWorkFallbackPublishTimes(analysisRows, workFallbackByPwKey);
+  applyWorkFallbackPublishTimes(intradayAnalysisRows, workFallbackByPwKey);
   const analysis = buildStatsAnalysis({
     dailyRows: analysisRows,
     summaryRows: analysisSummaryRows,
     accountRows: accountDaily.allRows,
+    intradayRows: intradayAnalysisRows,
     to: resolvedTo,
     period: analysisPeriod,
     now: nowVal,
@@ -3014,6 +3534,7 @@ function buildStatsWorkbookData(options = {}, deps) {
     contents: summaryRows.length,
     unlinkedWorks: workCounts.unlinkedWorks,
     workDailyRows: workDailyRows.length,
+    workIntradayRows: workIntradayRows.length,
     platformDailyRows: platformDaily.rows.length,
     accountDailyRows: accountDaily.rows.length,
   };
@@ -3031,6 +3552,7 @@ function buildStatsWorkbookData(options = {}, deps) {
 
   const sheets = {
     作品日明细: workDailyAoa,
+    作品时段明细: workIntradayAoa,
     作品跨平台汇总: contentSummary.aoa,
     平台日汇总: platformDaily.aoa,
     账号日快照: accountDailyAoa,
@@ -3414,12 +3936,317 @@ function buildContentTrendData(options = {}, depsArg) {
   };
 }
 
+/**
+ * 构建单条内容的各平台分时段播放走势数据（供「作品汇总」趋势弹窗「按时段」/ IPC stats:get-content-intraday 复用）。
+ * - 复用与 buildContentSummaryData 同一套跨平台关联（自动 + link-overrides）
+ * - 默认最近 3 天（支持 1/3/7 等正整数天数），跨分组按 platform|workId 去重
+ */
+function buildContentIntradayData(options = {}, depsArg) {
+  const opts = isPlainObject(options) ? options : {};
+  const contentKey = typeof opts.contentKey === "string" ? opts.contentKey.trim() : "";
+  if (!contentKey) {
+    throw new Error("contentKey 不能为空");
+  }
+  const rawDays = opts.days;
+  let days = DEFAULT_INTRADAY_DAYS;
+  if (rawDays !== undefined && rawDays !== null && rawDays !== "") {
+    const parsedDays = typeof rawDays === "number" ? rawDays : Number(rawDays);
+    if (!Number.isInteger(parsedDays) || parsedDays < 1 || parsedDays > MAX_INTRADAY_DAYS) {
+      throw new Error(`days 需为 1–${MAX_INTRADAY_DAYS} 的正整数：${rawDays}`);
+    }
+    days = parsedDays;
+  }
+  const explicitTo = validateOptionalDate(opts.to, "to");
+
+  const dataset = loadSummaryDataset(opts, depsArg, explicitTo);
+  const cutoffDate = explicitTo || dataset.latestDataDate || "";
+
+  const allContents = buildContentIndex(dataset.allPushRecords);
+  const link = linkWorks({
+    contents: allContents,
+    accounts: dataset.allAccountsData,
+    worksDaily: dataset.allWorksDailyByGp,
+    date: cutoffDate || undefined,
+    overrides: dataset.linkOverrides,
+  });
+  let summaryRows = buildContentSummaryRows({
+    contents: allContents,
+    accounts: dataset.allAccountsData,
+    link,
+    worksDaily: dataset.allWorksDailyByGp,
+    date: cutoffDate || undefined,
+    overrides: dataset.linkOverrides,
+    groups: dataset.groupSet,
+  });
+  if (dataset.groupSet) {
+    summaryRows = filterSummaryRowsByGroupScope(
+      summaryRows,
+      allContents,
+      link,
+      dataset.outputAccountsData,
+      dataset.groupSet,
+      cutoffDate
+    );
+  }
+
+  const targetRow = summaryRows.find((r) => r && r.contentKey === contentKey) || null;
+  if (!targetRow) {
+    return {
+      found: false,
+      contentKey,
+      title: "",
+      firstPublishDate: "",
+      date: cutoffDate,
+      days,
+      from: "",
+      to: cutoffDate,
+      timePoints: [],
+      collectedAts: [],
+      platforms: [],
+      totalPlay: [],
+      totalPlayDelta: [],
+    };
+  }
+
+  const targetPwKeys = new Set();
+  const targetPlatforms = new Set();
+  if (isPlainObject(targetRow.perPlatform)) {
+    for (const [pgKey, cell] of Object.entries(targetRow.perPlatform)) {
+      if (!isPlainObject(cell)) continue;
+      const { platform } = parsePgKey(pgKey);
+      if (Array.isArray(cell.workIds)) {
+        for (const wid of cell.workIds) {
+          if (wid != null && wid !== "") {
+            targetPwKeys.add(`${platform}|${String(wid).trim()}`);
+            if (platform) targetPlatforms.add(platform);
+          }
+        }
+      }
+      if (Array.isArray(cell.works)) {
+        for (const w of cell.works) {
+          if (isPlainObject(w) && w.workId != null && w.workId !== "") {
+            const p =
+              typeof w.platform === "string" && w.platform.trim()
+                ? w.platform.trim()
+                : platform;
+            targetPwKeys.add(`${p}|${String(w.workId).trim()}`);
+            if (p) targetPlatforms.add(p);
+          }
+        }
+      }
+    }
+  }
+
+  const rawByWork = new Map();
+  let latestIntradayDate = "";
+  const io = dataset.io;
+  const readRange = cutoffDate ? { to: cutoffDate } : {};
+
+  for (const acc of dataset.outputAccountsData) {
+    if (!isPlainObject(acc)) continue;
+    const platform = acc.platform == null ? "" : String(acc.platform);
+    if (!targetPlatforms.has(platform)) continue;
+    const intradayMap =
+      io && typeof io.readWorksIntraday === "function"
+        ? io.readWorksIntraday(acc.group, acc.platform, readRange)
+        : null;
+    if (!isPlainObject(intradayMap)) continue;
+
+    for (const workId of Object.keys(intradayMap)) {
+      const pwKey = `${platform}|${workId}`;
+      if (!targetPwKeys.has(pwKey)) continue;
+      const list = safeOwnGet(intradayMap, workId);
+      if (!Array.isArray(list) || !list.length) continue;
+
+      let bucket = rawByWork.get(pwKey);
+      if (!bucket) {
+        bucket = { platform, workId, byTimeKey: new Map() };
+        rawByWork.set(pwKey, bucket);
+      }
+      for (let i = 0; i < list.length; i++) {
+        const pt = list[i];
+        if (!isPlainObject(pt)) continue;
+        const d = typeof pt.date === "string" ? pt.date.trim() : "";
+        const s = typeof pt.slot === "string" ? pt.slot.trim() : "";
+        if (!isValidDateStr(d) || !SLOT_TIME_RE.test(s)) continue;
+        if (cutoffDate && d > cutoffDate) continue;
+        const timeKey = `${d} ${s}`;
+        // 跨分组保留排序第一组的观测
+        if (bucket.byTimeKey.has(timeKey)) continue;
+        const play = hasOwn(pt, "play") ? fastNormalizeMetric(pt.play) : null;
+        const collectedAt = parseRawTimestampMs(pt.collectedAt);
+        bucket.byTimeKey.set(timeKey, { date: d, slot: s, timeKey, collectedAt, play });
+        if (!latestIntradayDate || d > latestIntradayDate) {
+          latestIntradayDate = d;
+        }
+      }
+    }
+  }
+
+  const endDate = explicitTo || latestIntradayDate || cutoffDate;
+  const fromDate = endDate ? shiftDateStr(endDate, -(days - 1)) : "";
+
+  const platformWorksMap = new Map();
+  const platformActiveTimes = new Map();
+  const platformDeltaMap = new Map();
+  const timePointSet = new Set();
+  const collectedAtByTimeKey = new Map();
+
+  for (const bucket of rawByWork.values()) {
+    const pts = [...bucket.byTimeKey.values()].sort((a, b) =>
+      compareText(a.timeKey, b.timeKey)
+    );
+    let worksList = platformWorksMap.get(bucket.platform);
+    if (!worksList) {
+      worksList = [];
+      platformWorksMap.set(bucket.platform, worksList);
+    }
+    worksList.push(pts);
+
+    let prevPlay = null;
+    let hasPrev = false;
+
+    for (let i = 0; i < pts.length; i++) {
+      const pt = pts[i];
+      const play = pt.play;
+      const playDelta = hasPrev && play !== null && prevPlay !== null ? play - prevPlay : null;
+      hasPrev = true;
+      prevPlay = play;
+
+      if (fromDate && pt.date < fromDate) continue;
+      if (endDate && pt.date > endDate) continue;
+
+      timePointSet.add(pt.timeKey);
+      if (pt.collectedAt !== null) {
+        const prevTs = collectedAtByTimeKey.get(pt.timeKey);
+        if (prevTs === undefined || pt.collectedAt > prevTs) {
+          collectedAtByTimeKey.set(pt.timeKey, pt.collectedAt);
+        }
+      }
+
+      let activeTimes = platformActiveTimes.get(bucket.platform);
+      if (!activeTimes) {
+        activeTimes = new Set();
+        platformActiveTimes.set(bucket.platform, activeTimes);
+      }
+      activeTimes.add(pt.timeKey);
+
+      if (playDelta !== null) {
+        let deltaMap = platformDeltaMap.get(bucket.platform);
+        if (!deltaMap) {
+          deltaMap = new Map();
+          platformDeltaMap.set(bucket.platform, deltaMap);
+        }
+        const prevSum = deltaMap.has(pt.timeKey) ? deltaMap.get(pt.timeKey) : null;
+        const nextDelta = prevSum === null ? playDelta : prevSum + playDelta;
+        deltaMap.set(pt.timeKey, nextDelta === 0 ? 0 : nextDelta);
+      }
+    }
+  }
+
+  const timePoints = [...timePointSet].sort(compareText);
+  if (!timePoints.length) {
+    return {
+      found: true,
+      contentKey,
+      title: targetRow.title || "(无标题)",
+      firstPublishDate: targetRow.firstPublishDate || "",
+      date: cutoffDate || endDate,
+      days,
+      from: fromDate,
+      to: endDate,
+      timePoints: [],
+      collectedAts: [],
+      platforms: [],
+      totalPlay: [],
+      totalPlayDelta: [],
+    };
+  }
+
+  const collectedAts = timePoints.map((tk) =>
+    collectedAtByTimeKey.has(tk) ? collectedAtByTimeKey.get(tk) : null
+  );
+  const sortedPlatforms = [...platformActiveTimes.keys()].sort(comparePlatform);
+  const totalPlay = new Array(timePoints.length).fill(null);
+  const totalPlayDelta = new Array(timePoints.length).fill(null);
+
+  const platforms = sortedPlatforms.map((platform) => {
+    const worksList = platformWorksMap.get(platform) || [];
+    const activeTimes = platformActiveTimes.get(platform);
+    const deltaMap = platformDeltaMap.get(platform) || null;
+    const workCount = worksList.length;
+    const ptrs = new Int32Array(workCount);
+    const curPlays = new Array(workCount).fill(null);
+    const playArr = new Array(timePoints.length).fill(null);
+    const deltaArr = new Array(timePoints.length).fill(null);
+
+    for (let i = 0; i < timePoints.length; i++) {
+      const tk = timePoints[i];
+      for (let w = 0; w < workCount; w++) {
+        const pts = worksList[w];
+        let p = ptrs[w];
+        while (p < pts.length && pts[p].timeKey <= tk) {
+          curPlays[w] = pts[p].play;
+          p += 1;
+        }
+        ptrs[w] = p;
+      }
+
+      if (!activeTimes || !activeTimes.has(tk)) continue;
+
+      let sumPlay = null;
+      for (let w = 0; w < workCount; w++) {
+        if (curPlays[w] !== null) {
+          sumPlay = sumPlay === null ? curPlays[w] : sumPlay + curPlays[w];
+        }
+      }
+      if (sumPlay === 0) sumPlay = 0;
+      const slotDelta = deltaMap && deltaMap.has(tk) ? deltaMap.get(tk) : null;
+
+      playArr[i] = sumPlay;
+      deltaArr[i] = slotDelta;
+      if (sumPlay !== null) {
+        const np = totalPlay[i] === null ? sumPlay : totalPlay[i] + sumPlay;
+        totalPlay[i] = np === 0 ? 0 : np;
+      }
+      if (slotDelta !== null) {
+        const nd =
+          totalPlayDelta[i] === null ? slotDelta : totalPlayDelta[i] + slotDelta;
+        totalPlayDelta[i] = nd === 0 ? 0 : nd;
+      }
+    }
+
+    return {
+      platform,
+      play: playArr,
+      playDelta: deltaArr,
+    };
+  });
+
+  return {
+    found: true,
+    contentKey,
+    title: targetRow.title || "(无标题)",
+    firstPublishDate: targetRow.firstPublishDate || "",
+    date: cutoffDate || endDate,
+    days,
+    from: fromDate,
+    to: endDate,
+    timePoints,
+    collectedAts,
+    platforms,
+    totalPlay,
+    totalPlayDelta,
+  };
+}
+
 module.exports = {
   SHEET_NAMES,
   MAX_SHEET_ROWS,
   ROW_LIMIT_EXCEEDED_CODE,
   FUTURE_DATE_RANGE_ERROR,
   WORK_DAILY_HEADERS,
+  WORK_INTRADAY_HEADERS,
   SUMMARY_BASE_HEADERS,
   PLATFORM_DAILY_HEADERS,
   ACCOUNT_DAILY_HEADERS,
@@ -3434,9 +4261,11 @@ module.exports = {
   resolveDefaultCutoffDate,
   resolveLinkValidationContext,
   countWorkDailyRows,
+  countWorkIntradayRows,
   computeWorkCountsFromSummaryRows,
   buildContentSummaryData,
   buildContentTrendData,
+  buildContentIntradayData,
   buildAnalysisSheet,
   buildStatsAnalysisData,
   buildStatsWorkbookData,

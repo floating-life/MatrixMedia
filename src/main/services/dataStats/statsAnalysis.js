@@ -11,7 +11,9 @@ const { WORK_STAT_KEYS, normalizeMetric } = require("./statsTable");
 
 const UTC8_MS = 8 * 3600e3;
 const DAY_MS = 86400000;
+const HOUR_MS = 3600000;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const SLOT_TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
 const NAIVE_DATETIME_RE =
   /^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[T\s]+(\d{1,2}):(\d{1,2})(?::(\d{1,2})(?:\.(\d{1,3}))?)?)?$/;
 const TZ_SUFFIX_RE = /(?:[Zz]|[+-]\d{2}:?\d{2})$/;
@@ -46,6 +48,8 @@ const RANKING_LIMIT = 10;
 const PLATFORM_SKEW_RATIO = 3;
 const PLATFORM_SKEW_MIN_PLAY = 500;
 const NEW_WORK_MILESTONES = Object.freeze([1, 3, 7]);
+const NEW_WORKS_FIRST_24H_DAYS = 7;
+const NEW_WORKS_FIRST_24H_HOURS = 24;
 const LONG_TAIL_D7_D3_RATIO = 1.5;
 const BURST_FLAT_D3_D1_RATIO = 1.3;
 const BURST_FLAT_D7_D3_RATIO = 1.1;
@@ -300,7 +304,7 @@ function resolvePeriod(raw) {
 /**
  * 解析截止日期，并以 UTC+8 今天为上限（未来日期夹到今天，避免提前填入未到期里程碑）。
  */
-function resolveToDate(rawTo, dailyRows, accountRows, nowVal) {
+function resolveToDate(rawTo, dailyRows, accountRows, nowVal, intradayRows) {
   const todayUtc8 = formatUtc8Date(nowVal);
   if (rawTo !== undefined && rawTo !== null && rawTo !== "") {
     if (typeof rawTo !== "string" || !isValidDateStr(rawTo.trim())) {
@@ -318,6 +322,16 @@ function resolveToDate(rawTo, dailyRows, accountRows, nowVal) {
   }
   if (latestWorkDate) {
     return latestWorkDate > todayUtc8 ? todayUtc8 : latestWorkDate;
+  }
+  let latestIntradayDate = "";
+  for (const r of Array.isArray(intradayRows) ? intradayRows : []) {
+    if (!isPlainObject(r) || typeof r.date !== "string") continue;
+    const d = r.date.trim();
+    if (!isValidDateStr(d)) continue;
+    if (!latestIntradayDate || d > latestIntradayDate) latestIntradayDate = d;
+  }
+  if (latestIntradayDate) {
+    return latestIntradayDate > todayUtc8 ? todayUtc8 : latestIntradayDate;
   }
 
   let latestAccDate = "";
@@ -2502,13 +2516,368 @@ function buildSummarySection({
   };
 }
 
+/** 将 UTC+8 日期 + HH:mm 时段转换为时间戳（ms） */
+function slotToUtc8Ms(dateStr, slotStr) {
+  const dn = dateStrToDayNum(dateStr);
+  if (dn === null) return null;
+  const m = SLOT_TIME_RE.exec(typeof slotStr === "string" ? slotStr.trim() : "");
+  if (!m) return null;
+  const hh = Number(m[1]);
+  const mm = Number(m[2]);
+  return dn * DAY_MS + (hh * 60 + mm) * 60000 - UTC8_MS;
+}
+
 /**
- * 纯函数构建数据分析结果（7 节），供 GUI「数据分析」tab 与 Excel「分析」sheet 共用。
+ * 构建单个作品集合在参考发布时间 refPubMs 之后 [0, 24h] 内的累计播放曲线：
+ * - x = 发布后小时数（保留两位小数）
+ * - 在每个采集时点上，取集合内各作品最近一次 <= 该时点且 >= refPubMs 的累计播放求和
+ */
+function build24hCurve(workEntries, refPubMs) {
+  if (!Array.isArray(workEntries) || !workEntries.length || refPubMs === null) return [];
+  const maxTs = refPubMs + NEW_WORKS_FIRST_24H_HOURS * HOUR_MS;
+  const timeTicksMap = new Map();
+  const filteredLists = [];
+
+  for (const we of workEntries) {
+    const valid = [];
+    for (const pt of we.points) {
+      if (pt.tsMs < refPubMs || pt.tsMs > maxTs) continue;
+      valid.push(pt);
+      const tickKey = `${pt.date} ${pt.slot}|${pt.tsMs}`;
+      if (!timeTicksMap.has(tickKey)) {
+        timeTicksMap.set(tickKey, {
+          date: pt.date,
+          slot: pt.slot,
+          collectedAt: pt.collectedAt,
+          tsMs: pt.tsMs,
+        });
+      }
+    }
+    if (valid.length) filteredLists.push(valid);
+  }
+  if (!filteredLists.length || !timeTicksMap.size) return [];
+
+  const ticks = [...timeTicksMap.values()].sort((a, b) => {
+    if (a.tsMs !== b.tsMs) return a.tsMs - b.tsMs;
+    if (a.date !== b.date) return compareText(a.date, b.date);
+    return compareText(a.slot, b.slot);
+  });
+
+  const ptrs = new Int32Array(filteredLists.length);
+  const curPlays = new Array(filteredLists.length).fill(null);
+  const curve = [];
+
+  for (let ti = 0; ti < ticks.length; ti++) {
+    const tick = ticks[ti];
+    for (let wi = 0; wi < filteredLists.length; wi++) {
+      const list = filteredLists[wi];
+      let p = ptrs[wi];
+      while (p < list.length && list[p].tsMs <= tick.tsMs) {
+        curPlays[wi] = list[p].play;
+        p += 1;
+      }
+      ptrs[wi] = p;
+    }
+
+    let sumPlay = null;
+    for (let wi = 0; wi < filteredLists.length; wi++) {
+      if (curPlays[wi] !== null) {
+        sumPlay = sumPlay === null ? curPlays[wi] : sumPlay + curPlays[wi];
+      }
+    }
+    if (sumPlay === null) continue;
+    const hours = round2((tick.tsMs - refPubMs) / HOUR_MS);
+    if (hours === null || hours < 0 || hours > NEW_WORKS_FIRST_24H_HOURS) continue;
+
+    const point = {
+      hours,
+      play: sumPlay === 0 ? 0 : sumPlay,
+      date: tick.date,
+      slot: tick.slot,
+      collectedAt: tick.collectedAt,
+    };
+    const last = curve.length ? curve[curve.length - 1] : null;
+    if (last && last.hours === point.hours) {
+      curve[curve.length - 1] = point;
+    } else {
+      curve.push(point);
+    }
+  }
+
+  return curve;
+}
+
+/**
+ * 新作品前 24 小时起量走势：
+ * - 范围：近 7 天内（[to - 6, to]）发布的内容（按内容最早已知首发日，补发不算新作品）
+ * - 每个采集时点的累计播放（x = 发布后小时数，0..24h），提供内容总曲线与分平台曲线
+ */
+function buildNewWorksFirst24hSection(
+  intradayRows,
+  contentMetaByKey,
+  seriesByWork,
+  cutoffTo,
+  summaryWorkToContent
+) {
+  const recent7Start = shiftDateStr(cutoffTo, -(NEW_WORKS_FIRST_24H_DAYS - 1));
+  if (!Array.isArray(intradayRows) || intradayRows.length === 0) {
+    return {
+      totalCount: 0,
+      windowDays: NEW_WORKS_FIRST_24H_DAYS,
+      maxHours: NEW_WORKS_FIRST_24H_HOURS,
+      from: recent7Start,
+      to: cutoffTo,
+      items: [],
+    };
+  }
+
+  // 1. 按 (platform|workId, date, slot) 去重（多分组取分组名排序第一组），过滤掉 > cutoffTo 与空 play
+  const dedupByWorkSlot = new Map();
+  for (let i = 0; i < intradayRows.length; i++) {
+    const r = intradayRows[i];
+    if (!isPlainObject(r)) continue;
+    const date = typeof r.date === "string" ? r.date.trim() : "";
+    const slot = typeof r.slot === "string" ? r.slot.trim() : "";
+    if (!isValidDateStr(date) || !SLOT_TIME_RE.test(slot)) continue;
+    if (date > cutoffTo) continue;
+    const platform = r.platform == null ? "" : String(r.platform).trim();
+    const workId = r.workId == null ? "" : String(r.workId).trim();
+    if (!platform || !workId) continue;
+    const play = fastNormalizeMetric(r.play);
+    if (play === null) continue;
+
+    const group = r.group == null ? "" : String(r.group).trim();
+    const pwKey = `${platform}|${workId}`;
+    const slotKey = `${pwKey}\0${date}\0${slot}`;
+    const existing = dedupByWorkSlot.get(slotKey);
+    if (!existing || compareText(group, existing.group) < 0) {
+      const collectedAt = parseTimestampMs(r.collectedAt);
+      const tsMs = collectedAt !== null ? collectedAt : slotToUtc8Ms(date, slot);
+      if (tsMs === null) continue;
+      dedupByWorkSlot.set(slotKey, {
+        pwKey,
+        platform,
+        workId,
+        group,
+        date,
+        slot,
+        collectedAt,
+        tsMs,
+        play,
+        title: typeof r.title === "string" ? r.title : "",
+        contentKey: typeof r.contentKey === "string" && r.contentKey.trim() ? r.contentKey.trim() : "",
+        publishTimeMs:
+          typeof r.publishTimeMs === "number" && Number.isFinite(r.publishTimeMs) && r.publishTimeMs > 0
+            ? r.publishTimeMs
+            : parseTimestampMs(r.publishTime),
+        publishDate:
+          typeof r.publishDate === "string" && isValidDateStr(r.publishDate.trim())
+            ? r.publishDate.trim()
+            : "",
+      });
+    }
+  }
+
+  // 2. 归组到作品 -> 内容
+  const byWork = new Map();
+  for (const row of dedupByWorkSlot.values()) {
+    let bucket = byWork.get(row.pwKey);
+    if (!bucket) {
+      const series = seriesByWork.get(row.pwKey) || null;
+      const ck =
+        (summaryWorkToContent && summaryWorkToContent.get(row.pwKey)) ||
+        (series && series.contentKey) ||
+        row.contentKey ||
+        `unlinked:${row.platform}:${row.workId}`;
+      const pubMs =
+        row.publishTimeMs !== null
+          ? row.publishTimeMs
+          : series && series.publishTimeMs !== null
+          ? series.publishTimeMs
+          : null;
+      const pubDate =
+        row.publishDate ||
+        (pubMs !== null ? formatUtc8Date(pubMs) : "") ||
+        (series && series.publishDate) ||
+        "";
+      bucket = {
+        pwKey: row.pwKey,
+        contentKey: ck,
+        platform: row.platform,
+        workId: row.workId,
+        title: row.title || (series && series.title) || "",
+        pubMs,
+        pubDate,
+        points: [],
+      };
+      byWork.set(row.pwKey, bucket);
+    } else {
+      if (!bucket.title && row.title) bucket.title = row.title;
+      if (row.publishTimeMs !== null && (bucket.pubMs === null || row.publishTimeMs < bucket.pubMs)) {
+        bucket.pubMs = row.publishTimeMs;
+        bucket.pubDate = row.publishDate || formatUtc8Date(row.publishTimeMs);
+      }
+    }
+    bucket.points.push({
+      date: row.date,
+      slot: row.slot,
+      collectedAt: row.collectedAt,
+      tsMs: row.tsMs,
+      play: row.play,
+    });
+  }
+
+  // 收集 seriesByWork 中每个内容的已知最早作品发布日（确保未在 intraday 出现过的旧平台首发仍参与判定）
+  const seriesMinPubDateByContent = new Map();
+  for (const s of seriesByWork.values()) {
+    if (!s.publishDate) continue;
+    const prev = seriesMinPubDateByContent.get(s.contentKey) || "";
+    seriesMinPubDateByContent.set(s.contentKey, minNonEmptyDate(prev, s.publishDate));
+  }
+
+  const worksByContent = new Map();
+  for (const wb of byWork.values()) {
+    wb.points.sort((a, b) => {
+      if (a.tsMs !== b.tsMs) return a.tsMs - b.tsMs;
+      if (a.date !== b.date) return compareText(a.date, b.date);
+      return compareText(a.slot, b.slot);
+    });
+    let arr = worksByContent.get(wb.contentKey);
+    if (!arr) {
+      arr = [];
+      worksByContent.set(wb.contentKey, arr);
+    }
+    arr.push(wb);
+  }
+
+  // 3. 逐内容构建前 24 小时起量曲线
+  const items = [];
+  for (const [contentKey, workEntries] of worksByContent.entries()) {
+    const meta = contentMetaByKey.get(contentKey) || null;
+    let minWorkPubDate = seriesMinPubDateByContent.get(contentKey) || "";
+    for (const we of workEntries) {
+      if (we.pubDate) minWorkPubDate = minNonEmptyDate(minWorkPubDate, we.pubDate);
+    }
+    const contentPubDate = minNonEmptyDate(meta && meta.firstPublishDate, minWorkPubDate);
+    if (!contentPubDate || contentPubDate < recent7Start || contentPubDate > cutoffTo) {
+      continue;
+    }
+
+    // 确定内容参考发布时间戳（优先首发日内最早精确发布时间）
+    let contentPubMs = null;
+    if (meta && meta.firstPublishTime !== null && meta.firstPublishTime > 0) {
+      const metaDate = formatUtc8Date(meta.firstPublishTime);
+      if (metaDate === contentPubDate) {
+        contentPubMs = meta.firstPublishTime;
+      }
+    }
+    for (const we of workEntries) {
+      if (we.pubMs !== null && (!we.pubDate || we.pubDate === contentPubDate)) {
+        if (contentPubMs === null || we.pubMs < contentPubMs) {
+          contentPubMs = we.pubMs;
+        }
+      }
+    }
+    if (contentPubMs === null) {
+      for (const we of workEntries) {
+        if (we.pubMs !== null && (contentPubMs === null || we.pubMs < contentPubMs)) {
+          contentPubMs = we.pubMs;
+        }
+      }
+    }
+    if (contentPubMs === null && meta && meta.firstPublishTime !== null && meta.firstPublishTime > 0) {
+      contentPubMs = meta.firstPublishTime;
+    }
+    if (contentPubMs === null) continue;
+
+    const byPlatform = new Map();
+    for (const we of workEntries) {
+      let arr = byPlatform.get(we.platform);
+      if (!arr) {
+        arr = [];
+        byPlatform.set(we.platform, arr);
+      }
+      arr.push(we);
+    }
+
+    const sortedPlatforms = [...byPlatform.keys()].sort(comparePlatform);
+    const platformSeries = [];
+    for (const platform of sortedPlatforms) {
+      const pWorks = byPlatform.get(platform);
+      let pPubMs = null;
+      for (const we of pWorks) {
+        if (we.pubMs !== null && (pPubMs === null || we.pubMs < pPubMs)) {
+          pPubMs = we.pubMs;
+        }
+      }
+      if (pPubMs === null) pPubMs = contentPubMs;
+      const pCurve = build24hCurve(pWorks, pPubMs);
+      if (!pCurve.length) continue;
+      platformSeries.push({
+        platform,
+        publishTimeMs: pPubMs,
+        latestPlay24h: pCurve[pCurve.length - 1].play,
+        points: pCurve,
+      });
+    }
+
+    const totalCurve = build24hCurve(workEntries, contentPubMs);
+    if (!totalCurve.length) continue;
+
+    let primaryPlatform = "";
+    let maxPlatformPlay = -Infinity;
+    for (const ps of platformSeries) {
+      if (
+        ps.latestPlay24h > maxPlatformPlay ||
+        (ps.latestPlay24h === maxPlatformPlay &&
+          (!primaryPlatform || comparePlatform(ps.platform, primaryPlatform) < 0))
+      ) {
+        maxPlatformPlay = ps.latestPlay24h;
+        primaryPlatform = ps.platform;
+      }
+    }
+    if (!primaryPlatform && sortedPlatforms.length) {
+      primaryPlatform = sortedPlatforms[0];
+    }
+
+    const firstWorkTitle = workEntries.find((w) => w.title)?.title || "";
+    items.push({
+      contentKey,
+      title: (meta && meta.title) || firstWorkTitle || "(无标题)",
+      publishDate: contentPubDate,
+      publishTimeMs: contentPubMs,
+      primaryPlatform,
+      platformCount: platformSeries.length,
+      latestPlay24h: totalCurve[totalCurve.length - 1].play,
+      points: totalCurve,
+      platforms: platformSeries,
+    });
+  }
+
+  items.sort((a, b) => {
+    if (b.publishTimeMs !== a.publishTimeMs) return b.publishTimeMs - a.publishTimeMs;
+    if (b.latestPlay24h !== a.latestPlay24h) return b.latestPlay24h - a.latestPlay24h;
+    return compareText(a.contentKey, b.contentKey);
+  });
+
+  return {
+    totalCount: items.length,
+    windowDays: NEW_WORKS_FIRST_24H_DAYS,
+    maxHours: NEW_WORKS_FIRST_24H_HOURS,
+    from: recent7Start,
+    to: cutoffTo,
+    items,
+  };
+}
+
+/**
+ * 纯函数构建数据分析结果（7 节 + 新作品前 24 小时），供 GUI「数据分析」tab 与 Excel「分析」sheet 共用。
  *
  * @param {object} params
  * @param {Array<object>} [params.dailyRows]    作品日明细行（建议含全量快照以支持截止日后恢复异常识别、环比与7天基线）
  * @param {Array<object>} [params.summaryRows]  跨平台内容汇总行（截至 to，可携带 S6 最早已知 firstPublishTime）
  * @param {Array<object>} [params.accountRows]  账号日快照行（截至 to）
+ * @param {Array<object>} [params.intradayRows] 作品分时段快照行（近 7 天，用于「新作品前 24 小时」起量曲线）
  * @param {string} [params.to]                  截止日期 YYYY-MM-DD（上限为 UTC+8 今天，未来日期自动夹到今天）
  * @param {number} [params.period=30]           分析周期天数（7 / 30 或导出区间天数）
  * @param {number|Date} [params.now]            注入当前时间（UTC+8 今天上限与兜底截止日，保证确定性）
@@ -2517,12 +2886,13 @@ function buildStatsAnalysis({
   dailyRows = [],
   summaryRows = [],
   accountRows = [],
+  intradayRows = [],
   to,
   period = DEFAULT_ANALYSIS_PERIOD,
   now = Date.now(),
 } = {}) {
   const resolvedPeriod = resolvePeriod(period);
-  const resolvedTo = resolveToDate(to, dailyRows, accountRows, now);
+  const resolvedTo = resolveToDate(to, dailyRows, accountRows, now, intradayRows);
   const currentStart = shiftDateStr(resolvedTo, -(resolvedPeriod - 1));
   const prevEnd = shiftDateStr(currentStart, -1);
   const prevStart = shiftDateStr(currentStart, -resolvedPeriod);
@@ -2557,6 +2927,13 @@ function buildStatsAnalysis({
     currentStart,
     to: resolvedTo,
   });
+  const newWorksFirst24h = buildNewWorksFirst24hSection(
+    intradayRows,
+    contentMetaByKey,
+    seriesByWork,
+    resolvedTo,
+    summaryWorkToContent
+  );
   const publishTime = buildPublishTimeSection(contentMetaByKey, worksByContent, resolvedTo);
   const anomalies = buildAnomaliesSection(seriesByWork, allCollectionAnomalies, {
     currentStart,
@@ -2590,6 +2967,7 @@ function buildStatsAnalysis({
     platformComparison,
     rankings,
     newWorks,
+    newWorksFirst24h,
     publishTime,
     fansTrend,
     anomalies,
@@ -2607,6 +2985,8 @@ module.exports = {
   PLATFORM_SKEW_RATIO,
   PLATFORM_SKEW_MIN_PLAY,
   NEW_WORK_MILESTONES,
+  NEW_WORKS_FIRST_24H_DAYS,
+  NEW_WORKS_FIRST_24H_HOURS,
   LONG_TAIL_D7_D3_RATIO,
   BURST_FLAT_D3_D1_RATIO,
   BURST_FLAT_D7_D3_RATIO,

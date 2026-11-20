@@ -1741,6 +1741,345 @@ function buildContentTrendOption(trendData) {
   };
 }
 
+/**
+ * 作品汇总弹窗「按时段」：单条内容各平台分时段累计播放折线 + 较上次增量柱（x=采集时点 YYYY-MM-DD HH:mm）
+ */
+function buildContentIntradayOption(intradayData) {
+  if (!intradayData || typeof intradayData !== "object") {
+    return createEmptyOption("该内容在所选时段内暂无分时段快照");
+  }
+  const timePoints = Array.isArray(intradayData.timePoints)
+    ? intradayData.timePoints.filter((t) => typeof t === "string" && t.trim())
+    : [];
+  const rawPlatforms = Array.isArray(intradayData.platforms) ? intradayData.platforms : [];
+  const rawTotalDelta = Array.isArray(intradayData.totalPlayDelta)
+    ? intradayData.totalPlayDelta
+    : [];
+
+  if (!timePoints.length || !rawPlatforms.length) {
+    return createEmptyOption("该内容在所选时段内暂无分时段快照");
+  }
+
+  const sortedPlatforms = [...rawPlatforms]
+    .filter((p) => p && p.platform)
+    .sort((a, b) => comparePlatform(a.platform, b.platform));
+
+  if (!sortedPlatforms.length) {
+    return createEmptyOption("该内容在所选时段内暂无分时段快照");
+  }
+
+  const useLttb = shouldUseLttb(sortedPlatforms.length, timePoints.length);
+  const series = [];
+  const platformDeltaMap = new Map();
+  let hasAnyVal = false;
+
+  for (const pt of sortedPlatforms) {
+    const srcPlay = Array.isArray(pt.play) ? pt.play : [];
+    const srcDelta = Array.isArray(pt.playDelta) ? pt.playDelta : [];
+    const playAligned = new Array(timePoints.length).fill(null);
+    const deltaAligned = new Array(timePoints.length).fill(null);
+
+    for (let i = 0; i < timePoints.length; i++) {
+      const pv = i < srcPlay.length ? toFiniteOrNull(srcPlay[i]) : null;
+      const dv = i < srcDelta.length ? toFiniteOrNull(srcDelta[i]) : null;
+      if (pv !== null) {
+        playAligned[i] = pv;
+        hasAnyVal = true;
+      }
+      if (dv !== null) {
+        deltaAligned[i] = dv;
+        hasAnyVal = true;
+      }
+    }
+    platformDeltaMap.set(pt.platform, deltaAligned);
+
+    const color = getPlatformColor(pt.platform);
+    const s = {
+      name: pt.platform,
+      type: "line",
+      yAxisIndex: 0,
+      connectNulls: false,
+      ...buildLineSymbolConfig(playAligned, timePoints.length),
+      itemStyle: { color },
+      lineStyle: { color, width: 2 },
+      data: playAligned,
+    };
+    if (useLttb) {
+      s.sampling = "lttb";
+    }
+    series.push(s);
+  }
+
+  const totalDeltaAligned = new Array(timePoints.length).fill(null);
+  for (let i = 0; i < timePoints.length && i < rawTotalDelta.length; i++) {
+    const dv = toFiniteOrNull(rawTotalDelta[i]);
+    if (dv !== null) {
+      totalDeltaAligned[i] = dv;
+      hasAnyVal = true;
+    }
+  }
+
+  if (!hasAnyVal) {
+    return createEmptyOption("该内容在所选时段内暂无分时段播放快照");
+  }
+
+  series.push({
+    name: "较上次增量",
+    type: "bar",
+    yAxisIndex: 1,
+    barMaxWidth: 20,
+    itemStyle: {
+      color: "rgba(64, 158, 255, 0.35)",
+      borderRadius: [3, 3, 0, 0],
+    },
+    data: totalDeltaAligned,
+  });
+
+  return {
+    color: [...sortedPlatforms.map((p) => getPlatformColor(p.platform)), "#409eff"],
+    tooltip: {
+      trigger: "axis",
+      confine: true,
+      formatter(params) {
+        const list = Array.isArray(params) ? params : [params];
+        if (!list.length) return "";
+        const idx = list[0].dataIndex;
+        const tp = timePoints[idx] || list[0].axisValue || "";
+        const lines = [`<div style="font-weight:600;margin-bottom:4px;">${escapeHtml(tp)}</div>`];
+        for (const p of list) {
+          if (p.seriesType === "bar") {
+            const sign = typeof p.value === "number" && p.value > 0 ? "+" : "";
+            const valStr = p.value == null ? "-" : `${sign}${formatNum(p.value)}`;
+            lines.push(
+              `<div style="margin-top:2px;">${p.marker}${escapeHtml(p.seriesName)}：<b>${escapeHtml(valStr)}</b></div>`
+            );
+          } else {
+            const pDeltas = platformDeltaMap.get(p.seriesName);
+            const dv = pDeltas ? pDeltas[idx] : null;
+            const deltaSuffix =
+              dv != null ? `（较上次 ${dv > 0 ? "+" : ""}${formatNum(dv)}）` : "";
+            const valStr = p.value == null ? "-" : formatNum(p.value);
+            lines.push(
+              `<div>${p.marker}${escapeHtml(p.seriesName)}累计：<b>${escapeHtml(valStr)}</b>${escapeHtml(deltaSuffix)}</div>`
+            );
+          }
+        }
+        return lines.join("");
+      },
+    },
+    legend: {
+      type: "scroll",
+      top: 0,
+      left: 0,
+      textStyle: { fontSize: 12, color: "#606266" },
+    },
+    grid: {
+      top: 40,
+      left: 16,
+      right: 20,
+      bottom: 18,
+      containLabel: true,
+    },
+    xAxis: {
+      type: "category",
+      boundaryGap: true,
+      data: timePoints,
+      axisLabel: {
+        color: "#606266",
+        fontSize: 11,
+        formatter(v) {
+          return typeof v === "string" && v.length >= 16 ? v.slice(5, 16) : v;
+        },
+      },
+      axisLine: { lineStyle: { color: "#dcdfe6" } },
+    },
+    yAxis: [
+      {
+        type: "value",
+        name: "累计播放",
+        nameTextStyle: { color: "#909399", fontSize: 11 },
+        axisLabel: { color: "#606266", fontSize: 11, formatter: formatAxisCompact },
+        splitLine: { lineStyle: { color: "#ebeef5" } },
+      },
+      {
+        type: "value",
+        name: "较上次增量",
+        nameTextStyle: { color: "#909399", fontSize: 11 },
+        axisLabel: { color: "#606266", fontSize: 11, formatter: formatAxisCompact },
+        splitLine: { show: false },
+      },
+    ],
+    series,
+  };
+}
+
+/**
+ * 4b. 新作品前 24 小时起量折线图：
+ * - 近 7 天内发布的内容，x = 发布后小时数 (0..24h)，y = 累计播放
+ * - 最多 10 条，按发布时间降序，复用平台配色（同平台多条用线型区分）
+ */
+function buildNewWorksFirst24hOption(analysis, options = {}) {
+  const sec = analysis && analysis.newWorksFirst24h;
+  const rawItems = sec && Array.isArray(sec.items) ? sec.items : [];
+  const filterPlatform =
+    options && typeof options.platform === "string" && options.platform.trim() && options.platform !== "all"
+      ? options.platform.trim()
+      : "";
+
+  const candidates = [];
+  for (const it of rawItems) {
+    if (!it || typeof it !== "object") continue;
+    let rawPoints = null;
+    let colorPlatform = "";
+    if (filterPlatform) {
+      const pEntry = Array.isArray(it.platforms)
+        ? it.platforms.find((p) => p && p.platform === filterPlatform)
+        : null;
+      if (!pEntry || !Array.isArray(pEntry.points)) continue;
+      rawPoints = pEntry.points;
+      colorPlatform = filterPlatform;
+    } else {
+      rawPoints = Array.isArray(it.points) ? it.points : [];
+      colorPlatform =
+        it.primaryPlatform ||
+        (Array.isArray(it.platforms) && it.platforms[0] && it.platforms[0].platform) ||
+        "";
+    }
+
+    const cleanPoints = [];
+    for (const pt of rawPoints) {
+      if (!pt || typeof pt !== "object") continue;
+      const h = toFiniteOrNull(pt.hours);
+      const play = toFiniteOrNull(pt.play);
+      if (h === null || h < 0 || h > 24 || play === null) continue;
+      cleanPoints.push({
+        hours: h,
+        play,
+        date: typeof pt.date === "string" ? pt.date : "",
+        slot: typeof pt.slot === "string" ? pt.slot : "",
+        collectedAt: pt.collectedAt || null,
+      });
+    }
+    if (!cleanPoints.length) continue;
+    cleanPoints.sort((a, b) => a.hours - b.hours);
+    candidates.push({
+      contentKey: it.contentKey || "",
+      title: it.title || "(无标题)",
+      publishDate: it.publishDate || "",
+      publishTimeMs: toFiniteOrNull(it.publishTimeMs) || 0,
+      platform: colorPlatform,
+      points: cleanPoints,
+    });
+  }
+
+  if (!candidates.length) {
+    return createEmptyOption(
+      filterPlatform
+        ? `近 7 天暂无 ${filterPlatform} 新作品的前 24 小时分时段快照`
+        : "近 7 天暂无带分时段快照的新作品"
+    );
+  }
+
+  const topList = candidates.slice(0, NEW_WORKS_MAX_LINES);
+  const nameCounts = new Map();
+  const platformLineCount = new Map();
+
+  const series = topList.map((item) => {
+    const baseName = truncateText(item.title, 14);
+    const seen = nameCounts.get(baseName) || 0;
+    nameCounts.set(baseName, seen + 1);
+    const name = seen > 0 ? `${baseName} (${seen + 1})` : baseName;
+
+    const color = getPlatformColor(item.platform);
+    const ptIdx = platformLineCount.get(item.platform) || 0;
+    platformLineCount.set(item.platform, ptIdx + 1);
+    const lineType = SAME_PLATFORM_LINE_TYPES[ptIdx % SAME_PLATFORM_LINE_TYPES.length];
+
+    return {
+      name,
+      type: "line",
+      connectNulls: false,
+      symbol: "circle",
+      symbolSize: 6,
+      itemStyle: { color },
+      lineStyle: { color, width: 2, type: lineType },
+      data: item.points.map((pt) => ({
+        value: [pt.hours, pt.play],
+        date: pt.date,
+        slot: pt.slot,
+        collectedAt: pt.collectedAt,
+      })),
+      contentKey: item.contentKey,
+      fullTitle: item.title,
+      platform: item.platform,
+      publishDate: item.publishDate,
+    };
+  });
+
+  return {
+    color: series.map((s) => s.itemStyle.color),
+    tooltip: {
+      trigger: "item",
+      confine: true,
+      formatter(p) {
+        if (!p || !p.data || !Array.isArray(p.data.value)) return "";
+        const [hours, play] = p.data.value;
+        const sObj = series[p.seriesIndex] || {};
+        const title = sObj.fullTitle || p.seriesName || "";
+        const ptLabel = sObj.platform ? `（${sObj.platform}）` : "";
+        const timeStr =
+          p.data.date && p.data.slot ? `${p.data.date} ${p.data.slot}` : "";
+        const lines = [
+          `<div style="font-weight:600;margin-bottom:4px;">${escapeHtml(title)}${escapeHtml(ptLabel)}</div>`,
+          `<div>${p.marker}发布后 <b>+${escapeHtml(String(hours))}h</b>：<b>${escapeHtml(formatNum(play))}</b></div>`,
+        ];
+        if (timeStr) {
+          lines.push(`<div style="color:#909399;font-size:11px;">采集时点：${escapeHtml(timeStr)}</div>`);
+        }
+        return lines.join("");
+      },
+    },
+    legend: {
+      type: "scroll",
+      bottom: 0,
+      selectedMode: true,
+      textStyle: { fontSize: 11, color: "#606266" },
+    },
+    grid: {
+      top: 28,
+      left: 16,
+      right: 22,
+      bottom: 48,
+      containLabel: true,
+    },
+    xAxis: {
+      type: "value",
+      min: 0,
+      max: 24,
+      interval: 4,
+      name: "发布后小时数",
+      nameLocation: "middle",
+      nameGap: 24,
+      nameTextStyle: { color: "#909399", fontSize: 11 },
+      axisLabel: {
+        color: "#606266",
+        fontSize: 11,
+        formatter: "{value}h",
+      },
+      axisLine: { lineStyle: { color: "#dcdfe6" } },
+      splitLine: { lineStyle: { color: "#f2f6fc" } },
+    },
+    yAxis: {
+      type: "value",
+      name: "累计播放",
+      nameTextStyle: { color: "#909399", fontSize: 11 },
+      axisLabel: { color: "#606266", fontSize: 11, formatter: formatAxisCompact },
+      splitLine: { lineStyle: { color: "#ebeef5" } },
+    },
+    series,
+  };
+}
+
 module.exports = {
   PLATFORM_COLORS,
   PLATFORM_ORDER,
@@ -1760,7 +2099,9 @@ module.exports = {
   buildRankingTop10Option,
   buildNewWorksTrajectoryOption,
   buildNewWorksCategoryPieOption,
+  buildNewWorksFirst24hOption,
   buildPublishTimeHeatmapOption,
   buildFansTrendOption,
   buildContentTrendOption,
+  buildContentIntradayOption,
 };

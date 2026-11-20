@@ -40,27 +40,82 @@
       <collect-log-dialog :visible.sync="logVisible" :logs="logs" />
     </div>
     <div class="auto-collect-bar">
-      <div class="auto-collect-controls">
-        <span class="auto-collect-label">每日自动采集</span>
-        <el-switch
-          v-model="autoCollect.enabled"
-          @change="onAutoCollectChange"
-        />
-        <el-time-select
-          v-model="autoCollect.time"
-          size="mini"
-          class="auto-collect-time"
-          :disabled="!autoCollect.enabled"
-          :clearable="false"
-          :editable="false"
-          :picker-options="{ start: '00:00', step: '00:30', end: '23:30' }"
-          placeholder="选择时间"
-          @change="onAutoCollectChange"
-        />
+      <div class="auto-collect-row">
+        <div class="auto-collect-controls">
+          <span class="auto-collect-label">自动采集</span>
+          <el-switch
+            v-model="autoCollect.enabled"
+            @change="onAutoCollectChange"
+          />
+          <el-radio-group
+            v-model="autoCollect.mode"
+            size="mini"
+            :disabled="!autoCollect.enabled"
+            @change="onAutoCollectChange"
+          >
+            <el-radio-button label="daily">每日一次</el-radio-button>
+            <el-radio-button label="interval">分时段循环</el-radio-button>
+          </el-radio-group>
+          <template v-if="autoCollect.mode !== 'interval'">
+            <el-time-select
+              v-model="autoCollect.time"
+              size="mini"
+              class="auto-collect-time"
+              :disabled="!autoCollect.enabled"
+              :clearable="false"
+              :editable="false"
+              :picker-options="{ start: '00:00', step: '00:30', end: '23:30' }"
+              placeholder="选择时间"
+              @change="onAutoCollectChange"
+            />
+          </template>
+          <template v-else>
+            <el-time-select
+              v-model="autoCollect.startTime"
+              size="mini"
+              class="auto-collect-time"
+              :disabled="!autoCollect.enabled"
+              :clearable="false"
+              :editable="false"
+              :picker-options="{ start: '00:00', step: '00:30', end: '23:30' }"
+              placeholder="开始时间"
+              @change="onAutoCollectChange"
+            />
+            <span class="auto-collect-sep">至</span>
+            <el-time-select
+              v-model="autoCollect.endTime"
+              size="mini"
+              class="auto-collect-time"
+              :disabled="!autoCollect.enabled"
+              :clearable="false"
+              :editable="false"
+              :picker-options="{ start: '00:00', step: '00:30', end: '23:30' }"
+              placeholder="结束时间"
+              @change="onAutoCollectChange"
+            />
+            <el-select
+              v-model="autoCollect.intervalHours"
+              size="mini"
+              class="auto-collect-interval"
+              :disabled="!autoCollect.enabled"
+              @change="onAutoCollectChange"
+            >
+              <el-option
+                v-for="h in intervalHoursOptions"
+                :key="h"
+                :label="`每 ${h} 小时`"
+                :value="h"
+              />
+            </el-select>
+          </template>
+        </div>
+        <span class="auto-collect-last">
+          上次自动采集：{{ autoCollect.lastRunSlot || autoCollect.lastRunDate || "暂无" }}
+        </span>
       </div>
-      <span class="auto-collect-last">
-        上次自动采集：{{ autoCollect.lastRunDate || "暂无" }}
-      </span>
+      <div v-if="autoCollect.mode === 'interval'" class="auto-collect-warning">
+        采集越频繁越容易触发平台风控；部分平台作品数据本身每天才更新，分时段曲线可能是平的
+      </div>
     </div>
     <el-tabs v-model="activeTab" class="stats-tabs">
       <el-tab-pane label="账号总览" name="overview">
@@ -415,6 +470,23 @@
                 <span v-else class="num muted">-</span>
               </template>
             </el-table-column>
+            <el-table-column
+              prop="lastCollectedAt"
+              label="最近采集"
+              width="116"
+              sortable
+              :sort-method="sortLastCollectedAt"
+            >
+              <template #default="{ row }">
+                <span
+                  class="num"
+                  :class="{ muted: !row.lastCollectedAt }"
+                  :title="formatUtc8FullDateTime(row.lastCollectedAt)"
+                >
+                  {{ formatUtc8ShortDateTime(row.lastCollectedAt) }}
+                </span>
+              </template>
+            </el-table-column>
             <el-table-column label="趋势" width="72" align="center">
               <template #default="{ row }">
                 <el-button
@@ -477,6 +549,23 @@
               <template #default="{ row }">
                 <span class="num" :class="{ muted: row.like == null }">
                   {{ showNum(row.like) }}
+                </span>
+              </template>
+            </el-table-column>
+            <el-table-column
+              prop="lastCollectedAt"
+              label="最近采集"
+              width="116"
+              sortable
+              :sort-method="sortLastCollectedAt"
+            >
+              <template #default="{ row }">
+                <span
+                  class="num"
+                  :class="{ muted: !row.lastCollectedAt }"
+                  :title="formatUtc8FullDateTime(row.lastCollectedAt)"
+                >
+                  {{ formatUtc8ShortDateTime(row.lastCollectedAt) }}
                 </span>
               </template>
             </el-table-column>
@@ -618,23 +707,43 @@
           @closed="resetContentTrendDialog"
         >
           <div class="trend-dialog-head">
-            <span class="trend-dialog-tip">
-              <template v-if="contentTrendData && contentTrendData.from && contentTrendData.to">
-                区间：{{ contentTrendData.from }} ~ {{ contentTrendData.to }}
-              </template>
-              <template v-if="contentTrendData && contentTrendData.date">
-                · 截至 {{ contentTrendData.date }}
-              </template>
-              <template v-else-if="contentSummaryDate">
-                截至 {{ contentSummaryDate }}
-              </template>
-            </span>
+            <div class="trend-dialog-controls">
+              <el-radio-group
+                v-model="contentTrendMode"
+                size="mini"
+                @change="onContentTrendModeChange"
+              >
+                <el-radio-button label="daily">按天</el-radio-button>
+                <el-radio-button label="intraday">按时段</el-radio-button>
+              </el-radio-group>
+              <el-radio-group
+                v-if="contentTrendMode === 'intraday'"
+                v-model="contentIntradayDays"
+                size="mini"
+                @change="loadContentIntraday"
+              >
+                <el-radio-button :label="1">近1天</el-radio-button>
+                <el-radio-button :label="3">近3天</el-radio-button>
+                <el-radio-button :label="7">近7天</el-radio-button>
+              </el-radio-group>
+              <span class="trend-dialog-tip">
+                <template v-if="activeContentTrendData && activeContentTrendData.from && activeContentTrendData.to">
+                  区间：{{ activeContentTrendData.from }} ~ {{ activeContentTrendData.to }}
+                </template>
+                <template v-if="activeContentTrendData && activeContentTrendData.date">
+                  · 截至 {{ activeContentTrendData.date }}
+                </template>
+                <template v-else-if="contentSummaryDate">
+                  截至 {{ contentSummaryDate }}
+                </template>
+              </span>
+            </div>
             <el-button
               type="text"
               size="mini"
               icon="el-icon-download"
               :disabled="loadingContentTrend || isChartOptionEmpty(contentTrendOption)"
-              @click="saveChartImage('chartContentTrend', '作品趋势-' + (contentTrendRow && contentTrendRow.title ? contentTrendRow.title : '内容'), contentTrendChartDate)"
+              @click="saveChartImage('chartContentTrend', (contentTrendMode === 'intraday' ? '作品分时段-' : '作品趋势-') + (contentTrendRow && contentTrendRow.title ? contentTrendRow.title : '内容'), contentTrendChartDate)"
             >
               保存图片
             </el-button>
@@ -1317,6 +1426,42 @@
               </el-table>
             </div>
 
+            <!-- 4b. 新作品前 24 小时 -->
+            <div class="platform-card">
+              <div class="card-head">
+                <span class="card-title">新作品前 24 小时（近 7 天发布 · 起量速度）</span>
+                <div class="chart-inline-controls">
+                  <el-select
+                    v-model="newWorks24hPlatform"
+                    size="mini"
+                    class="newworks-24h-platform-select"
+                  >
+                    <el-option label="全部平台" value="all" />
+                    <el-option
+                      v-for="pt in analysisNewWorks24hPlatformOptions"
+                      :key="pt"
+                      :label="pt"
+                      :value="pt"
+                    />
+                  </el-select>
+                  <el-button
+                    type="text"
+                    size="mini"
+                    icon="el-icon-download"
+                    :disabled="isChartOptionEmpty(newWorksFirst24hOption)"
+                    @click="saveChartImage('chartNewWorksFirst24h', '新作品前24小时', analysisChartDate)"
+                  >
+                    保存图片
+                  </el-button>
+                </div>
+              </div>
+              <stats-chart
+                ref="chartNewWorksFirst24h"
+                :option="newWorksFirst24hOption"
+                height="320px"
+              />
+            </div>
+
             <!-- 5. 发布时间 -->
             <div class="platform-card">
               <div class="card-head">
@@ -1628,9 +1773,11 @@ import {
   buildRankingTop10Option,
   buildNewWorksTrajectoryOption,
   buildNewWorksCategoryPieOption,
+  buildNewWorksFirst24hOption,
   buildPublishTimeHeatmapOption,
   buildFansTrendOption,
   buildContentTrendOption,
+  buildContentIntradayOption,
 } from "../../utils/statsChartOptions";
 import {
   buildCollectAccounts,
@@ -1640,6 +1787,7 @@ import {
   onStatsProgress,
 } from "@/utils/statsApi";
 import {
+  VALID_INTERVAL_HOURS,
   loadSettings as loadAutoCollectSettings,
   subscribeRunComplete,
   subscribeSettings as subscribeAutoCollectSettings,
@@ -1647,6 +1795,7 @@ import {
 } from "@/utils/statsScheduler";
 
 const UNSTABLE_RECORD_KEY_RE = /^record:(?:.*:)?pos:\d+$/;
+const INTERVAL_HOURS_FALLBACK = [1, 2, 3, 4, 6];
 const PLATFORM_ORDER = [
   "抖音",
   "视频号",
@@ -1656,6 +1805,24 @@ const PLATFORM_ORDER = [
   "百家号",
   "头条",
 ];
+
+function normalizeAutoCollectView(raw) {
+  const s = raw && typeof raw === "object" ? raw : {};
+  return {
+    ...s,
+    enabled: Boolean(s.enabled),
+    mode: s.mode === "interval" ? "interval" : "daily",
+    time: typeof s.time === "string" && s.time ? s.time : "10:00",
+    startTime: typeof s.startTime === "string" && s.startTime ? s.startTime : "08:00",
+    endTime: typeof s.endTime === "string" && s.endTime ? s.endTime : "22:00",
+    intervalHours:
+      typeof s.intervalHours === "number" && INTERVAL_HOURS_FALLBACK.includes(s.intervalHours)
+        ? s.intervalHours
+        : 2,
+    lastRunDate: typeof s.lastRunDate === "string" ? s.lastRunDate : "",
+    lastRunSlot: typeof s.lastRunSlot === "string" ? s.lastRunSlot : "",
+  };
+}
 
 function formatLocalYmd(date) {
   const y = date.getFullYear();
@@ -1703,7 +1870,10 @@ export default {
       reassignTargetKey: "",
       contentTrendVisible: false,
       contentTrendRow: null,
+      contentTrendMode: "daily",
+      contentIntradayDays: 3,
       contentTrendData: null,
+      contentIntradayData: null,
       loadingContentTrend: false,
       analysisPeriod: 30,
       analysisTo: "",
@@ -1717,6 +1887,7 @@ export default {
       loadingAnalysis: false,
       overviewTrendMetric: "play",
       overviewTrendStacked: false,
+      newWorks24hPlatform: "all",
       fansSelectedAccounts: [],
       exportingAllCharts: false,
       analysisRankMetric: "play",
@@ -1725,10 +1896,15 @@ export default {
       progressText: "",
       logVisible: false,
       logs: [],
-      autoCollect: loadAutoCollectSettings(),
+      autoCollect: normalizeAutoCollectView(loadAutoCollectSettings()),
     };
   },
   computed: {
+    intervalHoursOptions() {
+      return Array.isArray(VALID_INTERVAL_HOURS) && VALID_INTERVAL_HOURS.length
+        ? VALID_INTERVAL_HOURS
+        : INTERVAL_HOURS_FALLBACK;
+    },
     rows() {
       return dailyToRows(this.overview.daily);
     },
@@ -1925,12 +2101,37 @@ export default {
     analysisChartDate() {
       return (this.analysisData && this.analysisData.to) || "";
     },
+    activeContentTrendData() {
+      return this.contentTrendMode === "intraday"
+        ? this.contentIntradayData
+        : this.contentTrendData;
+    },
     contentTrendChartDate() {
+      const cur = this.activeContentTrendData;
       return (
-        (this.contentTrendData && (this.contentTrendData.date || this.contentTrendData.to)) ||
+        (cur && (cur.date || cur.to)) ||
         this.contentSummaryDate ||
         ""
       );
+    },
+    analysisNewWorks24hPlatformOptions() {
+      const sec = this.analysisData && this.analysisData.newWorksFirst24h;
+      const items = sec && Array.isArray(sec.items) ? sec.items : [];
+      const set = new Set();
+      for (const it of items) {
+        if (!it || !Array.isArray(it.platforms)) continue;
+        for (const p of it.platforms) {
+          if (p && p.platform) set.add(p.platform);
+        }
+      }
+      return [...set].sort((a, b) => {
+        const ia = PLATFORM_ORDER.indexOf(a);
+        const ib = PLATFORM_ORDER.indexOf(b);
+        if (ia !== -1 && ib !== -1) return ia - ib;
+        if (ia !== -1) return -1;
+        if (ib !== -1) return 1;
+        return a < b ? -1 : a > b ? 1 : 0;
+      });
     },
     analysisFansAccountOptions() {
       const ft = this.analysisData && this.analysisData.fansTrend;
@@ -1961,6 +2162,11 @@ export default {
     newWorksPieOption() {
       return buildNewWorksCategoryPieOption(this.analysisData);
     },
+    newWorksFirst24hOption() {
+      return buildNewWorksFirst24hOption(this.analysisData, {
+        platform: this.newWorks24hPlatform === "all" ? "" : this.newWorks24hPlatform,
+      });
+    },
     publishTimeHeatmapOption() {
       return buildPublishTimeHeatmapOption(this.analysisData);
     },
@@ -1970,11 +2176,15 @@ export default {
       });
     },
     contentTrendOption() {
+      if (this.contentTrendMode === "intraday") {
+        return buildContentIntradayOption(this.contentIntradayData);
+      }
       return buildContentTrendOption(this.contentTrendData);
     },
     contentTrendDialogTitle() {
+      const cur = this.activeContentTrendData;
       const title =
-        (this.contentTrendData && this.contentTrendData.title) ||
+        (cur && cur.title) ||
         (this.contentTrendRow && this.contentTrendRow.title) ||
         "作品播放趋势";
       return `播放趋势 · ${title}`;
@@ -2013,7 +2223,7 @@ export default {
       }`;
     });
     this._unsubAutoCollect = subscribeAutoCollectSettings((next) => {
-      this.autoCollect = next;
+      this.autoCollect = normalizeAutoCollectView(next);
     });
     this._unsubAutoRunComplete = subscribeRunComplete(() => {
       if (!this.syncing) {
@@ -2023,7 +2233,7 @@ export default {
     });
   },
   activated() {
-    this.autoCollect = loadAutoCollectSettings();
+    this.autoCollect = normalizeAutoCollectView(loadAutoCollectSettings());
     if (this.activeTab === "analysis" && typeof this.$nextTick === "function") {
       this.$nextTick(() => this.resizeAnalysisCharts());
     }
@@ -2037,9 +2247,13 @@ export default {
     onAutoCollectChange() {
       const res = updateAutoCollectSettings({
         enabled: this.autoCollect.enabled,
+        mode: this.autoCollect.mode,
         time: this.autoCollect.time,
+        startTime: this.autoCollect.startTime,
+        endTime: this.autoCollect.endTime,
+        intervalHours: this.autoCollect.intervalHours,
       });
-      this.autoCollect = res.settings;
+      this.autoCollect = normalizeAutoCollectView(res.settings);
       if (!res.ok) {
         this.$message.error(
           `保存自动采集设置失败${res.error ? "：" + res.error : ""}`
@@ -2077,6 +2291,12 @@ export default {
           );
           this.fansSelectedAccounts = this.fansSelectedAccounts.filter((k) => validKeys.has(k));
         }
+        if (
+          this.newWorks24hPlatform !== "all" &&
+          !this.analysisNewWorks24hPlatformOptions.includes(this.newWorks24hPlatform)
+        ) {
+          this.newWorks24hPlatform = "all";
+        }
         if (typeof this.$nextTick === "function") {
           this.$nextTick(() => this.resizeAnalysisCharts());
         }
@@ -2103,6 +2323,7 @@ export default {
         },
         { ref: "chartNewWorksLine", name: "4-新作品走势-D1D3D7" },
         { ref: "chartNewWorksPie", name: "4-新作品走势-分类占比" },
+        { ref: "chartNewWorksFirst24h", name: "4b-新作品前24小时" },
         { ref: "chartPublishTimeHeatmap", name: "5-发布时间热力图" },
         { ref: "chartFansTrend", name: "6-粉丝趋势" },
       ];
@@ -2198,13 +2419,20 @@ export default {
     },
     async openContentTrend(row) {
       if (!row || !row.contentKey) return;
-      const reqId = (this._contentTrendReqId = (this._contentTrendReqId || 0) + 1);
       this.contentTrendRow = {
         contentKey: row.contentKey,
         title: row.title || "(无标题)",
       };
+      this.contentTrendMode = "daily";
       this.contentTrendData = null;
+      this.contentIntradayData = null;
       this.contentTrendVisible = true;
+      await this.loadContentDailyTrend();
+    },
+    async loadContentDailyTrend() {
+      const row = this.contentTrendRow;
+      if (!row || !row.contentKey) return;
+      const reqId = (this._contentTrendReqId = (this._contentTrendReqId || 0) + 1);
       this.loadingContentTrend = true;
       try {
         const payload = { contentKey: row.contentKey };
@@ -2232,6 +2460,52 @@ export default {
         }
       }
     },
+    async loadContentIntraday() {
+      const row = this.contentTrendRow;
+      if (!row || !row.contentKey) return;
+      const reqId = (this._contentTrendReqId = (this._contentTrendReqId || 0) + 1);
+      this.loadingContentTrend = true;
+      try {
+        const payload = {
+          contentKey: row.contentKey,
+          days: this.contentIntradayDays,
+        };
+        if (this.contentSummaryDate) payload.to = this.contentSummaryDate;
+        const res = await ipcRenderer.invoke("stats:get-content-intraday", payload);
+        if (reqId !== this._contentTrendReqId) return;
+        if (!res || res.ok === false || res.error) {
+          this.$message.warning((res && res.error) || "读取作品分时段趋势失败");
+          this.contentIntradayData = null;
+          return;
+        }
+        this.contentIntradayData = res;
+        if (typeof this.$nextTick === "function") {
+          this.$nextTick(() => {
+            const comp = this.$refs && this.$refs.chartContentTrend;
+            if (comp && typeof comp.resize === "function") comp.resize();
+          });
+        }
+      } catch (err) {
+        if (reqId !== this._contentTrendReqId) return;
+        this.$message.error(`读取作品分时段趋势失败：${(err && err.message) || err}`);
+      } finally {
+        if (reqId === this._contentTrendReqId) {
+          this.loadingContentTrend = false;
+        }
+      }
+    },
+    onContentTrendModeChange(mode) {
+      if (mode === "intraday") {
+        this.loadContentIntraday();
+      } else if (!this.contentTrendData) {
+        this.loadContentDailyTrend();
+      } else if (typeof this.$nextTick === "function") {
+        this.$nextTick(() => {
+          const comp = this.$refs && this.$refs.chartContentTrend;
+          if (comp && typeof comp.resize === "function") comp.resize();
+        });
+      }
+    },
     onContentTrendDialogOpened() {
       if (typeof this.$nextTick === "function") {
         this.$nextTick(() => {
@@ -2243,7 +2517,10 @@ export default {
     resetContentTrendDialog() {
       this._contentTrendReqId = (this._contentTrendReqId || 0) + 1;
       this.contentTrendRow = null;
+      this.contentTrendMode = "daily";
+      this.contentIntradayDays = 3;
       this.contentTrendData = null;
+      this.contentIntradayData = null;
       this.loadingContentTrend = false;
     },
     async copyAnalysisSummary() {
@@ -2711,6 +2988,17 @@ export default {
     sortTotalFansDelta(a, b) {
       return compareNullableMetric(a, b, "totalFansDelta");
     },
+    sortLastCollectedAt(a, b) {
+      return compareNullableMetric(a, b, "lastCollectedAt");
+    },
+    formatUtc8FullDateTime(ts) {
+      if (typeof ts !== "number" || !Number.isFinite(ts) || ts <= 0) return "";
+      return new Date(ts + 8 * 3600e3).toISOString().slice(0, 19).replace("T", " ");
+    },
+    formatUtc8ShortDateTime(ts) {
+      if (typeof ts !== "number" || !Number.isFinite(ts) || ts <= 0) return "-";
+      return new Date(ts + 8 * 3600e3).toISOString().slice(5, 16).replace("T", " ");
+    },
     async openLogs() {
       this.logs = await getCollectLogs();
       this.logVisible = true;
@@ -2787,9 +3075,8 @@ export default {
 
 .auto-collect-bar {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
+  flex-direction: column;
+  gap: 6px;
   margin-bottom: 10px;
   padding: 8px 14px;
   background: #ffffff;
@@ -2797,9 +3084,18 @@ export default {
   border-radius: 8px;
 }
 
+.auto-collect-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
 .auto-collect-controls {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 10px;
 }
 
@@ -2810,7 +3106,22 @@ export default {
 }
 
 .auto-collect-time {
-  width: 110px;
+  width: 104px;
+}
+
+.auto-collect-sep {
+  font-size: 12px;
+  color: #606266;
+}
+
+.auto-collect-interval {
+  width: 104px;
+}
+
+.auto-collect-warning {
+  font-size: 12px;
+  color: #e6a23c;
+  line-height: 1.4;
 }
 
 .auto-collect-last {
@@ -3170,12 +3481,24 @@ export default {
   width: 240px;
 }
 
+.newworks-24h-platform-select {
+  width: 130px;
+}
+
 .trend-dialog-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 10px;
   margin-bottom: 8px;
+}
+
+.trend-dialog-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
 }
 
 .trend-dialog-tip {

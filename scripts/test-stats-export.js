@@ -49,6 +49,7 @@ const {
   MAX_SHEET_ROWS,
   ROW_LIMIT_EXCEEDED_CODE,
   WORK_DAILY_HEADERS,
+  WORK_INTRADAY_HEADERS,
   PLATFORM_DAILY_HEADERS,
   ACCOUNT_DAILY_HEADERS,
   SCHEMA_HEADERS,
@@ -119,6 +120,7 @@ async function main() {
 
       assert.deepStrictEqual(emptyData.sheetOrder, [
         "作品日明细",
+        "作品时段明细",
         "作品跨平台汇总",
         "平台日汇总",
         "账号日快照",
@@ -130,6 +132,8 @@ async function main() {
       assert.strictEqual(emptyData.from, "2026-10-21", "默认 from 应为 to 往前 29 天");
       assert.strictEqual(emptyData.analysisPeriod, 30, "默认导出分析周期应为 30 天");
       assert.strictEqual(emptyData.sheets["作品日明细"].length, 1);
+      assert.strictEqual(emptyData.sheets["作品时段明细"].length, 1);
+      assert.deepStrictEqual(emptyData.sheets["作品时段明细"][0], WORK_INTRADAY_HEADERS);
       assert.strictEqual(emptyData.sheets["作品跨平台汇总"].length, 1);
       assert.strictEqual(emptyData.sheets["平台日汇总"].length, 1);
       assert.strictEqual(emptyData.sheets["账号日快照"].length, 1);
@@ -165,6 +169,7 @@ async function main() {
         contents: 0,
         unlinkedWorks: 0,
         workDailyRows: 0,
+        workIntradayRows: 0,
         platformDailyRows: 0,
         accountDailyRows: 0,
       });
@@ -2964,6 +2969,200 @@ async function main() {
       assert.strictEqual(readCrossRow[8], 3);
       assert.strictEqual(readCrossRow[10], "抖音");
       console.log("✓ S7-r3#1(testS7r3ExportTrajectoryExcelSync) 通过");
+    }
+
+    /* ---------- S9: 作品时段明细 sheet 顺序、表头、增量与距上次小时数、行数上限 ---------- */
+    {
+      const ts = (ymd, hh, mm = 0) => Date.parse(`${ymd}T${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}:00+08:00`);
+      const intradayDeps = {
+        now: ts("2026-11-20", 14, 0),
+        listAccounts: () => [
+          { group: "G1", platform: "抖音" },
+          { group: "G1", platform: "快手" },
+        ],
+        readWorks: (g, p) => {
+          if (p === "抖音") {
+            return [{ workId: "DY_S9", title: "=红烧肉分时段", url: "https://www.douyin.com/video/s9", publishTime: ts("2026-11-19", 9, 0) }];
+          }
+          return [{ workId: "KS_S9", title: "快手分时段", url: "https://www.kuaishou.com/short-video/s9", publishTime: ts("2026-11-19", 9, 0) }];
+        },
+        readWorksDaily: (g, p) => {
+          if (p === "抖音") {
+            return { DY_S9: { "2026-11-19": { play: 100, like: 10, comment: 2 }, "2026-11-20": { play: 320, like: 35, comment: 7 } } };
+          }
+          return { KS_S9: { "2026-11-20": { play: 50, like: 5, comment: 1 } } };
+        },
+        readWorksIntraday: (g, p) => {
+          if (p === "抖音") {
+            return {
+              DY_S9: [
+                { date: "2026-11-19", slot: "22:00", collectedAt: ts("2026-11-19", 22, 0), play: 100, like: 10, comment: 2, share: 1, favorite: 3, fansDelta: 1 },
+                { date: "2026-11-20", slot: "08:00", collectedAt: ts("2026-11-20", 8, 30), play: 220, like: 22, comment: 5, share: 2, favorite: 6, fansDelta: 3 },
+                { date: "2026-11-20", slot: "10:00", collectedAt: ts("2026-11-20", 10, 0), play: 320, like: 35, comment: 7, share: 4, favorite: 9, fansDelta: 5 },
+              ],
+            };
+          }
+          return {
+            KS_S9: [
+              { date: "2026-11-20", slot: "08:00", collectedAt: ts("2026-11-20", 8, 15), play: 50, like: 5, comment: 1, share: null, favorite: null, fansDelta: null },
+            ],
+          };
+        },
+        readDaily: () => ({}),
+        readPushRecords: () => [
+          {
+            id: "rec-s9-1",
+            filePath: "/v/s9.mp4",
+            title: "红烧肉分时段",
+            pt: "抖音",
+            group: "G1",
+            videoLink: "https://www.douyin.com/video/s9",
+            publishStatus: "success",
+            lastPublishAt: ts("2026-11-19", 9, 0),
+          },
+        ],
+      };
+
+      // 仅导出 2026-11-20，验证跨 from 边界增量与距上次小时数
+      const wbS9 = buildStatsWorkbookData(
+        { from: "2026-11-20", to: "2026-11-20" },
+        intradayDeps
+      );
+      assert.strictEqual(
+        wbS9.sheetOrder.indexOf("作品时段明细"),
+        wbS9.sheetOrder.indexOf("作品日明细") + 1,
+        "「作品时段明细」必须紧跟「作品日明细」之后"
+      );
+      const sIntra = wbS9.sheets["作品时段明细"];
+      assert.deepStrictEqual(sIntra[0], [
+        "日期",
+        "时段",
+        "采集时间",
+        "平台",
+        "分组",
+        "内容ID",
+        "关联方式",
+        "作品ID",
+        "标题",
+        "播放",
+        "点赞",
+        "评论",
+        "分享",
+        "收藏",
+        "涨粉",
+        "播放较上次增量",
+        "点赞较上次增量",
+        "评论较上次增量",
+        "距上次小时数",
+      ]);
+      assert.strictEqual(wbS9.counts.workIntradayRows, 3);
+      assert.strictEqual(sIntra.length, 4);
+
+      // 第 1 行：2026-11-20 08:00 抖音 DY_S9（跨边界减 11-19 22:00：+120, +12, +3, 10.5h）
+      assert.deepStrictEqual(sIntra[1], [
+        "2026-11-20",
+        "08:00",
+        "2026-11-20 08:30:00",
+        "抖音",
+        "G1",
+        "file:/v/s9.mp4",
+        "link",
+        "DY_S9",
+        "'=红烧肉分时段",
+        220,
+        22,
+        5,
+        2,
+        6,
+        3,
+        120,
+        12,
+        3,
+        10.5,
+      ]);
+      // 第 2 行：2026-11-20 08:00 快手 KS_S9（首次记录，增量与距上次小时数均为 null）
+      assert.deepStrictEqual(sIntra[2], [
+        "2026-11-20",
+        "08:00",
+        "2026-11-20 08:15:00",
+        "快手",
+        "G1",
+        null,
+        null,
+        "KS_S9",
+        "快手分时段",
+        50,
+        5,
+        1,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+      ]);
+      // 第 3 行：2026-11-20 10:00 抖音 DY_S9（减 08:30：+100, +13, +2, 1.5h）
+      assert.deepStrictEqual(sIntra[3], [
+        "2026-11-20",
+        "10:00",
+        "2026-11-20 10:00:00",
+        "抖音",
+        "G1",
+        "file:/v/s9.mp4",
+        "link",
+        "DY_S9",
+        "'=红烧肉分时段",
+        320,
+        35,
+        7,
+        4,
+        9,
+        5,
+        100,
+        13,
+        2,
+        1.5,
+      ]);
+
+      // 字段说明中「作品时段明细」1:1 匹配 19 列
+      const s9SchemaCols = wbS9.sheets["字段说明"]
+        .slice(1)
+        .filter((r) => r[0] === "作品时段明细")
+        .map((r) => r[1]);
+      assert.deepStrictEqual(s9SchemaCols, WORK_INTRADAY_HEADERS);
+
+      // 写出并读回 .xlsx 校验
+      const s9Xlsx = path.join(tmpRoot, "s9-intraday.xlsx");
+      writeStatsXlsx(wbS9, s9Xlsx);
+      const readS9Wb = xlsx.readFile(s9Xlsx);
+      assert.deepStrictEqual(readS9Wb.SheetNames, SHEET_NAMES);
+      const wsIntra = readS9Wb.Sheets["作品时段明细"];
+      assert.strictEqual(wsIntra["A2"].v, "2026-11-20");
+      assert.strictEqual(wsIntra["B2"].v, "08:00");
+      assert.strictEqual(wsIntra["P2"].t, "n");
+      assert.strictEqual(wsIntra["P2"].v, 120);
+      assert.strictEqual(wsIntra["S2"].t, "n");
+      assert.strictEqual(wsIntra["S2"].v, 10.5);
+
+      // 行上限：作品时段明细超过 maxRows（3 > 2）应直接抛 ROW_LIMIT_EXCEEDED 并提示缩短区间
+      assert.throws(
+        () =>
+          buildStatsWorkbookData(
+            { from: "2026-11-20", to: "2026-11-20", maxRows: 2 },
+            intradayDeps
+          ),
+        (err) => {
+          assert.strictEqual(err.code, ROW_LIMIT_EXCEEDED_CODE);
+          assert.strictEqual(err.sheetName, "作品时段明细");
+          assert.strictEqual(
+            err.message,
+            "数据量过大（3 行），请缩小日期范围后再导出"
+          );
+          return true;
+        }
+      );
+      console.log("✓ S9 作品时段明细 sheet（顺序/19列/跨边界增量/距上次小时数/字段说明/行上限）通过");
     }
 
     // 恢复 require.cache

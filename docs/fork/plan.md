@@ -21,6 +21,17 @@
 | S6 | feat/stats-fuzzy-link | 跨平台作品模糊匹配自动合并（作品↔target + 无发布记录跨平台聚类）+ 手工矫正持久化（link-overrides.json）+ 界面矫正交互 + 导出新列 |
 | S7 | feat/stats-analysis | 纯规则「数据分析」页（7 节分析 + 采集掉0异常剔除重算 + 上推荐识别 + 文字小结）+ Excel「分析」sheet（与 GUI 共用计算与默认截止日） |
 | S8 | feat/stats-charts | ECharts 5.5.1 按需封装 `StatsChart.vue` +「数据分析」6 节可视化图表 + 导出单图/全部图表 PNG +「作品汇总」单内容播放走势弹窗 |
+| S9 | feat/stats-intraday | 固定时段内每 N 小时（默认 2）自动采集 + 分时段作品快照 `works-intraday/YYYY-MM-DD.json`（含保留期清理）+ 作品趋势「按天/按时段」+「最近采集」列 +「新作品前 24 小时」图 + Excel「作品时段明细」sheet |
+
+## S9：固定时段循环自动采集 + 作品分时段数据（`feat/stats-intraday`）
+- **设置与时段槽调度（`src/renderer/utils/statsScheduler.js` + `src/main/services/dataStats/index.js` + `store.js`）**：
+  - 设置扩展为 `{ enabled, mode: "interval"|"daily", startTime: "08:00", endTime: "22:00", intervalHours: 2, time: "10:00", retentionDays: 60 }`，`intervalHours` 支持 `1/2/3/4/6`；旧设置 `{ enabled, time }` 自动迁移为 `mode: "daily"`，保持旧行为不擅自加大频率；时段槽从 `startTime` 起每 `intervalHours` 一槽（含恰好落点的 `endTime`），`endTime < startTime` 按跨零点计算且槽日期按槽开始时刻的 UTC+8 日历日。
+  - 渲染层维持 60s 轮询，在 `[slotStart, nextSlotStart)` 内且未跑过时向主进程发送 `stats:auto-run { slot: "YYYY-MM-DD HH:mm", slotEndMs, retentionDays }`；主进程 `auto-run.json` 升级为兼容旧日期记录与新时段槽记录（按日历日保留最近 14 天），保持内存守卫、开跑前落盘与 `collecting` 互斥（忙则下一轮重试，已过下一槽时刻返回 `expired` 放弃不补采，休眠/关机漏槽直接跳过），分区跳重在分时段模式下改为按槽（`collectedBySlot`），`daily` 模式行为与历史完全一致。
+- **分时段快照存储（`src/main/services/dataStats/store.js` + `statsTable.js`）**：
+  - 每次 `mergeWorks` 维持 `works-daily` 语义不变，同时原子写入 `<userData>/data-stats/<group>/<platform>/works-intraday/YYYY-MM-DD.json`（自动采集用槽键，手动采集按 UTC+8 实际时刻向下取整为 `"HH:00"`，同槽覆盖、跨零点放弃）；每天首次写入成功后自动清理 `works-intraday/` 下超过 `retentionDays` 的合法 `YYYY-MM-DD.json` 普通文件；提供 `readWorksIntraday(group, platform, { from, to })`（按时间升序，损坏文件 warn 跳过）与 `buildWorkIntradayRows`（计算播放/点赞/评论较上次增量与距上次小时数）。
+- **展示、分析与 Excel（`statsAnalysis.js` + `statsExport.js` + `statsChartOptions.js` + `dataStats/index.vue`）**：
+  - 设置栏支持模式切换、起止时段、间隔与风控/平曲线提示；「作品汇总」表新增「最近采集」列（取内容各平台作品最新 `collectedAt`）；趋势弹窗新增「按天 / 按时段」切换及 1/3/7 天区间（默认 3 天），对接新 IPC `stats:get-content-intraday`（与汇总共用关联与 `link-overrides`）；「数据分析」新增「新作品前 24 小时」折线图（近 7 天内发布内容，x=发布后小时数，最多 10 条，复用 `StatsChart` 与平台色）。
+  - Excel 在「作品日明细」后新增「作品时段明细」sheet（19 列，含播放/点赞/评论较上次增量与距上次小时数），行数计入现有 `200000` 行上限并同步补充「字段说明」。
 
 ## S8：数据可视化（`feat/stats-charts`）
 - **依赖与通用组件（`package.json` + `src/renderer/components/StatsChart.vue` + `src/renderer/utils/statsChartOptions.js`）**：引入 `echarts@5.5.1`（本地打包，按需注册 `LineChart`/`BarChart`/`PieChart`/`HeatmapChart` 与必要组件）；自研 `StatsChart.vue` 通用组件（`ResizeObserver` 自适应与 `el-tabs` 隐藏切回重算尺寸、空数据展示「暂无数据」占位、暴露 `getDataURL()` 供导出 PNG）；全页共用固定 7 平台配色常量（`PLATFORM_COLORS` / `getPlatformColor`）；图表 option 全部抽离为纯函数 `statsChartOptions.js`（缺天补空连续日期轴 + `connectNulls: false`、折线数据点 `> 2000` 自动启用 `sampling: "lttb"`）。

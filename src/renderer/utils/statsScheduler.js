@@ -1,25 +1,40 @@
 /**
- * 每日定时自动采集调度器（渲染层）：
- * - 设置保存在 localStorage "statsAutoCollect"：{ enabled, time, lastRunDate }
- *   其中 lastRunDate 仅作界面展示，不参与跳过判定；「每天只跑一次」的权威判定在主进程 stats:auto-run
+ * 定时自动采集调度器（渲染层）：
+ * - 支持两种模式：
+ *   - daily：每日定点一次（沿用 S3 全部语义，兼容旧配置 { enabled, time, lastRunDate }）
+ *   - interval：固定时段 [startTime, endTime] 内每 intervalHours（1/2/3/4/6）小时采集一个槽
+ *     - endTime < startTime 视为跨零点，槽日期按槽开始时刻的 UTC+8 日历日
+ *     - 到达某槽（当前时刻 >= 槽时刻 且 < 下一槽时刻）且该槽未跑过 → 调 stats:auto-run { accounts, slot: "YYYY-MM-DD HH:mm" }
+ *     - 电脑休眠/关机漏掉或 busy 拖过下一槽时刻的旧槽直接放弃不补采
+ * - 设置保存在 localStorage "statsAutoCollect"：
+ *   { enabled, mode, startTime, endTime, intervalHours, time, retentionDays, lastRunDate, lastRunSlot }
+ *   其中 lastRunDate / lastRunSlot 仅作界面展示，不参与跳过判定；权威防重裁决在主进程 stats:auto-run
  * - 启动后用单调时钟（performance.now）延迟 2 分钟，之后每 60s 轮询一次
- * - enabled 且本地时间 >= time 且内存标记 doneLocalDate !== 本地日期时，组装账号并调用 stats:auto-run：
- *   - "done" / "already-ran" → doneLocalDate = 本地日期，更新显示用 lastRunDate；done 时 $notify
- *   - "busy" 或 IPC 异常 → 不设标记，下一分钟继续重试
  */
 
 export const STORAGE_KEY = "statsAutoCollect";
 export const CHECK_INTERVAL_MS = 60 * 1000;
 export const STARTUP_DELAY_MS = 2 * 60 * 1000;
+export const VALID_INTERVAL_HOURS = Object.freeze([1, 2, 3, 4, 6]);
+export const DEFAULT_RETENTION_DAYS = 60;
 
 export const DEFAULT_SETTINGS = Object.freeze({
   enabled: true,
+  mode: "daily",
+  startTime: "08:00",
+  endTime: "22:00",
+  intervalHours: 2,
   time: "10:00",
+  retentionDays: DEFAULT_RETENTION_DAYS,
   lastRunDate: "",
+  lastRunSlot: "",
 });
 
+const UTC8_MS = 8 * 3600 * 1000;
+const DAY_MS = 24 * 3600 * 1000;
 const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
 const DATE_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+const SLOT_RE = /^(\d{4}-\d{2}-\d{2}) ([01]\d|2[0-3]):([0-5]\d)$/;
 const MAIN_ROUTE_PREFIXES = [
   "/data-stats",
   "/video-manager",
@@ -53,6 +68,13 @@ export function isValidDateStr(date) {
   );
 }
 
+export function isValidSlotStr(slot) {
+  if (typeof slot !== "string") return false;
+  const match = SLOT_RE.exec(slot);
+  if (!match) return false;
+  return isValidDateStr(match[1]);
+}
+
 /** 本地日期格式化为 YYYY-MM-DD；非法时间返回空串 */
 export function formatLocalDate(now) {
   const dt = now instanceof Date ? now : new Date(now);
@@ -63,17 +85,129 @@ export function formatLocalDate(now) {
   return `${year}-${month}-${day}`;
 }
 
-/** 清洗配置对象，任何坏数据均回落到对应默认值 */
+/** UTC+8 日期格式化为 YYYY-MM-DD；非法时间返回空串 */
+export function formatUtc8Date(now) {
+  const dt = now instanceof Date ? now : new Date(now);
+  const ms = dt.getTime();
+  if (!Number.isFinite(ms)) return "";
+  return new Date(ms + UTC8_MS).toISOString().slice(0, 10);
+}
+
+/** 解析 UTC+8 日历日 YYYY-MM-DD 零点对应的真实 UTC 毫秒时间戳 */
+function utc8DayStartMs(ymd) {
+  if (!isValidDateStr(ymd)) return null;
+  const [y, m, d] = ymd.split("-").map(Number);
+  return Date.UTC(y, m - 1, d) - UTC8_MS;
+}
+
+function shiftUtc8Date(ymd, deltaDays) {
+  const start = utc8DayStartMs(ymd);
+  if (start === null) return "";
+  return formatUtc8Date(start + deltaDays * DAY_MS);
+}
+
+function normalizeIntervalHours(val) {
+  const n = typeof val === "number" ? val : Number(val);
+  if (Number.isInteger(n) && VALID_INTERVAL_HOURS.includes(n)) {
+    return n;
+  }
+  return DEFAULT_SETTINGS.intervalHours;
+}
+
+function normalizeRetentionDays(val) {
+  const n = typeof val === "number" ? val : Number(val);
+  if (Number.isInteger(n) && n >= 1 && n <= 3650) {
+    return n;
+  }
+  return DEFAULT_RETENTION_DAYS;
+}
+
+/**
+ * 清洗配置对象，任何坏数据均回落到对应默认值。
+ * 旧设置 { enabled, time } 不含 mode 字段时自动迁移为 mode="daily"（不擅自加大采集频率）。
+ */
 export function normalizeSettings(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     return { ...DEFAULT_SETTINGS };
   }
+  const mode = raw.mode === "interval" ? "interval" : "daily";
   return {
     enabled:
       typeof raw.enabled === "boolean" ? raw.enabled : DEFAULT_SETTINGS.enabled,
+    mode,
+    startTime: isValidTimeStr(raw.startTime)
+      ? raw.startTime
+      : DEFAULT_SETTINGS.startTime,
+    endTime: isValidTimeStr(raw.endTime) ? raw.endTime : DEFAULT_SETTINGS.endTime,
+    intervalHours: normalizeIntervalHours(raw.intervalHours),
     time: isValidTimeStr(raw.time) ? raw.time : DEFAULT_SETTINGS.time,
+    retentionDays: normalizeRetentionDays(raw.retentionDays),
     lastRunDate: isValidDateStr(raw.lastRunDate) ? raw.lastRunDate : "",
+    lastRunSlot: isValidSlotStr(raw.lastRunSlot) ? raw.lastRunSlot : "",
   };
+}
+
+/**
+ * 计算以指定 UTC+8 日历日 baseDate 为起点的固定时段内所有槽：
+ * - 从 startTime 起每 intervalHours 小时一个槽，若 endTime 恰好落在槽上则包含 endTime
+ * - endTime < startTime 视为跨零点（延续到次日 endTime），每个槽的日期按槽开始时刻的 UTC+8 日历日
+ * - 每个槽的有效窗口为 [startMs, endMs)，其中 endMs = startMs + intervalHours * 3600s
+ */
+export function buildScheduleSlots(baseDate, settings) {
+  const baseStartMs = utc8DayStartMs(baseDate);
+  if (baseStartMs === null) return [];
+  const cfg = normalizeSettings(settings);
+  const startMin = parseTimeToMinutes(cfg.startTime);
+  const endMin = parseTimeToMinutes(cfg.endTime);
+  if (startMin === null || endMin === null) return [];
+
+  const stepMin = cfg.intervalHours * 60;
+  const spanMin = endMin < startMin ? endMin + 1440 - startMin : endMin - startMin;
+  const slots = [];
+
+  for (let offsetMin = 0; offsetMin <= spanMin; offsetMin += stepMin) {
+    const startMs = baseStartMs + (startMin + offsetMin) * 60000;
+    const endMs = startMs + stepMin * 60000;
+    const shifted = new Date(startMs + UTC8_MS);
+    const date = shifted.toISOString().slice(0, 10);
+    const time = shifted.toISOString().slice(11, 16);
+    slots.push({
+      slot: `${date} ${time}`,
+      date,
+      time,
+      startMs,
+      endMs,
+    });
+  }
+  return slots;
+}
+
+/**
+ * 纯函数：在 interval 模式下计算 now 时刻所属的当前活动槽（满足 startMs <= now < endMs）。
+ * 若未启用、非 interval 模式或当前时刻不在任何槽窗口内，返回 null。
+ */
+export function getCurrentSlot(now, settings) {
+  const dt = now instanceof Date ? now : new Date(now);
+  const nowMs = dt.getTime();
+  if (!Number.isFinite(nowMs)) return null;
+  const cfg = normalizeSettings(settings);
+  if (!cfg.enabled || cfg.mode !== "interval") return null;
+
+  const todayUtc8 = formatUtc8Date(nowMs);
+  if (!todayUtc8) return null;
+  const yesterdayUtc8 = shiftUtc8Date(todayUtc8, -1);
+
+  for (const baseDate of [yesterdayUtc8, todayUtc8]) {
+    if (!baseDate) continue;
+    const slots = buildScheduleSlots(baseDate, cfg);
+    for (let i = 0; i < slots.length; i++) {
+      const s = slots[i];
+      if (nowMs >= s.startMs && nowMs < s.endMs) {
+        return s;
+      }
+    }
+  }
+  return null;
 }
 
 /** 判断当前渲染器的 location 是否为主窗口页面（排除登录窗、加载窗及子窗口） */
@@ -102,12 +236,22 @@ export function isMainWindowLocation(
   );
 }
 
-/** 纯函数：基于本地时间与内存 doneLocalDate 判断本轮是否应向主进程发起自动采集 */
-export function shouldRun({ now, settings, doneLocalDate = "" } = {}) {
+/**
+ * 纯函数：判断本轮是否应向主进程发起自动采集。
+ * - daily 模式：基于本地时间与内存 doneLocalDate（与 S3 完全一致）
+ * - interval 模式：基于 UTC+8 时段槽与内存 doneSlot
+ */
+export function shouldRun({ now, settings, doneLocalDate = "", doneSlot = "" } = {}) {
   const dt = now instanceof Date ? now : new Date(now);
   if (!Number.isFinite(dt.getTime())) return false;
   const cfg = normalizeSettings(settings);
   if (!cfg.enabled) return false;
+
+  if (cfg.mode === "interval") {
+    const active = getCurrentSlot(dt, cfg);
+    return Boolean(active && doneSlot !== active.slot);
+  }
+
   const localDate = formatLocalDate(dt);
   if (!localDate || doneLocalDate === localDate) return false;
   const targetMinutes = parseTimeToMinutes(cfg.time);
@@ -117,9 +261,15 @@ export function shouldRun({ now, settings, doneLocalDate = "" } = {}) {
 
 /** 组装完成后的 Element UI $notify 参数 */
 export function buildNotifyPayload(res) {
+  const slotSuffix =
+    res && typeof res.slot === "string" && isValidSlotStr(res.slot)
+      ? `（${res.slot.slice(11, 16)}）`
+      : "";
+  const prefix = slotSuffix ? "定时自动采集" : "每日自动采集";
+
   if (res && typeof res.error === "string" && res.error) {
     return {
-      title: "每日自动采集失败",
+      title: `${prefix}失败${slotSuffix}`,
       message: res.error,
       type: "warning",
       duration: 6000,
@@ -140,7 +290,7 @@ export function buildNotifyPayload(res) {
 
   if (res && res.cancelled) {
     return {
-      title: "每日自动采集已取消",
+      title: `${prefix}已取消${slotSuffix}`,
       message: `${countText}，详情请查看「拉取记录」`,
       type: "info",
       duration: 6000,
@@ -148,14 +298,14 @@ export function buildNotifyPayload(res) {
   }
   if (failCount > 0) {
     return {
-      title: "每日自动采集完成",
+      title: `${prefix}完成${slotSuffix}`,
       message: `${countText}，详情请查看「拉取记录」`,
       type: "warning",
       duration: 6000,
     };
   }
   return {
-    title: "每日自动采集完成",
+    title: `${prefix}完成${slotSuffix}`,
     message: countText,
     type: successCount > 0 ? "success" : "info",
     duration: 6000,
@@ -236,10 +386,22 @@ export function saveSettings(settings, storage = getDefaultStorage()) {
   return { ok: true, settings: normalized };
 }
 
+const UPDATABLE_SETTINGS_KEYS = [
+  "enabled",
+  "mode",
+  "startTime",
+  "endTime",
+  "intervalHours",
+  "time",
+  "retentionDays",
+  "lastRunDate",
+  "lastRunSlot",
+];
+
 export function updateSettings(patch, storage = getDefaultStorage()) {
   const merged = { ...loadSettings(storage) };
   if (patch && typeof patch === "object" && !Array.isArray(patch)) {
-    for (const key of ["enabled", "time", "lastRunDate"]) {
+    for (const key of UPDATABLE_SETTINGS_KEYS) {
       if (patch[key] !== undefined) merged[key] = patch[key];
     }
   }
@@ -251,15 +413,25 @@ function defaultGetAccounts() {
   return buildCollectAccounts();
 }
 
-function defaultAutoRun(accounts) {
+function defaultAutoRun(accounts, meta) {
   const { ipcRenderer } = require("electron");
   if (ipcRenderer && typeof ipcRenderer.invoke === "function") {
-    return ipcRenderer.invoke("stats:auto-run", { accounts });
+    const payload = { accounts };
+    if (meta && typeof meta.slot === "string" && meta.slot) {
+      payload.slot = meta.slot;
+    }
+    if (meta && Number.isFinite(meta.slotEndMs)) {
+      payload.slotEndMs = meta.slotEndMs;
+    }
+    if (meta && Number.isInteger(meta.retentionDays) && meta.retentionDays > 0) {
+      payload.retentionDays = meta.retentionDays;
+    }
+    return ipcRenderer.invoke("stats:auto-run", payload);
   }
   return Promise.reject(new Error("ipcRenderer 不可用"));
 }
 
-/** 创建可测试、可依赖注入的每日自动采集调度器实例 */
+/** 创建可测试、可依赖注入的定时自动采集调度器实例 */
 export function createStatsScheduler(options = {}) {
   const {
     storage,
@@ -281,6 +453,7 @@ export function createStatsScheduler(options = {}) {
   let running = false;
   let stopped = true;
   let doneLocalDate = "";
+  let doneSlot = "";
 
   async function tick() {
     if (stopped || running) {
@@ -304,7 +477,10 @@ export function createStatsScheduler(options = {}) {
     }
 
     const settings = loadSettings(storage);
-    if (!shouldRun({ now: currentNow, settings, doneLocalDate })) {
+    const isInterval = settings.mode === "interval";
+    const activeSlot = isInterval ? getCurrentSlot(currentNow, settings) : null;
+
+    if (!shouldRun({ now: currentNow, settings, doneLocalDate, doneSlot })) {
       return { ran: false, reason: "not-due" };
     }
 
@@ -321,9 +497,21 @@ export function createStatsScheduler(options = {}) {
         return { ran: false, reason: "no-accounts" };
       }
 
+      const runMeta = isInterval
+        ? {
+            mode: "interval",
+            slot: activeSlot.slot,
+            slotEndMs: activeSlot.endMs,
+            retentionDays: settings.retentionDays,
+          }
+        : {
+            mode: "daily",
+            retentionDays: settings.retentionDays,
+          };
+
       let res;
       try {
-        res = await autoRun(accounts);
+        res = await autoRun(accounts, runMeta);
       } catch (err) {
         return {
           ran: false,
@@ -342,10 +530,53 @@ export function createStatsScheduler(options = {}) {
         return { ran: false, reason: res.status || "unknown" };
       }
 
+      if (isInterval) {
+        doneSlot = activeSlot.slot;
+        const displaySlot = isValidSlotStr(res.slot) ? res.slot : activeSlot.slot;
+        const displayDate = isValidDateStr(res.date)
+          ? res.date
+          : displaySlot.slice(0, 10);
+        const cur = loadSettings(storage);
+        if (cur.lastRunDate !== displayDate || cur.lastRunSlot !== displaySlot) {
+          updateSettings(
+            { lastRunDate: displayDate, lastRunSlot: displaySlot },
+            storage
+          );
+        }
+        if (res.status === "already-ran") {
+          return {
+            ran: false,
+            reason: "already-ran",
+            date: displayDate,
+            slot: displaySlot,
+          };
+        }
+        if (!stopped) {
+          if (typeof notify === "function") {
+            try {
+              notify(buildNotifyPayload({ ...res, slot: displaySlot }));
+            } catch (_) {}
+          }
+          if (typeof onRunComplete === "function") {
+            try {
+              onRunComplete(res);
+            } catch (_) {}
+          }
+          if (emitGlobalRunComplete) {
+            emitListeners(runCompleteListeners, res);
+          }
+        }
+        return { ran: true, result: res, date: displayDate, slot: displaySlot };
+      }
+
       doneLocalDate = localDate;
       const displayDate = isValidDateStr(res.date) ? res.date : "";
-      if (displayDate && loadSettings(storage).lastRunDate !== displayDate) {
-        updateSettings({ lastRunDate: displayDate }, storage);
+      const cur = loadSettings(storage);
+      if (
+        (displayDate && cur.lastRunDate !== displayDate) ||
+        (displayDate && cur.lastRunSlot !== "")
+      ) {
+        updateSettings({ lastRunDate: displayDate, lastRunSlot: "" }, storage);
       }
 
       if (res.status === "already-ran") {
@@ -391,7 +622,7 @@ export function createStatsScheduler(options = {}) {
   }
 
   function getState() {
-    return { running, stopped, startedAtMono, doneLocalDate };
+    return { running, stopped, startedAtMono, doneLocalDate, doneSlot };
   }
 
   return { start, stop, tick, getState };
@@ -424,8 +655,17 @@ export default {
   DEFAULT_SETTINGS,
   CHECK_INTERVAL_MS,
   STARTUP_DELAY_MS,
+  VALID_INTERVAL_HOURS,
+  DEFAULT_RETENTION_DAYS,
+  isValidTimeStr,
+  parseTimeToMinutes,
+  isValidDateStr,
+  isValidSlotStr,
   formatLocalDate,
+  formatUtc8Date,
   normalizeSettings,
+  buildScheduleSlots,
+  getCurrentSlot,
   isMainWindowLocation,
   shouldRun,
   buildNotifyPayload,

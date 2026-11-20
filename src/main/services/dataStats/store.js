@@ -173,7 +173,8 @@ function parseValidPublishTime(raw) {
  * - 已有作品：更新当前累计值；若重采得到有效 publishTime（>0 且可解析）同步更新
  * - 展示时优先用封闭值（closedStats），未封闭用当前值
  */
-function mergeWorks(group, platform, newWorks, now = Date.now()) {
+function mergeWorks(group, platform, newWorks, now = Date.now(), options = null) {
+  const startedReal = Date.now();
   const data = readWorks(group, platform);
   const byId = new Map(data.works.map((w) => [w.workId, w]));
   // 首次全量导入时不做封闭：封闭语义是「两次采集之间出现了新发布」，
@@ -231,7 +232,12 @@ function mergeWorks(group, platform, newWorks, now = Date.now()) {
   // 展示按发布时间倒序
   data.works.sort((a, b) => (b.publishTime || 0) - (a.publishTime || 0));
   writeWorks(group, platform, data);
-  recordWorksDaily(group, platform, sorted, now);
+  recordWorksDaily(group, platform, sorted, now, startedReal);
+  recordWorksIntraday(group, platform, sorted, {
+    ...(isPlainObject(options) ? options : {}),
+    now,
+    _startedReal: startedReal,
+  });
   return data;
 }
 
@@ -563,7 +569,7 @@ function readWorksDailyLatestAsOf(group, platform, cutoffDate = "") {
  * 写入作品当日累计快照（UTC+8，只读写当天 YYYY-MM-DD.json，不加锁、不写非当天文件）。
  * 读当天文件（不存在/损坏视为空，损坏时 warn）→ 按 workId 合并 → 原子写；失败仅 warn，不影响 mergeWorks。
  */
-function recordWorksDaily(group, platform, works, now = Date.now()) {
+function recordWorksDaily(group, platform, works, now = Date.now(), startedRealArg) {
   if (!works || !works.length) return;
   const validWorks = [];
   for (const w of works) {
@@ -575,7 +581,7 @@ function recordWorksDaily(group, platform, works, now = Date.now()) {
   const file = path.join(worksDailyDir(group, platform), `${today}.json`);
   // 跨零点保护：写入耗时内若 UTC+8 日期已变，放弃替换，绝不改写已成为「昨天」的文件。
   // 用「注入的 now + 实际流逝时间」推算当前时刻，兼容测试注入时间。
-  const startedReal = Date.now();
+  const startedReal = typeof startedRealArg === "number" ? startedRealArg : Date.now();
   const ensureSameDay = () => {
     if (todayStr(now + (Date.now() - startedReal)) !== today) {
       const err = new Error(`写入跨过零点，放弃改写 ${today} 的快照`);
@@ -599,6 +605,381 @@ function recordWorksDaily(group, platform, works, now = Date.now()) {
       (err && err.message) || err
     );
   }
+}
+
+/* ---------------- works-intraday（作品分时段快照，按天分文件） ---------------- */
+
+const DEFAULT_INTRADAY_RETENTION_DAYS = 60;
+const SLOT_TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
+const AUTO_RUN_SLOT_RE = /^(\d{4}-\d{2}-\d{2}) ([01]\d|2[0-3]):([0-5]\d)$/;
+const DAY_MS = 86400000;
+// 记录每个 works-intraday 目录当天是否已完成过期清理：dir -> "YYYY-MM-DD|retentionDays"
+const intradayCleanupDone = new Map();
+
+function worksIntradayDir(group, platform) {
+  return path.join(accountDir(group, platform), "works-intraday");
+}
+
+function dateStrToDayNum(ymd) {
+  if (!isValidAutoRunDate(ymd)) return null;
+  const [y, m, d] = ymd.split("-").map(Number);
+  return Math.floor(Date.UTC(y, m - 1, d) / DAY_MS);
+}
+
+/** 将时间戳向下取整到 UTC+8 整点，返回 "YYYY-MM-DD HH:00" */
+function formatManualSlotKey(now = Date.now()) {
+  const ms = now instanceof Date ? now.getTime() : Number(now);
+  const safeMs = Number.isFinite(ms) ? ms : Date.now();
+  const iso = new Date(safeMs + 8 * 3600e3).toISOString();
+  return `${iso.slice(0, 10)} ${iso.slice(11, 13)}:00`;
+}
+
+function normalizeIntradayCollectedAt(raw) {
+  if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) return raw;
+  if (typeof raw === "string" && raw.trim()) {
+    const s = raw.trim();
+    const ms = /^\d+$/.test(s) ? Number(s) : Date.parse(s);
+    if (Number.isFinite(ms) && ms > 0) return ms;
+  }
+  return null;
+}
+
+function normalizeRetentionDaysOption(raw) {
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (Number.isInteger(n) && n >= 1 && n <= 3650) return n;
+  return DEFAULT_INTRADAY_RETENTION_DAYS;
+}
+
+/**
+ * 解析单日分时段快照文件，返回无原型 slots 字典 `{ "HH:mm": { collectedAt, works } }`。
+ * 不存在返回 null；JSON 损坏或结构无效告警并返回 null；读 I/O 错误上抛由调用方处理。
+ */
+function parseIntradayDayFile(file) {
+  let raw;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch (err) {
+    if (err && err.code === "ENOENT") return null;
+    throw err;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    console.warn(`[dataStats] 作品分时段快照 JSON 损坏 (${file}):`, (err && err.message) || err);
+    return null;
+  }
+  if (!isPlainObject(parsed) || !isPlainObject(parsed.slots)) {
+    console.warn(`[dataStats] 作品分时段快照结构无效 (${file})`);
+    return null;
+  }
+  const slots = Object.create(null);
+  for (const slotTime of Object.keys(parsed.slots)) {
+    if (!SLOT_TIME_RE.test(slotTime)) continue;
+    const slotDesc = Object.getOwnPropertyDescriptor(parsed.slots, slotTime);
+    const slotObj = slotDesc ? slotDesc.value : null;
+    if (!isPlainObject(slotObj) || !isPlainObject(slotObj.works)) continue;
+    const works = Object.create(null);
+    for (const workId of Object.keys(slotObj.works)) {
+      const wDesc = Object.getOwnPropertyDescriptor(slotObj.works, workId);
+      if (wDesc && isPlainObject(wDesc.value)) {
+        works[workId] = pickWorkDailyStats(wDesc.value);
+      }
+    }
+    slots[slotTime] = {
+      collectedAt: normalizeIntradayCollectedAt(slotObj.collectedAt),
+      works,
+    };
+  }
+  return slots;
+}
+
+/**
+ * 清理超过 retentionDays 的分时段快照文件：
+ * 仅删除 works-intraday 目录下文件名严格符合 YYYY-MM-DD.json 且为普通文件、
+ * 日期早于 today - retentionDays 的文件；不触碰目录内外任何其他文件。
+ */
+function cleanupWorksIntraday(
+  group,
+  platform,
+  now = Date.now(),
+  retentionDays = DEFAULT_INTRADAY_RETENTION_DAYS
+) {
+  const dir = worksIntradayDir(group, platform);
+  const today = todayStr(now);
+  const todayDayNum = dateStrToDayNum(today);
+  if (todayDayNum === null) return [];
+  const keepDays = normalizeRetentionDaysOption(retentionDays);
+  const minKeepDayNum = todayDayNum - keepDays;
+
+  let entries;
+  try {
+    entries = fs.readdirSync(dir);
+  } catch (err) {
+    if (err && err.code === "ENOENT") return [];
+    console.warn(
+      `[dataStats] 清理 works-intraday 读目录失败 (${dir}):`,
+      (err && err.message) || err
+    );
+    return [];
+  }
+
+  const deleted = [];
+  for (const name of entries) {
+    const match = WORKS_DAILY_FILE_RE.exec(name);
+    if (!match) continue;
+    const fileDate = match[1];
+    const fileDayNum = dateStrToDayNum(fileDate);
+    if (fileDayNum === null || fileDayNum >= minKeepDayNum) continue;
+    const fullPath = path.join(dir, name);
+    try {
+      const stat = fs.lstatSync(fullPath);
+      if (!stat.isFile()) continue;
+      fs.unlinkSync(fullPath);
+      deleted.push(name);
+    } catch (err) {
+      console.warn(
+        `[dataStats] 清理过期 works-intraday 文件失败 (${fullPath}):`,
+        (err && err.message) || err
+      );
+    }
+  }
+  return deleted;
+}
+
+/**
+ * 写入作品分时段快照（works-intraday/YYYY-MM-DD.json）：
+ * - 自动采集：使用传入 slot ("YYYY-MM-DD HH:mm") 的日期与时段作为文件与槽键
+ * - 手动采集（未传 slot）：按实际时刻（UTC+8）向下取整到整点 "HH:00"
+ * - 同槽重复采集覆盖该槽；同日其他槽完整保留
+ * - 复用原子写与跨零点保护；每天首次写入成功后自动清理超过 retentionDays 的历史 intraday 文件
+ */
+function recordWorksIntraday(group, platform, works, optionsOrNow, extraOpts) {
+  if (!works || !works.length) return;
+  const validWorks = [];
+  for (const w of works) {
+    if (w && w.workId != null && w.workId !== "") validWorks.push(w);
+  }
+  if (!validWorks.length) return;
+
+  let opts;
+  if (isPlainObject(optionsOrNow)) {
+    opts = optionsOrNow;
+  } else {
+    opts = {
+      ...(isPlainObject(extraOpts) ? extraOpts : {}),
+      now: optionsOrNow !== undefined ? optionsOrNow : Date.now(),
+    };
+  }
+  const now =
+    typeof opts.now === "number" && Number.isFinite(opts.now) ? opts.now : Date.now();
+  const retentionDays = normalizeRetentionDaysOption(opts.retentionDays);
+
+  let targetDate;
+  let slotTime;
+  const rawSlot = typeof opts.slot === "string" ? opts.slot.trim() : "";
+  if (rawSlot && isValidAutoRunSlot(rawSlot)) {
+    targetDate = rawSlot.slice(0, 10);
+    slotTime = rawSlot.slice(11, 16);
+  } else if (rawSlot && SLOT_TIME_RE.test(rawSlot)) {
+    targetDate = todayStr(now);
+    slotTime = rawSlot;
+  } else {
+    const manualSlot = formatManualSlotKey(now);
+    targetDate = manualSlot.slice(0, 10);
+    slotTime = manualSlot.slice(11, 16);
+  }
+
+  const startedDay = todayStr(now);
+  const startedReal =
+    typeof opts._startedReal === "number" ? opts._startedReal : Date.now();
+  const ensureSameDay = () => {
+    if (todayStr(now + (Date.now() - startedReal)) !== startedDay) {
+      const err = new Error(`写入跨过零点，放弃改写 ${targetDate} 的分时段快照`);
+      err.code = "EDAYROLL";
+      throw err;
+    }
+  };
+
+  const dir = worksIntradayDir(group, platform);
+  const file = path.join(dir, `${targetDate}.json`);
+
+  try {
+    const existingSlots = parseIntradayDayFile(file) || Object.create(null);
+    const slotWorks = Object.create(null);
+    for (const w of validWorks) {
+      slotWorks[String(w.workId)] = pickWorkDailyStats(w);
+    }
+    existingSlots[slotTime] = {
+      collectedAt: now,
+      works: slotWorks,
+    };
+
+    writeWorksDailyAtomic(
+      file,
+      {
+        date: targetDate,
+        slots: existingSlots,
+      },
+      ensureSameDay
+    );
+
+    const cleanupKey = `${startedDay}|${retentionDays}`;
+    if (intradayCleanupDone.get(dir) !== cleanupKey) {
+      intradayCleanupDone.set(dir, cleanupKey);
+      cleanupWorksIntraday(group, platform, now, retentionDays);
+    }
+  } catch (err) {
+    console.warn(
+      `[dataStats] 写入 works-intraday/${targetDate}.json 失败 (${group}/${platform}):`,
+      (err && err.message) || err
+    );
+  }
+}
+
+/**
+ * 读取作品分时段快照，返回无原型字典：
+ * `{ workId: [{ date, slot, collectedAt, play, like, comment, share, favorite, fansDelta }] }`
+ * 按时间升序（date → slot → collectedAt）；支持 { from, to } 日期范围过滤；损坏/读失败文件 warn 并跳过。
+ */
+function readWorksIntraday(group, platform, range = {}) {
+  const result = Object.create(null);
+  const opts = isPlainObject(range) ? range : {};
+  const fromStr =
+    typeof opts.from === "string" && isValidAutoRunDate(opts.from.trim())
+      ? opts.from.trim()
+      : "";
+  const toStr =
+    typeof opts.to === "string" && isValidAutoRunDate(opts.to.trim())
+      ? opts.to.trim()
+      : "";
+  if (fromStr && toStr && fromStr > toStr) return result;
+
+  const dir = worksIntradayDir(group, platform);
+  let entries;
+  try {
+    entries = fs.readdirSync(dir);
+  } catch (err) {
+    if (err && err.code === "ENOENT") return result;
+    console.warn(
+      `[dataStats] 读取 works-intraday 目录失败 (${dir}):`,
+      (err && err.message) || err
+    );
+    return result;
+  }
+
+  entries.sort();
+  for (const name of entries) {
+    const match = WORKS_DAILY_FILE_RE.exec(name);
+    if (!match) continue;
+    const date = match[1];
+    if (!isValidAutoRunDate(date)) continue;
+    if (fromStr && date < fromStr) continue;
+    if (toStr && date > toStr) continue;
+
+    const file = path.join(dir, name);
+    let slots;
+    try {
+      slots = parseIntradayDayFile(file);
+    } catch (err) {
+      console.warn(
+        `[dataStats] 读取作品分时段快照失败，已跳过 (${file}):`,
+        (err && err.message) || err
+      );
+      continue;
+    }
+    if (!slots) continue;
+
+    const slotTimes = Object.keys(slots).sort();
+    for (const slotTime of slotTimes) {
+      const slotEntry = slots[slotTime];
+      if (!slotEntry || !isPlainObject(slotEntry.works)) continue;
+      const collectedAt = slotEntry.collectedAt;
+      for (const workId of Object.keys(slotEntry.works)) {
+        const stats = slotEntry.works[workId];
+        if (!result[workId]) result[workId] = [];
+        result[workId].push({
+          date,
+          slot: slotTime,
+          collectedAt,
+          ...stats,
+        });
+      }
+    }
+  }
+
+  for (const workId of Object.keys(result)) {
+    result[workId].sort((a, b) => {
+      if (a.date !== b.date) return a.date < b.date ? -1 : 1;
+      if (a.slot !== b.slot) return a.slot < b.slot ? -1 : 1;
+      return (a.collectedAt || 0) - (b.collectedAt || 0);
+    });
+  }
+
+  return result;
+}
+
+/**
+ * 仅读取截至 cutoffDate 每个作品在 works-intraday 中最近一次 collectedAt（用于作品汇总「最近采集」列）。
+ * 返回无原型字典 `{ [workId]: maxCollectedAtMs }`。
+ */
+function readWorksIntradayLatestCollectedAt(group, platform, cutoffDate = "") {
+  const out = Object.create(null);
+  const cutoff =
+    typeof cutoffDate === "string" && isValidAutoRunDate(cutoffDate.trim())
+      ? cutoffDate.trim()
+      : "";
+  const dir = worksIntradayDir(group, platform);
+  let entries;
+  try {
+    entries = fs.readdirSync(dir);
+  } catch (err) {
+    if (!err || err.code !== "ENOENT") {
+      console.warn(
+        `[dataStats] 读取 works-intraday 目录失败 (${dir}):`,
+        (err && err.message) || err
+      );
+    }
+    return out;
+  }
+
+  const dayFiles = [];
+  for (const name of entries) {
+    const m = WORKS_DAILY_FILE_RE.exec(name);
+    if (!m) continue;
+    const date = m[1];
+    if (!isValidAutoRunDate(date)) continue;
+    if (cutoff && date > cutoff) continue;
+    dayFiles.push({ date, name });
+  }
+  dayFiles.sort((a, b) => (a.date > b.date ? -1 : a.date < b.date ? 1 : 0));
+
+  for (const { name } of dayFiles) {
+    const file = path.join(dir, name);
+    let slots;
+    try {
+      slots = parseIntradayDayFile(file);
+    } catch (err) {
+      console.warn(
+        `[dataStats] 读取作品分时段快照失败，已跳过 (${file}):`,
+        (err && err.message) || err
+      );
+      continue;
+    }
+    if (!slots) continue;
+    for (const slotTime of Object.keys(slots)) {
+      const slotEntry = slots[slotTime];
+      if (!slotEntry || !isPlainObject(slotEntry.works)) continue;
+      const ts = slotEntry.collectedAt;
+      if (typeof ts !== "number" || !Number.isFinite(ts) || ts <= 0) continue;
+      for (const workId of Object.keys(slotEntry.works)) {
+        if (out[workId] === undefined || ts > out[workId]) {
+          out[workId] = ts;
+        }
+      }
+    }
+  }
+  return out;
 }
 
 /* ---------------- meta ---------------- */
@@ -647,21 +1028,46 @@ function isValidAutoRunDate(str) {
   );
 }
 
-function normalizeAutoRuns(list) {
-  if (!Array.isArray(list)) return [];
-  const seen = new Set();
-  const out = [];
-  for (const item of list) {
-    if (!isValidAutoRunDate(item)) continue;
-    if (seen.has(item)) continue;
-    seen.add(item);
-    out.push(item);
-  }
-  return out.slice(-MAX_AUTO_RUN_DATES);
+function isValidAutoRunSlot(str) {
+  if (typeof str !== "string") return false;
+  const match = AUTO_RUN_SLOT_RE.exec(str);
+  if (!match) return false;
+  return isValidAutoRunDate(match[1]);
+}
+
+function isValidAutoRunEntry(str) {
+  return isValidAutoRunDate(str) || isValidAutoRunSlot(str);
 }
 
 /**
- * 读取 <userData>/data-stats/auto-run.json 中的已运行日期列表。
+ * 归一化 auto-run.json 记录：
+ * - 兼容旧按日期记录 ("YYYY-MM-DD") 与新按槽记录 ("YYYY-MM-DD HH:mm")
+ * - 去重保持追加顺序，按所属日期保留最近 MAX_AUTO_RUN_DATES（14）个不同日历日的全部记录
+ */
+function normalizeAutoRuns(list) {
+  if (!Array.isArray(list)) return [];
+  const seen = new Set();
+  const deduped = [];
+  for (const item of list) {
+    if (!isValidAutoRunEntry(item)) continue;
+    if (seen.has(item)) continue;
+    seen.add(item);
+    deduped.push(item);
+  }
+  // 从末尾向前收集最多 MAX_AUTO_RUN_DATES 个不同日历日（保留最新 14 天的全部槽与兼容日期记录）
+  const keptDates = new Set();
+  for (let i = deduped.length - 1; i >= 0; i--) {
+    const d = deduped[i].slice(0, 10);
+    if (!keptDates.has(d)) {
+      if (keptDates.size >= MAX_AUTO_RUN_DATES) continue;
+      keptDates.add(d);
+    }
+  }
+  return deduped.filter((item) => keptDates.has(item.slice(0, 10)));
+}
+
+/**
+ * 读取 <userData>/data-stats/auto-run.json 中的已运行日期/时段槽列表。
  * 不存在返回 []；JSON 损坏或结构无效告警并返回 []；读 I/O 错误上抛由调用方处理。
  */
 function readAutoRuns() {
@@ -688,15 +1094,15 @@ function readAutoRuns() {
 }
 
 /**
- * 追加运行日期到 <userData>/data-stats/auto-run.json（复用 S1 同款原子写，仅保留最近 14 个日期）。
- * 写入失败直接抛错，保留旧文件完整。
+ * 追加运行日期 ("YYYY-MM-DD") 或时段槽 ("YYYY-MM-DD HH:mm") 到 auto-run.json
+ * （复用原子写，仅保留最近 14 天的记录）。写入失败直接抛错，保留旧文件完整。
  */
-function appendAutoRun(date) {
-  if (!isValidAutoRunDate(date)) {
-    throw new Error(`非法自动采集日期: ${date}`);
+function appendAutoRun(entry) {
+  if (!isValidAutoRunEntry(entry)) {
+    throw new Error(`非法自动采集记录: ${entry}`);
   }
   const runs = readAutoRuns();
-  const normalized = normalizeAutoRuns([...runs, date]);
+  const normalized = normalizeAutoRuns([...runs, entry]);
   writeWorksDailyAtomic(autoRunFile(), { runs: normalized });
   return normalized;
 }
@@ -1045,12 +1451,20 @@ function readOverview() {
 module.exports = {
   METRIC_KEYS,
   WORK_STAT_KEYS,
+  DEFAULT_INTRADAY_RETENTION_DAYS,
   mergeDaily,
   mergeWorks,
+  recordWorksIntraday,
+  cleanupWorksIntraday,
   readDaily,
   readWorks,
   readWorksDaily,
   readWorksDailyLatestAsOf,
+  worksDailyDir,
+  worksIntradayDir,
+  readWorksIntraday,
+  readWorksIntradayLatestCollectedAt,
+  formatManualSlotKey,
   readAccount,
   readOverview,
   listAccounts,
@@ -1058,6 +1472,9 @@ module.exports = {
   appendCollectLog,
   readCollectLogs,
   MAX_AUTO_RUN_DATES,
+  autoRunFile,
+  isValidAutoRunDate,
+  isValidAutoRunSlot,
   readAutoRuns,
   appendAutoRun,
   LINK_OVERRIDES_VERSION,
