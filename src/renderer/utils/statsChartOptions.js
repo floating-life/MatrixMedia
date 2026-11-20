@@ -196,7 +196,13 @@ function round2(v) {
 
 function extractLineDatumValue(datum) {
   if (typeof datum === "number") return Number.isFinite(datum) ? datum : null;
-  if (datum && typeof datum === "object" && !Array.isArray(datum)) {
+  if (Array.isArray(datum)) {
+    return datum.length >= 2 ? toFiniteOrNull(datum[1]) : null;
+  }
+  if (datum && typeof datum === "object") {
+    if (Array.isArray(datum.value)) {
+      return datum.value.length >= 2 ? toFiniteOrNull(datum.value[1]) : null;
+    }
     return toFiniteOrNull(datum.value);
   }
   return null;
@@ -1741,22 +1747,65 @@ function buildContentTrendOption(trendData) {
   };
 }
 
+const SLOT_KEY_RE = /^(\d{4}-\d{2}-\d{2}) ([01]\d|2[0-3]):([0-5]\d)$/;
+
+function parseIntradayTimestampMs(raw) {
+  if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) return raw;
+  if (typeof raw === "string" && raw.trim()) {
+    const s = raw.trim();
+    const ms = /^\d+$/.test(s) ? Number(s) : Date.parse(s);
+    if (Number.isFinite(ms) && ms > 0) return ms;
+  }
+  return null;
+}
+
+function parseSlotKeyToUtc8Ms(slotKey) {
+  if (typeof slotKey !== "string") return null;
+  const m = SLOT_KEY_RE.exec(slotKey.trim());
+  if (!m) return null;
+  const dayNum = dateStrToDayNum(m[1]);
+  if (dayNum === null) return null;
+  return dayNum * DAY_MS + (Number(m[2]) * 60 + Number(m[3])) * 60000 - 8 * 3600e3;
+}
+
+function formatUtc8AxisDateTime(ms) {
+  const n = typeof ms === "number" ? ms : Number(ms);
+  if (!Number.isFinite(n)) return "";
+  const iso = new Date(n + 8 * 3600e3).toISOString();
+  return `${iso.slice(5, 10)} ${iso.slice(11, 16)}`;
+}
+
+function formatUtc8TooltipDateTime(ms) {
+  const n = typeof ms === "number" ? ms : Number(ms);
+  if (!Number.isFinite(n)) return "";
+  const iso = new Date(n + 8 * 3600e3).toISOString();
+  const sec = iso.slice(17, 19);
+  return sec === "00"
+    ? `${iso.slice(0, 10)} ${iso.slice(11, 16)}`
+    : `${iso.slice(0, 10)} ${iso.slice(11, 19)}`;
+}
+
 /**
- * 作品汇总弹窗「按时段」：单条内容各平台分时段累计播放折线 + 较上次增量柱（x=采集时点 YYYY-MM-DD HH:mm）
+ * 作品汇总弹窗「按时段」：
+ * - x 轴为真实时间轴（type: "time"），各平台曲线用各自实际 collectedAt 作为 x
+ * - 增量按各自平台上一点计算；槽键仅在 tooltip 显示归属
  */
 function buildContentIntradayOption(intradayData) {
   if (!intradayData || typeof intradayData !== "object") {
     return createEmptyOption("该内容在所选时段内暂无分时段快照");
   }
   const timePoints = Array.isArray(intradayData.timePoints)
-    ? intradayData.timePoints.filter((t) => typeof t === "string" && t.trim())
+    ? intradayData.timePoints.map((t) => (typeof t === "string" ? t.trim() : ""))
+    : [];
+  const rawCollectedAts = Array.isArray(intradayData.collectedAts)
+    ? intradayData.collectedAts
     : [];
   const rawPlatforms = Array.isArray(intradayData.platforms) ? intradayData.platforms : [];
   const rawTotalDelta = Array.isArray(intradayData.totalPlayDelta)
     ? intradayData.totalPlayDelta
     : [];
 
-  if (!timePoints.length || !rawPlatforms.length) {
+  if (!rawPlatforms.length) {
     return createEmptyOption("该内容在所选时段内暂无分时段快照");
   }
 
@@ -1768,60 +1817,155 @@ function buildContentIntradayOption(intradayData) {
     return createEmptyOption("该内容在所选时段内暂无分时段快照");
   }
 
-  const useLttb = shouldUseLttb(sortedPlatforms.length, timePoints.length);
-  const series = [];
-  const platformDeltaMap = new Map();
+  const platformLineEntries = [];
+  const deltaByXMs = new Map();
+  let usedStructuredPoints = false;
   let hasAnyVal = false;
+  let totalLinePointCount = 0;
+  let maxPlatformPointCount = 0;
 
   for (const pt of sortedPlatforms) {
-    const srcPlay = Array.isArray(pt.play) ? pt.play : [];
-    const srcDelta = Array.isArray(pt.playDelta) ? pt.playDelta : [];
-    const playAligned = new Array(timePoints.length).fill(null);
-    const deltaAligned = new Array(timePoints.length).fill(null);
-
-    for (let i = 0; i < timePoints.length; i++) {
-      const pv = i < srcPlay.length ? toFiniteOrNull(srcPlay[i]) : null;
-      const dv = i < srcDelta.length ? toFiniteOrNull(srcDelta[i]) : null;
-      if (pv !== null) {
-        playAligned[i] = pv;
-        hasAnyVal = true;
+    const pts = [];
+    if (Array.isArray(pt.points)) {
+      usedStructuredPoints = true;
+      for (let i = 0; i < pt.points.length; i++) {
+        const rawPt = pt.points[i];
+        if (!rawPt || typeof rawPt !== "object") continue;
+        const dStr = typeof rawPt.date === "string" ? rawPt.date.trim() : "";
+        const sStr = typeof rawPt.slot === "string" ? rawPt.slot.trim() : "";
+        const tk =
+          typeof rawPt.timeKey === "string" && rawPt.timeKey.trim()
+            ? rawPt.timeKey.trim()
+            : dStr && sStr
+            ? `${dStr} ${sStr}`
+            : "";
+        const xMs =
+          parseIntradayTimestampMs(rawPt.collectedAt) ?? parseSlotKeyToUtc8Ms(tk);
+        if (xMs === null) continue;
+        const pv = toFiniteOrNull(rawPt.play);
+        const dv = toFiniteOrNull(rawPt.playDelta);
+        if (pv !== null || dv !== null) hasAnyVal = true;
+        pts.push({
+          xMs,
+          date: dStr || (tk.length >= 10 ? tk.slice(0, 10) : ""),
+          slot: sStr || (tk.length >= 16 ? tk.slice(11, 16) : ""),
+          timeKey: tk,
+          play: pv,
+          playDelta: dv,
+        });
       }
-      if (dv !== null) {
-        deltaAligned[i] = dv;
+    } else {
+      const srcPlay = Array.isArray(pt.play) ? pt.play : [];
+      const srcDelta = Array.isArray(pt.playDelta) ? pt.playDelta : [];
+      const len = Math.max(timePoints.length, rawCollectedAts.length, srcPlay.length, srcDelta.length);
+      for (let i = 0; i < len; i++) {
+        const pv = i < srcPlay.length ? toFiniteOrNull(srcPlay[i]) : null;
+        const dv = i < srcDelta.length ? toFiniteOrNull(srcDelta[i]) : null;
+        if (pv === null && dv === null) continue;
+        const tk = i < timePoints.length ? timePoints[i] : "";
+        const xMs =
+          (i < rawCollectedAts.length ? parseIntradayTimestampMs(rawCollectedAts[i]) : null) ??
+          parseSlotKeyToUtc8Ms(tk);
+        if (xMs === null) continue;
         hasAnyVal = true;
+        pts.push({
+          xMs,
+          date: tk.length >= 10 ? tk.slice(0, 10) : "",
+          slot: tk.length >= 16 ? tk.slice(11, 16) : "",
+          timeKey: tk,
+          play: pv,
+          playDelta: dv,
+        });
       }
     }
-    platformDeltaMap.set(pt.platform, deltaAligned);
 
-    const color = getPlatformColor(pt.platform);
-    const s = {
-      name: pt.platform,
-      type: "line",
-      yAxisIndex: 0,
-      connectNulls: false,
-      ...buildLineSymbolConfig(playAligned, timePoints.length),
-      itemStyle: { color },
-      lineStyle: { color, width: 2 },
-      data: playAligned,
-    };
-    if (useLttb) {
-      s.sampling = "lttb";
-    }
-    series.push(s);
+    pts.sort((a, b) => {
+      if (a.xMs !== b.xMs) return a.xMs - b.xMs;
+      return compareText(a.timeKey, b.timeKey);
+    });
+
+    if (pts.length > maxPlatformPointCount) maxPlatformPointCount = pts.length;
+    totalLinePointCount += pts.length;
+
+    const lineData = pts.map((p) => {
+      if (p.playDelta !== null) {
+        let agg = deltaByXMs.get(p.xMs);
+        if (!agg) {
+          agg = { xMs: p.xMs, delta: p.playDelta, slots: new Set() };
+          deltaByXMs.set(p.xMs, agg);
+        } else {
+          const sum = agg.delta + p.playDelta;
+          agg.delta = sum === 0 ? 0 : sum;
+        }
+        if (p.timeKey) agg.slots.add(p.timeKey);
+      }
+      return {
+        value: [p.xMs, p.play],
+        collectedAt: p.xMs,
+        date: p.date,
+        slot: p.slot,
+        timeKey: p.timeKey,
+        playDelta: p.playDelta,
+      };
+    });
+
+    platformLineEntries.push({ platform: pt.platform, lineData });
   }
 
-  const totalDeltaAligned = new Array(timePoints.length).fill(null);
-  for (let i = 0; i < timePoints.length && i < rawTotalDelta.length; i++) {
-    const dv = toFiniteOrNull(rawTotalDelta[i]);
-    if (dv !== null) {
-      totalDeltaAligned[i] = dv;
+  // 兼容旧结构仅提供 totalPlayDelta 而未提供各平台 playDelta 的场景
+  if (!usedStructuredPoints && deltaByXMs.size === 0 && rawTotalDelta.length > 0) {
+    for (let i = 0; i < rawTotalDelta.length; i++) {
+      const dv = toFiniteOrNull(rawTotalDelta[i]);
+      if (dv === null) continue;
+      const tk = i < timePoints.length ? timePoints[i] : "";
+      const xMs =
+        (i < rawCollectedAts.length ? parseIntradayTimestampMs(rawCollectedAts[i]) : null) ??
+        parseSlotKeyToUtc8Ms(tk);
+      if (xMs === null) continue;
       hasAnyVal = true;
+      let agg = deltaByXMs.get(xMs);
+      if (!agg) {
+        agg = { xMs, delta: dv, slots: new Set() };
+        deltaByXMs.set(xMs, agg);
+      } else {
+        const sum = agg.delta + dv;
+        agg.delta = sum === 0 ? 0 : sum;
+      }
+      if (tk) agg.slots.add(tk);
     }
   }
 
   if (!hasAnyVal) {
     return createEmptyOption("该内容在所选时段内暂无分时段播放快照");
   }
+
+  const useLttb =
+    maxPlatformPointCount > LTTB_POINT_THRESHOLD || totalLinePointCount > LTTB_POINT_THRESHOLD;
+  const series = platformLineEntries.map(({ platform, lineData }) => {
+    const color = getPlatformColor(platform);
+    const s = {
+      name: platform,
+      type: "line",
+      yAxisIndex: 0,
+      connectNulls: false,
+      ...buildLineSymbolConfig(lineData, lineData.length),
+      itemStyle: { color },
+      lineStyle: { color, width: 2 },
+      data: lineData,
+    };
+    if (useLttb) {
+      s.sampling = "lttb";
+    }
+    return s;
+  });
+
+  const barData = [...deltaByXMs.values()]
+    .sort((a, b) => a.xMs - b.xMs)
+    .map((agg) => ({
+      value: [agg.xMs, agg.delta === 0 ? 0 : agg.delta],
+      collectedAt: agg.xMs,
+      timeKey: [...agg.slots].sort(compareText).join(" / "),
+    }));
 
   series.push({
     name: "较上次增量",
@@ -1832,7 +1976,7 @@ function buildContentIntradayOption(intradayData) {
       color: "rgba(64, 158, 255, 0.35)",
       borderRadius: [3, 3, 0, 0],
     },
-    data: totalDeltaAligned,
+    data: barData,
   });
 
   return {
@@ -1843,24 +1987,46 @@ function buildContentIntradayOption(intradayData) {
       formatter(params) {
         const list = Array.isArray(params) ? params : [params];
         if (!list.length) return "";
-        const idx = list[0].dataIndex;
-        const tp = timePoints[idx] || list[0].axisValue || "";
-        const lines = [`<div style="font-weight:600;margin-bottom:4px;">${escapeHtml(tp)}</div>`];
+        const first = list[0] || {};
+        const firstData = first.data && typeof first.data === "object" ? first.data : null;
+        const headerTs =
+          (firstData && parseIntradayTimestampMs(firstData.collectedAt)) ??
+          (Array.isArray(first.value) ? parseIntradayTimestampMs(first.value[0]) : null) ??
+          parseIntradayTimestampMs(first.axisValue);
+        const headerLabel =
+          headerTs !== null
+            ? formatUtc8TooltipDateTime(headerTs)
+            : String(first.axisValueLabel || first.axisValue || "");
+        const lines = [
+          `<div style="font-weight:600;margin-bottom:4px;">${escapeHtml(headerLabel)}</div>`,
+        ];
         for (const p of list) {
+          if (!p) continue;
+          const d = p.data && typeof p.data === "object" ? p.data : null;
+          const yVal = Array.isArray(p.value)
+            ? p.value[1]
+            : d && Array.isArray(d.value)
+            ? d.value[1]
+            : p.value;
+          const slotText =
+            (d && typeof d.timeKey === "string" && d.timeKey) ||
+            (d && d.date && d.slot ? `${d.date} ${d.slot}` : "") ||
+            (d && typeof d.slot === "string" ? d.slot : "");
           if (p.seriesType === "bar") {
-            const sign = typeof p.value === "number" && p.value > 0 ? "+" : "";
-            const valStr = p.value == null ? "-" : `${sign}${formatNum(p.value)}`;
+            const sign = typeof yVal === "number" && yVal > 0 ? "+" : "";
+            const valStr = yVal == null ? "-" : `${sign}${formatNum(yVal)}`;
+            const slotSuffix = slotText ? `（归属槽 ${slotText}）` : "";
             lines.push(
-              `<div style="margin-top:2px;">${p.marker}${escapeHtml(p.seriesName)}：<b>${escapeHtml(valStr)}</b></div>`
+              `<div style="margin-top:2px;">${p.marker}${escapeHtml(p.seriesName)}：<b>${escapeHtml(valStr)}</b>${escapeHtml(slotSuffix)}</div>`
             );
           } else {
-            const pDeltas = platformDeltaMap.get(p.seriesName);
-            const dv = pDeltas ? pDeltas[idx] : null;
+            const dv = d && d.playDelta !== undefined ? toFiniteOrNull(d.playDelta) : null;
             const deltaSuffix =
               dv != null ? `（较上次 ${dv > 0 ? "+" : ""}${formatNum(dv)}）` : "";
-            const valStr = p.value == null ? "-" : formatNum(p.value);
+            const slotSuffix = slotText ? ` · 归属槽 ${slotText}` : "";
+            const valStr = yVal == null ? "-" : formatNum(yVal);
             lines.push(
-              `<div>${p.marker}${escapeHtml(p.seriesName)}累计：<b>${escapeHtml(valStr)}</b>${escapeHtml(deltaSuffix)}</div>`
+              `<div>${p.marker}${escapeHtml(p.seriesName)}累计：<b>${escapeHtml(valStr)}</b>${escapeHtml(deltaSuffix)}${escapeHtml(slotSuffix)}</div>`
             );
           }
         }
@@ -1881,14 +2047,12 @@ function buildContentIntradayOption(intradayData) {
       containLabel: true,
     },
     xAxis: {
-      type: "category",
-      boundaryGap: true,
-      data: timePoints,
+      type: "time",
       axisLabel: {
         color: "#606266",
         fontSize: 11,
         formatter(v) {
-          return typeof v === "string" && v.length >= 16 ? v.slice(5, 16) : v;
+          return formatUtc8AxisDateTime(v);
         },
       },
       axisLine: { lineStyle: { color: "#dcdfe6" } },

@@ -26,9 +26,9 @@
 ## S9：固定时段循环自动采集 + 作品分时段数据（`feat/stats-intraday`）
 - **设置与时段槽调度（`src/renderer/utils/statsScheduler.js` + `src/main/services/dataStats/index.js` + `store.js`）**：
   - 设置扩展为 `{ enabled, mode: "interval"|"daily", startTime: "08:00", endTime: "22:00", intervalHours: 2, time: "10:00", retentionDays: 60 }`，`intervalHours` 支持 `1/2/3/4/6`；旧设置 `{ enabled, time }` 自动迁移为 `mode: "daily"`，保持旧行为不擅自加大频率；时段槽从 `startTime` 起每 `intervalHours` 一槽（含恰好落点的 `endTime`），`endTime < startTime` 按跨零点计算且槽日期按槽开始时刻的 UTC+8 日历日。
-  - 渲染层维持 60s 轮询，在 `[slotStart, nextSlotStart)` 内且未跑过时向主进程发送 `stats:auto-run { slot: "YYYY-MM-DD HH:mm", slotEndMs, retentionDays }`；主进程 `auto-run.json` 升级为兼容旧日期记录与新时段槽记录（按日历日保留最近 14 天），保持内存守卫、开跑前落盘与 `collecting` 互斥（忙则下一轮重试，已过下一槽时刻返回 `expired` 放弃不补采，休眠/关机漏槽直接跳过），分区跳重在分时段模式下改为按槽（`collectedBySlot`），`daily` 模式行为与历史完全一致。
+  - 渲染层维持 60s 轮询，在 `[slotStart, nextSlotStart)` 内且未跑过时向主进程发送 `stats:auto-run { slot: "YYYY-MM-DD HH:mm", slotEndMs }`（采集 IPC 不携带/覆盖 `retentionDays`，保留期仅由主进程 `auto-settings.json` 权威保存并通过设置保存 IPC 修改，渲染层旧缓存仅在主进程尚无设置时做一次性迁移）；主进程 `auto-run.json` 升级为兼容旧日期记录与新时段槽记录（按日历日保留最近 14 天），槽认领与限流时间戳分开记录（仅在实际发起至少一个分区的自动采集时更新上次自动采集时间，全跳过只记槽认领），保持内存守卫、开跑前落盘与 `collecting` 互斥（忙则下一轮重试，已过下一槽时刻返回 `expired` 放弃不补采，休眠/关机漏槽直接跳过），分区跳重在分时段模式下按采集成功时间是否落入当前槽判断，`daily` 模式行为与历史完全一致。
 - **分时段快照存储（`src/main/services/dataStats/store.js` + `statsTable.js`）**：
-  - 每次 `mergeWorks` 维持 `works-daily` 语义不变，同时原子写入 `<userData>/data-stats/<group>/<platform>/works-intraday/YYYY-MM-DD.json`（自动采集用槽键，手动采集按 UTC+8 实际时刻向下取整为 `"HH:00"`，同槽覆盖、跨零点放弃）；每天首次写入成功后自动清理 `works-intraday/` 下超过 `retentionDays` 的合法 `YYYY-MM-DD.json` 普通文件；提供 `readWorksIntraday(group, platform, { from, to })`（按时间升序，损坏文件 warn 跳过）与 `buildWorkIntradayRows`（计算播放/点赞/评论较上次增量与距上次小时数）。
+  - 每次 `mergeWorks` 维持 `works-daily` 语义不变，同时原子写入 `<userData>/data-stats/<group>/<platform>/works-intraday/YYYY-MM-DD.json`（自动采集用槽键，手动采集按 UTC+8 实际时刻向下取整为 `"HH:00"`，同槽覆盖；整次写入统一以采集返回时刻 `collectNow` 的 UTC+8 日期归档，daily/works-daily/intraday 一致）；每天首次写入成功后自动清理 `works-intraday/` 下严格早于（今天 − 主进程 `retentionDays`）的合法 `YYYY-MM-DD.json` 普通文件；提供 `readWorksIntraday(group, platform, { from, to })`（按时间升序，损坏文件 warn 跳过）与 `buildWorkIntradayRows`（计算播放/点赞/评论较上次增量与距上次小时数）。
 - **展示、分析与 Excel（`statsAnalysis.js` + `statsExport.js` + `statsChartOptions.js` + `dataStats/index.vue`）**：
   - 设置栏支持模式切换、起止时段、间隔与风控/平曲线提示；「作品汇总」表新增「最近采集」列（取内容各平台作品最新 `collectedAt`）；趋势弹窗新增「按天 / 按时段」切换及 1/3/7 天区间（默认 3 天），对接新 IPC `stats:get-content-intraday`（与汇总共用关联与 `link-overrides`）；「数据分析」新增「新作品前 24 小时」折线图（近 7 天内发布内容，x=发布后小时数，最多 10 条，复用 `StatsChart` 与平台色）。
   - Excel 在「作品日明细」后新增「作品时段明细」sheet（19 列，含播放/点赞/评论较上次增量与距上次小时数），行数计入现有 `200000` 行上限并同步补充「字段说明」。
@@ -68,7 +68,6 @@
 ## 已知问题
 - 〔上游，路线 B 候选 PR〕`src/main/services/accountMigration.js:41` 启动迁移会把带连字符的合法分组目录（如 `品牌-A`，且 `品牌` 目录不存在时）整体改名为 `品牌`，导致该分组统计历史读回为空。应改为按账号记录中明确的旧 phone→group 映射迁移。（GPT Pro 评审 S1 时发现，2026-11-19）
 - 适配器把缺失指标写成 0（如抖音 view_count 缺失），会产生「掉 0 再回升」的假增量；需改采集层区分缺失与 0，暂在导出「字段说明」注明。
-- 一次采集的账号快照与作品快照若恰跨零点可能分属两天（影响极小，暂不处理）。
 - `src/main/services/dataStats/index.js` 中各 `stats:*` IPC（含导出、作品汇总与 `link-overrides` 读写接口）沿用 `isLocalFrameEvent` 校验（放行无 host 的 `file:` 与 `localhost`/`127.0.0.1`），授权范围偏宽（生产模式未收紧到受信任应用主窗口 mainFrame 及应用页面路径，开发模式未收紧到配置的开发 server origin）；待后续统一收紧全量 stats IPC 鉴权时一并处理。（Codex 评审 S6 时发现，2026-11-19）
 - 仅有 `id`、缺 `filePath` 的旧发布记录在重发补齐 `filePath` 后，内容键会从 `record:id:…` 变为 `file:…`，导致指向原 `record:id:…` 的既有手工关联失效，后续可维护记录 ID 到当前内容键的映射。（Codex 评审 S6-r3 #4，2026-11-19）
 - 跨组同一作品在不同分组元数据里的 `publishTime` 跨过导出截止日冲突时，Excel「作品日明细」与「作品跨平台汇总」对截止日资格与归属的裁决存在不一致，后续需按作品身份统一裁决两表消费。（Codex 评审 S6-r3 #5，2026-11-19）

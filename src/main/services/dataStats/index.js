@@ -546,7 +546,7 @@ function normalizeIntervalHoursArg(raw) {
   return null;
 }
 
-function resolveEffectiveRetentionDays(args) {
+function resolveEffectiveRetentionDays() {
   const persisted =
     typeof store.readAutoSettings === "function"
       ? store.readAutoSettings()
@@ -555,24 +555,6 @@ function resolveEffectiveRetentionDays(args) {
     normalizeRetentionDaysArg(persisted && persisted.retentionDays) ||
     store.DEFAULT_INTRADAY_RETENTION_DAYS ||
     60;
-  const reqRetention = normalizeRetentionDaysArg(args && args.retentionDays);
-  if (reqRetention !== null) {
-    lastRetentionDays = reqRetention;
-    if (
-      reqRetention !== persistedDays &&
-      typeof store.writeAutoSettings === "function"
-    ) {
-      try {
-        store.writeAutoSettings({ retentionDays: reqRetention }, Date.now());
-      } catch (err) {
-        console.warn(
-          "[dataStats] 持久化 retentionDays 失败:",
-          (err && err.message) || err
-        );
-      }
-    }
-    return reqRetention;
-  }
   lastRetentionDays = persistedDays;
   return persistedDays;
 }
@@ -635,10 +617,13 @@ async function collectAccounts(accounts, sender, options = {}) {
     options && options.persistedPartitionAutoRunAt
       ? options.persistedPartitionAutoRunAt
       : null;
-  const retentionDays =
-    normalizeRetentionDaysArg(options && options.retentionDays) ||
-    resolveEffectiveRetentionDays(null);
+  const onAutoCollectInitiated =
+    isAutoTrigger && options && typeof options.onAutoCollectInitiated === "function"
+      ? options.onAutoCollectInitiated
+      : null;
   const collectedAutoPartitions = Object.create(null);
+  const attemptedAutoPartitions = Object.create(null);
+  let firstAutoAttemptAt = 0;
   let hasCollectedAny = false;
 
   for (let i = 0; i < total; i++) {
@@ -697,58 +682,37 @@ async function collectAccounts(accounts, sender, options = {}) {
     }
     hasCollectedAny = true;
 
+    const attemptNow = Date.now();
+    if (isAutoTrigger) {
+      if (!firstAutoAttemptAt) firstAutoAttemptAt = attemptNow;
+      const normPart = normalizePartition(acc.partition);
+      if (normPart) {
+        attemptedAutoPartitions[normPart] = attemptNow;
+        setBoundedMap(lastAutoRunAtByPartition, normPart, attemptNow, MAX_COLLECTED_PARTITIONS);
+      }
+      if (onAutoCollectInitiated) {
+        onAutoCollectInitiated(attemptNow, normPart);
+      }
+    }
+
     progress("running");
     try {
       const data = await collectAccount({
         partition: acc.partition,
         platform: acc.platform,
       });
+      // 以采集返回时刻的 UTC+8 日期为整次写入的唯一日期，daily/works-daily/intraday 统一按 collectNow 归档
       const collectNow = Date.now();
-      const ensureSameDay =
-        typeof store.createSameDayGuard === "function"
-          ? store.createSameDayGuard(collectNow, collectNow)
-          : () => {};
-      let dayRolled = false;
-      try {
-        ensureSameDay();
-        store.mergeDaily(
-          acc.group,
-          acc.platform,
-          data.overview,
-          data.fansHistory,
-          collectNow,
-          { ensureSameDay, throwOnDayRoll: true }
-        );
-        ensureSameDay();
-        store.mergeWorks(acc.group, acc.platform, data.works, collectNow, {
-          slot: slot || undefined,
-          retentionDays,
-          ensureSameDay,
-          throwOnDayRoll: true,
-        });
-        ensureSameDay();
-      } catch (persistErr) {
-        if (persistErr && persistErr.code === "EDAYROLL") {
-          dayRolled = true;
-          console.warn(
-            `[dataStats] 采集落盘跨过零点，整次放弃写入 (${acc.group}/${acc.platform}):`,
-            persistErr.message
-          );
-        } else {
-          throw persistErr;
-        }
-      }
-      if (dayRolled) {
-        results.push({
-          group: acc.group,
-          platform: acc.platform,
-          success: false,
-          dayRolled: true,
-          error: "写入跨过零点，已放弃本次保存",
-        });
-        progress("failed", { error: "写入跨过零点，已放弃本次保存" });
-        continue;
-      }
+      store.mergeDaily(
+        acc.group,
+        acc.platform,
+        data.overview,
+        data.fansHistory,
+        collectNow
+      );
+      store.mergeWorks(acc.group, acc.platform, data.works, collectNow, {
+        slot: slot || undefined,
+      });
       store.writeMeta(acc.group, acc.platform, {
         lastCollectAt: collectNow,
         lastError: "",
@@ -757,7 +721,13 @@ async function collectAccounts(accounts, sender, options = {}) {
       markPartitionCollected(acc.partition, collectNow, isAutoTrigger);
       if (isAutoTrigger) {
         const normPart = normalizePartition(acc.partition);
-        if (normPart) collectedAutoPartitions[normPart] = collectNow;
+        if (normPart) {
+          collectedAutoPartitions[normPart] = collectNow;
+          attemptedAutoPartitions[normPart] = collectNow;
+          if (onAutoCollectInitiated) {
+            onAutoCollectInitiated(collectNow, normPart, true);
+          }
+        }
       }
       results.push({
         group: acc.group,
@@ -810,7 +780,13 @@ async function collectAccounts(accounts, sender, options = {}) {
       (err && err.message) || err
     );
   }
-  return { results, cancelled, collectedAutoPartitions };
+  return {
+    results,
+    cancelled,
+    collectedAutoPartitions,
+    attemptedAutoPartitions,
+    firstAutoAttemptAt,
+  };
 }
 
 function isLocalFrameEvent(event) {
@@ -1010,13 +986,11 @@ function registerDataStatsIpc(options = {}) {
     if (!accounts.length) return { results: [], error: "没有可采集的账号" };
     const trigger =
       args && VALID_TRIGGERS.has(args.trigger) ? args.trigger : undefined;
-    const retentionDays = resolveEffectiveRetentionDays(args);
     collecting = true;
     cancelled = false;
     try {
       const out = await collectAccounts(accounts, event && event.sender, {
         trigger,
-        retentionDays,
       });
       return { results: out.results, cancelled: out.cancelled };
     } finally {
@@ -1028,15 +1002,14 @@ function registerDataStatsIpc(options = {}) {
    * 定时自动采集单一操作（认领与采集合并）：
    * - interval 模式（传入 args.slot = "YYYY-MM-DD HH:mm"）：
    *   按槽去重与落盘 auto-run.json，支持 slotEndMs 过槽放弃、设置变更生效边界、
-   *   主进程防高频硬下限（< intervalHours*60-10 分钟跳过本槽）、以及同槽 [槽开始, 下一槽开始) 分区跳重
+   *   主进程防高频硬下限（< intervalHours*60-10 分钟跳过本槽）、以及同槽 [槽开始, 下一槽开始) 分区跳重；
+   *   槽认领与限流时间分开记录：只有实际发起了至少一个分区的自动采集才更新上次自动采集时间，全跳过只记槽认领
    * - daily 模式（未传 slot，兼容旧调用）：
    *   today = store.todayStr()（UTC+8，由主进程计算），行为与历史完全一致
    * - 均遵守：auto-run.json 已含目标 → already-ran；collecting 中 → busy（不写入）；
    *   开跑前原子追加目标到 runs（写失败返回 store-failed、不采集），结束后复位 collecting
    */
   ipcMain.handle("stats:auto-run", async (event, args) => {
-    const retentionDays = resolveEffectiveRetentionDays(args);
-
     const hasSlotArg =
       args &&
       Object.prototype.hasOwnProperty.call(args, "slot") &&
@@ -1190,8 +1163,9 @@ function registerDataStatsIpc(options = {}) {
       if (!accounts.length) {
         return { status: "empty", date: slotDate, slot, results: [] };
       }
+      // 仅记录槽认领；不在此处更新限流时间（只有实际发起至少一个分区的自动采集才更新）
       try {
-        store.appendAutoRun(slot, { autoRunAt: now });
+        store.appendAutoRun(slot);
       } catch (err) {
         console.warn(
           "[dataStats] 写入 auto-run.json 失败，本轮不自动采集:",
@@ -1200,9 +1174,10 @@ function registerDataStatsIpc(options = {}) {
         return { status: "store-failed" };
       }
       autoRanInMemory.add(slot);
-      lastGlobalAutoRunAt = now;
       collecting = true;
       cancelled = false;
+      let initiatedAutoAt = 0;
+      const initiatedAutoPartitions = Object.create(null);
       try {
         const out = await collectAccounts(accounts, event && event.sender, {
           trigger: "auto",
@@ -1212,25 +1187,16 @@ function registerDataStatsIpc(options = {}) {
           slotEndMs: effectiveSlotEndMs,
           minAutoIntervalMs,
           persistedPartitionAutoRunAt: autoRunState.partitionAutoRunAt,
-          retentionDays,
+          onAutoCollectInitiated: (ts, normPart, isSuccessUpdate) => {
+            if (!isSuccessUpdate && !initiatedAutoAt) {
+              initiatedAutoAt = ts;
+              lastGlobalAutoRunAt = ts;
+            }
+            if (normPart) {
+              initiatedAutoPartitions[normPart] = ts;
+            }
+          },
         });
-        if (
-          out.collectedAutoPartitions &&
-          Object.keys(out.collectedAutoPartitions).length > 0 &&
-          typeof store.updateAutoRunTimestamps === "function"
-        ) {
-          try {
-            store.updateAutoRunTimestamps({
-              lastAutoRunAt: now,
-              partitionAutoRunAt: out.collectedAutoPartitions,
-            });
-          } catch (tsErr) {
-            console.warn(
-              "[dataStats] 更新 auto-run.json 分区时间戳失败:",
-              (tsErr && tsErr.message) || tsErr
-            );
-          }
-        }
         return {
           status: "done",
           date: slotDate,
@@ -1239,6 +1205,22 @@ function registerDataStatsIpc(options = {}) {
           cancelled: Boolean(out.cancelled),
         };
       } finally {
+        if (
+          initiatedAutoAt > 0 &&
+          typeof store.updateAutoRunTimestamps === "function"
+        ) {
+          try {
+            store.updateAutoRunTimestamps({
+              lastAutoRunAt: initiatedAutoAt,
+              partitionAutoRunAt: initiatedAutoPartitions,
+            });
+          } catch (tsErr) {
+            console.warn(
+              "[dataStats] 更新 auto-run.json 限流时间戳失败:",
+              (tsErr && tsErr.message) || tsErr
+            );
+          }
+        }
         collecting = false;
       }
     }
@@ -1280,7 +1262,6 @@ function registerDataStatsIpc(options = {}) {
       const out = await collectAccounts(accounts, event && event.sender, {
         trigger: "auto",
         skipCollectedToday: true,
-        retentionDays,
       });
       return {
         status: "done",
@@ -1833,7 +1814,6 @@ function registerDataStatsIpc(options = {}) {
       groupsMap.get(gk).tasks.push(t);
     }
 
-    const retentionDays = resolveEffectiveRetentionDays(args);
     collecting = true;
     try {
       const entries = [...groupsMap.values()];
@@ -1841,49 +1821,22 @@ function registerDataStatsIpc(options = {}) {
         const { partition, platform, group, tasks: groupTasks } = entries[i];
         try {
           const data = await collectAccount({ partition, platform });
+          // 以采集返回时刻的 UTC+8 日期为整次写入的唯一日期，daily/works-daily/intraday 统一按 collectNow 归档
           const collectNow = Date.now();
-          const ensureSameDay =
-            typeof store.createSameDayGuard === "function"
-              ? store.createSameDayGuard(collectNow, collectNow)
-              : () => {};
-          let dayRolled = false;
-          try {
-            ensureSameDay();
-            // 顺带落库（与「同步数据」同效果），全过程共享同一个 collectNow 与 ensureSameDay
-            store.mergeDaily(
-              group,
-              platform,
-              data.overview,
-              data.fansHistory,
-              collectNow,
-              { ensureSameDay, throwOnDayRoll: true }
-            );
-            ensureSameDay();
-            store.mergeWorks(group, platform, data.works, collectNow, {
-              retentionDays,
-              ensureSameDay,
-              throwOnDayRoll: true,
-            });
-            ensureSameDay();
-          } catch (persistErr) {
-            if (persistErr && persistErr.code === "EDAYROLL") {
-              dayRolled = true;
-              console.warn(
-                `[dataStats] 状态匹配落盘跨过零点，整次放弃写入 (${group}/${platform}):`,
-                persistErr.message
-              );
-            } else {
-              throw persistErr;
-            }
-          }
-          if (!dayRolled) {
-            store.writeMeta(group, platform, {
-              lastCollectAt: collectNow,
-              lastError: "",
-              workCount: data.works.length,
-            });
-            markPartitionCollected(partition, collectNow, false);
-          }
+          store.mergeDaily(
+            group,
+            platform,
+            data.overview,
+            data.fansHistory,
+            collectNow
+          );
+          store.mergeWorks(group, platform, data.works, collectNow);
+          store.writeMeta(group, platform, {
+            lastCollectAt: collectNow,
+            lastError: "",
+            workCount: data.works.length,
+          });
+          markPartitionCollected(partition, collectNow, false);
           const byTitle = buildTitleIndex(data.works, normalizeStatusTitle);
           for (const t of groupTasks) {
             const key = normalizeStatusTitle(t.title);

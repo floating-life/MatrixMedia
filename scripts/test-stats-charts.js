@@ -1995,51 +1995,109 @@ async function testS9_IntradayAndFirst24hCharts() {
     true
   );
 
+  const cnTs = (d, hh, mm = 0, ss = 0) =>
+    Date.parse(`${d}T${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}:${String(ss).padStart(2, "0")}+08:00`);
   const intraOpt = buildContentIntradayOption({
     timePoints: ["2026-11-19 10:00", "2026-11-19 12:00", "2026-11-20 08:00"],
+    collectedAts: [
+      cnTs("2026-11-19", 10, 0),
+      cnTs("2026-11-19", 12, 0),
+      cnTs("2026-11-20", 8, 0),
+    ],
     platforms: [
-      { platform: "快手", play: [null, 80, 180], playDelta: [null, null, 100] },
-      { platform: "抖音", play: [100, 220, 400], playDelta: [null, 120, 180] },
+      {
+        platform: "快手",
+        points: [
+          { collectedAt: cnTs("2026-11-19", 12, 0), date: "2026-11-19", slot: "12:00", timeKey: "2026-11-19 12:00", play: 80, playDelta: null },
+          { collectedAt: cnTs("2026-11-20", 8, 0), date: "2026-11-20", slot: "08:00", timeKey: "2026-11-20 08:00", play: 180, playDelta: 100 },
+        ],
+        play: [null, 80, 180],
+        playDelta: [null, null, 100],
+      },
+      {
+        platform: "抖音",
+        points: [
+          { collectedAt: cnTs("2026-11-19", 10, 0), date: "2026-11-19", slot: "10:00", timeKey: "2026-11-19 10:00", play: 100, playDelta: null },
+          { collectedAt: cnTs("2026-11-19", 12, 0), date: "2026-11-19", slot: "12:00", timeKey: "2026-11-19 12:00", play: 220, playDelta: 120 },
+          { collectedAt: cnTs("2026-11-20", 8, 0), date: "2026-11-20", slot: "08:00", timeKey: "2026-11-20 08:00", play: 400, playDelta: 180 },
+        ],
+        play: [100, 220, 400],
+        playDelta: [null, 120, 180],
+      },
     ],
     totalPlay: [100, 300, 580],
     totalPlayDelta: [null, 120, 280],
   });
   assert.strictEqual(isEmptyChartOption(intraOpt), false);
-  assert.deepStrictEqual(intraOpt.xAxis.data, [
-    "2026-11-19 10:00",
-    "2026-11-19 12:00",
-    "2026-11-20 08:00",
-  ]);
-  assert.strictEqual(intraOpt.xAxis.axisLabel.formatter("2026-11-19 10:00"), "11-19 10:00");
+  assert.strictEqual(intraOpt.xAxis.type, "time", "按时段趋势图必须使用真实时间轴 type:'time'");
+  assert.strictEqual(intraOpt.xAxis.data, undefined, "时间轴不得使用槽键字符串作为类目 xAxis.data");
+  assert.strictEqual(intraOpt.xAxis.axisLabel.formatter(cnTs("2026-11-19", 10, 0)), "11-19 10:00");
   assert.strictEqual(intraOpt.series.length, 3, "2 个平台折线 + 1 条较上次增量柱");
   assert.strictEqual(intraOpt.series[0].name, "抖音");
   assert.strictEqual(intraOpt.series[0].type, "line");
   assert.strictEqual(intraOpt.series[0].connectNulls, false);
   assert.strictEqual(intraOpt.series[0].itemStyle.color, PLATFORM_COLORS["抖音"]);
+  assert.deepStrictEqual(
+    intraOpt.series[0].data.map((d) => d.value),
+    [
+      [cnTs("2026-11-19", 10, 0), 100],
+      [cnTs("2026-11-19", 12, 0), 220],
+      [cnTs("2026-11-20", 8, 0), 400],
+    ]
+  );
   assert.strictEqual(intraOpt.series[1].name, "快手");
   assert.strictEqual(intraOpt.series[1].itemStyle.color, PLATFORM_COLORS["快手"]);
+  assert.deepStrictEqual(
+    intraOpt.series[1].data.map((d) => d.value),
+    [
+      [cnTs("2026-11-19", 12, 0), 80],
+      [cnTs("2026-11-20", 8, 0), 180],
+    ]
+  );
   assert.strictEqual(intraOpt.series[2].name, "较上次增量");
   assert.strictEqual(intraOpt.series[2].type, "bar");
   assert.strictEqual(intraOpt.series[2].yAxisIndex, 1);
-  assert.deepStrictEqual(intraOpt.series[2].data, [null, 120, 280]);
+  assert.deepStrictEqual(
+    intraOpt.series[2].data.map((d) => d.value),
+    [
+      [cnTs("2026-11-19", 12, 0), 120],
+      [cnTs("2026-11-20", 8, 0), 280],
+    ]
+  );
 
   const tipHtml = intraOpt.tooltip.formatter([
-    { dataIndex: 2, seriesType: "line", seriesName: "抖音", value: 400, marker: "*" },
-    { dataIndex: 2, seriesType: "bar", seriesName: "较上次增量", value: 280, marker: "#" },
+    {
+      seriesType: "line",
+      seriesName: "抖音",
+      value: intraOpt.series[0].data[2].value,
+      data: intraOpt.series[0].data[2],
+      marker: "*",
+    },
+    {
+      seriesType: "bar",
+      seriesName: "较上次增量",
+      value: intraOpt.series[2].data[1].value,
+      data: intraOpt.series[2].data[1],
+      marker: "#",
+    },
   ]);
   assert.ok(tipHtml.includes("2026-11-20 08:00") && tipHtml.includes("+180") && tipHtml.includes("+280"));
 
   // LTTB (> 2000 点自动开启)
   const manyPts = [];
+  const manyAts = [];
   const manyPlay = [];
   const manyDelta = [];
+  const baseLttb = cnTs("2026-11-01", 0, 0);
   for (let i = 0; i < 1100; i++) {
     manyPts.push(`2026-11-01 ${String(i % 24).padStart(2, "0")}:${String(i % 60).padStart(2, "0")}`);
+    manyAts.push(baseLttb + i * 60000);
     manyPlay.push(i * 10);
     manyDelta.push(10);
   }
   const lttbIntra = buildContentIntradayOption({
     timePoints: manyPts,
+    collectedAts: manyAts,
     platforms: [
       { platform: "抖音", play: manyPlay, playDelta: manyDelta },
       { platform: "快手", play: manyPlay, playDelta: manyDelta },
@@ -2190,6 +2248,14 @@ async function testS9_IntradayAndFirst24hCharts() {
     await ctx.loadContentIntraday();
     assert.strictEqual(invokeLog[2].ch, "stats:get-content-intraday");
     assert.strictEqual(invokeLog[2].payload.days, 7);
+
+    // 设置栏修改开关/调度参数时调用 stats:save-auto-settings 且不得携带渲染层缓存 retentionDays 覆盖主进程
+    ctx.autoCollect.enabled = false;
+    ctx.autoCollect.retentionDays = 60;
+    ctx.onAutoCollectChange();
+    const saveCall = invokeLog.find((x) => x.ch === "stats:save-auto-settings");
+    assert.ok(saveCall, "修改自动采集设置应调用 stats:save-auto-settings");
+    assert.strictEqual(saveCall.payload.retentionDays, undefined, "切换开关/调度参数不得携带 stale retentionDays 覆盖主进程");
   } finally {
     cleanup();
   }
@@ -2219,9 +2285,130 @@ async function testS9_IntradayAndFirst24hCharts() {
     const { buildContentIntradayData } = require("../src/main/services/dataStats/statsExport.js");
     const intra6 = buildContentIntradayData({ contentKey: "unlinked:抖音:W_C6" }, sortDeps);
     const opt6 = buildContentIntradayOption(intra6);
-    assert.deepStrictEqual(opt6.xAxis.data, ["2026-11-20 10:30", "2026-11-20 10:00"]);
-    assert.deepStrictEqual(opt6.series[0].data, [100, 150]);
-    assert.deepStrictEqual(opt6.series[1].data, [null, 50]);
+    assert.strictEqual(opt6.xAxis.type, "time");
+    assert.strictEqual(opt6.xAxis.data, undefined);
+    assert.deepStrictEqual(
+      opt6.series[0].data.map((d) => d.value),
+      [
+        [cnMs2("2026-11-20", 10, 31), 100],
+        [cnMs2("2026-11-20", 10, 40), 150],
+      ]
+    );
+    assert.deepStrictEqual(
+      opt6.series[1].data.map((d) => d.value),
+      [[cnMs2("2026-11-20", 10, 40), 50]]
+    );
+
+    // testS9R3_4_CrossPlatformTimeAxisAndTooltipSlotAttribution
+    // 评审2 #4：抖音 10:31(100, 槽10:30) / 10:40(150, 槽10:00) + 快手 10:29(100, 槽10:00) / 10:31:02(150, 槽10:30)
+    // 图表使用 type:'time'，两平台曲线各自按实际 collectedAt 递增、增量 [+50] 落在各自第二点，槽键仅在 tooltip 显示归属
+    {
+      const pubMs = cnMs2("2026-11-20", 8, 0);
+      const t1029 = Date.parse("2026-11-20T10:29:00+08:00");
+      const t1031 = Date.parse("2026-11-20T10:31:00+08:00");
+      const t103102 = Date.parse("2026-11-20T10:31:02+08:00");
+      const t1040 = Date.parse("2026-11-20T10:40:00+08:00");
+      const dyUrl = "https://www.douyin.com/video/123456";
+      const ksUrl = "https://www.kuaishou.com/short-video/ks1";
+      const crossDeps = {
+        now: t1040,
+        listAccounts: () => [
+          { group: "示例", platform: "抖音" },
+          { group: "示例", platform: "快手" },
+        ],
+        readWorks: (_g, p) =>
+          p === "抖音"
+            ? [{ workId: "123456", title: "样片", url: dyUrl, publishTime: pubMs }]
+            : [{ workId: "ks1", title: "样片", url: ksUrl, publishTime: pubMs }],
+        readWorksDaily: (_g, p) =>
+          p === "抖音"
+            ? { 123456: { "2026-11-20": { play: 150 } } }
+            : { ks1: { "2026-11-20": { play: 150 } } },
+        readWorksIntraday: (_g, p) =>
+          p === "抖音"
+            ? {
+                123456: [
+                  { date: "2026-11-20", slot: "10:30", collectedAt: t1031, play: 100 },
+                  { date: "2026-11-20", slot: "10:00", collectedAt: t1040, play: 150 },
+                ],
+              }
+            : {
+                ks1: [
+                  { date: "2026-11-20", slot: "10:00", collectedAt: t1029, play: 100 },
+                  { date: "2026-11-20", slot: "10:30", collectedAt: t103102, play: 150 },
+                ],
+              },
+        readDaily: () => ({}),
+        readPushRecords: () => [
+          { id: "123456", filePath: "/v/sample.mp4", title: "样片", pt: "抖音", group: "示例", videoLink: dyUrl, publishStatus: "success", lastPublishAt: pubMs },
+          { id: "ks1", filePath: "/v/sample.mp4", title: "样片", pt: "快手", group: "示例", videoLink: ksUrl, publishStatus: "success", lastPublishAt: pubMs },
+        ],
+      };
+
+      const crossData = buildContentIntradayData({ contentKey: "file:/v/sample.mp4", days: 1 }, crossDeps);
+      const crossOpt = buildContentIntradayOption(crossData);
+      assert.strictEqual(crossOpt.xAxis.type, "time", "必须使用时间轴 type:'time'");
+      assert.strictEqual(crossOpt.xAxis.data, undefined, "不得使用槽键作为类目轴");
+
+      const dySeries = crossOpt.series.find((s) => s.name === "抖音");
+      const ksSeries = crossOpt.series.find((s) => s.name === "快手");
+      const barSeries = crossOpt.series.find((s) => s.type === "bar");
+      assert.ok(dySeries && ksSeries && barSeries);
+
+      assert.deepStrictEqual(
+        dySeries.data.map((d) => d.value),
+        [
+          [t1031, 100],
+          [t1040, 150],
+        ],
+        "抖音曲线 x 为实际 collectedAt 且保持 100→150"
+      );
+      assert.deepStrictEqual(dySeries.data.map((d) => d.playDelta), [null, 50]);
+
+      assert.deepStrictEqual(
+        ksSeries.data.map((d) => d.value),
+        [
+          [t1029, 100],
+          [t103102, 150],
+        ],
+        "快手曲线 x 为实际 collectedAt 且保持 100→150，绝不得反画成 150→100"
+      );
+      assert.deepStrictEqual(ksSeries.data.map((d) => d.playDelta), [null, 50], "快手 +50 增量必须落在第二点");
+
+      assert.deepStrictEqual(
+        barSeries.data.map((d) => d.value),
+        [
+          [t103102, 50],
+          [t1040, 50],
+        ]
+      );
+
+      // tooltip 显示实际采集时刻、较上次增量与槽键归属
+      const ksTip = crossOpt.tooltip.formatter([
+        { seriesType: "line", seriesName: "快手", value: ksSeries.data[1].value, data: ksSeries.data[1], marker: "●" },
+        { seriesType: "bar", seriesName: "较上次增量", value: barSeries.data[0].value, data: barSeries.data[0], marker: "■" },
+      ]);
+      assert.ok(ksTip.includes("2026-11-20 10:31:02"), `tooltip 应显示实际采集时间，实际：${ksTip}`);
+      assert.ok(ksTip.includes("2026-11-20 10:30"), `tooltip 应显示槽键归属，实际：${ksTip}`);
+      assert.ok(ksTip.includes("+50"), `tooltip 应显示 +50 增量，实际：${ksTip}`);
+
+      const dyTip = crossOpt.tooltip.formatter([
+        { seriesType: "line", seriesName: "抖音", value: dySeries.data[1].value, data: dySeries.data[1], marker: "●" },
+      ]);
+      assert.ok(dyTip.includes("2026-11-20 10:40") && dyTip.includes("2026-11-20 10:00") && dyTip.includes("+50"));
+
+      // 用真实 ECharts SSR 渲染验证 time 轴 + 折线 + 增量柱无异常
+      const realEcharts = require("echarts");
+      const ssrChart = realEcharts.init(null, null, { renderer: "svg", ssr: true, width: 640, height: 320 });
+      try {
+        ssrChart.setOption(crossOpt, true);
+        const svg = ssrChart.renderToSVGString();
+        assert.ok(typeof svg === "string" && svg.includes("<svg"), "真实 ECharts SSR 应正常渲染 time 轴分时段趋势图");
+      } finally {
+        ssrChart.dispose();
+      }
+      console.log("✓ [S9-r3 #4] testS9R3_4_CrossPlatformTimeAxisAndTooltipSlotAttribution 通过");
+    }
 
     // #7a：归一化 firstPublishTimeMs（11-19 08:00 首发，11-20 10:00 补发，11-20 12:00 采集距首发 28h）→ 超过 24h 不画
     const firstPub = cnMs2("2026-11-19", 8, 0);

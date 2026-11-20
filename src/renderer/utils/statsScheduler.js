@@ -423,7 +423,6 @@ export function saveSettings(settings, storage = getDefaultStorage()) {
   }
   if (storage === getDefaultStorage()) {
     emitListeners(settingsListeners, { ...normalized });
-    syncSettingsToMain(normalized);
   }
   return { ok: true, settings: normalized };
 }
@@ -473,9 +472,6 @@ function defaultAutoRun(accounts, meta) {
     }
     if (meta && typeof meta.endTime === "string" && isValidTimeStr(meta.endTime)) {
       payload.endTime = meta.endTime;
-    }
-    if (meta && Number.isInteger(meta.retentionDays) && meta.retentionDays > 0) {
-      payload.retentionDays = meta.retentionDays;
     }
     return ipcRenderer.invoke("stats:auto-run", payload);
   }
@@ -597,11 +593,9 @@ export function createStatsScheduler(options = {}) {
             intervalHours: settings.intervalHours,
             startTime: settings.startTime,
             endTime: settings.endTime,
-            retentionDays: settings.retentionDays,
           }
         : {
             mode: "daily",
-            retentionDays: settings.retentionDays,
           };
 
       let res;

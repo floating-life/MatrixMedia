@@ -2210,6 +2210,8 @@ export default {
     },
   },
   created() {
+    this._mainRetentionDays = null;
+    this.syncAutoSettingsFromMain();
     this.refresh();
     this._unsubProgress = onStatsProgress((p) => {
       this.progressText = `[${p.index + 1}/${p.total}] ${p.group} · ${p.platform} ${
@@ -2223,7 +2225,11 @@ export default {
       }`;
     });
     this._unsubAutoCollect = subscribeAutoCollectSettings((next) => {
-      this.autoCollect = normalizeAutoCollectView(next);
+      const view = normalizeAutoCollectView(next);
+      if (this._mainRetentionDays !== null) {
+        view.retentionDays = this._mainRetentionDays;
+      }
+      this.autoCollect = view;
     });
     this._unsubAutoRunComplete = subscribeRunComplete(() => {
       if (!this.syncing) {
@@ -2233,7 +2239,12 @@ export default {
     });
   },
   activated() {
-    this.autoCollect = normalizeAutoCollectView(loadAutoCollectSettings());
+    const view = normalizeAutoCollectView(loadAutoCollectSettings());
+    if (this._mainRetentionDays !== null) {
+      view.retentionDays = this._mainRetentionDays;
+    }
+    this.autoCollect = view;
+    this.syncAutoSettingsFromMain();
     if (this.activeTab === "analysis" && typeof this.$nextTick === "function") {
       this.$nextTick(() => this.resizeAnalysisCharts());
     }
@@ -2244,6 +2255,18 @@ export default {
     if (this._unsubAutoRunComplete) this._unsubAutoRunComplete();
   },
   methods: {
+    syncAutoSettingsFromMain() {
+      if (!ipcRenderer || typeof ipcRenderer.invoke !== "function") return;
+      Promise.resolve(ipcRenderer.invoke("stats:get-auto-settings"))
+        .then((res) => {
+          const days = res && res.ok && res.settings && res.settings.retentionDays;
+          if (Number.isInteger(days) && days >= 1 && days <= 3650) {
+            this._mainRetentionDays = days;
+            this.autoCollect = { ...this.autoCollect, retentionDays: days };
+          }
+        })
+        .catch(() => {});
+    },
     onAutoCollectChange() {
       const res = updateAutoCollectSettings({
         enabled: this.autoCollect.enabled,
@@ -2252,9 +2275,12 @@ export default {
         startTime: this.autoCollect.startTime,
         endTime: this.autoCollect.endTime,
         intervalHours: this.autoCollect.intervalHours,
-        retentionDays: this.autoCollect.retentionDays,
       });
-      this.autoCollect = normalizeAutoCollectView(res.settings);
+      const nextView = normalizeAutoCollectView(res.settings);
+      if (this._mainRetentionDays !== null) {
+        nextView.retentionDays = this._mainRetentionDays;
+      }
+      this.autoCollect = nextView;
       if (!res.ok) {
         this.$message.error(
           `保存自动采集设置失败${res.error ? "：" + res.error : ""}`
@@ -2262,17 +2288,23 @@ export default {
         return;
       }
       if (ipcRenderer && typeof ipcRenderer.invoke === "function") {
-        Promise.resolve(
-          ipcRenderer.invoke("stats:save-auto-settings", {
-            enabled: this.autoCollect.enabled,
-            mode: this.autoCollect.mode,
-            time: this.autoCollect.time,
-            startTime: this.autoCollect.startTime,
-            endTime: this.autoCollect.endTime,
-            intervalHours: this.autoCollect.intervalHours,
-            retentionDays: this.autoCollect.retentionDays,
+        const mainPayload = {
+          enabled: this.autoCollect.enabled,
+          mode: this.autoCollect.mode,
+          time: this.autoCollect.time,
+          startTime: this.autoCollect.startTime,
+          endTime: this.autoCollect.endTime,
+          intervalHours: this.autoCollect.intervalHours,
+        };
+        Promise.resolve(ipcRenderer.invoke("stats:save-auto-settings", mainPayload))
+          .then((saved) => {
+            const days = saved && saved.ok && saved.settings && saved.settings.retentionDays;
+            if (Number.isInteger(days) && days >= 1 && days <= 3650) {
+              this._mainRetentionDays = days;
+              this.autoCollect = { ...this.autoCollect, retentionDays: days };
+            }
           })
-        ).catch(() => {});
+          .catch(() => {});
       }
     },
     async refresh() {

@@ -48,55 +48,21 @@ function todayStr(now = Date.now()) {
   return d.toISOString().slice(0, 10);
 }
 
-/**
- * 创建跨零点保护校验器：覆盖从取得 collectNow 到各文件原子替换的全过程。
- * 用「注入的 now + 实际流逝时间」推算当前时刻，兼容测试注入时间与真实系统时钟。
- */
-function createSameDayGuard(now = Date.now(), startedRealArg, label = "") {
-  const safeNow = typeof now === "number" && Number.isFinite(now) ? now : Date.now();
-  const startedDay = todayStr(safeNow);
-  const startedReal =
-    typeof startedRealArg === "number" && Number.isFinite(startedRealArg)
-      ? startedRealArg
-      : Date.now();
-  const ensureSameDay = () => {
-    if (todayStr(safeNow + (Date.now() - startedReal)) !== startedDay) {
-      const err = new Error(`写入跨过零点，放弃改写 ${label || startedDay} 的快照`);
-      err.code = "EDAYROLL";
-      throw err;
-    }
-  };
-  ensureSameDay.now = safeNow;
-  ensureSameDay.startedDay = startedDay;
-  ensureSameDay.startedReal = startedReal;
-  return ensureSameDay;
-}
-
 /* ---------------- daily ---------------- */
 
 function readDaily(group, platform) {
   return readJson(path.join(accountDir(group, platform), "daily.json"), {});
 }
 
-function writeDaily(group, platform, daily, beforeRename) {
+function writeDaily(group, platform, daily) {
   const file = path.join(accountDir(group, platform), "daily.json");
-  writeWorksDailyAtomic(file, daily, beforeRename);
+  writeWorksDailyAtomic(file, daily);
 }
 
 /**
- * 合并一次采集到 daily：写入当日总量快照；fansHistory 只回填缺失日期。
- * 支持传入统一 ensureSameDay 跨零点保护（跨零点则放弃写入并 warn，若 throwOnDayRoll=true 则上抛 EDAYROLL）。
+ * 合并一次采集到 daily：以 collectNow 的 UTC+8 日期写入当日总量快照；fansHistory 只回填缺失日期。
  */
-function mergeDaily(group, platform, overview, fansHistory, now = Date.now(), options = null) {
-  const opts = isPlainObject(options) ? options : null;
-  const ensureSameDay =
-    opts && typeof opts.ensureSameDay === "function"
-      ? opts.ensureSameDay
-      : createSameDayGuard(
-          now,
-          opts && typeof opts._startedReal === "number" ? opts._startedReal : undefined
-        );
-  const throwOnDayRoll = Boolean(opts && opts.throwOnDayRoll);
+function mergeDaily(group, platform, overview, fansHistory, now = Date.now()) {
   const daily = readDaily(group, platform);
   const today = todayStr(now);
   const snap = {};
@@ -113,21 +79,8 @@ function mergeDaily(group, platform, overview, fansHistory, now = Date.now(), op
       nextDaily[point.date].fans = Number(point.value) || 0;
     }
   }
-  try {
-    ensureSameDay();
-    writeDaily(group, platform, nextDaily, ensureSameDay);
-    return nextDaily;
-  } catch (err) {
-    if (err && err.code === "EDAYROLL") {
-      if (throwOnDayRoll) throw err;
-      console.warn(
-        `[dataStats] 写入 daily.json 跨过零点，放弃本次写入 (${group}/${platform}):`,
-        err.message
-      );
-      return daily;
-    }
-    throw err;
-  }
+  writeDaily(group, platform, nextDaily);
+  return nextDaily;
 }
 
 /* ---------------- works（发布增长） ---------------- */
@@ -224,13 +177,6 @@ function parseValidPublishTime(raw) {
  */
 function mergeWorks(group, platform, newWorks, now = Date.now(), options = null) {
   const opts = isPlainObject(options) ? options : null;
-  const startedReal =
-    opts && typeof opts._startedReal === "number" ? opts._startedReal : Date.now();
-  const ensureSameDay =
-    opts && typeof opts.ensureSameDay === "function"
-      ? opts.ensureSameDay
-      : createSameDayGuard(now, startedReal);
-  const throwOnDayRoll = Boolean(opts && opts.throwOnDayRoll);
 
   const data = readWorks(group, platform);
   const byId = new Map(data.works.map((w) => [w.workId, w]));
@@ -289,34 +235,12 @@ function mergeWorks(group, platform, newWorks, now = Date.now(), options = null)
   // 展示按发布时间倒序
   data.works.sort((a, b) => (b.publishTime || 0) - (a.publishTime || 0));
 
-  // 跨零点校验覆盖 works.json / works-daily / works-intraday 全过程
-  try {
-    ensureSameDay();
-  } catch (err) {
-    if (err && err.code === "EDAYROLL") {
-      if (throwOnDayRoll) throw err;
-      console.warn(
-        `[dataStats] 写入 works.json 跨过零点，放弃本次写入 (${group}/${platform}):`,
-        err.message
-      );
-      return readWorks(group, platform);
-    }
-    throw err;
-  }
-
+  // 整次写入统一以 collectNow（now）的 UTC+8 日期归档，不因写入耗时跨零点而中途放弃
   writeWorks(group, platform, data);
-  const dailyOut = recordWorksDaily(group, platform, sorted, now, ensureSameDay, {
-    throwOnDayRoll,
-  });
-  if (dailyOut && dailyOut.dayRolled) {
-    return data;
-  }
+  recordWorksDaily(group, platform, sorted, now);
   recordWorksIntraday(group, platform, sorted, {
     ...(opts || {}),
     now,
-    _startedReal: startedReal,
-    ensureSameDay,
-    throwOnDayRoll,
   });
   return data;
 }
@@ -373,10 +297,8 @@ function writeAllSync(fd, buf) {
   }
 }
 
-function renameWithRetrySync(src, dest, beforeRename) {
+function renameWithRetrySync(src, dest) {
   for (let attempt = 0; attempt <= WORKS_DAILY_RENAME_MAX_RETRIES; attempt++) {
-    // 每次替换前校验（如跨零点）：校验失败抛错，由调用方清理临时文件、保留旧文件
-    if (beforeRename) beforeRename();
     try {
       fs.renameSync(src, dest);
       return;
@@ -394,7 +316,7 @@ function renameWithRetrySync(src, dest, beforeRename) {
  * 原子写入单日文件：同目录唯一临时文件 → writeSync 全量 → fsync → renameSync 覆盖。
  * 任何步骤失败都删除临时文件并保留旧文件完整。
  */
-function writeWorksDailyAtomic(file, payload, beforeRename) {
+function writeWorksDailyAtomic(file, payload) {
   const dir = path.dirname(file);
   const base = path.basename(file);
   const buf = Buffer.from(JSON.stringify(payload, null, 2), "utf8");
@@ -411,7 +333,7 @@ function writeWorksDailyAtomic(file, payload, beforeRename) {
     const closeFd = fd;
     fd = null;
     fs.closeSync(closeFd);
-    renameWithRetrySync(tmpFile, file, beforeRename);
+    renameWithRetrySync(tmpFile, file);
     tmpCreated = false;
   } catch (err) {
     if (fd !== null) {
@@ -646,27 +568,20 @@ function readWorksDailyLatestAsOf(group, platform, cutoffDate = "") {
 }
 
 /**
- * 写入作品当日累计快照（UTC+8，只读写当天 YYYY-MM-DD.json，不加锁、不写非当天文件）。
- * 读当天文件（不存在/损坏视为空，损坏时 warn）→ 按 workId 合并 → 原子写；失败仅 warn，不影响 mergeWorks。
+ * 写入作品当日累计快照（UTC+8，以 collectNow 的 UTC+8 日期为准，只读写该日 YYYY-MM-DD.json）。
+ * 读当日文件（不存在/损坏视为空，损坏时 warn）→ 按 workId 合并 → 原子写；失败仅 warn，不影响 mergeWorks。
  */
-function recordWorksDaily(group, platform, works, now = Date.now(), startedRealOrGuard, extraOpts) {
-  if (!works || !works.length) return { dayRolled: false };
+function recordWorksDaily(group, platform, works, now = Date.now()) {
+  if (!works || !works.length) return;
   const validWorks = [];
   for (const w of works) {
     if (w && w.workId) validWorks.push(w);
   }
-  if (!validWorks.length) return { dayRolled: false };
+  if (!validWorks.length) return;
 
   const today = todayStr(now);
   const file = path.join(worksDailyDir(group, platform), `${today}.json`);
-  const throwOnDayRoll = Boolean(isPlainObject(extraOpts) && extraOpts.throwOnDayRoll);
-  // 跨零点保护：优先复用调用方传入的统一 ensureSameDay；否则按 startedReal + now 新建。
-  const ensureSameDay =
-    typeof startedRealOrGuard === "function"
-      ? startedRealOrGuard
-      : createSameDayGuard(now, startedRealOrGuard, today);
   try {
-    ensureSameDay();
     const dayWorks = parseDayWorksFile(file) || Object.create(null);
     for (const w of validWorks) {
       dayWorks[String(w.workId)] = pickWorkDailyStats(w);
@@ -675,22 +590,12 @@ function recordWorksDaily(group, platform, works, now = Date.now(), startedRealO
       date: today,
       updatedAt: now,
       works: dayWorks,
-    }, ensureSameDay);
-    return { dayRolled: false };
+    });
   } catch (err) {
-    if (err && err.code === "EDAYROLL") {
-      if (throwOnDayRoll) throw err;
-      console.warn(
-        `[dataStats] 写入 works-daily/${today}.json 失败 (${group}/${platform}):`,
-        (err && err.message) || err
-      );
-      return { dayRolled: true };
-    }
     console.warn(
       `[dataStats] 写入 works-daily/${today}.json 失败 (${group}/${platform}):`,
       (err && err.message) || err
     );
-    return { dayRolled: false };
   }
 }
 
@@ -784,19 +689,26 @@ function parseIntradayDayFile(file) {
 /**
  * 清理超过 retentionDays 的分时段快照文件：
  * 仅删除 works-intraday 目录下文件名严格符合 YYYY-MM-DD.json 且为普通文件、
- * 日期早于 today - retentionDays 的文件；不触碰目录内外任何其他文件。
+ * 日期严格早于 (today - retentionDays) 的文件；未显式传入 retentionDays 时以主进程持久化设置为准，
+ * 并在每个文件删除前再次校验日期严格早于 (今天 - 主进程 retentionDays)；不触碰目录内外任何其他文件。
  */
 function cleanupWorksIntraday(
   group,
   platform,
   now = Date.now(),
-  retentionDays = DEFAULT_INTRADAY_RETENTION_DAYS
+  retentionDaysArg
 ) {
   const dir = worksIntradayDir(group, platform);
   const today = todayStr(now);
   const todayDayNum = dateStrToDayNum(today);
   if (todayDayNum === null) return [];
-  const keepDays = normalizeRetentionDaysOption(retentionDays);
+  const hasExplicit =
+    retentionDaysArg !== undefined &&
+    retentionDaysArg !== null &&
+    retentionDaysArg !== "";
+  const keepDays = hasExplicit
+    ? normalizeRetentionDaysOption(retentionDaysArg)
+    : readAutoSettings().retentionDays;
   const minKeepDayNum = todayDayNum - keepDays;
 
   let entries;
@@ -818,6 +730,9 @@ function cleanupWorksIntraday(
     const fileDate = match[1];
     const fileDayNum = dateStrToDayNum(fileDate);
     if (fileDayNum === null || fileDayNum >= minKeepDayNum) continue;
+    // 清理前再次校验：只删严格早于（今天 − 主进程 retentionDays）的文件
+    const verifyKeepDays = hasExplicit ? keepDays : readAutoSettings().retentionDays;
+    if (fileDayNum >= todayDayNum - verifyKeepDays) continue;
     const fullPath = path.join(dir, name);
     try {
       const stat = fs.lstatSync(fullPath);
@@ -837,9 +752,9 @@ function cleanupWorksIntraday(
 /**
  * 写入作品分时段快照（works-intraday/YYYY-MM-DD.json）：
  * - 自动采集：使用传入 slot ("YYYY-MM-DD HH:mm") 的日期与时段作为文件与槽键
- * - 手动采集（未传 slot）：按实际时刻（UTC+8）向下取整到整点 "HH:00"
+ * - 手动采集（未传 slot）：按 collectNow（UTC+8）向下取整到整点 "HH:00"
  * - 同槽重复采集覆盖该槽；同日其他槽完整保留
- * - 复用原子写与跨零点保护；每天首次写入成功后自动清理超过 retentionDays 的历史 intraday 文件
+ * - 整次写入统一以 collectNow 归档，不因写入耗时跨零点而放弃；每天首次写入成功后自动清理过期 intraday 文件
  */
 function recordWorksIntraday(group, platform, works, optionsOrNow, extraOpts) {
   if (!works || !works.length) return;
@@ -862,10 +777,6 @@ function recordWorksIntraday(group, platform, works, optionsOrNow, extraOpts) {
     typeof opts.now === "number" && Number.isFinite(opts.now) ? opts.now : Date.now();
   const hasExplicitRetention =
     opts.retentionDays !== undefined && opts.retentionDays !== null && opts.retentionDays !== "";
-  const retentionDays = hasExplicitRetention
-    ? normalizeRetentionDaysOption(opts.retentionDays)
-    : readAutoSettings().retentionDays;
-  const throwOnDayRoll = Boolean(opts.throwOnDayRoll);
 
   let targetDate;
   let slotTime;
@@ -883,20 +794,10 @@ function recordWorksIntraday(group, platform, works, optionsOrNow, extraOpts) {
   }
 
   const startedDay = todayStr(now);
-  const ensureSameDay =
-    typeof opts.ensureSameDay === "function"
-      ? opts.ensureSameDay
-      : createSameDayGuard(
-          now,
-          typeof opts._startedReal === "number" ? opts._startedReal : undefined,
-          `${targetDate} 的分时段`
-        );
-
   const dir = worksIntradayDir(group, platform);
   const file = path.join(dir, `${targetDate}.json`);
 
   try {
-    ensureSameDay();
     const existingSlots = parseIntradayDayFile(file) || Object.create(null);
     const slotWorks = Object.create(null);
     for (const w of validWorks) {
@@ -907,24 +808,25 @@ function recordWorksIntraday(group, platform, works, optionsOrNow, extraOpts) {
       works: slotWorks,
     };
 
-    writeWorksDailyAtomic(
-      file,
-      {
-        date: targetDate,
-        slots: existingSlots,
-      },
-      ensureSameDay
-    );
+    writeWorksDailyAtomic(file, {
+      date: targetDate,
+      slots: existingSlots,
+    });
 
-    const cleanupKey = `${startedDay}|${retentionDays}`;
+    const cleanupRetention = hasExplicitRetention
+      ? normalizeRetentionDaysOption(opts.retentionDays)
+      : readAutoSettings().retentionDays;
+    const cleanupKey = `${startedDay}|${cleanupRetention}`;
     if (intradayCleanupDone.get(dir) !== cleanupKey) {
       intradayCleanupDone.set(dir, cleanupKey);
-      cleanupWorksIntraday(group, platform, now, retentionDays);
+      cleanupWorksIntraday(
+        group,
+        platform,
+        now,
+        hasExplicitRetention ? cleanupRetention : undefined
+      );
     }
   } catch (err) {
-    if (err && err.code === "EDAYROLL" && throwOnDayRoll) {
-      throw err;
-    }
     console.warn(
       `[dataStats] 写入 works-intraday/${targetDate}.json 失败 (${group}/${platform}):`,
       (err && err.message) || err
@@ -1850,7 +1752,6 @@ module.exports = {
   readAutoRuns,
   appendAutoRun,
   updateAutoRunTimestamps,
-  createSameDayGuard,
   LINK_OVERRIDES_VERSION,
   readLinkOverrides,
   writeLinkOverrides,

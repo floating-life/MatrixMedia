@@ -328,46 +328,44 @@ async function main() {
       console.log("✓ 3. 原子写失败（writeSync/fsyncSync/renameSync）：旧文件完整、无 .tmp 残留、不阻断 mergeWorks");
     }
 
-    /* ---------- 4. 跨零点写入放弃 ---------- */
+    /* ---------- 4. 跨零点写入：以 collectNow 的 UTC+8 日期为唯一日期，不中途放弃 ---------- */
     {
       const g = "跨零点组";
       const p = "视频号";
       const beforeMid = cnTime(2026, 11, 20, 23, 59, 58);
       store.recordWorksIntraday(g, p, [{ workId: "m1", play: 100 }], {
-        now: beforeMid,
+        now: cnTime(2026, 11, 20, 22, 0, 0),
         slot: "2026-11-20 22:00",
       });
       const dir = store.worksIntradayDir(g, p);
       const dayFile = path.join(dir, "2026-11-20.json");
-      const beforeBytes = fs.readFileSync(dayFile);
+      const nextDayFile = path.join(dir, "2026-11-21.json");
 
-      // 模拟写入过程中真实时间前进 5 秒，跨过 2026-11-21 00:00:00 (UTC+8)
+      // 模拟写入过程中时钟跨过 2026-11-21 00:00:00 (UTC+8)：仍按 collectNow (2026-11-20) 完整写入前一天文件
       const origDateNow = Date.now;
       let calls = 0;
-      const baseReal = origDateNow();
       Date.now = () => {
         calls += 1;
-        // 第 1 次获取 startedReal，后续检查 ensureSameDay 时已跨零点（+5000ms）
-        return calls <= 1 ? baseReal : baseReal + 5000;
+        return calls <= 1 ? beforeMid : cnTime(2026, 11, 21, 0, 0, 3);
       };
       try {
         const { warns } = captureWarns(() => {
-          store.recordWorksIntraday(g, p, [{ workId: "m1", play: 999 }], {
+          store.recordWorksIntraday(g, p, [{ workId: "m1", play: 250 }], {
             now: beforeMid,
             slot: "2026-11-20 23:00",
           });
         });
-        assert.ok(warns.some((w) => w.includes("跨过零点")), "跨零点应告警放弃");
+        assert.deepStrictEqual(warns, [], "零点前采集、零点后写入不再中断告警");
       } finally {
         Date.now = origDateNow;
       }
-      assert.strictEqual(
-        Buffer.compare(fs.readFileSync(dayFile), beforeBytes),
-        0,
-        "跨零点放弃后昨日文件必须保持原样"
-      );
-      assert.strictEqual(fs.readdirSync(dir).some((f) => f.includes(".tmp")), false, "跨零点放弃不得残留 .tmp");
-      console.log("✓ 4. 跨零点写入放弃：昨日文件保持完整且无 .tmp 残留");
+      const doc = JSON.parse(fs.readFileSync(dayFile, "utf8"));
+      assert.strictEqual(doc.slots["22:00"].works.m1.play, 100);
+      assert.strictEqual(doc.slots["23:00"].works.m1.play, 250);
+      assert.strictEqual(doc.slots["23:00"].collectedAt, beforeMid);
+      assert.strictEqual(fs.existsSync(nextDayFile), false, "不得拆写到次日文件");
+      assert.strictEqual(fs.readdirSync(dir).some((f) => f.includes(".tmp")), false, "不得残留 .tmp");
+      console.log("✓ 4. 跨零点写入：以 collectNow 归档 2026-11-20 且无 .tmp 残留");
     }
 
     /* ---------- 5. 保留期清理：每天首次写入触发、只删 works-intraday 目标文件 ---------- */
@@ -777,21 +775,50 @@ async function main() {
           );
           assert.strictEqual(fs.existsSync(store4a.autoSettingsFile()), true);
 
-          // 模拟进程重启：清 require.cache 并重新注册 IPC，直接手动同步（不传 retentionDays）
+          // 模拟进程重启：清 require.cache 并重新注册 IPC，直接手动同步（即使调用方误传 retentionDays=60 也不得覆盖主进程 90）
           fix4Handlers.clear();
           delete require.cache[storeId];
           delete require.cache[indexId];
+          const store4b = require(storeId);
           require(indexId).registerDataStatsIpc();
 
+          // 额外放入边界文件 2026-08-22.json（恰 90 天前 → 保留）与 2026-08-21.json（91 天前 → 删）
+          fs.writeFileSync(path.join(dir4, "2026-08-22.json"), oldSnap("2026-08-22"));
+          fs.writeFileSync(path.join(dir4, "2026-08-21.json"), oldSnap("2026-08-21"));
+
+          // 一次性迁移 initOnly:true 在主进程已有设置时不得覆盖 90
+          const initRes = await fix4Handlers.get("stats:save-auto-settings")(
+            { senderFrame: { url: "file:///app/index.html" } },
+            { enabled: false, mode: "daily", retentionDays: 60, initOnly: true }
+          );
+          assert.strictEqual(initRes.ok, true);
+          assert.strictEqual(initRes.settings.retentionDays, 90, "主进程已有保留期时 initOnly 迁移不得覆盖");
+
+          // 即使采集 IPC 携带 retentionDays=60，主进程也必须忽略并以自身持久化 90 为准
           const colRes = await fix4Handlers.get("stats:collect")(
             { sender: { send: () => {} } },
-            { accounts: [{ group: "保留组", platform: "抖音", partition: "persist:r4-dy" }], trigger: "manual" }
+            {
+              accounts: [{ group: "保留组", platform: "抖音", partition: "persist:r4-dy" }],
+              trigger: "manual",
+              retentionDays: 60,
+            }
           );
           assert.strictEqual(colRes.results[0].success, true);
+          assert.strictEqual(store4b.readAutoSettings().retentionDays, 90, "采集 IPC 不得覆盖主进程 retentionDays");
           assert.strictEqual(
             fs.existsSync(path.join(dir4, "2026-09-11.json")),
             true,
-            "重启后手动同步必须沿用持久化 retentionDays=90，不得删除 70 天前快照"
+            "重启后手动同步必须沿用主进程 retentionDays=90，不得删除 70 天前快照"
+          );
+          assert.strictEqual(
+            fs.existsSync(path.join(dir4, "2026-08-22.json")),
+            true,
+            "恰等于 90 天的边界文件必须保留"
+          );
+          assert.strictEqual(
+            fs.existsSync(path.join(dir4, "2026-08-21.json")),
+            false,
+            "早于 今天-90天 的 91 天前快照应被清理"
           );
           assert.strictEqual(
             fs.existsSync(path.join(dir4, "2026-08-17.json")),
@@ -799,7 +826,20 @@ async function main() {
             "超过 90 天的 95 天前快照应被清理"
           );
 
-          // stats:match-works 入口同样共用持久化 retentionDays=90
+          // stats:auto-run 携带 retentionDays=30 同样不得覆盖主进程 90
+          await fix4Handlers.get("stats:auto-run")(
+            { sender: { send: () => {} } },
+            {
+              accounts: [{ group: "保留组", platform: "抖音", partition: "persist:r4-auto" }],
+              slot: "2026-11-20 10:00",
+              slotEndMs: cnTime(2026, 11, 20, 12, 0, 0),
+              retentionDays: 30,
+            }
+          );
+          assert.strictEqual(store4b.readAutoSettings().retentionDays, 90, "stats:auto-run 不得覆盖主进程 retentionDays");
+          assert.strictEqual(fs.existsSync(path.join(dir4, "2026-09-11.json")), true);
+
+          // stats:match-works 入口同样共用主进程 retentionDays=90，且忽略调用方传入的 30
           const dir4b = store4a.worksIntradayDir("匹配保留组", "快手");
           fs.mkdirSync(dir4b, { recursive: true });
           fs.writeFileSync(path.join(dir4b, "2026-09-11.json"), oldSnap("2026-09-11")); // 70 天前
@@ -807,15 +847,26 @@ async function main() {
           await fix4Handlers.get("stats:match-works")(
             {},
             {
+              retentionDays: 30,
               tasks: [
                 { key: "k1", group: "匹配保留组", platform: "快手", partition: "persist:r4-ks", title: "保留期测试" },
               ],
             }
           );
-          assert.strictEqual(fs.existsSync(path.join(dir4b, "2026-09-11.json")), true, "match-works 须共用 retentionDays=90");
+          assert.strictEqual(store4b.readAutoSettings().retentionDays, 90);
+          assert.strictEqual(fs.existsSync(path.join(dir4b, "2026-09-11.json")), true, "match-works 须共用主进程 retentionDays=90");
           assert.strictEqual(fs.existsSync(path.join(dir4b, "2026-08-17.json")), false);
 
-          // 未设置过的新 userData 目录回退默认 60 天（删除 65 天前，保留 55 天前）
+          // 只有设置保存 IPC（非 initOnly）才能修改主进程 retentionDays
+          const explicitSave = await fix4Handlers.get("stats:save-auto-settings")(
+            { senderFrame: { url: "file:///app/index.html" } },
+            { retentionDays: 120 }
+          );
+          assert.strictEqual(explicitSave.ok, true);
+          assert.strictEqual(explicitSave.settings.retentionDays, 120);
+          assert.strictEqual(store4b.readAutoSettings().retentionDays, 120);
+
+          // 未设置过的新 userData 目录：initOnly:true 可一次性迁移渲染层缓存，后续再次 initOnly 不覆盖；无迁移时默认 60 天
           const defaultRoot = fs.mkdtempSync(path.join(os.tmpdir(), "mm-s9fix4-def-"));
           try {
             require.cache[electronId].exports.app.getPath = (name) =>
@@ -835,6 +886,20 @@ async function main() {
             );
             assert.strictEqual(fs.existsSync(path.join(dirDef, "2026-09-16.json")), false, "未设置 retentionDays 默认 60 天，65 天前应清理");
             assert.strictEqual(fs.existsSync(path.join(dirDef, "2026-09-26.json")), true, "55 天前应保留");
+
+            // 尚无 auto-settings.json 时 initOnly:true 一次性迁移为 90，二次 initOnly:true(60) 不覆盖
+            assert.strictEqual(fs.existsSync(storeDef.autoSettingsFile()), false);
+            const firstMig = await fix4Handlers.get("stats:save-auto-settings")(
+              { senderFrame: { url: "file:///app/index.html" } },
+              { enabled: false, mode: "daily", retentionDays: 90, initOnly: true }
+            );
+            assert.strictEqual(firstMig.settings.retentionDays, 90);
+            const secondMig = await fix4Handlers.get("stats:save-auto-settings")(
+              { senderFrame: { url: "file:///app/index.html" } },
+              { enabled: false, mode: "daily", retentionDays: 60, initOnly: true }
+            );
+            assert.strictEqual(secondMig.settings.retentionDays, 90);
+            assert.strictEqual(storeDef.readAutoSettings().retentionDays, 90);
           } finally {
             fs.rmSync(defaultRoot, { recursive: true, force: true });
           }
@@ -847,105 +912,118 @@ async function main() {
           delete require.cache[indexId];
           fs.rmSync(fix4Root, { recursive: true, force: true });
         }
-        console.log("✓ [S9-fix #4] testS9Fix4_PersistedRetentionDaysAcrossRestartAndAllEntries 通过");
+        console.log("✓ [S9-r3 #1] testS9R3_1_MainProcessAuthoritativeRetentionDays 通过");
       }
 
-      // testS9Fix5_MidnightGuardCoversMergeDailyToIntraday
-      // 评审 #5：采集在零点前返回，mergeDaily 跨过零点后，整次放弃写入（不改写昨日 daily/works/works-daily/works-intraday）并 warn
+      // testS9R3_2_MidnightWriteUsesCollectNowDateConsistently
+      // 评审2 #2：22:01 采到 170，23:59:59.900 采到 250，daily.json 替换完成时跨到 00:00:00.100；
+      // 整次写入统一以 collectNow 的 UTC+8 日期 2026-11-20 归档，daily/works/works-daily/works-intraday 全部一致为 250，不留半次写入
       {
-        const fix5Root = fs.mkdtempSync(path.join(os.tmpdir(), "mm-s9fix5-"));
+        const fix5Root = fs.mkdtempSync(path.join(os.tmpdir(), "mm-s9r3-2-"));
         const origGetPath = require.cache[electronId].exports.app.getPath;
         const origHandle = require.cache[electronId].exports.ipcMain.handle;
         const origCollector = require.cache[collectorId].exports.collectAccount;
         const origDateNow = Date.now;
-        const origFsync = fs.fsyncSync;
+        const origRename = fs.renameSync;
         const fix5Handlers = new Map();
+        let mockPlay = 170;
         try {
           require.cache[electronId].exports.app.getPath = (name) =>
             name === "documents" ? docsDir : fix5Root;
           require.cache[electronId].exports.ipcMain.handle = (ch, fn) => fix5Handlers.set(ch, fn);
           require.cache[collectorId].exports.collectAccount = async () => ({
-            overview: { plays: 999, fans: 99 },
+            overview: { plays: mockPlay, fans: 10 },
             fansHistory: [],
-            works: [{ workId: "M5", title: "原片", play: 999 }],
+            works: [{ workId: "W1", title: "短片", publishTime: cnTime(2026, 11, 20, 8, 0, 0), play: mockPlay }],
           });
           delete require.cache[storeId];
           delete require.cache[indexId];
           const store5 = require(storeId);
           require(indexId).registerDataStatsIpc();
 
-          const g = "跨零点全链路组";
+          const g = "示例";
           const p = "抖音";
-          const tInit = cnTime(2026, 11, 20, 22, 0, 0);
-          Date.now = () => tInit;
-          store5.mergeDaily(g, p, { plays: 100, fans: 10 }, [], tInit);
-          store5.mergeWorks(g, p, [{ workId: "M5", title: "原片", play: 100 }], tInit, {
-            slot: "2026-11-20 22:00",
-          });
+          const acc = { group: g, platform: p, partition: "persist:demo抖音" };
+          const day = "2026-11-20";
+          const midnight = cnTime(2026, 11, 21, 0, 0, 0);
 
-          const accDir = path.join(fix5Root, "data-stats", g, p);
-          const dailyJsonFile = path.join(accDir, "daily.json");
-          const worksJsonFile = path.join(accDir, "works.json");
-          const worksDailyFile = path.join(accDir, "works-daily", "2026-11-20.json");
-          const worksIntradayFile = path.join(accDir, "works-intraday", "2026-11-20.json");
-
-          const beforeDaily = fs.readFileSync(dailyJsonFile);
-          const beforeWorks = fs.readFileSync(worksJsonFile);
-          const beforeWD = fs.readFileSync(worksDailyFile);
-          const beforeWI = fs.readFileSync(worksIntradayFile);
-
-          // 情形 A：collectAccount 在 23:59:59 返回，mergeDaily 落盘 fsync 期间时钟跨过零点到 2026-11-21 00:00:02
-          let mockNow = cnTime(2026, 11, 20, 23, 59, 59);
+          // 1) 22:01 手动采集 170
+          let mockNow = cnTime(2026, 11, 20, 22, 1, 0);
           Date.now = () => mockNow;
-          let bumped = false;
-          fs.fsyncSync = function (fd) {
-            origFsync.call(this, fd);
-            if (!bumped) {
-              bumped = true;
-              mockNow = cnTime(2026, 11, 21, 0, 0, 2);
-            }
-          };
-
-          const { res: r5a, warns: warns5a } = await captureWarns(() =>
-            fix5Handlers.get("stats:collect")(
-              { sender: { send: () => {} } },
-              { accounts: [{ group: g, platform: p, partition: "persist:m5-a" }], trigger: "manual" }
-            )
+          mockPlay = 170;
+          const rInit = await fix5Handlers.get("stats:collect")(
+            { sender: { send: () => {} } },
+            { accounts: [acc], trigger: "manual" }
           );
-          fs.fsyncSync = origFsync;
+          assert.strictEqual(rInit.results[0].success, true);
 
-          assert.strictEqual(r5a.results[0].dayRolled, true);
-          assert.ok(warns5a.some((w) => w.includes("跨过零点")), "跨零点放弃写入必须 warn");
-          assert.strictEqual(Buffer.compare(fs.readFileSync(dailyJsonFile), beforeDaily), 0, "跨零点不得改写 daily.json");
-          assert.strictEqual(Buffer.compare(fs.readFileSync(worksJsonFile), beforeWorks), 0, "跨零点不得改写 works.json");
-          assert.strictEqual(Buffer.compare(fs.readFileSync(worksDailyFile), beforeWD), 0, "跨零点不得改写昨日 works-daily");
-          assert.strictEqual(Buffer.compare(fs.readFileSync(worksIntradayFile), beforeWI), 0, "跨零点不得向昨日 works-intraday 写新记录");
-          assert.strictEqual(fs.readdirSync(accDir).some((f) => f.endsWith(".tmp")), false);
-          assert.strictEqual(fs.readdirSync(path.dirname(worksDailyFile)).some((f) => f.endsWith(".tmp")), false);
-          assert.strictEqual(fs.readdirSync(path.dirname(worksIntradayFile)).some((f) => f.endsWith(".tmp")), false);
-
-          // 情形 B：mergeDaily 完成后、mergeWorks 开始前已跨零点 → mergeWorks/works-daily/works-intraday 全部放弃并 warn
-          mockNow = cnTime(2026, 11, 20, 23, 59, 59);
-          const origMergeDaily = store5.mergeDaily;
-          store5.mergeDaily = (...args) => {
-            const out = origMergeDaily(...args);
-            mockNow = cnTime(2026, 11, 21, 0, 0, 2);
+          // 2) 23:59:59.900 采到 250，daily.json 替换完成瞬间时钟跨到 2026-11-21 00:00:00.100
+          mockNow = midnight - 100;
+          mockPlay = 250;
+          let rolled = false;
+          fs.renameSync = (src, dest) => {
+            const out = origRename(src, dest);
+            if (!rolled && typeof dest === "string" && path.basename(dest) === "daily.json") {
+              rolled = true;
+              mockNow = midnight + 100;
+            }
             return out;
           };
-          const { res: r5b, warns: warns5b } = await captureWarns(() =>
-            fix5Handlers.get("stats:collect")(
-              { sender: { send: () => {} } },
-              { accounts: [{ group: g, platform: p, partition: "persist:m5-b" }], trigger: "manual" }
-            )
+
+          const rMid = await fix5Handlers.get("stats:collect")(
+            { sender: { send: () => {} } },
+            { accounts: [acc], trigger: "manual" }
           );
-          store5.mergeDaily = origMergeDaily;
-          assert.strictEqual(r5b.results[0].dayRolled, true);
-          assert.ok(warns5b.some((w) => w.includes("跨过零点")));
-          assert.strictEqual(Buffer.compare(fs.readFileSync(worksJsonFile), beforeWorks), 0, "mergeDaily 后跨零点不得改写 works.json");
-          assert.strictEqual(Buffer.compare(fs.readFileSync(worksDailyFile), beforeWD), 0, "mergeDaily 后跨零点不得改写昨日 works-daily");
-          assert.strictEqual(Buffer.compare(fs.readFileSync(worksIntradayFile), beforeWI), 0, "mergeDaily 后跨零点不得改写昨日 works-intraday");
+          fs.renameSync = origRename;
+
+          assert.strictEqual(rolled, true, "确认 daily.json 替换时跨过零点");
+          assert.strictEqual(rMid.results[0].success, true, "零点前采到的数据应完整写入并成功返回");
+          assert.strictEqual(Boolean(rMid.results[0].dayRolled), false, "不再中途 abort 置 dayRolled");
+          assert.strictEqual(store5.readDaily(g, p)[day].plays, 250, "账号日快照为 250");
+          assert.strictEqual(store5.readDaily(g, p)["2026-11-21"], undefined, "不得拆写到次日 daily");
+          assert.strictEqual(store5.readWorks(g, p).works[0].play, 250, "works.json 为 250");
+          assert.strictEqual(store5.readWorksDaily(g, p).W1[day].play, 250, "works-daily 必须同步为 250（非半次写入 170）");
+          assert.strictEqual(store5.readWorksDaily(g, p).W1["2026-11-21"], undefined, "不得拆写到次日 works-daily");
+          assert.deepStrictEqual(
+            store5.readWorksIntraday(g, p).W1.map((x) => [x.date, x.slot, x.play]),
+            [
+              ["2026-11-20", "22:00", 170],
+              ["2026-11-20", "23:00", 250],
+            ],
+            "works-intraday 必须完整写入 2026-11-20 的 23:00 槽 (250)"
+          );
+          assert.strictEqual(
+            fs.existsSync(path.join(store5.worksIntradayDir(g, p), "2026-11-21.json")),
+            false,
+            "不得生成次日 works-intraday 文件"
+          );
+
+          // 3) stats:match-works 写入跨零点同样三类文件一致归档到 collectNow 所属日期
+          const gMatch = "匹配跨零点组";
+          mockNow = midnight - 100;
+          mockPlay = 320;
+          let rolledMatch = false;
+          fs.renameSync = (src, dest) => {
+            const out = origRename(src, dest);
+            if (!rolledMatch && typeof dest === "string" && path.basename(dest) === "daily.json") {
+              rolledMatch = true;
+              mockNow = midnight + 100;
+            }
+            return out;
+          };
+          const matchOut = await fix5Handlers.get("stats:match-works")(
+            {},
+            { tasks: [{ key: "m1", group: gMatch, platform: p, partition: "persist:m-mid", title: "短片" }] }
+          );
+          fs.renameSync = origRename;
+          assert.strictEqual(rolledMatch, true);
+          assert.strictEqual(matchOut.matches.m1.found, true);
+          assert.strictEqual(store5.readDaily(gMatch, p)[day].plays, 320);
+          assert.strictEqual(store5.readWorksDaily(gMatch, p).W1[day].play, 320);
+          assert.strictEqual(store5.readWorksIntraday(gMatch, p).W1[0].date, day);
+          assert.strictEqual(store5.readWorksIntraday(gMatch, p).W1[0].play, 320);
         } finally {
-          fs.fsyncSync = origFsync;
+          fs.renameSync = origRename;
           Date.now = origDateNow;
           require.cache[electronId].exports.app.getPath = origGetPath;
           require.cache[electronId].exports.ipcMain.handle = origHandle;
@@ -954,7 +1032,7 @@ async function main() {
           delete require.cache[indexId];
           fs.rmSync(fix5Root, { recursive: true, force: true });
         }
-        console.log("✓ [S9-fix #5] testS9Fix5_MidnightGuardCoversMergeDailyToIntraday 通过");
+        console.log("✓ [S9-r3 #2] testS9R3_2_MidnightWriteUsesCollectNowDateConsistently 通过");
       }
 
       // testS9Fix6_IntradayTrendAndRowsSortByActualCollectedAt
@@ -1031,6 +1109,87 @@ async function main() {
           fs.rmSync(fix6Root, { recursive: true, force: true });
         }
         console.log("✓ [S9-fix #6] testS9Fix6_IntradayTrendAndRowsSortByActualCollectedAt 通过");
+      }
+
+      // testS9R3_4_CrossPlatformIntradayUsesOwnCollectedAtAndDelta
+      // 评审2 #4：抖音 10:31→100 (10:30 槽) 与 10:40→150 (10:00 槽)，同时快手 10:29→100 (10:00 槽) 与 10:31:02→150 (10:30 槽)；
+      // 两平台曲线必须按各自实际 collectedAt 递增、各自增量 [+50] 落在第二点，不再因共享槽轴把快手倒序画成 150→100
+      {
+        const r3_4Root = fs.mkdtempSync(path.join(os.tmpdir(), "mm-s9r3-4-"));
+        const r3_4Push = path.join(r3_4Root, "pushData");
+        fs.mkdirSync(r3_4Push, { recursive: true });
+        const origGetPath = require.cache[electronId].exports.app.getPath;
+        try {
+          require.cache[electronId].exports.app.getPath = (name) =>
+            name === "documents" ? docsDir : r3_4Root;
+          delete require.cache[storeId];
+          delete require.cache[exportId];
+          const store4 = require(storeId);
+          const export4 = require(exportId);
+
+          const day = "2026-11-20";
+          const pub = cnTime(2026, 11, 20, 8, 0, 0);
+          const t1029 = cnTime(2026, 11, 20, 10, 29, 0);
+          const t1031 = cnTime(2026, 11, 20, 10, 31, 0);
+          const t103102 = cnTime(2026, 11, 20, 10, 31, 2);
+          const t1040 = cnTime(2026, 11, 20, 10, 40, 0);
+          const dyUrl = "https://www.douyin.com/video/123456";
+          const ksUrl = "https://www.kuaishou.com/short-video/ks1";
+
+          fs.writeFileSync(
+            path.join(r3_4Push, `${day}.json`),
+            JSON.stringify([
+              { id: "123456", filePath: "/v/sample.mp4", title: "样片", pt: "抖音", group: "示例", videoLink: dyUrl, publishStatus: "success", lastPublishAt: pub },
+              { id: "ks1", filePath: "/v/sample.mp4", title: "样片", pt: "快手", group: "示例", videoLink: ksUrl, publishStatus: "success", lastPublishAt: pub },
+            ])
+          );
+
+          store4.mergeWorks("示例", "快手", [{ workId: "ks1", title: "样片", publishTime: pub, play: 100, url: ksUrl }], t1029);
+          store4.mergeWorks("示例", "抖音", [{ workId: "123456", title: "样片", publishTime: pub, play: 100, url: dyUrl }], t1031, { slot: `${day} 10:30` });
+          store4.mergeWorks("示例", "快手", [{ workId: "ks1", title: "样片", publishTime: pub, play: 150, url: ksUrl }], t103102, { slot: `${day} 10:30` });
+          store4.mergeWorks("示例", "抖音", [{ workId: "123456", title: "样片", publishTime: pub, play: 150, url: dyUrl }], t1040);
+
+          const trend = export4.buildContentIntradayData({
+            contentKey: "file:/v/sample.mp4",
+            days: 1,
+            pushDataDir: r3_4Push,
+          });
+          assert.strictEqual(trend.found, true);
+          assert.deepStrictEqual(trend.collectedAts, [t1029, t1031, t103102, t1040], "全局时间戳必须严格按实际 collectedAt 升序");
+
+          const dy = trend.platforms.find((x) => x.platform === "抖音");
+          const ks = trend.platforms.find((x) => x.platform === "快手");
+          assert.ok(dy && ks);
+
+          // 抖音自身时间线：10:31 (100, delta null, 槽 10:30) → 10:40 (150, delta +50, 槽 10:00)
+          assert.deepStrictEqual(
+            dy.points.map((x) => [x.collectedAt, x.slot, x.play, x.playDelta]),
+            [
+              [t1031, "10:30", 100, null],
+              [t1040, "10:00", 150, 50],
+            ]
+          );
+          // 快手自身时间线：10:29 (100, delta null, 槽 10:00) → 10:31:02 (150, delta +50, 槽 10:30)
+          assert.deepStrictEqual(
+            ks.points.map((x) => [x.collectedAt, x.slot, x.play, x.playDelta]),
+            [
+              [t1029, "10:00", 100, null],
+              [t103102, "10:30", 150, 50],
+            ],
+            "快手曲线必须保持 100→150 增长且 +50 落在第二点，绝不得倒序为 150→100"
+          );
+          assert.deepStrictEqual(ks.play, [100, null, 150, null]);
+          assert.deepStrictEqual(ks.playDelta, [null, null, 50, null]);
+          assert.deepStrictEqual(dy.play, [null, 100, null, 150]);
+          assert.deepStrictEqual(dy.playDelta, [null, null, null, 50]);
+          assert.deepStrictEqual(trend.totalPlayDelta, [null, null, 50, 50]);
+        } finally {
+          require.cache[electronId].exports.app.getPath = origGetPath;
+          delete require.cache[storeId];
+          delete require.cache[exportId];
+          fs.rmSync(r3_4Root, { recursive: true, force: true });
+        }
+        console.log("✓ [S9-r3 #4] testS9R3_4_CrossPlatformIntradayUsesOwnCollectedAtAndDelta 通过");
       }
 
       // testS9Fix7_First24hNormalizedFirstPublishTimeAndCutoffByCollectedAt

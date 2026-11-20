@@ -1336,29 +1336,117 @@ try {
   }
 
 
-  /* ---------- 跨零点：同一次写入跨过 UTC+8 零点，不得改写「昨天」文件 ---------- */
+  /* ---------- 跨零点：以 collectNow 的 UTC+8 日期为唯一日期，零点前采集、零点后写入 → 写入前一天文件且三类文件一致 ---------- */
   {
     const G = "跨零点组", P = "抖音";
-    const before = Date.parse("2026-11-10T15:59:59.900Z"); // UTC+8 23:59:59.900
-    store.mergeWorks(G, P, [{ workId: "A", title: "a", publishTime: 1, play: 1 }], before - 60000);
+    const before = Date.parse("2026-11-10T15:59:59.900Z"); // UTC+8 2026-11-10 23:59:59.900
+    const afterMidnight = Date.parse("2026-11-10T16:00:00.100Z"); // UTC+8 2026-11-11 00:00:00.100
+    store.mergeDaily(G, P, { plays: 170 }, [], before - 60000);
+    store.mergeWorks(G, P, [{ workId: "A", title: "a", publishTime: 1, play: 170 }], before - 60000);
+
     const dayFile = path.join(tmpRoot, "data-stats", G, P, "works-daily", "2026-11-10.json");
-    const bytesBefore = fs.readFileSync(dayFile);
+    const nextDayFile = path.join(tmpRoot, "data-stats", G, P, "works-daily", "2026-11-11.json");
+    const intradayFile = path.join(tmpRoot, "data-stats", G, P, "works-intraday", "2026-11-10.json");
+    const nextIntradayFile = path.join(tmpRoot, "data-stats", G, P, "works-intraday", "2026-11-11.json");
+
     const realNow = Date.now;
     const realFsync = fs.fsyncSync;
-    let base = realNow();
+    let clock = before;
+    let rolled = false;
     try {
-      // fsync 期间「真实时间」前进 200ms → 推算时刻跨过零点
-      fs.fsyncSync = (fd) => { realFsync(fd); const t = base + 200; Date.now = () => t; };
-      Date.now = () => base;
-      store.mergeWorks(G, P, [{ workId: "B", title: "b", publishTime: 2, play: 2 }], before);
+      Date.now = () => clock;
+      // daily.json 落盘 fsync 期间时钟跨过零点到次日 00:00:00.100
+      fs.fsyncSync = (fd) => {
+        realFsync(fd);
+        if (!rolled) {
+          rolled = true;
+          clock = afterMidnight;
+        }
+      };
+      store.mergeDaily(G, P, { plays: 250 }, [], before);
+      store.mergeWorks(
+        G,
+        P,
+        [
+          { workId: "A", title: "a", publishTime: 1, play: 250 },
+          { workId: "B", title: "b", publishTime: 2, play: 2 },
+        ],
+        before
+      );
     } finally {
       Date.now = realNow;
       fs.fsyncSync = realFsync;
     }
-    assert.deepStrictEqual(fs.readFileSync(dayFile), bytesBefore, "跨零点写入改写了昨天的文件");
-    const leftovers = fs.readdirSync(path.dirname(dayFile)).filter((f) => f.endsWith(".tmp"));
-    assert.strictEqual(leftovers.length, 0, "跨零点放弃替换后残留临时文件");
-    console.log("✓ 跨零点写入放弃替换，昨天文件字节不变、无临时文件残留");
+
+    assert.strictEqual(rolled, true, "确认写入过程中已跨过零点");
+    // 1) daily.json 归档在前一天 2026-11-10，不生成 2026-11-11
+    const accDaily = store.readDaily(G, P);
+    assert.strictEqual(accDaily["2026-11-10"].plays, 250, "daily.json 应按 collectNow 写入 2026-11-10");
+    assert.strictEqual(accDaily["2026-11-11"], undefined, "不得因写入跨零点拆写到 2026-11-11");
+    // 2) works-daily 归档在前一天 2026-11-10.json，不生成 2026-11-11.json
+    const worksDaily = store.readWorksDaily(G, P);
+    assert.strictEqual(worksDaily.A["2026-11-10"].play, 250, "works-daily 应与 daily 一致写入 250");
+    assert.strictEqual(worksDaily.B["2026-11-10"].play, 2);
+    assert.strictEqual(fs.existsSync(nextDayFile), false, "不得生成次日 works-daily/2026-11-11.json");
+    // 3) works-intraday 归档在前一天 2026-11-10.json 的 23:00 槽，不生成 2026-11-11.json
+    assert.strictEqual(fs.existsSync(intradayFile), true);
+    assert.strictEqual(fs.existsSync(nextIntradayFile), false, "不得生成次日 works-intraday/2026-11-11.json");
+    const intraday = store.readWorksIntraday(G, P);
+    assert.strictEqual(intraday.A[intraday.A.length - 1].date, "2026-11-10");
+    assert.strictEqual(intraday.A[intraday.A.length - 1].slot, "23:00");
+    assert.strictEqual(intraday.A[intraday.A.length - 1].play, 250);
+    assert.strictEqual(intraday.A[intraday.A.length - 1].collectedAt, before);
+    // 4) 无临时文件残留
+    assert.strictEqual(fs.readdirSync(path.dirname(dayFile)).filter((f) => f.endsWith(".tmp")).length, 0);
+    assert.strictEqual(fs.readdirSync(path.dirname(intradayFile)).filter((f) => f.endsWith(".tmp")).length, 0);
+    console.log("✓ 跨零点（零点前采集、零点后写入）：以 collectNow 的 UTC+8 日期写入前一天，daily/works-daily/works-intraday 三类文件一致");
+  }
+
+  /* ---------- 评审场景（S9-r3 #2）：2026-11-20 22:01 采到 170，23:59:59.900 采到 250 且 daily.json 替换时跨到 11-21 00:00:00.100 ---------- */
+  {
+    const G = "跨零点评审组", P = "抖音";
+    const t2201 = Date.parse("2026-11-20T22:01:00+08:00");
+    const tBeforeMid = Date.parse("2026-11-20T23:59:59.900+08:00");
+    const tAfterMid = Date.parse("2026-11-21T00:00:00.100+08:00");
+
+    store.mergeDaily(G, P, { plays: 170 }, [], t2201);
+    store.mergeWorks(G, P, [{ workId: "W1", title: "短片", publishTime: Date.parse("2026-11-20T08:00:00+08:00"), play: 170 }], t2201);
+
+    const realNow = Date.now;
+    const realRename = fs.renameSync;
+    let clock = tBeforeMid;
+    let rolledOnDaily = false;
+    try {
+      Date.now = () => clock;
+      fs.renameSync = (src, dest) => {
+        const out = realRename(src, dest);
+        if (!rolledOnDaily && typeof dest === "string" && path.basename(dest) === "daily.json") {
+          rolledOnDaily = true;
+          clock = tAfterMid;
+        }
+        return out;
+      };
+      store.mergeDaily(G, P, { plays: 250 }, [], tBeforeMid);
+      store.mergeWorks(G, P, [{ workId: "W1", title: "短片", publishTime: Date.parse("2026-11-20T08:00:00+08:00"), play: 250 }], tBeforeMid);
+    } finally {
+      Date.now = realNow;
+      fs.renameSync = realRename;
+    }
+
+    assert.strictEqual(rolledOnDaily, true);
+    assert.strictEqual(store.readDaily(G, P)["2026-11-20"].plays, 250);
+    assert.strictEqual(store.readDaily(G, P)["2026-11-21"], undefined);
+    assert.strictEqual(store.readWorks(G, P).works[0].play, 250);
+    assert.strictEqual(store.readWorksDaily(G, P).W1["2026-11-20"].play, 250);
+    assert.strictEqual(store.readWorksDaily(G, P).W1["2026-11-21"], undefined);
+    assert.deepStrictEqual(
+      store.readWorksIntraday(G, P).W1.map((x) => [x.date, x.slot, x.play]),
+      [
+        ["2026-11-20", "22:00", 170],
+        ["2026-11-20", "23:00", 250],
+      ]
+    );
+    console.log("✓ [S9-r3 #2] 评审跨零点场景：daily.json 替换跨零点后不留半次写入，三类文件一致落盘 2026-11-20 (250)");
   }
 
   console.log("\n全部通过：works-daily 存储与 statsTable 长表构建");

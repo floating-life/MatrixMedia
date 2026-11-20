@@ -64,39 +64,11 @@ export function buildCollectAccounts(filter) {
   return accounts.length ? accounts : null;
 }
 
-function readStoredRetentionDays() {
-  try {
-    if (typeof localStorage === "undefined" || !localStorage) return null;
-    const raw = localStorage.getItem("statsAutoCollect");
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
-    if (!Object.prototype.hasOwnProperty.call(parsed, "retentionDays")) return null;
-    const n = typeof parsed.retentionDays === "number" ? parsed.retentionDays : Number(parsed.retentionDays);
-    return Number.isInteger(n) && n >= 1 && n <= 3650 ? n : null;
-  } catch (_) {
-    return null;
-  }
-}
-
 export function collectAccounts(accounts, options = {}) {
   const payload = { accounts };
   if (options && typeof options === "object" && !Array.isArray(options)) {
     if (typeof options.trigger === "string" && options.trigger) {
       payload.trigger = options.trigger;
-    }
-    const reqRetention =
-      typeof options.retentionDays === "number"
-        ? options.retentionDays
-        : Number(options.retentionDays);
-    if (Number.isInteger(reqRetention) && reqRetention >= 1 && reqRetention <= 3650) {
-      payload.retentionDays = reqRetention;
-    }
-  }
-  if (payload.retentionDays === undefined) {
-    const storedRetention = readStoredRetentionDays();
-    if (storedRetention !== null) {
-      payload.retentionDays = storedRetention;
     }
   }
   return ipcRenderer.invoke("stats:collect", payload);

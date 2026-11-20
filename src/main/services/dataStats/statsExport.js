@@ -4119,86 +4119,109 @@ function buildContentIntradayData(options = {}, depsArg) {
   const endDate = explicitTo || latestIntradayDate || cutoffDate;
   const fromDate = endDate ? shiftDateStr(endDate, -(days - 1)) : "";
 
-  const platformWorksMap = new Map();
-  const platformActiveTimes = new Map();
-  const platformDeltaMap = new Map();
-  const timePointSet = new Set();
-  const collectedAtByTimeKey = new Map();
-  const sortTsByTimeKey = new Map();
+  const comparePointEvent = (a, b) => {
+    if (a.sortTsMs !== null && b.sortTsMs !== null && a.sortTsMs !== b.sortTsMs) {
+      return a.sortTsMs - b.sortTsMs;
+    }
+    if (a.sortTsMs !== null && b.sortTsMs === null) return -1;
+    if (a.sortTsMs === null && b.sortTsMs !== null) return 1;
+    return compareText(a.timeKey, b.timeKey);
+  };
 
+  const platformWorksMap = new Map();
   for (const bucket of rawByWork.values()) {
-    // 按实际 collectedAt（缺省回退槽时刻）升序排列并计算较上次增量
-    const pts = [...bucket.byTimeKey.values()].sort((a, b) => {
-      if (a.sortTsMs !== null && b.sortTsMs !== null && a.sortTsMs !== b.sortTsMs) {
-        return a.sortTsMs - b.sortTsMs;
-      }
-      if (a.sortTsMs !== null && b.sortTsMs === null) return -1;
-      if (a.sortTsMs === null && b.sortTsMs !== null) return 1;
-      return compareText(a.timeKey, b.timeKey);
-    });
+    const pts = [...bucket.byTimeKey.values()].sort(comparePointEvent);
     let worksList = platformWorksMap.get(bucket.platform);
     if (!worksList) {
       worksList = [];
       platformWorksMap.set(bucket.platform, worksList);
     }
     worksList.push(pts);
+  }
 
-    let prevPlay = null;
+  // 按平台独立构建按实际 collectedAt（缺省回退槽时刻）升序的点列，增量严格按各自平台上一点计算
+  const sortedPlatformNames = [...platformWorksMap.keys()].sort(comparePlatform);
+  const platformSeriesList = [];
+  for (const platform of sortedPlatformNames) {
+    const worksList = platformWorksMap.get(platform) || [];
+    const eventMap = new Map();
+    for (let w = 0; w < worksList.length; w++) {
+      const pts = worksList[w];
+      for (let i = 0; i < pts.length; i++) {
+        const pt = pts[i];
+        const evKey = `${pt.sortTsMs !== null ? pt.sortTsMs : ""}|${pt.timeKey}`;
+        const existing = eventMap.get(evKey);
+        if (!existing) {
+          eventMap.set(evKey, {
+            sortTsMs: pt.sortTsMs,
+            collectedAt: pt.collectedAt,
+            date: pt.date,
+            slot: pt.slot,
+            timeKey: pt.timeKey,
+          });
+        } else if (
+          pt.collectedAt !== null &&
+          (existing.collectedAt === null || pt.collectedAt > existing.collectedAt)
+        ) {
+          existing.collectedAt = pt.collectedAt;
+        }
+      }
+    }
+    const events = [...eventMap.values()].sort(comparePointEvent);
+    const workCount = worksList.length;
+    const ptrs = new Int32Array(workCount);
+    const curPlays = new Array(workCount).fill(null);
     let hasPrev = false;
+    let prevPlay = null;
+    const windowPoints = [];
 
-    for (let i = 0; i < pts.length; i++) {
-      const pt = pts[i];
-      const play = pt.play;
-      const playDelta = hasPrev && play !== null && prevPlay !== null ? play - prevPlay : null;
+    for (let i = 0; i < events.length; i++) {
+      const ev = events[i];
+      for (let w = 0; w < workCount; w++) {
+        const pts = worksList[w];
+        let p = ptrs[w];
+        while (p < pts.length && comparePointEvent(pts[p], ev) <= 0) {
+          curPlays[w] = pts[p].play;
+          p += 1;
+        }
+        ptrs[w] = p;
+      }
+
+      let sumPlay = null;
+      for (let w = 0; w < workCount; w++) {
+        if (curPlays[w] !== null) {
+          sumPlay = sumPlay === null ? curPlays[w] : sumPlay + curPlays[w];
+        }
+      }
+      if (sumPlay === 0) sumPlay = 0;
+
+      const rawDelta =
+        hasPrev && sumPlay !== null && prevPlay !== null ? sumPlay - prevPlay : null;
+      const playDelta = rawDelta === 0 ? 0 : rawDelta;
       hasPrev = true;
-      prevPlay = play;
+      prevPlay = sumPlay;
 
-      if (fromDate && pt.date < fromDate) continue;
-      if (endDate && pt.date > endDate) continue;
+      if (fromDate && ev.date < fromDate) continue;
+      if (endDate && ev.date > endDate) continue;
 
-      timePointSet.add(pt.timeKey);
-      if (pt.collectedAt !== null) {
-        const prevTs = collectedAtByTimeKey.get(pt.timeKey);
-        if (prevTs === undefined || pt.collectedAt > prevTs) {
-          collectedAtByTimeKey.set(pt.timeKey, pt.collectedAt);
-        }
-      }
-      if (pt.sortTsMs !== null) {
-        const prevSortTs = sortTsByTimeKey.get(pt.timeKey);
-        if (prevSortTs === undefined || pt.sortTsMs > prevSortTs) {
-          sortTsByTimeKey.set(pt.timeKey, pt.sortTsMs);
-        }
-      }
+      const xMs = ev.collectedAt !== null ? ev.collectedAt : ev.sortTsMs;
+      if (xMs === null) continue;
+      windowPoints.push({
+        collectedAt: xMs,
+        date: ev.date,
+        slot: ev.slot,
+        timeKey: ev.timeKey,
+        play: sumPlay,
+        playDelta,
+      });
+    }
 
-      let activeTimes = platformActiveTimes.get(bucket.platform);
-      if (!activeTimes) {
-        activeTimes = new Set();
-        platformActiveTimes.set(bucket.platform, activeTimes);
-      }
-      activeTimes.add(pt.timeKey);
-
-      if (playDelta !== null) {
-        let deltaMap = platformDeltaMap.get(bucket.platform);
-        if (!deltaMap) {
-          deltaMap = new Map();
-          platformDeltaMap.set(bucket.platform, deltaMap);
-        }
-        const prevSum = deltaMap.has(pt.timeKey) ? deltaMap.get(pt.timeKey) : null;
-        const nextDelta = prevSum === null ? playDelta : prevSum + playDelta;
-        deltaMap.set(pt.timeKey, nextDelta === 0 ? 0 : nextDelta);
-      }
+    if (windowPoints.length > 0) {
+      platformSeriesList.push({ platform, points: windowPoints });
     }
   }
 
-  const timePoints = [...timePointSet].sort((a, b) => {
-    const ta = sortTsByTimeKey.has(a) ? sortTsByTimeKey.get(a) : null;
-    const tb = sortTsByTimeKey.has(b) ? sortTsByTimeKey.get(b) : null;
-    if (ta !== null && tb !== null && ta !== tb) return ta - tb;
-    if (ta !== null && tb === null) return -1;
-    if (ta === null && tb !== null) return 1;
-    return compareText(a, b);
-  });
-  if (!timePoints.length) {
+  if (!platformSeriesList.length) {
     return {
       found: true,
       contentKey,
@@ -4216,87 +4239,68 @@ function buildContentIntradayData(options = {}, depsArg) {
     };
   }
 
-  const collectedAts = timePoints.map((tk) =>
-    collectedAtByTimeKey.has(tk) ? collectedAtByTimeKey.get(tk) : null
-  );
-  const timeKeyOrder = new Map(timePoints.map((tk, idx) => [tk, idx]));
-  const firstWindowTs = sortTsByTimeKey.has(timePoints[0])
-    ? sortTsByTimeKey.get(timePoints[0])
-    : null;
-  const sortedPlatforms = [...platformActiveTimes.keys()].sort(comparePlatform);
-  const totalPlay = new Array(timePoints.length).fill(null);
-  const totalPlayDelta = new Array(timePoints.length).fill(null);
-
-  const platforms = sortedPlatforms.map((platform) => {
-    const rawWorksList = platformWorksMap.get(platform) || [];
-    const worksList = rawWorksList.map((pts) =>
-      pts
-        .map((pt) => {
-          let order;
-          if (timeKeyOrder.has(pt.timeKey)) {
-            order = timeKeyOrder.get(pt.timeKey);
-          } else if (
-            (firstWindowTs !== null && pt.sortTsMs !== null && pt.sortTsMs <= firstWindowTs) ||
-            (fromDate && pt.date < fromDate)
-          ) {
-            order = -1;
-          } else {
-            order = Infinity;
-          }
-          return { order, sortTsMs: pt.sortTsMs, play: pt.play };
-        })
-        .sort((a, b) => {
-          if (a.order !== b.order) return a.order - b.order;
-          if (a.sortTsMs !== null && b.sortTsMs !== null) return a.sortTsMs - b.sortTsMs;
-          return 0;
-        })
-    );
-    const activeTimes = platformActiveTimes.get(platform);
-    const deltaMap = platformDeltaMap.get(platform) || null;
-    const workCount = worksList.length;
-    const ptrs = new Int32Array(workCount);
-    const curPlays = new Array(workCount).fill(null);
-    const playArr = new Array(timePoints.length).fill(null);
-    const deltaArr = new Array(timePoints.length).fill(null);
-
-    for (let i = 0; i < timePoints.length; i++) {
-      const tk = timePoints[i];
-      for (let w = 0; w < workCount; w++) {
-        const pts = worksList[w];
-        let p = ptrs[w];
-        while (p < pts.length && pts[p].order <= i) {
-          curPlays[w] = pts[p].play;
-          p += 1;
-        }
-        ptrs[w] = p;
+  // 全局时间线按实际 collectedAt 升序，不同平台的独立采集时刻不因槽键相同而折叠或倒序
+  const globalBucketMap = new Map();
+  for (const ps of platformSeriesList) {
+    const usedKeyInPlatform = new Set();
+    for (const pt of ps.points) {
+      let key = String(pt.collectedAt);
+      if (usedKeyInPlatform.has(key)) {
+        key = `${pt.collectedAt}|${pt.timeKey}`;
       }
-
-      if (!activeTimes || !activeTimes.has(tk)) continue;
-
-      let sumPlay = null;
-      for (let w = 0; w < workCount; w++) {
-        if (curPlays[w] !== null) {
-          sumPlay = sumPlay === null ? curPlays[w] : sumPlay + curPlays[w];
-        }
-      }
-      if (sumPlay === 0) sumPlay = 0;
-      const slotDelta = deltaMap && deltaMap.has(tk) ? deltaMap.get(tk) : null;
-
-      playArr[i] = sumPlay;
-      deltaArr[i] = slotDelta;
-      if (sumPlay !== null) {
-        const np = totalPlay[i] === null ? sumPlay : totalPlay[i] + sumPlay;
-        totalPlay[i] = np === 0 ? 0 : np;
-      }
-      if (slotDelta !== null) {
-        const nd =
-          totalPlayDelta[i] === null ? slotDelta : totalPlayDelta[i] + slotDelta;
-        totalPlayDelta[i] = nd === 0 ? 0 : nd;
+      usedKeyInPlatform.add(key);
+      pt._globalKey = key;
+      if (!globalBucketMap.has(key)) {
+        globalBucketMap.set(key, {
+          key,
+          collectedAt: pt.collectedAt,
+          timeKey: pt.timeKey,
+        });
       }
     }
+  }
+
+  const timeline = [...globalBucketMap.values()].sort((a, b) => {
+    if (a.collectedAt !== b.collectedAt) return a.collectedAt - b.collectedAt;
+    return compareText(a.timeKey, b.timeKey);
+  });
+  const keyToIdx = new Map(timeline.map((e, idx) => [e.key, idx]));
+  const collectedAts = timeline.map((e) => e.collectedAt);
+  const timePoints = timeline.map((e) => e.timeKey);
+  const totalPlay = new Array(timeline.length).fill(null);
+  const totalPlayDelta = new Array(timeline.length).fill(null);
+
+  const platforms = platformSeriesList.map((ps) => {
+    const playArr = new Array(timeline.length).fill(null);
+    const deltaArr = new Array(timeline.length).fill(null);
+    const cleanPoints = ps.points.map((pt) => {
+      const idx = keyToIdx.get(pt._globalKey);
+      if (idx !== undefined) {
+        playArr[idx] = pt.play;
+        deltaArr[idx] = pt.playDelta;
+        if (pt.play !== null) {
+          const np = totalPlay[idx] === null ? pt.play : totalPlay[idx] + pt.play;
+          totalPlay[idx] = np === 0 ? 0 : np;
+        }
+        if (pt.playDelta !== null) {
+          const nd =
+            totalPlayDelta[idx] === null ? pt.playDelta : totalPlayDelta[idx] + pt.playDelta;
+          totalPlayDelta[idx] = nd === 0 ? 0 : nd;
+        }
+      }
+      return {
+        collectedAt: pt.collectedAt,
+        date: pt.date,
+        slot: pt.slot,
+        timeKey: pt.timeKey,
+        play: pt.play,
+        playDelta: pt.playDelta,
+      };
+    });
 
     return {
-      platform,
+      platform: ps.platform,
+      points: cleanPoints,
       play: playArr,
       playDelta: deltaArr,
     };

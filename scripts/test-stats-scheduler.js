@@ -2044,10 +2044,146 @@ async function main() {
           console.log("✓ [S9-fix #2] testS9Fix2_RateLimitFloorAndSettingsChangeEffectiveBoundary 通过");
         }
 
-        // testS9Fix4_StatsApiCollectAccountsRespectsPersistedRetentionDays
-        // 验证 statsApi.collectAccounts 不传默认值覆盖主进程持久化 retentionDays，且兼容 localStorage 显式 retentionDays
+        // testS9R3_3_SlotClaimSeparatedFromAutoRunRateLimitTimestamp
+        // 评审2 #3：单账号 11:15 手动同步，11:16 自动轮询 10:00 槽跳过该账号（只记槽认领、不更新上次自动采集时间），
+        // 12:00 槽必须正常采集，12:01 再次轮询返回 already-ran
         {
-          const fix4ApiRoot = fs.mkdtempSync(path.join(os.tmpdir(), "mm-s9fix4-api-"));
+          const r3Root = fs.mkdtempSync(path.join(os.tmpdir(), "mm-s9r3-3-"));
+          const origGetPath = require.cache[electronId].exports.app.getPath;
+          const origHandle = require.cache[electronId].exports.ipcMain.handle;
+          const localHandlers = new Map();
+          require.cache[electronId].exports.app.getPath = () => r3Root;
+          require.cache[electronId].exports.ipcMain.handle = (ch, fn) => localHandlers.set(ch, fn);
+          delete require.cache[storeId];
+          delete require.cache[indexId];
+          try {
+            const storeR3 = require(storeId);
+            require(indexId).registerDataStatsIpc();
+            const cHandler = localHandlers.get("stats:collect");
+            const aHandler = localHandlers.get("stats:auto-run");
+            const acc = { group: "示例", platform: "抖音", partition: "persist:demo抖音" };
+            let mockNow = cnTime(2026, 11, 20, 11, 15, 0);
+
+            await withImmediateTimers(async () => {
+              await withMockDateNow(() => mockNow, async () => {
+                const startBatches = collectedBatches.length;
+
+                // 1) 11:15 手动同步成功
+                const manRes = await cHandler(fakeEvent, { accounts: [acc], trigger: "manual" });
+                assert.strictEqual(manRes.results[0].success, true);
+                assert.strictEqual(collectedBatches.length, startBatches + 1);
+
+                // 2) 11:16 自动轮询 10:00 槽 [10:00, 12:00)：该账号被跳过，只记槽认领，不写 lastAutoRunAt
+                mockNow = cnTime(2026, 11, 20, 11, 16, 0);
+                const sameRes = await aHandler(fakeEvent, {
+                  accounts: [acc],
+                  slot: "2026-11-20 10:00",
+                  slotEndMs: cnTime(2026, 11, 20, 12, 0, 0),
+                  intervalHours: 2,
+                  startTime: "08:00",
+                  endTime: "22:00",
+                });
+                assert.strictEqual(sameRes.status, "done");
+                assert.strictEqual(sameRes.results[0].skipped, true, "11:16 必须跳过 11:15 手动同步过的账号");
+                assert.strictEqual(collectedBatches.length, startBatches + 1, "11:16 不得发起实际采集");
+                const ledger11 = JSON.parse(fs.readFileSync(storeR3.autoRunFile(), "utf8"));
+                assert.deepStrictEqual(ledger11.runs, ["2026-11-20 10:00"], "应记录 10:00 槽认领");
+                assert.strictEqual(
+                  ledger11.lastAutoRunAt,
+                  undefined,
+                  "全部分区跳过时不得写入上次自动采集时间 lastAutoRunAt"
+                );
+
+                // 3) 12:00 槽 [12:00, 14:00)：必须正常采集，不得被 11:16 的全跳过误限流
+                mockNow = cnTime(2026, 11, 20, 12, 0, 0);
+                const noonRes = await aHandler(fakeEvent, {
+                  accounts: [acc],
+                  slot: "2026-11-20 12:00",
+                  slotEndMs: cnTime(2026, 11, 20, 14, 0, 0),
+                  intervalHours: 2,
+                  startTime: "08:00",
+                  endTime: "22:00",
+                });
+                assert.strictEqual(noonRes.status, "done", "12:00 槽必须正常采集而非 rate-limited");
+                assert.strictEqual(noonRes.results[0].skipped, undefined);
+                assert.strictEqual(noonRes.results[0].success, true);
+                assert.strictEqual(collectedBatches.length, startBatches + 2, "12:00 槽必须发起真实采集");
+                const ledger12 = JSON.parse(fs.readFileSync(storeR3.autoRunFile(), "utf8"));
+                assert.strictEqual(
+                  ledger12.lastAutoRunAt,
+                  cnTime(2026, 11, 20, 12, 0, 0),
+                  "实际发起自动采集后应更新 lastAutoRunAt"
+                );
+
+                // 4) 12:01 再次轮询 12:00 槽 → already-ran，不重采
+                mockNow = cnTime(2026, 11, 20, 12, 1, 0);
+                const retryRes = await aHandler(fakeEvent, {
+                  accounts: [acc],
+                  slot: "2026-11-20 12:00",
+                  slotEndMs: cnTime(2026, 11, 20, 14, 0, 0),
+                  intervalHours: 2,
+                  startTime: "08:00",
+                  endTime: "22:00",
+                });
+                assert.strictEqual(retryRes.status, "already-ran");
+                assert.strictEqual(collectedBatches.length, startBatches + 2);
+
+                // 5) 已有 12:00 限流时间后，13:55 手动同步 + 13:56 全跳过 14:00 前某槽不会把 12:00 改写成 13:56；
+                //    而 12:30 距 12:00 仅 30 分钟 < 110 分钟仍被限流
+                mockNow = cnTime(2026, 11, 20, 12, 30, 0);
+                const rlRes = await aHandler(fakeEvent, {
+                  accounts: [acc],
+                  slot: "2026-11-20 12:30",
+                  slotEndMs: cnTime(2026, 11, 20, 14, 30, 0),
+                  intervalHours: 2,
+                });
+                assert.strictEqual(rlRes.status, "skipped");
+                assert.strictEqual(rlRes.reason, "rate-limited");
+
+                // 6) 若某槽确实发起了自动采集但采集失败，仍应更新限流时间防止紧接着高频重采
+                const origImplR3 = collectorImpl;
+                mockNow = cnTime(2026, 11, 20, 14, 0, 0);
+                collectorImpl = async () => {
+                  throw new Error("模拟平台超时");
+                };
+                try {
+                  const failAuto = await aHandler(fakeEvent, {
+                    accounts: [acc],
+                    slot: "2026-11-20 14:00",
+                    slotEndMs: cnTime(2026, 11, 20, 16, 0, 0),
+                    intervalHours: 2,
+                  });
+                  assert.strictEqual(failAuto.status, "done");
+                  assert.strictEqual(failAuto.results[0].success, false);
+                } finally {
+                  collectorImpl = origImplR3;
+                }
+                const ledger14 = JSON.parse(fs.readFileSync(storeR3.autoRunFile(), "utf8"));
+                assert.strictEqual(ledger14.lastAutoRunAt, cnTime(2026, 11, 20, 14, 0, 0));
+                mockNow = cnTime(2026, 11, 20, 14, 30, 0);
+                const afterFailRl = await aHandler(fakeEvent, {
+                  accounts: [acc],
+                  slot: "2026-11-20 14:30",
+                  slotEndMs: cnTime(2026, 11, 20, 16, 30, 0),
+                  intervalHours: 2,
+                });
+                assert.strictEqual(afterFailRl.status, "skipped");
+                assert.strictEqual(afterFailRl.reason, "rate-limited");
+              });
+            });
+          } finally {
+            require.cache[electronId].exports.app.getPath = origGetPath;
+            require.cache[electronId].exports.ipcMain.handle = origHandle;
+            fs.rmSync(r3Root, { recursive: true, force: true });
+          }
+          console.log("✓ [S9-r3 #3] testS9R3_3_SlotClaimSeparatedFromAutoRunRateLimitTimestamp 通过");
+        }
+
+        // testS9R3_1_StatsApiAndSchedulerNeverSendOrOverrideRetentionDays
+        // 评审2 #1：主进程已保存 retentionDays=90 并关闭自动采集，渲染层仍缓存 60 天；
+        // 重启后手动同步不得携带或覆盖 retentionDays，不得误删 70 天前（2026-09-11.json）快照
+        {
+          const fix4ApiRoot = fs.mkdtempSync(path.join(os.tmpdir(), "mm-s9r3-1-api-"));
           const origGetPath = require.cache[electronId].exports.app.getPath;
           const origHandle = require.cache[electronId].exports.ipcMain.handle;
           const origInvoke = require.cache[electronId].exports.ipcRenderer.invoke;
@@ -2060,32 +2196,90 @@ async function main() {
             require.cache[electronId].exports.ipcRenderer.invoke = async (ch, payload) => {
               sentPayloads.push({ ch, payload });
               const fn = apiHandlers.get(ch);
-              return fn ? fn({ sender: { send: () => {} } }, payload) : null;
+              return fn
+                ? fn({ sender: { send: () => {} }, senderFrame: { url: "file:///app/index.html" } }, payload)
+                : null;
             };
-            delete require.cache[storeId];
-            delete require.cache[indexId];
+            const startMainApi = () => {
+              apiHandlers.clear();
+              delete require.cache[storeId];
+              delete require.cache[indexId];
+              const s = require(storeId);
+              require(indexId).registerDataStatsIpc();
+              return s;
+            };
             delete require.cache[statsApiId];
-            const storeApi = require(storeId);
-            require(indexId).registerDataStatsIpc();
+            let storeApi = startMainApi();
             const statsApiMod = require(statsApiId);
+            const acc = { group: "示例", platform: "抖音", partition: "persist:demo抖音" };
+            const oldDay = "2026-09-11";
+            const tToday = cnTime(2026, 11, 20, 9, 0, 0);
 
-            // 主进程已持久化 retentionDays=90，而 localStorage 为空 → collectAccounts 不得发送默认 60 覆盖 90
-            storeApi.writeAutoSettings({ enabled: false, retentionDays: 90 });
-            const lsApi = createMemoryStorage();
-            global.localStorage = lsApi;
-            await statsApiMod.collectAccounts([
-              { group: "ApiG", platform: "抖音", partition: "persist:api-r1" },
-            ]);
-            assert.strictEqual(sentPayloads[sentPayloads.length - 1].payload.retentionDays, undefined);
-            assert.strictEqual(storeApi.readAutoSettings().retentionDays, 90);
+            await withMockDateNow(() => tToday, async () => {
+              // 1) 写入 70 天前历史快照（2026-09-11.json）
+              storeApi.recordWorksIntraday(acc.group, acc.platform, [{ workId: "W1", play: 20 }], {
+                now: cnTime(2026, 9, 11, 10, 0, 0),
+                retentionDays: 90,
+              });
+              const retentionFile = path.join(
+                storeApi.worksIntradayDir(acc.group, acc.platform),
+                `${oldDay}.json`
+              );
+              assert.strictEqual(fs.existsSync(retentionFile), true);
 
-            // localStorage 显式保存 retentionDays=120 → collectAccounts 透传 120 且主进程持久化为 120
-            lsApi.setItem(STORAGE_KEY, JSON.stringify({ enabled: false, retentionDays: 120 }));
-            await statsApiMod.collectAccounts([
-              { group: "ApiG", platform: "抖音", partition: "persist:api-r2" },
-            ]);
-            assert.strictEqual(sentPayloads[sentPayloads.length - 1].payload.retentionDays, 120);
-            assert.strictEqual(storeApi.readAutoSettings().retentionDays, 120);
+              // 2) 主进程保存 retentionDays=90 并关闭自动采集
+              const saved = await apiHandlers.get("stats:save-auto-settings")(
+                { senderFrame: { url: "file:///app/index.html" } },
+                { enabled: false, mode: "daily", retentionDays: 90 }
+              );
+              assert.strictEqual(saved.ok, true);
+              assert.strictEqual(saved.settings.retentionDays, 90);
+
+              // 3) 模拟重启，渲染层 localStorage 仍残留旧缓存 retentionDays=60
+              storeApi = startMainApi();
+              const lsApi = createMemoryStorage({
+                [STORAGE_KEY]: JSON.stringify({ enabled: false, mode: "daily", retentionDays: 60 }),
+              });
+              global.localStorage = lsApi;
+
+              // 启动一次性迁移 initOnly:true 不得用缓存 60 覆盖主进程 90
+              await schedulerMod.syncSettingsToMain(loadSettings(lsApi), { initOnly: true });
+              assert.strictEqual(storeApi.readAutoSettings().retentionDays, 90);
+
+              // 渲染层更新本地展示字段（saveSettings/updateSettings）不得覆盖主进程 90
+              updateSettings({ lastRunDate: "2026-11-20" }, lsApi);
+              assert.strictEqual(storeApi.readAutoSettings().retentionDays, 90);
+
+              // 4) 重启后通过 statsApi.collectAccounts 手动同步：不携带 retentionDays、不覆盖主进程 90、不误删 2026-09-11.json
+              sentPayloads.length = 0;
+              await statsApiMod.collectAccounts([acc]);
+              const lastCollect = sentPayloads.find((x) => x.ch === "stats:collect");
+              assert.ok(lastCollect, "应调用 stats:collect");
+              assert.strictEqual(lastCollect.payload.retentionDays, undefined, "stats:collect 不得携带 retentionDays");
+              assert.strictEqual(storeApi.readAutoSettings().retentionDays, 90, "主进程 retentionDays 须保持 90");
+              assert.strictEqual(fs.existsSync(retentionFile), true, "70 天前快照 2026-09-11.json 不得被误删");
+
+              // 5) 调度器 defaultAutoRun 也不携带 retentionDays
+              saveSettings({ enabled: true, mode: "interval", startTime: "08:00", endTime: "22:00", intervalHours: 2, retentionDays: 60 }, lsApi);
+              sentPayloads.length = 0;
+              const sNoRet = createStatsScheduler({
+                storage: lsApi,
+                now: () => cnTime(2026, 11, 20, 10, 5, 0),
+                monotonicNow: () => STARTUP_DELAY_MS,
+                startupDelayMs: 0,
+                getAccounts: () => [acc],
+                setIntervalFn: () => 1,
+                clearIntervalFn: () => {},
+              });
+              sNoRet.start();
+              await sNoRet.tick();
+              sNoRet.stop();
+              const autoSent = sentPayloads.find((x) => x.ch === "stats:auto-run");
+              assert.ok(autoSent, "调度器应调用 stats:auto-run");
+              assert.strictEqual(autoSent.payload.retentionDays, undefined, "stats:auto-run 不得携带 retentionDays");
+              assert.strictEqual(storeApi.readAutoSettings().retentionDays, 90);
+              assert.strictEqual(fs.existsSync(retentionFile), true);
+            });
           } finally {
             if (origLS === undefined) delete global.localStorage;
             else global.localStorage = origLS;
@@ -2094,7 +2288,7 @@ async function main() {
             require.cache[electronId].exports.ipcRenderer.invoke = origInvoke;
             fs.rmSync(fix4ApiRoot, { recursive: true, force: true });
           }
-          console.log("✓ [S9-fix #4] testS9Fix4_StatsApiCollectAccountsRespectsPersistedRetentionDays 通过");
+          console.log("✓ [S9-r3 #1] testS9R3_1_StatsApiAndSchedulerNeverSendOrOverrideRetentionDays 通过");
         }
       }
     } finally {
