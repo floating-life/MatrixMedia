@@ -38,6 +38,7 @@ const {
   buildContentSummaryData,
   buildContentTrendData,
 } = require("../src/main/services/dataStats/statsExport.js");
+const statsChartOptions = require("../src/renderer/utils/statsChartOptions.js");
 const {
   PLATFORM_COLORS,
   PLATFORM_ORDER,
@@ -54,7 +55,7 @@ const {
   buildPublishTimeHeatmapOption,
   buildFansTrendOption,
   buildContentTrendOption,
-} = require("../src/renderer/utils/statsChartOptions.js");
+} = statsChartOptions;
 
 const DAY_MS = 86400000;
 
@@ -1208,10 +1209,12 @@ async function main() {
         assert.strictEqual(invokeLog[0].payload.dataUrl, VALID_PNG_DATA_URL);
         assert.strictEqual(invokeLog[0].payload.date, "2026-11-20");
 
-        // 2) 批量导出全部 8 张图表
+        // 2) 批量导出全部 8 张图表（同时携带周期 period 与截止日 date）
         await ctx.exportAllCharts();
         assert.strictEqual(invokeLog[1].ch, "stats:save-chart-images-batch");
         assert.strictEqual(invokeLog[1].payload.items.length, 8);
+        assert.strictEqual(invokeLog[1].payload.period, analysis.period);
+        assert.strictEqual(invokeLog[1].payload.date, analysis.to);
         assert.ok(resizedCount >= 8);
 
         // 3) 作品汇总「趋势」弹窗打开并透传汇总截止日
@@ -1230,7 +1233,768 @@ async function main() {
     }
   }
 
+  /* ---------- 7. S8-fix 评审返修 1–9 回归用例 ---------- */
+  await runS8FixRegressions(analysis);
+
   console.log("\ntest-stats-charts: 全部断言通过");
+}
+
+/* ======================== S8-fix 1–9 回归用例 ======================== */
+
+// 1. content-trend 同平台多作品累计播放=截至当天最新快照之和，整平台当天无快照→空
+function testFix1_ContentTrendCumulativeSumAcrossSamePlatformWorks() {
+  const pubMs = Date.parse("2026-11-10T10:00:00+08:00");
+  const deps = {
+    now: Date.parse("2026-11-20T12:00:00+08:00"),
+    listAccounts: () => [{ group: "主组", platform: "抖音" }],
+    readWorks: () => [
+      { workId: "DY_A", title: "手工合并作品A", publishTime: pubMs },
+      { workId: "DY_B", title: "手工合并作品B", publishTime: pubMs },
+    ],
+    readWorksDaily: () => ({
+      DY_A: {
+        "2026-11-11": { play: 550 },
+        // 11-12 与 11-13 均无 DY_A 新快照
+      },
+      DY_B: {
+        // 仅在 11-13 采到 200（11-12 整平台无任何快照）
+        "2026-11-13": { play: 200 },
+      },
+    }),
+    readDaily: () => ({}),
+    readPushRecords: () => [],
+    readLinkOverrides: () => ({
+      version: 1,
+      updatedAt: pubMs,
+      contents: { "manual:same-pt": { title: "同平台合并视频", createdAt: pubMs } },
+      excludedAuto: {},
+      overrides: {
+        "抖音|DY_A": { action: "assign", contentKey: "manual:same-pt" },
+        "抖音|DY_B": { action: "assign", contentKey: "manual:same-pt" },
+      },
+    }),
+  };
+
+  const summary = buildContentSummaryData({}, deps);
+  const summaryRow = summary.rows.find((r) => r.contentKey === "manual:same-pt");
+  assert.ok(summaryRow, "汇总表应包含 manual:same-pt");
+  assert.strictEqual(summaryRow.totalPlay, 750, "汇总表总播放应为 550 + 200 = 750");
+
+  const trend = buildContentTrendData({ contentKey: "manual:same-pt" }, deps);
+  assert.strictEqual(trend.found, true);
+  assert.deepStrictEqual(trend.dates, ["2026-11-11", "2026-11-12", "2026-11-13"]);
+  const dyPt = trend.platforms.find((p) => p.platform === "抖音");
+  assert.ok(dyPt, "应包含抖音平台序列");
+  // 11-11: 550; 11-12: 整平台无快照 → null; 11-13: DY_A最新(550) + DY_B最新(200) = 750
+  assert.deepStrictEqual(dyPt.play, [550, null, 750], "同平台多作品累计播放必须等于截至当天各作品最新快照之和，整平台缺天仍留空");
+  assert.deepStrictEqual(trend.totalPlay, [550, null, 750]);
+
+  // 指定 from=2026-11-13 时仍应计入 DY_A 在 from 之前（11-11）的最新快照 550
+  const tailTrend = buildContentTrendData(
+    { contentKey: "manual:same-pt", from: "2026-11-13", to: "2026-11-13" },
+    deps
+  );
+  assert.deepStrictEqual(tailTrend.dates, ["2026-11-13"]);
+  assert.deepStrictEqual(tailTrend.platforms[0].play, [750]);
+  console.log("✓ [S8-fix #1] content-trend 同平台多作品累计播放与汇总一致、整平台缺天留空");
+}
+
+// 2. StatsChart 隐藏时收到新 option 保存为 pending，恢复可见后先 setOption 再 resize
+async function testFix2_StatsChartPendingOptionWhenHiddenAppliesBeforeResize(analysis) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-s8fix2-"));
+  const origLoad = Module._load;
+  const origRO = global.ResizeObserver;
+  try {
+    const statsChartPath = path.resolve(__dirname, "../src/renderer/components/StatsChart.vue");
+    const chartSfc = vueCompiler.parseComponent(fs.readFileSync(statsChartPath, "utf8"));
+    const chartTpl = vueCompiler.compile(chartSfc.template.content);
+    assert.strictEqual(chartTpl.errors.length, 0);
+
+    const outBundle = path.join(tmpDir, "StatsChart-pending.cjs");
+    await build({
+      stdin: {
+        contents: chartSfc.script.content,
+        resolveDir: path.dirname(statsChartPath),
+        loader: "js",
+      },
+      bundle: true,
+      platform: "node",
+      format: "cjs",
+      external: ["echarts/core", "echarts/charts", "echarts/components", "echarts/renderers"],
+      outfile: outBundle,
+    });
+
+    let roCb = null;
+    const ops = [];
+    global.ResizeObserver = class MockRO {
+      constructor(cb) {
+        roCb = cb;
+      }
+      observe() {}
+      disconnect() {}
+    };
+    Module._load = function (req, ...rest) {
+      if (req === "echarts/core") {
+        return {
+          use: () => {},
+          init: () => ({
+            setOption: (opt, notMerge) => ops.push({ type: "setOption", opt, notMerge }),
+            resize: () => ops.push({ type: "resize" }),
+            clear: () => ops.push({ type: "clear" }),
+            on: () => {},
+            off: () => {},
+            showLoading: () => {},
+            hideLoading: () => {},
+            getDataURL: () => VALID_PNG_DATA_URL,
+            dispose: () => ops.push({ type: "dispose" }),
+          }),
+        };
+      }
+      if (req === "echarts/charts" || req === "echarts/components" || req === "echarts/renderers") {
+        return {};
+      }
+      return origLoad.call(this, req, ...rest);
+    };
+
+    const compDef = require(outBundle).default;
+    const canvasEl = { clientWidth: 640, clientHeight: 320 };
+    const optOld = buildOverviewTrendOption(analysis, { metric: "play", stacked: false });
+    const optNew = buildOverviewTrendOption(analysis, { metric: "like", stacked: false });
+    const ctx = {
+      option: optOld,
+      height: "320px",
+      loading: false,
+      emptyText: "暂无数据",
+      $refs: { root: {}, canvas: canvasEl },
+      $nextTick: (fn) => fn(),
+    };
+    for (const [k, fn] of Object.entries(compDef.computed)) {
+      Object.defineProperty(ctx, k, { get: () => fn.call(ctx), configurable: true });
+    }
+    for (const [k, fn] of Object.entries(compDef.methods)) {
+      ctx[k] = fn.bind(ctx);
+    }
+
+    // 先在可见状态完成首次初始化
+    compDef.mounted.call(ctx);
+    assert.strictEqual(ops.length, 1);
+    assert.strictEqual(ops[0].type, "setOption");
+    assert.strictEqual(ops[0].opt.yAxis.name, "播放日增");
+
+    // 切走页面容器隐藏（宽高变 0），期间后台刷新推送新 option
+    ops.length = 0;
+    canvasEl.clientWidth = 0;
+    canvasEl.clientHeight = 0;
+    ctx.option = optNew;
+    compDef.watch.option.handler.call(ctx);
+    assert.strictEqual(ops.length, 0, "隐藏时不得直接对 0 宽画布 setOption 或 resize");
+
+    // 切回页面容器恢复可见，activated/ResizeObserver 触发 resize()
+    canvasEl.clientWidth = 640;
+    canvasEl.clientHeight = 320;
+    roCb();
+    assert.ok(ops.length >= 2, `恢复可见后必须先 setOption 再 resize，实际调用：${JSON.stringify(ops.map((o) => o.type))}`);
+    assert.strictEqual(ops[0].type, "setOption", "恢复可见后第一步必须先应用 pending option");
+    assert.strictEqual(ops[0].notMerge, true);
+    assert.strictEqual(ops[0].opt.yAxis.name, "点赞日增", "应用的必须是隐藏期间收到的最新 option");
+    assert.strictEqual(ops[1].type, "resize", "setOption 之后再调用 resize");
+
+    // 后续无 option 变更再次 resize 时不应重复 setOption
+    ops.length = 0;
+    ctx.resize();
+    assert.deepStrictEqual(ops.map((o) => o.type), ["resize"]);
+
+    compDef.beforeDestroy.call(ctx);
+    console.log("✓ [S8-fix #2] StatsChart 隐藏时保留 pending option，恢复可见先 setOption 再 resize");
+  } finally {
+    Module._load = origLoad;
+    if (origRO === undefined) delete global.ResizeObserver;
+    else global.ResizeObserver = origRO;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+// 3. 批量导出全部图表在所选目录下新建独立子目录 MatrixMedia-图表-<周期>-<截止日>-<HHmmss>
+async function testFix3_BatchExportCreatesIsolatedTimestampedSubdir() {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "mm-s8fix3-"));
+  const chosenDir = path.join(tmpRoot, "exports");
+  fs.mkdirSync(chosenDir, { recursive: true });
+  const ipcHandlers = new Map();
+  const electronId = require.resolve("electron");
+  const origElectronCache = require.cache[electronId];
+  const collectorId = require.resolve("../src/main/services/dataStats/collector.js");
+  const origCollectorCache = require.cache[collectorId];
+  const storeId = require.resolve("../src/main/services/dataStats/store.js");
+  const indexId = require.resolve("../src/main/services/dataStats/index.js");
+
+  try {
+    const mockWin = { id: 1 };
+    require.cache[electronId] = {
+      id: electronId,
+      filename: electronId,
+      loaded: true,
+      exports: {
+        app: { getPath: () => tmpRoot, getVersion: () => "0.14.9-fork.test" },
+        BrowserWindow: { fromWebContents: (s) => (s ? mockWin : null) },
+        dialog: {
+          showSaveDialog: async () => ({ canceled: true }),
+          showOpenDialog: async () => ({ canceled: false, filePaths: [chosenDir] }),
+        },
+        ipcMain: { handle: (ch, fn) => ipcHandlers.set(ch, fn) },
+      },
+    };
+    require.cache[collectorId] = {
+      id: collectorId,
+      filename: collectorId,
+      loaded: true,
+      exports: { collectAccount: async () => ({ overview: {}, fansHistory: [], works: [] }) },
+    };
+    delete require.cache[storeId];
+    delete require.cache[indexId];
+
+    const { registerDataStatsIpc } = require(indexId);
+    registerDataStatsIpc({
+      exportDeps: { now: Date.parse("2026-11-20T14:25:36+08:00") },
+    });
+    const saveBatch = ipcHandlers.get("stats:save-chart-images-batch");
+    const localEv = { senderFrame: { url: "file:///app/index.html" }, sender: {} };
+
+    // 同一截止日、同一所选目录先导出近 30 天（2 张），再导出近 7 天（仅 1 张），再同秒再导一次近 7 天
+    const res30 = await saveBatch(localEv, {
+      period: 30,
+      date: "2026-11-20",
+      items: [
+        { dataUrl: VALID_PNG_DATA_URL, name: "1-总览-日趋势-播放" },
+        { dataUrl: VALID_PNG_DATA_URL, name: "2-平台对比" },
+      ],
+    });
+    const res7 = await saveBatch(localEv, {
+      period: 7,
+      date: "2026-11-20",
+      items: [{ dataUrl: VALID_PNG_DATA_URL, name: "1-总览-日趋势-播放" }],
+    });
+    const res7Second = await saveBatch(localEv, {
+      period: 7,
+      date: "2026-11-20",
+      items: [{ dataUrl: VALID_PNG_DATA_URL, name: "1-总览-日趋势-播放" }],
+    });
+
+    assert.strictEqual(res30.ok, true);
+    assert.strictEqual(res7.ok, true);
+    assert.strictEqual(res7Second.ok, true);
+    assert.strictEqual(path.dirname(res30.dir), chosenDir, "近 30 天应在所选目录下新建子目录");
+    assert.strictEqual(path.dirname(res7.dir), chosenDir, "近 7 天应在所选目录下新建子目录");
+    assert.strictEqual(path.basename(res30.dir), "MatrixMedia-图表-近30天-2026-11-20-142536");
+    assert.strictEqual(path.basename(res7.dir), "MatrixMedia-图表-近7天-2026-11-20-142536");
+    assert.notStrictEqual(res7Second.dir, res7.dir, "同秒重复导出不得覆盖已有目录");
+    assert.strictEqual(path.basename(res7Second.dir), "MatrixMedia-图表-近7天-2026-11-20-142536-2");
+    assert.strictEqual(fs.readdirSync(res30.dir).length, 2, "近 30 天目录两张旧图应完好保留");
+    assert.strictEqual(fs.readdirSync(res7.dir).length, 1, "近 7 天目录只应包含本次导出的 1 张图，不混入旧图");
+    console.log("✓ [S8-fix #3] 批量导出新建独立子目录 MatrixMedia-图表-<周期>-<截止日>-<HHmmss>");
+  } finally {
+    if (origElectronCache) require.cache[electronId] = origElectronCache;
+    else delete require.cache[electronId];
+    if (origCollectorCache) require.cache[collectorId] = origCollectorCache;
+    else delete require.cache[collectorId];
+    delete require.cache[storeId];
+    delete require.cache[indexId];
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+}
+
+// 4. Top/Bottom 10 切换图表与表格共用同一数据，图名与导出名同步
+async function testFix4_RankingBottom10SharesDataAndSyncsTitleExportName(analysis) {
+  // 纯函数：order="bottom" 返回 Bottom 10，且支持传入与表格共用的 items
+  const topOpt = buildRankingTop10Option(analysis, { metric: "play", order: "top" });
+  const bottomOpt = buildRankingTop10Option(analysis, { metric: "play", order: "bottom" });
+  const bottomList = analysis.rankings.byPlay.bottom;
+  const topList = analysis.rankings.byPlay.top;
+  assert.notStrictEqual(topList[0].contentKey, bottomList[0].contentKey, "12 条样本下 Top1 与 Bottom1 必须不同");
+  assert.ok(
+    bottomOpt.yAxis.data[0].includes(bottomList[0].title),
+    `Bottom10 图表首项应为表格 Bottom1(${bottomList[0].title})，实际：${bottomOpt.yAxis.data[0]}`
+  );
+  assert.notStrictEqual(topOpt.yAxis.data[0], bottomOpt.yAxis.data[0], "Top10 与 Bottom10 图表内容必须不同");
+
+  const sharedOpt = buildRankingTop10Option(analysis, {
+    metric: "play",
+    order: "bottom",
+    items: bottomList,
+  });
+  assert.deepStrictEqual(sharedOpt.yAxis.data, bottomOpt.yAxis.data);
+
+  // Vue 组件：切换 analysisRankOrder="bottom" 后图表、表格、图名与导出名完全同步
+  const { compDef, template, cleanup } = await loadDataStatsIndexComponent();
+  try {
+    const ctx = createDataStatsCtx(compDef, analysis);
+    ctx.analysisRankOrder = "bottom";
+    ctx.analysisRankMetric = "play";
+    assert.strictEqual(ctx.analysisDisplayedRankRows[0].contentKey, bottomList[0].contentKey);
+    assert.ok(
+      ctx.rankingTop10Option.yAxis.data[0].includes(ctx.analysisDisplayedRankRows[0].title),
+      "切换 Bottom 10 后图表应与表格展示同一批作品"
+    );
+    const rankSpec = ctx.getAnalysisChartSpecs().find((s) => s.ref === "chartRankingTop10");
+    assert.ok(
+      rankSpec && rankSpec.name.includes("Bottom10") && !rankSpec.name.includes("Top10"),
+      `批量导出图名应同步为 Bottom10，实际：${rankSpec && rankSpec.name}`
+    );
+    assert.ok(
+      !template.includes("Top 10 横向对比（按平台堆叠"),
+      "模板图表标题不得写死 Top 10"
+    );
+    assert.ok(
+      !template.includes("'作品排行Top10-'"),
+      "模板单图导出名不得写死作品排行Top10"
+    );
+    console.log("✓ [S8-fix #4] Top/Bottom 10 图表与表格共用数据，图名与导出名同步");
+  } finally {
+    cleanup();
+  }
+}
+
+// 5. 超过 45 天时间轴上的孤立有效点必须保留 symbol
+function testFix5_IsolatedValidPointsKeepSymbolOnLongRange() {
+  const longDates = buildContinuousDates(["2026-09-22", "2026-11-20"]); // 60 天 > 45
+  assert.ok(longDates.length > 45);
+
+  // 5a. 作品趋势：仅采到 1 次播放的旧作品（孤立点在索引 3）
+  const soloPlay = new Array(longDates.length).fill(null);
+  soloPlay[3] = 520;
+  const soloOpt = buildContentTrendOption({
+    dates: longDates,
+    platforms: [{ platform: "抖音", play: soloPlay, playDelta: new Array(longDates.length).fill(null) }],
+    totalPlayDelta: new Array(longDates.length).fill(null),
+  });
+  const soloLine = soloOpt.series.find((s) => s.type === "line");
+  assert.strictEqual(soloLine.showSymbol, true, "含孤立有效点的 >45 天折线必须开启 showSymbol");
+  assert.strictEqual(soloLine.showAllSymbol, true, "含孤立有效点时必须 showAllSymbol:true 防止被刻度抽稀隐藏");
+  const soloSymbolAt3 =
+    typeof soloLine.symbol === "function"
+      ? soloLine.symbol(520, { dataIndex: 3 })
+      : soloLine.symbol;
+  assert.notStrictEqual(soloSymbolAt3, "none", "唯一孤立有效点必须保留可见 symbol");
+
+  // 5b. 混合场景：既有连续段（索引 10..15）又有孤立点（索引 40）
+  const mixedPlay = new Array(longDates.length).fill(null);
+  for (let i = 10; i <= 15; i++) mixedPlay[i] = 100 + i;
+  mixedPlay[40] = 900;
+  const mixedOpt = buildContentTrendOption({
+    dates: longDates,
+    platforms: [{ platform: "快手", play: mixedPlay, playDelta: new Array(longDates.length).fill(null) }],
+    totalPlayDelta: new Array(longDates.length).fill(null),
+  });
+  const mixedLine = mixedOpt.series.find((s) => s.type === "line");
+  assert.strictEqual(mixedLine.showSymbol, true);
+  assert.strictEqual(mixedLine.showAllSymbol, true);
+  assert.strictEqual(typeof mixedLine.symbol, "function", "混合长序列应按点判断，仅孤立点显示 symbol");
+  assert.strictEqual(mixedLine.symbol(900, { dataIndex: 40 }), "circle");
+  assert.strictEqual(mixedLine.symbol(112, { dataIndex: 12 }), "none");
+
+  // 5c. 总览折线与粉丝趋势在 >45 天同样保留孤立有效点 symbol
+  const ovSolo = buildOverviewTrendOption({
+    overview: { dailyTrend: { dates: longDates, platforms: [{ platform: "抖音", play: soloPlay }] } },
+  });
+  assert.strictEqual(ovSolo.series[0].showSymbol, true);
+  assert.strictEqual(ovSolo.series[0].showAllSymbol, true);
+
+  const fansSolo = buildFansTrendOption({
+    fansTrend: {
+      dates: longDates,
+      accounts: [{ accountKey: "抖音|主组", platform: "抖音", group: "主组", label: "抖音·主组", fans: soloPlay }],
+    },
+  });
+  assert.strictEqual(fansSolo.series[0].showSymbol, true);
+  assert.strictEqual(fansSolo.series[0].showAllSymbol, true);
+
+  // 5d. 无孤立点的连续长序列仍保持 showSymbol:false 避免密密麻麻圆点
+  const densePlay = longDates.map((_, idx) => 100 + idx);
+  const denseOpt = buildContentTrendOption({
+    dates: longDates,
+    platforms: [{ platform: "抖音", play: densePlay, playDelta: new Array(longDates.length).fill(1) }],
+    totalPlayDelta: new Array(longDates.length).fill(1),
+  });
+  assert.strictEqual(denseOpt.series.find((s) => s.type === "line").showSymbol, false);
+  console.log("✓ [S8-fix #5] >45 天时间轴孤立有效点保留 symbol（内容/总览/粉丝折线）");
+}
+
+// 6. 平台占比环形图标签使用后端 sharePct 且禁止图例筛除扇区
+function testFix6_OverviewPieUsesBackendSharePctAndDisablesLegendToggle() {
+  const pieOpt = buildOverviewPieOption({
+    overview: {
+      platformContribution: [
+        { platform: "抖音", play: 100, sharePct: 33.33 },
+        { platform: "快手", play: 100, sharePct: 33.33 },
+        { platform: "视频号", play: 100, sharePct: 33.33 },
+      ],
+    },
+  });
+  assert.strictEqual(pieOpt.legend.selectedMode, false, "环形图图例必须禁止筛除扇区以保持分母与表格一致");
+  const labelFmt = pieOpt.series[0].label.formatter;
+  assert.strictEqual(typeof labelFmt, "function", "环形图标签 formatter 必须为函数以读取后端 sharePct");
+  // 即使模拟 ECharts 传入不同的重算 percent=50，标签仍必须显示后端 sharePct=33.33%
+  const labelText = labelFmt({
+    name: "抖音",
+    value: 100,
+    percent: 50,
+    data: pieOpt.series[0].data[0],
+  });
+  assert.strictEqual(labelText, "抖音 33.33%");
+  console.log("✓ [S8-fix #6] 环形图标签使用后端 sharePct 且 legend.selectedMode=false");
+}
+
+// 7. 堆叠面积图图例筛选后按可见系列重算异常标记坐标
+async function testFix7_StackedAreaRecomputesMarkPointsOnLegendSelectChanged() {
+  const analysisFixture = {
+    currentRange: { from: "2026-11-18", to: "2026-11-18" },
+    overview: {
+      dailyTrend: {
+        dates: ["2026-11-18"],
+        platforms: [
+          { platform: "抖音", play: [100] },
+          { platform: "快手", play: [100] },
+        ],
+      },
+    },
+    anomalies: {
+      collectionAnomalies: [],
+      recommendSpikes: [
+        { date: "2026-11-18", platform: "快手", title: "爆款视频", dailyPlayDelta: 100, ratio: 6 },
+      ],
+    },
+  };
+
+  const stackedOpt = buildOverviewTrendOption(analysisFixture, { metric: "play", stacked: true });
+  const ksSeriesBefore = stackedOpt.series.find((s) => s.name === "快手");
+  assert.deepStrictEqual(ksSeriesBefore.markPoint.data[0].coord, ["2026-11-18", 200]);
+
+  assert.strictEqual(
+    typeof statsChartOptions.recomputeStackedMarkPoints,
+    "function",
+    "statsChartOptions 必须导出 recomputeStackedMarkPoints"
+  );
+  const recomputedHidden = statsChartOptions.recomputeStackedMarkPoints(stackedOpt, {
+    抖音: false,
+    快手: true,
+  });
+  const ksHidden = recomputedHidden.series.find((s) => s.name === "快手");
+  assert.deepStrictEqual(
+    ksHidden.markPoint.data[0].coord,
+    ["2026-11-18", 100],
+    "隐藏下层平台抖音后，快手「荐」标记坐标必须重算为 100"
+  );
+
+  const recomputedRestored = statsChartOptions.recomputeStackedMarkPoints(stackedOpt, {
+    抖音: true,
+    快手: true,
+  });
+  assert.deepStrictEqual(
+    recomputedRestored.series.find((s) => s.name === "快手").markPoint.data[0].coord,
+    ["2026-11-18", 200],
+    "重新显示抖音后，快手标记应恢复为 200"
+  );
+
+  // 验证 StatsChart.vue 监听 legendselectchanged 并调用 setOption(patch, false) 重算标记
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-s8fix7-"));
+  const origLoad = Module._load;
+  const origRO = global.ResizeObserver;
+  try {
+    const statsChartPath = path.resolve(__dirname, "../src/renderer/components/StatsChart.vue");
+    const chartSfc = vueCompiler.parseComponent(fs.readFileSync(statsChartPath, "utf8"));
+    const outBundle = path.join(tmpDir, "StatsChart-legend.cjs");
+    await build({
+      stdin: {
+        contents: chartSfc.script.content,
+        resolveDir: path.dirname(statsChartPath),
+        loader: "js",
+      },
+      bundle: true,
+      platform: "node",
+      format: "cjs",
+      external: ["echarts/core", "echarts/charts", "echarts/components", "echarts/renderers"],
+      outfile: outBundle,
+    });
+
+    const listeners = new Map();
+    const setOptionCalls = [];
+    global.ResizeObserver = class MockRO {
+      observe() {}
+      disconnect() {}
+    };
+    Module._load = function (req, ...rest) {
+      if (req === "echarts/core") {
+        return {
+          use: () => {},
+          init: () => ({
+            setOption: (opt, notMerge) => setOptionCalls.push({ opt, notMerge }),
+            resize: () => {},
+            clear: () => {},
+            on: (evt, fn) => listeners.set(evt, fn),
+            off: (evt) => listeners.delete(evt),
+            showLoading: () => {},
+            hideLoading: () => {},
+            getDataURL: () => VALID_PNG_DATA_URL,
+            dispose: () => {},
+          }),
+        };
+      }
+      if (req === "echarts/charts" || req === "echarts/components" || req === "echarts/renderers") {
+        return {};
+      }
+      return origLoad.call(this, req, ...rest);
+    };
+
+    const compDef = require(outBundle).default;
+    const ctx = {
+      option: stackedOpt,
+      height: "320px",
+      loading: false,
+      emptyText: "暂无数据",
+      $refs: { root: {}, canvas: { clientWidth: 640, clientHeight: 320 } },
+      $nextTick: (fn) => fn(),
+    };
+    for (const [k, fn] of Object.entries(compDef.computed)) {
+      Object.defineProperty(ctx, k, { get: () => fn.call(ctx), configurable: true });
+    }
+    for (const [k, fn] of Object.entries(compDef.methods)) {
+      ctx[k] = fn.bind(ctx);
+    }
+
+    compDef.mounted.call(ctx);
+    const legendListener = listeners.get("legendselectchanged");
+    assert.strictEqual(typeof legendListener, "function", "StatsChart 必须注册 legendselectchanged 监听");
+    legendListener({ selected: { 抖音: false, 快手: true } });
+
+    const lastCall = setOptionCalls[setOptionCalls.length - 1];
+    assert.strictEqual(lastCall.notMerge, false, "图例筛选重算标记应采用合并更新 notMerge=false 保留图例选择状态");
+    const patchedKs = lastCall.opt.series.find((s) => s.name === "快手");
+    assert.deepStrictEqual(patchedKs.markPoint.data[0].coord, ["2026-11-18", 100]);
+
+    compDef.beforeDestroy.call(ctx);
+    assert.strictEqual(listeners.has("legendselectchanged"), false, "销毁时应解绑 legendselectchanged");
+
+    // 额外用真实 ECharts 实例验证 legendToggleSelect → 重算 markPoint 坐标且保持图例状态无报错
+    const realEcharts = require("echarts");
+    const realChart = realEcharts.init(null, null, { renderer: "svg", ssr: true, width: 640, height: 320 });
+    try {
+      realChart.on("legendselectchanged", (params) => {
+        const patch = statsChartOptions.buildStackedMarkPointPatch(stackedOpt, params.selected);
+        if (patch) realChart.setOption(patch, false);
+      });
+      realChart.setOption(stackedOpt, true);
+      assert.deepStrictEqual(realChart.getOption().series[1].markPoint.data[0].coord, ["2026-11-18", 200]);
+      realChart.dispatchAction({ type: "legendToggleSelect", name: "抖音" });
+      assert.deepStrictEqual(realChart.getOption().series[1].markPoint.data[0].coord, ["2026-11-18", 100]);
+      assert.strictEqual(realChart.getOption().legend[0].selected["抖音"], false);
+      realChart.dispatchAction({ type: "legendToggleSelect", name: "抖音" });
+      assert.deepStrictEqual(realChart.getOption().series[1].markPoint.data[0].coord, ["2026-11-18", 200]);
+    } finally {
+      realChart.dispose();
+    }
+    console.log("✓ [S8-fix #7] 堆叠面积图图例筛选时按可见系列重算异常标记坐标");
+  } finally {
+    Module._load = origLoad;
+    if (origRO === undefined) delete global.ResizeObserver;
+    else global.ResizeObserver = origRO;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+// 8. 互动率堆叠用原始贡献值绘图，显示时再舍入，合计与表格一致
+function testFix8_EngagementRankingStacksRawContribAndRoundsOnDisplay() {
+  const analysis = buildStatsAnalysis({
+    summaryRows: [
+      {
+        contentKey: "file:/v/eng-round.mp4",
+        title: "互动率舍入校验",
+        firstPublishDate: "2026-11-18",
+        perPlatform: {
+          "抖音|主组": { play: 600, like: 20, comment: 0, share: 0 },
+          "快手|主组": { play: 600, like: 20, comment: 0, share: 0 },
+        },
+        totalPlay: 1200,
+        totalLike: 40,
+        totalComment: 0,
+        totalShare: 0,
+      },
+    ],
+    to: "2026-11-20",
+    now: Date.parse("2026-11-20T12:00:00+08:00"),
+  });
+
+  const row = analysis.rankings.byEngagement.top[0];
+  assert.strictEqual(row.engagementRatePct, 3.33, "表格互动率合计应为 3.33%");
+
+  const rkOpt = buildRankingTop10Option(analysis, { metric: "engagement" });
+  const stackedSum = rkOpt.series.reduce((sum, s) => sum + (s.data[0] || 0), 0);
+  const roundedStackedSum = Math.round(stackedSum * 100) / 100;
+  assert.strictEqual(
+    roundedStackedSum,
+    row.engagementRatePct,
+    `互动率堆叠柱总和应舍入为 ${row.engagementRatePct}%（不提前舍入成 3.34%），实际堆叠和=${stackedSum}`
+  );
+
+  // tooltip 单项与合计在展示时均应舍入为两位小数，不出现长浮点尾巴
+  const tipHtml = rkOpt.tooltip.formatter(
+    rkOpt.series.map((s) => ({
+      dataIndex: 0,
+      seriesName: s.name,
+      value: s.data[0],
+      marker: "●",
+    }))
+  );
+  assert.ok(tipHtml.includes("3.33%"), `tooltip 合计应显示 3.33%，实际：${tipHtml}`);
+  assert.ok(tipHtml.includes("1.67%"), `tooltip 单平台贡献应舍入显示 1.67%，实际：${tipHtml}`);
+  assert.ok(!tipHtml.includes("1.6666"), `tooltip 不得直接输出未舍入长小数：${tipHtml}`);
+  console.log("✓ [S8-fix #8] 互动率堆叠按原始值绘图、显示时再舍入，合计与表格一致");
+}
+
+// 9. 每张图保存 PNG 文件名使用该图自身的截止日
+async function testFix9_SaveChartImageUsesOwnCutoffDate(analysis) {
+  const { compDef, template, invokeLog, cleanup } = await loadDataStatsIndexComponent();
+  try {
+    const ctx = createDataStatsCtx(compDef, { ...analysis, to: "2026-11-13" });
+    ctx.contentSummaryDate = "2026-11-20";
+    ctx.contentTrendData = {
+      found: true,
+      date: "2026-11-20",
+      from: "2026-11-18",
+      to: "2026-11-20",
+      dates: ["2026-11-18", "2026-11-19", "2026-11-20"],
+      platforms: [{ platform: "抖音", play: [100, 150, 200], playDelta: [null, 50, 50] }],
+      totalPlayDelta: [null, 50, 50],
+    };
+
+    // 即使只传 2 参，保存作品趋势图也必须取作品趋势自身截止日 2026-11-20，而非数据分析的 2026-11-13
+    await ctx.saveChartImage("chartContentTrend", "作品趋势-示例");
+    assert.strictEqual(invokeLog[0].ch, "stats:save-chart-image");
+    assert.strictEqual(
+      invokeLog[0].payload.date,
+      "2026-11-20",
+      `作品趋势 PNG 截止日应为 2026-11-20，实际：${invokeLog[0].payload.date}`
+    );
+
+    // 显式传入自身截止日同样正确；数据分析图使用数据分析自身截止日 2026-11-13
+    await ctx.saveChartImage("chartOverviewTrend", "总览-日趋势-播放", ctx.analysisChartDate);
+    assert.strictEqual(invokeLog[1].payload.date, "2026-11-13");
+
+    // 模板中每个保存按钮都应显式传入各自截止日
+    assert.ok(template.includes("contentTrendChartDate"), "作品趋势保存按钮应显式传入 contentTrendChartDate");
+    assert.ok(template.includes("analysisChartDate"), "数据分析图表保存按钮应显式传入 analysisChartDate");
+    console.log("✓ [S8-fix #9] 单图保存 PNG 均使用各自图表的截止日");
+  } finally {
+    cleanup();
+  }
+}
+
+async function loadDataStatsIndexComponent() {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-s8fix-idx-"));
+  const indexVuePath = path.resolve(__dirname, "../src/renderer/views/dataStats/index.vue");
+  const indexSfc = vueCompiler.parseComponent(fs.readFileSync(indexVuePath, "utf8"));
+  const indexBundle = path.join(tmpDir, "dataStats-index-fix.cjs");
+  await build({
+    stdin: {
+      contents: indexSfc.script.content,
+      resolveDir: path.dirname(indexVuePath),
+      loader: "js",
+    },
+    bundle: true,
+    platform: "node",
+    format: "cjs",
+    external: ["electron"],
+    outfile: indexBundle,
+    plugins: [
+      {
+        name: "stub-vue-deps",
+        setup(b) {
+          b.onResolve({ filter: /(\.vue$|^@\/|\.?\/components\/|\.?\/statsUtils)/ }, (args) => ({
+            path: args.path,
+            namespace: "stub",
+          }));
+          b.onLoad({ filter: /.*/, namespace: "stub" }, () => ({
+            contents:
+              "module.exports = { default: {}, dailyToRows: () => [], buildCollectAccounts: () => [], collectAccounts: async () => ({}), getCollectLogs: async () => [], getOverviewStats: async () => ({ daily: {}, accounts: [] }), onStatsProgress: () => () => {}, loadSettings: () => ({ enabled: false, time: '10:00', lastRunDate: '' }), subscribeRunComplete: () => () => {}, subscribeSettings: () => () => {}, updateSettings: () => ({ ok: true, settings: {} }) };",
+            loader: "js",
+          }));
+        },
+      },
+    ],
+  });
+
+  const origLoad = Module._load;
+  const invokeLog = [];
+  Module._load = function (req, ...rest) {
+    if (req === "electron") {
+      return {
+        ipcRenderer: {
+          invoke: async (ch, payload) => {
+            invokeLog.push({ ch, payload });
+            if (ch === "stats:save-chart-image") return { ok: true, filePath: "/tmp/a.png" };
+            if (ch === "stats:save-chart-images-batch") return { ok: true, dir: "/tmp/out", count: payload.items.length };
+            return { ok: true };
+          },
+        },
+        shell: { openExternal: async () => {} },
+        clipboard: { writeText: () => {} },
+      };
+    }
+    return origLoad.call(this, req, ...rest);
+  };
+  const compDef = require(indexBundle).default;
+  return {
+    compDef,
+    template: indexSfc.template.content,
+    invokeLog,
+    cleanup: () => {
+      Module._load = origLoad;
+      delete require.cache[indexBundle];
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    },
+  };
+}
+
+function createDataStatsCtx(compDef, analysis) {
+  const mockChartRef = {
+    resize: () => {},
+    getDataURL: () => VALID_PNG_DATA_URL,
+  };
+  const ctx = {
+    ...compDef.data(),
+    analysisData: analysis,
+    contentSummaryDate: "2026-11-20",
+    $refs: {
+      chartOverviewTrend: mockChartRef,
+      chartOverviewPie: mockChartRef,
+      chartPlatformCompare: mockChartRef,
+      chartRankingTop10: mockChartRef,
+      chartNewWorksLine: mockChartRef,
+      chartNewWorksPie: mockChartRef,
+      chartPublishTimeHeatmap: mockChartRef,
+      chartFansTrend: mockChartRef,
+      chartContentTrend: mockChartRef,
+    },
+    $nextTick: (fn) => fn(),
+    $message: { success: () => {}, warning: () => {}, error: () => {} },
+  };
+  for (const [k, fn] of Object.entries(compDef.computed)) {
+    Object.defineProperty(ctx, k, { get: () => fn.call(ctx), configurable: true });
+  }
+  for (const [k, fn] of Object.entries(compDef.methods)) {
+    ctx[k] = fn.bind(ctx);
+  }
+  return ctx;
+}
+
+async function runS8FixRegressions(analysis) {
+  testFix1_ContentTrendCumulativeSumAcrossSamePlatformWorks();
+  await testFix2_StatsChartPendingOptionWhenHiddenAppliesBeforeResize(analysis);
+  await testFix3_BatchExportCreatesIsolatedTimestampedSubdir();
+  await testFix4_RankingBottom10SharesDataAndSyncsTitleExportName(analysis);
+  testFix5_IsolatedValidPointsKeepSymbolOnLongRange();
+  testFix6_OverviewPieUsesBackendSharePctAndDisablesLegendToggle();
+  await testFix7_StackedAreaRecomputesMarkPointsOnLegendSelectChanged();
+  testFix8_EngagementRankingStacksRawContribAndRoundsOnDisplay();
+  await testFix9_SaveChartImageUsesOwnCutoffDate(analysis);
 }
 
 main().catch((err) => {

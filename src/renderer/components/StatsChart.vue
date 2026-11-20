@@ -28,6 +28,7 @@ import {
   PLATFORM_COLORS,
   getPlatformColor,
   isEmptyChartOption,
+  buildStackedMarkPointPatch,
 } from "../utils/statsChartOptions";
 
 echarts.use([
@@ -43,6 +44,14 @@ echarts.use([
   VisualMapComponent,
   CanvasRenderer,
 ]);
+
+const LEGEND_SELECT_EVENTS = [
+  "legendselectchanged",
+  "legendselected",
+  "legendunselected",
+  "legendselectall",
+  "legendinverseselect",
+];
 
 export { PLATFORM_COLORS, getPlatformColor };
 
@@ -105,7 +114,10 @@ export default {
   mounted() {
     this._chart = null;
     this._ro = null;
+    this._pendingOption = null;
+    this._hasPendingOption = false;
     this._onWindowResize = () => this.resize();
+    this._onLegendSelectChanged = (params) => this.handleLegendSelectChanged(params);
 
     if (typeof ResizeObserver !== "undefined" && this.$refs.root) {
       this._ro = new ResizeObserver(() => {
@@ -121,6 +133,8 @@ export default {
     });
   },
   beforeDestroy() {
+    this._pendingOption = null;
+    this._hasPendingOption = false;
     if (this._ro) {
       this._ro.disconnect();
       this._ro = null;
@@ -129,6 +143,11 @@ export default {
       window.removeEventListener("resize", this._onWindowResize);
     }
     if (this._chart) {
+      if (typeof this._chart.off === "function" && this._onLegendSelectChanged) {
+        for (const ev of LEGEND_SELECT_EVENTS) {
+          this._chart.off(ev, this._onLegendSelectChanged);
+        }
+      }
       this._chart.dispose();
       this._chart = null;
     }
@@ -146,32 +165,71 @@ export default {
       const el = this.$refs.canvas;
       return Boolean(el && el.clientWidth > 0 && el.clientHeight > 0);
     },
+    bindChartEvents() {
+      if (!this._chart || typeof this._chart.on !== "function") return;
+      for (const ev of LEGEND_SELECT_EVENTS) {
+        if (typeof this._chart.off === "function") {
+          this._chart.off(ev, this._onLegendSelectChanged);
+        }
+        this._chart.on(ev, this._onLegendSelectChanged);
+      }
+    },
+    handleLegendSelectChanged(params) {
+      if (!this._chart || this.isEmpty) return;
+      const selected = params && params.selected;
+      if (!selected || typeof selected !== "object") return;
+      const renderOpt = this.buildRenderOption();
+      if (!renderOpt) return;
+      const patch = buildStackedMarkPointPatch(renderOpt, selected);
+      if (patch) {
+        this._chart.setOption(patch, false);
+      }
+    },
     initOrUpdate() {
       if (this.isEmpty) {
+        this._pendingOption = null;
+        this._hasPendingOption = false;
         if (this._chart) this._chart.clear();
         return;
       }
-      if (!this.hasVisibleSize()) return;
+      const renderOpt = this._hasPendingOption
+        ? this._pendingOption || this.buildRenderOption()
+        : this.buildRenderOption();
+      if (!this.hasVisibleSize()) {
+        this._pendingOption = renderOpt;
+        this._hasPendingOption = Boolean(renderOpt);
+        return;
+      }
       if (!this._chart) {
         this._chart = echarts.init(this.$refs.canvas);
         this.syncLoading(this.loading);
+        this.bindChartEvents();
       }
-      const renderOpt = this.buildRenderOption();
+      this._pendingOption = null;
+      this._hasPendingOption = false;
       if (renderOpt) {
         this._chart.setOption(renderOpt, true);
       }
     },
     syncOption() {
       if (this.isEmpty) {
+        this._pendingOption = null;
+        this._hasPendingOption = false;
         if (this._chart) this._chart.clear();
+        return;
+      }
+      const renderOpt = this.buildRenderOption();
+      if (!this.hasVisibleSize()) {
+        this._pendingOption = renderOpt;
+        this._hasPendingOption = Boolean(renderOpt);
         return;
       }
       if (!this._chart) {
         this.initOrUpdate();
         return;
       }
-      if (!this.hasVisibleSize()) return;
-      const renderOpt = this.buildRenderOption();
+      this._pendingOption = null;
+      this._hasPendingOption = false;
       if (renderOpt) {
         this._chart.setOption(renderOpt, true);
         this._chart.resize();
@@ -191,18 +249,34 @@ export default {
       }
     },
     resize() {
-      if (this.isEmpty) return;
+      if (this.isEmpty) {
+        this._pendingOption = null;
+        this._hasPendingOption = false;
+        return;
+      }
       if (!this.hasVisibleSize()) return;
       if (!this._chart) {
         this.initOrUpdate();
         return;
       }
+      if (this._hasPendingOption) {
+        const pending = this._pendingOption || this.buildRenderOption();
+        this._pendingOption = null;
+        this._hasPendingOption = false;
+        if (pending) {
+          this._chart.setOption(pending, true);
+        }
+      }
       this._chart.resize();
     },
     getDataURL(opts = {}) {
       if (this.isEmpty) return "";
-      if (!this._chart && this.hasVisibleSize()) {
-        this.initOrUpdate();
+      if (this.hasVisibleSize()) {
+        if (!this._chart) {
+          this.initOrUpdate();
+        } else if (this._hasPendingOption) {
+          this.resize();
+        }
       }
       if (!this._chart) return "";
       return this._chart.getDataURL({

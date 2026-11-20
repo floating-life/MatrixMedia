@@ -3267,12 +3267,21 @@ function buildContentTrendData(options = {}, depsArg) {
     }
   }
 
-  const platformDayMap = new Map();
+  const platformWorksMap = new Map();
+  const platformActiveDays = new Map();
+  const platformDeltaMap = new Map();
   let minDayNum = Infinity;
   let maxDayNum = -Infinity;
 
   for (const bucket of rawByWork.values()) {
     const pts = [...bucket.byDayNum.values()].sort((a, b) => a.dayNum - b.dayNum);
+    let worksList = platformWorksMap.get(bucket.platform);
+    if (!worksList) {
+      worksList = [];
+      platformWorksMap.set(bucket.platform, worksList);
+    }
+    worksList.push(pts);
+
     let prevPlay = null;
     let hasPrev = false;
 
@@ -3289,23 +3298,22 @@ function buildContentTrendData(options = {}, depsArg) {
       if (pt.dayNum < minDayNum) minDayNum = pt.dayNum;
       if (pt.dayNum > maxDayNum) maxDayNum = pt.dayNum;
 
-      let dayMap = platformDayMap.get(bucket.platform);
-      if (!dayMap) {
-        dayMap = new Map();
-        platformDayMap.set(bucket.platform, dayMap);
+      let activeDays = platformActiveDays.get(bucket.platform);
+      if (!activeDays) {
+        activeDays = new Set();
+        platformActiveDays.set(bucket.platform, activeDays);
       }
-      let cell = dayMap.get(pt.dayNum);
-      if (!cell) {
-        cell = { play: null, playDelta: null };
-        dayMap.set(pt.dayNum, cell);
-      }
-      if (play !== null) {
-        const nextPlay = cell.play === null ? play : cell.play + play;
-        cell.play = nextPlay === 0 ? 0 : nextPlay;
-      }
+      activeDays.add(pt.dayNum);
+
       if (playDelta !== null) {
-        const nextDelta = cell.playDelta === null ? playDelta : cell.playDelta + playDelta;
-        cell.playDelta = nextDelta === 0 ? 0 : nextDelta;
+        let deltaMap = platformDeltaMap.get(bucket.platform);
+        if (!deltaMap) {
+          deltaMap = new Map();
+          platformDeltaMap.set(bucket.platform, deltaMap);
+        }
+        const prevSum = deltaMap.has(pt.dayNum) ? deltaMap.get(pt.dayNum) : null;
+        const nextDelta = prevSum === null ? playDelta : prevSum + playDelta;
+        deltaMap.set(pt.dayNum, nextDelta === 0 ? 0 : nextDelta);
       }
     }
   }
@@ -3334,26 +3342,53 @@ function buildContentTrendData(options = {}, depsArg) {
     dates[i] = dayNumToDateStr(rangeStartDay + i);
   }
 
-  const sortedPlatforms = [...platformDayMap.keys()].sort(comparePlatform);
+  const sortedPlatforms = [...platformActiveDays.keys()].sort(comparePlatform);
   const totalPlay = new Array(spanDays).fill(null);
   const totalPlayDelta = new Array(spanDays).fill(null);
 
   const platforms = sortedPlatforms.map((platform) => {
-    const dayMap = platformDayMap.get(platform);
+    const worksList = platformWorksMap.get(platform) || [];
+    const activeDays = platformActiveDays.get(platform);
+    const deltaMap = platformDeltaMap.get(platform) || null;
+    const workCount = worksList.length;
+    const ptrs = new Int32Array(workCount);
+    const curPlays = new Array(workCount).fill(null);
     const playArr = new Array(spanDays).fill(null);
     const deltaArr = new Array(spanDays).fill(null);
+
     for (let i = 0; i < spanDays; i++) {
-      const cell = dayMap.get(rangeStartDay + i);
-      if (!cell) continue;
-      playArr[i] = cell.play;
-      deltaArr[i] = cell.playDelta;
-      if (cell.play !== null) {
-        const np = totalPlay[i] === null ? cell.play : totalPlay[i] + cell.play;
+      const dn = rangeStartDay + i;
+      for (let w = 0; w < workCount; w++) {
+        const pts = worksList[w];
+        let p = ptrs[w];
+        while (p < pts.length && pts[p].dayNum <= dn) {
+          curPlays[w] = pts[p].play;
+          p += 1;
+        }
+        ptrs[w] = p;
+      }
+
+      // 整平台当天无任何作品快照时保持留空（null），不伪造当日点
+      if (!activeDays || !activeDays.has(dn)) continue;
+
+      let sumPlay = null;
+      for (let w = 0; w < workCount; w++) {
+        if (curPlays[w] !== null) {
+          sumPlay = sumPlay === null ? curPlays[w] : sumPlay + curPlays[w];
+        }
+      }
+      if (sumPlay === 0) sumPlay = 0;
+      const dayDelta = deltaMap && deltaMap.has(dn) ? deltaMap.get(dn) : null;
+
+      playArr[i] = sumPlay;
+      deltaArr[i] = dayDelta;
+      if (sumPlay !== null) {
+        const np = totalPlay[i] === null ? sumPlay : totalPlay[i] + sumPlay;
         totalPlay[i] = np === 0 ? 0 : np;
       }
-      if (cell.playDelta !== null) {
+      if (dayDelta !== null) {
         const nd =
-          totalPlayDelta[i] === null ? cell.playDelta : totalPlayDelta[i] + cell.playDelta;
+          totalPlayDelta[i] === null ? dayDelta : totalPlayDelta[i] + dayDelta;
         totalPlayDelta[i] = nd === 0 ? 0 : nd;
       }
     }

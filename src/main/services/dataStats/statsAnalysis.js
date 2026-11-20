@@ -1543,10 +1543,12 @@ function buildRankingsSection(contentRows) {
       const pRate = computeItemEngagementRate(p.play, p.like, p.comment, p.share);
       const hasInt = p.like !== null || p.comment !== null || p.share !== null;
       const interactions = hasInt ? (p.like || 0) + (p.comment || 0) + (p.share || 0) : null;
-      const engagementContribPct =
+      const rawEngagementContribPct =
         item.totalPlay !== null && item.totalPlay > 0 && interactions !== null
-          ? round2((interactions / item.totalPlay) * 100)
+          ? normalizeZero((interactions / item.totalPlay) * 100)
           : null;
+      const engagementContribPct =
+        rawEngagementContribPct !== null ? round2(rawEngagementContribPct) : null;
       return {
         platform: p.platform,
         play: p.play,
@@ -1556,6 +1558,7 @@ function buildRankingsSection(contentRows) {
         fansDelta: p.fansDelta,
         engagementRatePct: pRate !== null ? round2(pRate * 100) : null,
         engagementContribPct,
+        rawEngagementContribPct,
       };
     }),
   });

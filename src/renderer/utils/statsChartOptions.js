@@ -188,6 +188,198 @@ function toFiniteOrNull(v) {
   return v === 0 ? 0 : v;
 }
 
+function round2(v) {
+  if (typeof v !== "number" || !Number.isFinite(v)) return null;
+  const rounded = Math.round((v + (v >= 0 ? Number.EPSILON : -Number.EPSILON)) * 100) / 100;
+  return rounded === 0 ? 0 : rounded;
+}
+
+function extractLineDatumValue(datum) {
+  if (typeof datum === "number") return Number.isFinite(datum) ? datum : null;
+  if (datum && typeof datum === "object" && !Array.isArray(datum)) {
+    return toFiniteOrNull(datum.value);
+  }
+  return null;
+}
+
+/**
+ * 找出折线序列中的孤立有效点（前后均为空或越界，connectNulls:false 下无任何线段相连）。
+ */
+function findIsolatedPointIndices(data) {
+  const isolated = new Set();
+  let validCount = 0;
+  if (!Array.isArray(data) || !data.length) return { isolated, validCount };
+  for (let i = 0; i < data.length; i++) {
+    if (extractLineDatumValue(data[i]) === null) continue;
+    validCount += 1;
+    const prevValid = i > 0 && extractLineDatumValue(data[i - 1]) !== null;
+    const nextValid = i < data.length - 1 && extractLineDatumValue(data[i + 1]) !== null;
+    if (!prevValid && !nextValid) {
+      isolated.add(i);
+    }
+  }
+  return { isolated, validCount };
+}
+
+/**
+ * 构建折线 symbol 显示配置：
+ * - 时间轴 <=45 天常规显示圆点；有孤立点时开启 showAllSymbol 防止窄容器抽稀隐藏
+ * - 时间轴 >45 天无孤立点时关闭 showSymbol 避免过密；存在孤立有效点时保留孤立点圆点
+ */
+function buildLineSymbolConfig(data, datesLength) {
+  const { isolated, validCount } = findIsolatedPointIndices(data);
+  if (datesLength <= 45) {
+    const cfg = {
+      showSymbol: true,
+      symbol: "circle",
+      symbolSize: 5,
+    };
+    if (isolated.size > 0) {
+      cfg.showAllSymbol = true;
+    }
+    return cfg;
+  }
+  if (isolated.size === 0) {
+    return {
+      showSymbol: false,
+      symbol: "circle",
+      symbolSize: 5,
+    };
+  }
+  if (isolated.size === validCount) {
+    return {
+      showSymbol: true,
+      showAllSymbol: true,
+      symbol: "circle",
+      symbolSize: 5,
+    };
+  }
+  return {
+    showSymbol: true,
+    showAllSymbol: true,
+    symbol(_val, params) {
+      return params && isolated.has(params.dataIndex) ? "circle" : "none";
+    },
+    symbolSize: 5,
+  };
+}
+
+/**
+ * 按当前图例可见系列重算堆叠折线/面积图的 markPoint 纵坐标，返回供 setOption(patch, false) 合并的 patch。
+ * 若 option 不含带 markPoint 的堆叠系列则返回 null。
+ */
+function buildStackedMarkPointPatch(option, selected) {
+  if (!option || typeof option !== "object" || !Array.isArray(option.series) || !option.series.length) {
+    return null;
+  }
+  const xData =
+    option.xAxis && !Array.isArray(option.xAxis) && Array.isArray(option.xAxis.data)
+      ? option.xAxis.data
+      : [];
+  if (!xData.length) return null;
+
+  const hasStackedMarkPoint = option.series.some(
+    (s) =>
+      s &&
+      s.stack &&
+      s.markPoint &&
+      Array.isArray(s.markPoint.data) &&
+      s.markPoint.data.length > 0
+  );
+  if (!hasStackedMarkPoint) return null;
+
+  const dateToIdx = new Map();
+  for (let i = 0; i < xData.length; i++) dateToIdx.set(xData[i], i);
+
+  const stackAccs = new Map();
+  const seriesPatch = option.series.map((s) => {
+    if (!s || typeof s !== "object") return {};
+    const name = s.name;
+    const isVisible =
+      !selected ||
+      typeof selected !== "object" ||
+      !Object.prototype.hasOwnProperty.call(selected, name) ||
+      selected[name] !== false;
+
+    if (!s.stack || !isVisible) {
+      return name != null ? { name } : {};
+    }
+
+    let acc = stackAccs.get(s.stack);
+    if (!acc) {
+      acc = {
+        pos: new Array(xData.length).fill(0),
+        neg: new Array(xData.length).fill(0),
+      };
+      stackAccs.set(s.stack, acc);
+    }
+
+    const dataArr = Array.isArray(s.data) ? s.data : [];
+    const top = new Array(xData.length).fill(0);
+    for (let i = 0; i < xData.length; i++) {
+      const v = i < dataArr.length ? extractLineDatumValue(dataArr[i]) : null;
+      if (v !== null) {
+        if (v >= 0) {
+          acc.pos[i] += v;
+          top[i] = acc.pos[i];
+        } else {
+          acc.neg[i] += v;
+          top[i] = acc.neg[i];
+        }
+      } else {
+        top[i] = acc.pos[i];
+      }
+    }
+
+    if (!s.markPoint || !Array.isArray(s.markPoint.data) || !s.markPoint.data.length) {
+      return name != null ? { name } : {};
+    }
+
+    const nextMarkData = s.markPoint.data.map((mp) => {
+      if (!mp || typeof mp !== "object" || !Array.isArray(mp.coord) || mp.coord.length < 2) {
+        return mp;
+      }
+      const xKey = mp.coord[0];
+      const idx = dateToIdx.has(xKey)
+        ? dateToIdx.get(xKey)
+        : typeof xKey === "number" && Number.isInteger(xKey) && xKey >= 0 && xKey < xData.length
+        ? xKey
+        : -1;
+      if (idx < 0) return mp;
+      return {
+        ...mp,
+        coord: [xKey, top[idx]],
+      };
+    });
+
+    return {
+      name,
+      markPoint: {
+        ...s.markPoint,
+        data: nextMarkData,
+      },
+    };
+  });
+
+  return { series: seriesPatch };
+}
+
+function recomputeStackedMarkPoints(option, selected) {
+  const patch = buildStackedMarkPointPatch(option, selected);
+  if (!patch) return option;
+  return {
+    ...option,
+    series: option.series.map((s, idx) => {
+      const p = patch.series[idx];
+      if (!p || !p.markPoint) return s;
+      return {
+        ...s,
+        markPoint: p.markPoint,
+      };
+    }),
+  };
+}
+
 function formatNum(v) {
   if (typeof v !== "number" || !Number.isFinite(v)) return "-";
   return Number(v).toLocaleString("zh-CN");
@@ -446,9 +638,7 @@ function buildOverviewTrendOption(analysis, options = {}) {
       type: "line",
       data,
       connectNulls: false,
-      showSymbol: dates.length <= 45,
-      symbol: "circle",
-      symbolSize: 5,
+      ...buildLineSymbolConfig(data, dates.length),
       smooth: false,
       itemStyle: { color },
       lineStyle: { color, width: 2 },
@@ -470,7 +660,7 @@ function buildOverviewTrendOption(analysis, options = {}) {
     return s;
   });
 
-  return {
+  const option = {
     color: sortedPlatforms.map(getPlatformColor),
     tooltip: {
       trigger: "axis",
@@ -554,6 +744,10 @@ function buildOverviewTrendOption(analysis, options = {}) {
     },
     series,
   };
+  if (stacked && options && options.selected && typeof options.selected === "object") {
+    return recomputeStackedMarkPoints(option, options.selected);
+  }
+  return option;
 }
 
 /**
@@ -593,6 +787,7 @@ function buildOverviewPieOption(analysis) {
     legend: {
       type: "scroll",
       bottom: 0,
+      selectedMode: false,
       textStyle: { fontSize: 12, color: "#606266" },
     },
     series: [
@@ -610,7 +805,11 @@ function buildOverviewPieOption(analysis) {
           show: true,
           fontSize: 11,
           color: "#606266",
-          formatter: "{b} {d}%",
+          formatter(p) {
+            const pct =
+              p && p.data && p.data.sharePct != null ? p.data.sharePct : p && p.percent;
+            return pct != null ? `${p.name} ${pct}%` : `${p.name}`;
+          },
         },
         data: items,
       },
@@ -731,32 +930,40 @@ function buildPlatformComparisonOption(analysis) {
 }
 
 /**
- * 3. 作品排行：Top10 横向条形图（按平台堆叠，可切 播放 / 互动率 / 涨粉）
+ * 3. 作品排行：Top10 / Bottom10 横向条形图（按平台堆叠，可切 播放 / 互动率 / 涨粉）
  */
 function buildRankingTop10Option(analysis, options = {}) {
   const metric =
     options && (options.metric === "engagement" || options.metric === "fans")
       ? options.metric
       : "play";
-  const rankings = analysis && analysis.rankings;
-  const bucket =
-    rankings &&
-    (metric === "engagement"
-      ? rankings.byEngagement
-      : metric === "fans"
-      ? rankings.byFans
-      : rankings.byPlay);
-  const rawList = bucket && Array.isArray(bucket.top) ? bucket.top : [];
+  const order = options && options.order === "bottom" ? "bottom" : "top";
+  const orderLabel = order === "bottom" ? "Bottom 10" : "Top 10";
+
+  let rawList;
+  if (options && Array.isArray(options.items)) {
+    rawList = options.items;
+  } else {
+    const rankings = analysis && analysis.rankings;
+    const bucket =
+      rankings &&
+      (metric === "engagement"
+        ? rankings.byEngagement
+        : metric === "fans"
+        ? rankings.byFans
+        : rankings.byPlay);
+    rawList = bucket && Array.isArray(bucket[order]) ? bucket[order] : [];
+  }
   const items = rawList.slice(0, RANKING_TOP_LIMIT);
 
   if (!items.length) {
-    return createEmptyOption("暂无作品排行 Top10 数据");
+    return createEmptyOption(`暂无作品排行 ${orderLabel} 数据`);
   }
 
   const unitLabel =
     metric === "engagement" ? "互动率(%)" : metric === "fans" ? "总涨粉" : "总播放";
 
-  // 收集 Top10 涉及的所有平台（按固定顺序排序）
+  // 收集当前排行涉及的所有平台（按固定顺序排序）
   const platformSet = new Set();
   for (const it of items) {
     if (it && Array.isArray(it.platforms)) {
@@ -780,8 +987,11 @@ function buildRankingTop10Option(analysis, options = {}) {
             : null;
         if (!pCell) return null;
         if (metric === "engagement") {
+          // 优先使用未提前舍入的原始互动率贡献值绘图，避免各平台分段提前舍入导致堆叠合计偏离表格
           const v =
-            pCell.engagementContribPct != null
+            pCell.rawEngagementContribPct != null
+              ? pCell.rawEngagementContribPct
+              : pCell.engagementContribPct != null
               ? pCell.engagementContribPct
               : pCell.engagementRatePct;
           return toFiniteOrNull(v);
@@ -819,7 +1029,7 @@ function buildRankingTop10Option(analysis, options = {}) {
 
   const hasAny = series.some((s) => s.data.some((v) => v !== null));
   if (!hasAny) {
-    return createEmptyOption("暂无作品排行 Top10 数据");
+    return createEmptyOption(`暂无作品排行 ${orderLabel} 数据`);
   }
 
   return {
@@ -834,14 +1044,26 @@ function buildRankingTop10Option(analysis, options = {}) {
         const idx = list[0].dataIndex;
         const row = items[idx];
         if (!row) return "";
-        const totalText =
-          metric === "engagement"
-            ? row.engagementRatePct != null
-              ? `${row.engagementRatePct}%`
-              : "-"
-            : metric === "fans"
-            ? formatNum(row.totalFansDelta)
-            : formatNum(row.totalPlay);
+        let totalText;
+        if (metric === "engagement") {
+          if (row.engagementRatePct != null) {
+            totalText = `${round2(row.engagementRatePct)}%`;
+          } else {
+            let sumRaw = 0;
+            let hasAnyRaw = false;
+            for (const p of list) {
+              if (typeof p.value === "number" && Number.isFinite(p.value)) {
+                sumRaw += p.value;
+                hasAnyRaw = true;
+              }
+            }
+            totalText = hasAnyRaw ? `${round2(sumRaw)}%` : "-";
+          }
+        } else if (metric === "fans") {
+          totalText = formatNum(row.totalFansDelta);
+        } else {
+          totalText = formatNum(row.totalPlay);
+        }
         const lines = [
           `<div style="font-weight:600;margin-bottom:4px;">#${idx + 1} ${escapeHtml(row.title || "(无标题)")}</div>`,
           `<div style="margin-bottom:4px;">${escapeHtml(unitLabel)}合计：<b>${escapeHtml(totalText)}</b></div>`,
@@ -852,12 +1074,16 @@ function buildRankingTop10Option(analysis, options = {}) {
             const pCell =
               Array.isArray(row.platforms) &&
               row.platforms.find((x) => x && x.platform === p.seriesName);
+            const displayContrib =
+              typeof p.value === "number" && Number.isFinite(p.value)
+                ? round2(p.value)
+                : p.value;
             const ownTxt =
               pCell && pCell.engagementRatePct != null
-                ? `（本端互动率 ${pCell.engagementRatePct}%）`
+                ? `（本端互动率 ${round2(pCell.engagementRatePct)}%）`
                 : "";
             lines.push(
-              `<div>${p.marker}${escapeHtml(p.seriesName)}：<b>${escapeHtml(p.value)}%</b>${escapeHtml(ownTxt)}</div>`
+              `<div>${p.marker}${escapeHtml(p.seriesName)}：<b>${escapeHtml(displayContrib)}%</b>${escapeHtml(ownTxt)}</div>`
             );
           } else {
             lines.push(
@@ -888,7 +1114,10 @@ function buildRankingTop10Option(analysis, options = {}) {
       axisLabel: {
         color: "#606266",
         fontSize: 11,
-        formatter: metric === "engagement" ? "{value}%" : formatAxisCompact,
+        formatter:
+          metric === "engagement"
+            ? (v) => (typeof v === "number" && Number.isFinite(v) ? `${round2(v)}%` : "")
+            : formatAxisCompact,
       },
       splitLine: { lineStyle: { color: "#ebeef5" } },
     },
@@ -1265,9 +1494,7 @@ function buildFansTrendOption(analysis, options = {}) {
       type: "line",
       data: aligned,
       connectNulls: false,
-      showSymbol: dates.length <= 45,
-      symbol: "circle",
-      symbolSize: 5,
+      ...buildLineSymbolConfig(aligned, dates.length),
       itemStyle: { color },
       lineStyle: { color, width: 2, type: lineType },
       platform: acc.platform,
@@ -1398,9 +1625,7 @@ function buildContentTrendOption(trendData) {
       type: "line",
       yAxisIndex: 0,
       connectNulls: false,
-      showSymbol: dates.length <= 45,
-      symbol: "circle",
-      symbolSize: 5,
+      ...buildLineSymbolConfig(playAligned, dates.length),
       itemStyle: { color },
       lineStyle: { color, width: 2 },
       data: playAligned,
@@ -1527,6 +1752,8 @@ module.exports = {
   buildContinuousDates,
   createEmptyOption,
   isEmptyChartOption,
+  buildStackedMarkPointPatch,
+  recomputeStackedMarkPoints,
   buildOverviewTrendOption,
   buildOverviewPieOption,
   buildPlatformComparisonOption,

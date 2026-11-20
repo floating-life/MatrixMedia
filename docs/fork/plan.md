@@ -64,6 +64,7 @@
 - 按分组导出 Excel 时 `statsExport.js` 仍会为未选分组加载完整 `works-daily` 历史，大历史数据下内存与耗时偏高，后续可对未选分组改用截至日读取路径参与全量归属裁决。（Codex 评审 S6-r3 #6，2026-11-19）
 - 旧版单文件快照 `works-daily.json` 在单次手工指定校验时仍会整份 `JSON.parse`，大数据量下额外堆占用偏高，后续可改为逐作品流式读取仅保留截止日前最新快照。（Codex 评审 S6-r3 #7，2026-11-19）
 - 百家号、小红书适配器在 S7-fix 前曾按宿主机系统时区解析无时区发布时间字符串；S7-fix 已改为显式按 UTC+8 解析，S7-r3 已在 `store.mergeWorks` 中支持重采得到有效 `publishTime` 时更新存量作品（未重新采集前的旧存量时间戳仍维持原值，重采后自动修正）。（Codex 评审 S7 #5 / S7-review2 #5，2026-11-20）
+- 根目录 `package-lock.json` 未随 S8 同步新增的 `echarts@5.5.1`（及 `zrender`/`tslib`）条目：本 fork 统一使用 `yarn` 管理依赖与 CI 冻结安装（`yarn.lock` 已同步），暂不维护 npm 锁文件。（Codex 评审 S8 #10，2026-11-20）
 
 ### S6 已知问题（评审第 3 轮列出，暂不修）
 - 旧发布记录事后补上 filePath 时，内容键从 record:id 变成 file:，原手工关联失效，需重新指定。

@@ -627,6 +627,47 @@ function buildChartImageFileName(rawName, dateStr) {
   return `${stem}.png`;
 }
 
+function formatUtc8Hms(now = Date.now()) {
+  const ms = now instanceof Date ? now.getTime() : Number(now);
+  const safeMs = Number.isFinite(ms) ? ms : Date.now();
+  return new Date(safeMs + 8 * 3600e3).toISOString().slice(11, 19).replace(/:/g, "");
+}
+
+function formatChartBatchPeriodLabel(rawPeriod) {
+  if (typeof rawPeriod === "number" && Number.isInteger(rawPeriod) && rawPeriod > 0) {
+    return `近${rawPeriod}天`;
+  }
+  if (typeof rawPeriod === "string") {
+    const trimmed = rawPeriod.trim();
+    if (/^\d+$/.test(trimmed) && Number(trimmed) > 0) {
+      return `近${Number(trimmed)}天`;
+    }
+    const safe = sanitizeChartFileName(trimmed, "");
+    if (safe) return safe;
+  }
+  return "全部";
+}
+
+function createUniqueBatchExportDir(parentDir, baseDirName) {
+  fs.mkdirSync(parentDir, { recursive: true });
+  const safeBase = sanitizeChartFileName(baseDirName, "MatrixMedia-图表");
+  for (let seq = 1; seq <= 999; seq++) {
+    const dirName = seq === 1 ? safeBase : `${safeBase}-${seq}`;
+    const candidate = path.resolve(parentDir, dirName);
+    if (path.dirname(candidate) !== parentDir) {
+      throw new Error(`非法导出目录名：${dirName}`);
+    }
+    try {
+      fs.mkdirSync(candidate);
+      return candidate;
+    } catch (err) {
+      if (err && err.code === "EEXIST") continue;
+      throw err;
+    }
+  }
+  throw new Error("无法创建独立的图表导出子目录");
+}
+
 function registerDataStatsIpc(options = {}) {
   const exportMaxRows =
     options && options.exportMaxRows !== undefined ? options.exportMaxRows : undefined;
@@ -916,8 +957,11 @@ function registerDataStatsIpc(options = {}) {
         return { ok: false, canceled: true };
       }
 
-      const targetDir = path.resolve(result.filePaths[0]);
-      fs.mkdirSync(targetDir, { recursive: true });
+      const parentDir = path.resolve(result.filePaths[0]);
+      const periodLabel = formatChartBatchPeriodLabel(args.period);
+      const hms = formatUtc8Hms(exportNow);
+      const subDirName = `MatrixMedia-图表-${periodLabel}-${dateStr}-${hms}`;
+      const targetDir = createUniqueBatchExportDir(parentDir, subDirName);
       const files = [];
       for (const item of prepared) {
         const targetPath = path.resolve(targetDir, item.fileName);
@@ -930,6 +974,7 @@ function registerDataStatsIpc(options = {}) {
       return {
         ok: true,
         dir: targetDir,
+        parentDir,
         files,
         count: files.length,
       };

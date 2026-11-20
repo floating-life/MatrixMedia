@@ -634,7 +634,7 @@
               size="mini"
               icon="el-icon-download"
               :disabled="loadingContentTrend || isChartOptionEmpty(contentTrendOption)"
-              @click="saveChartImage('chartContentTrend', '作品趋势-' + (contentTrendRow && contentTrendRow.title ? contentTrendRow.title : '内容'))"
+              @click="saveChartImage('chartContentTrend', '作品趋势-' + (contentTrendRow && contentTrendRow.title ? contentTrendRow.title : '内容'), contentTrendChartDate)"
             >
               保存图片
             </el-button>
@@ -759,7 +759,7 @@
                       size="mini"
                       icon="el-icon-download"
                       :disabled="isChartOptionEmpty(overviewTrendOption)"
-                      @click="saveChartImage('chartOverviewTrend', '总览-日趋势-' + overviewTrendMetricLabel)"
+                      @click="saveChartImage('chartOverviewTrend', '总览-日趋势-' + overviewTrendMetricLabel, analysisChartDate)"
                     >
                       保存图片
                     </el-button>
@@ -778,7 +778,7 @@
                       size="mini"
                       icon="el-icon-download"
                       :disabled="isChartOptionEmpty(overviewPieOption)"
-                      @click="saveChartImage('chartOverviewPie', '总览-平台占比')"
+                      @click="saveChartImage('chartOverviewPie', '总览-平台占比', analysisChartDate)"
                     >
                       保存图片
                     </el-button>
@@ -910,7 +910,7 @@
                     size="mini"
                     icon="el-icon-download"
                     :disabled="isChartOptionEmpty(platformCompareOption)"
-                    @click="saveChartImage('chartPlatformCompare', '平台对比')"
+                    @click="saveChartImage('chartPlatformCompare', '平台对比', analysisChartDate)"
                   >
                     保存图片
                   </el-button>
@@ -1014,13 +1014,13 @@
               </div>
               <div class="chart-box chart-box-block">
                 <div class="chart-box-head">
-                  <span class="chart-box-title">Top 10 横向对比（按平台堆叠 · {{ analysisRankMetricShortLabel }}）</span>
+                  <span class="chart-box-title">{{ analysisRankOrderLabel }} 横向对比（按平台堆叠 · {{ analysisRankMetricShortLabel }}）</span>
                   <el-button
                     type="text"
                     size="mini"
                     icon="el-icon-download"
                     :disabled="isChartOptionEmpty(rankingTop10Option)"
-                    @click="saveChartImage('chartRankingTop10', '作品排行Top10-' + analysisRankMetricShortLabel)"
+                    @click="saveChartImage('chartRankingTop10', '作品排行' + analysisRankOrderShortLabel + '-' + analysisRankMetricShortLabel, analysisChartDate)"
                   >
                     保存图片
                   </el-button>
@@ -1157,7 +1157,7 @@
                       size="mini"
                       icon="el-icon-download"
                       :disabled="isChartOptionEmpty(newWorksLineOption)"
-                      @click="saveChartImage('chartNewWorksLine', '新作品走势-D1D3D7')"
+                      @click="saveChartImage('chartNewWorksLine', '新作品走势-D1D3D7', analysisChartDate)"
                     >
                       保存图片
                     </el-button>
@@ -1176,7 +1176,7 @@
                       size="mini"
                       icon="el-icon-download"
                       :disabled="isChartOptionEmpty(newWorksPieOption)"
-                      @click="saveChartImage('chartNewWorksPie', '新作品走势-分类占比')"
+                      @click="saveChartImage('chartNewWorksPie', '新作品走势-分类占比', analysisChartDate)"
                     >
                       保存图片
                     </el-button>
@@ -1335,7 +1335,7 @@
                     size="mini"
                     icon="el-icon-download"
                     :disabled="isChartOptionEmpty(publishTimeHeatmapOption)"
-                    @click="saveChartImage('chartPublishTimeHeatmap', '发布时间热力图')"
+                    @click="saveChartImage('chartPublishTimeHeatmap', '发布时间热力图', analysisChartDate)"
                   >
                     保存图片
                   </el-button>
@@ -1418,7 +1418,7 @@
                     size="mini"
                     icon="el-icon-download"
                     :disabled="isChartOptionEmpty(fansTrendOption)"
-                    @click="saveChartImage('chartFansTrend', '粉丝趋势')"
+                    @click="saveChartImage('chartFansTrend', '粉丝趋势', analysisChartDate)"
                   >
                     保存图片
                   </el-button>
@@ -1916,6 +1916,22 @@ export default {
       if (this.analysisRankMetric === "fans") return "涨粉";
       return "播放";
     },
+    analysisRankOrderLabel() {
+      return this.analysisRankOrder === "bottom" ? "Bottom 10" : "Top 10";
+    },
+    analysisRankOrderShortLabel() {
+      return this.analysisRankOrder === "bottom" ? "Bottom10" : "Top10";
+    },
+    analysisChartDate() {
+      return (this.analysisData && this.analysisData.to) || "";
+    },
+    contentTrendChartDate() {
+      return (
+        (this.contentTrendData && (this.contentTrendData.date || this.contentTrendData.to)) ||
+        this.contentSummaryDate ||
+        ""
+      );
+    },
     analysisFansAccountOptions() {
       const ft = this.analysisData && this.analysisData.fansTrend;
       return ft && Array.isArray(ft.accounts) ? ft.accounts : [];
@@ -1935,6 +1951,8 @@ export default {
     rankingTop10Option() {
       return buildRankingTop10Option(this.analysisData, {
         metric: this.analysisRankMetric,
+        order: this.analysisRankOrder,
+        items: this.analysisDisplayedRankRows,
       });
     },
     newWorksLineOption() {
@@ -2079,7 +2097,10 @@ export default {
         { ref: "chartOverviewTrend", name: `1-总览-日趋势-${this.overviewTrendMetricLabel}` },
         { ref: "chartOverviewPie", name: "1-总览-平台占比" },
         { ref: "chartPlatformCompare", name: "2-平台对比" },
-        { ref: "chartRankingTop10", name: `3-作品排行Top10-${this.analysisRankMetricShortLabel}` },
+        {
+          ref: "chartRankingTop10",
+          name: `3-作品排行${this.analysisRankOrderShortLabel}-${this.analysisRankMetricShortLabel}`,
+        },
         { ref: "chartNewWorksLine", name: "4-新作品走势-D1D3D7" },
         { ref: "chartNewWorksPie", name: "4-新作品走势-分类占比" },
         { ref: "chartPublishTimeHeatmap", name: "5-发布时间热力图" },
@@ -2095,7 +2116,7 @@ export default {
         }
       }
     },
-    async saveChartImage(refName, chartName) {
+    async saveChartImage(refName, chartName, explicitDate) {
       const comp = this.$refs && this.$refs[refName];
       if (!comp || typeof comp.getDataURL !== "function") {
         this.$message.warning("图表尚未就绪");
@@ -2111,10 +2132,16 @@ export default {
           dataUrl,
           name: chartName || "图表",
         };
+        const fallbackDate =
+          refName === "chartContentTrend"
+            ? (this.contentTrendData && (this.contentTrendData.date || this.contentTrendData.to)) ||
+              this.contentSummaryDate ||
+              ""
+            : (this.analysisData && this.analysisData.to) || "";
         const chartDate =
-          (this.analysisData && this.analysisData.to) ||
-          (this.contentTrendData && this.contentTrendData.date) ||
-          "";
+          typeof explicitDate === "string" && explicitDate.trim()
+            ? explicitDate.trim()
+            : fallbackDate;
         if (chartDate) payload.date = chartDate;
         const res = await ipcRenderer.invoke("stats:save-chart-image", payload);
         if (res && res.ok) {
@@ -2149,6 +2176,11 @@ export default {
         const payload = { items };
         if (this.analysisData && this.analysisData.to) {
           payload.date = this.analysisData.to;
+        }
+        const period =
+          (this.analysisData && this.analysisData.period) || this.analysisPeriod;
+        if (period) {
+          payload.period = period;
         }
         const res = await ipcRenderer.invoke("stats:save-chart-images-batch", payload);
         if (res && res.ok) {
