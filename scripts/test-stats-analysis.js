@@ -22,10 +22,15 @@ const assert = require("assert");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const vm = require("vm");
+const { performance } = require("perf_hooks");
 const { build } = require("esbuild");
 const vueCompiler = require("vue-template-compiler");
 
+const { ADAPTERS } = require("../src/main/services/dataStats/adapters.js");
+
 const {
+  PLATFORM_PLAY_CLOSE_DIFF_RATIO,
   ENGAGEMENT_MIN_PLAY,
   RANKING_LIMIT,
   PLATFORM_SKEW_RATIO,
@@ -469,6 +474,7 @@ function buildRich30DayDataset() {
 
 async function main() {
   /* ---------- 0. 导出常量校验 ---------- */
+  assert.strictEqual(PLATFORM_PLAY_CLOSE_DIFF_RATIO, 0.05);
   assert.strictEqual(ENGAGEMENT_MIN_PLAY, 100);
   assert.strictEqual(RANKING_LIMIT, 10);
   assert.strictEqual(PLATFORM_SKEW_RATIO, 3);
@@ -1021,6 +1027,10 @@ async function main() {
         `dataStats/index.vue 模板编译失败: ${compiled.errors.join("; ")}`
       );
       assert.ok(sfc.template.content.includes('label="数据分析"'), "应包含「数据分析」tab");
+      assert.ok(
+        sfc.template.content.includes(':picker-options="analysisDatePickerOptions"'),
+        "S7-fix#7: 数据分析截止日选择器必须绑定 analysisDatePickerOptions 禁选未来日期"
+      );
       assert.strictEqual(
         sfc.template.content.includes("activeTab === 'analysis'"),
         false,
@@ -1104,8 +1114,87 @@ async function main() {
         await ctx.copyAnalysisSummary();
         assert.strictEqual(copiedText, ipcRes.summary.text, "复制小结应写入完整文字小结到剪贴板");
         assert.ok(msgs.some((m) => m.type === "success"));
+
+        // S7-fix#7: 校验 GUI 日期选择器 disabledDate 禁选 UTC+8 未来日期、放行今天及以前
+        assert.strictEqual(typeof ctx.analysisDatePickerOptions.disabledDate, "function");
+        const utc8TodayStr = new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 10);
+        const makeLocalDate = (ymd) => {
+          const [y, m, d] = ymd.split("-").map(Number);
+          return new Date(y, m - 1, d);
+        };
+        assert.strictEqual(
+          ctx.analysisDatePickerOptions.disabledDate(makeLocalDate(utc8TodayStr)),
+          false,
+          "UTC+8 今天必须可选"
+        );
+        assert.strictEqual(
+          ctx.analysisDatePickerOptions.disabledDate(makeLocalDate(shiftDate(utc8TodayStr, -1))),
+          false,
+          "UTC+8 昨天必须可选"
+        );
+        assert.strictEqual(
+          ctx.analysisDatePickerOptions.disabledDate(makeLocalDate(shiftDate(utc8TodayStr, 1))),
+          true,
+          "UTC+8 明天必须禁选"
+        );
+        assert.strictEqual(
+          ctx.analysisDatePickerOptions.disabledDate(makeLocalDate(shiftDate(utc8TodayStr, 9))),
+          true,
+          "UTC+8 未来 9 天必须禁选"
+        );
       } finally {
         Module._load = origLoad;
+      }
+
+      // S7-fix#7(testS7Fix7CutoffClampedToUtc8TodayAndGuiDisablesFuture): IPC 未来 to 夹到 UTC+8 今天，未到期 D3/D7 为空
+      {
+        const futureDeps = {
+          now: Date.parse("2026-11-20T10:00:00+08:00"),
+          listAccounts: () => [{ group: "创作组", platform: "抖音" }],
+          readWorks: () => [
+            {
+              workId: "1",
+              title: "工作日发布的作品",
+              publishTime: Date.parse("2026-11-19T18:00:00+08:00"),
+            },
+          ],
+          readWorksDaily: () => ({ 1: { "2026-11-20": { play: 1000 } } }),
+          readDaily: () => ({}),
+          readPushRecords: () => [],
+        };
+        registerDataStatsIpc({ exportDeps: futureDeps });
+        const callFuture = ipcHandlers.get("stats:get-analysis");
+        const ordinary = await callFuture(localEv, { period: 30 });
+        const futureRes = await callFuture(localEv, { period: 30, to: "2026-11-29" });
+        assert.strictEqual(ordinary.ok, true);
+        assert.strictEqual(futureRes.ok, true);
+        assert.strictEqual(futureRes.to, "2026-11-20", "未来截止日必须夹到 UTC+8 今天 2026-11-20");
+        assert.strictEqual(futureRes.newWorks.items[0].d1Play, 1000);
+        assert.strictEqual(futureRes.newWorks.items[0].d3Play, null, "未到 D3 必须为空");
+        assert.strictEqual(futureRes.newWorks.items[0].d7Play, null, "未到 D7 必须为空");
+        assert.strictEqual(futureRes.newWorks.items[0].category, "数据不足");
+        // 纯函数 buildStatsAnalysis 同样将未来 to 夹到 UTC+8 今天
+        const coreFuture = buildStatsAnalysis({
+          dailyRows: [
+            {
+              date: "2026-11-20",
+              platform: "抖音",
+              workId: "1",
+              title: "工作日发布的作品",
+              publishTime: Date.parse("2026-11-19T18:00:00+08:00"),
+              play: 1000,
+              contentKey: "file:/future1.mp4",
+            },
+          ],
+          summaryRows: [],
+          to: "2026-11-29",
+          period: 30,
+          now: Date.parse("2026-11-20T10:00:00+08:00"),
+        });
+        assert.strictEqual(coreFuture.to, "2026-11-20");
+        assert.strictEqual(coreFuture.newWorks.items[0].d3Play, null);
+        assert.strictEqual(coreFuture.newWorks.items[0].d7Play, null);
+        assert.strictEqual(coreFuture.newWorks.items[0].category, "数据不足");
       }
 
       console.log("✓ IPC stats:get-analysis 安全校验、GUI/Excel 一致性与 dataStats/index.vue 校验通过");
@@ -1116,6 +1205,524 @@ async function main() {
       else delete require.cache[collectorId];
       fs.rmSync(tmpRoot, { recursive: true, force: true });
     }
+  }
+
+  /* ---------- 9. S7-fix 评审 9 条专项回归用例 + 性能验收 ---------- */
+
+  // testS7Fix1HistoricalDropZeroUsesAllSnapshots（评审 #1：11/14→11/16 为 1000→0→1300，选 11/15 截止）
+  {
+    const pubMs = Date.parse("2026-11-12T10:00:00+08:00");
+    const dropDeps = {
+      now: Date.parse("2026-11-17T10:00:00+08:00"),
+      listAccounts: () => [{ group: "创作组", platform: "抖音" }],
+      readWorks: () => [{ workId: "W_DROP", title: "掉0恢复作品", publishTime: pubMs }],
+      readWorksDaily: () => ({
+        W_DROP: {
+          "2026-11-14": { play: 1000, like: 50, comment: 5, share: 2 },
+          "2026-11-15": { play: 0, like: 55, comment: 5, share: 2 },
+          "2026-11-16": { play: 1300, like: 65, comment: 6, share: 3 },
+        },
+      }),
+      readDaily: () => ({}),
+      readPushRecords: () => [
+        {
+          id: "rec-drop",
+          pt: "抖音",
+          group: "创作组",
+          publishStatus: "success",
+          title: "掉0恢复作品",
+          filePath: "/videos/drop0.mp4",
+          lastPublishAt: pubMs,
+        },
+      ],
+    };
+    const guiRes = buildStatsAnalysisData({ period: 7, to: "2026-11-15" }, dropDeps);
+    const wbRes = buildStatsWorkbookData({ from: "2026-11-12", to: "2026-11-15" }, dropDeps);
+    for (const [label, res] of [
+      ["GUI", guiRes],
+      ["Excel", wbRes.analysis],
+    ]) {
+      assert.strictEqual(res.to, "2026-11-15");
+      assert.strictEqual(
+        res.anomalies.collectionAnomalies.length,
+        1,
+        `${label}: 11/15 掉 0 经 11/16 恢复后必须被识别为异常`
+      );
+      assert.strictEqual(res.anomalies.collectionAnomalies[0].date, "2026-11-15");
+      assert.strictEqual(res.anomalies.collectionAnomalies[0].prevValue, 1000);
+      assert.strictEqual(res.anomalies.collectionAnomalies[0].nextDate, "2026-11-16");
+      assert.strictEqual(res.anomalies.collectionAnomalies[0].nextValue, 1300);
+      assert.strictEqual(
+        res.overview.metrics.play.current,
+        null,
+        `${label}: 剔除 11/15 掉 0 后总览不得计入 -1000`
+      );
+      assert.strictEqual(
+        res.rankings.byPlay.top[0].totalPlay,
+        1000,
+        `${label}: 剔除 11/15 掉 0 后排行总播放应回退为 11/14 有效值 1000`
+      );
+      assert.strictEqual(
+        res.newWorks.items[0].d3Play,
+        1000,
+        `${label}: 11/12 发布作品 D3(11/15) 应剔除掉 0 回退为 1000`
+      );
+      assert.strictEqual(
+        res.snapshotDays,
+        2,
+        `${label}: snapshotDays 仅统计 <= 截止日 11/15 的天数（11/14、11/15）`
+      );
+    }
+    console.log("✓ S7-fix#1(testS7Fix1HistoricalDropZeroUsesAllSnapshots) 通过");
+  }
+
+  // testS7Fix2TrajectoryUsesComparablePlatformsOnly（评审 #2：抖音 D1/D3/D7=100，快手仅 D7=200）
+  {
+    const pub = utc8Iso("2026-11-01", 10, 0);
+    const rComp = buildStatsAnalysis({
+      dailyRows: [
+        // 内容 A：抖音 D1/D3/D7 均为 100，快手仅 D7 采到 200 → 可比平台仅抖音，应归「爆发后平稳」而非「长尾型」
+        { date: "2026-11-02", platform: "抖音", workId: "A_DY", title: "漏采不造长尾", publishTime: pub, play: 100, contentKey: "file:/s7fix2/a.mp4" },
+        { date: "2026-11-04", platform: "抖音", workId: "A_DY", title: "漏采不造长尾", publishTime: pub, play: 100, contentKey: "file:/s7fix2/a.mp4" },
+        { date: "2026-11-08", platform: "抖音", workId: "A_DY", title: "漏采不造长尾", publishTime: pub, play: 100, contentKey: "file:/s7fix2/a.mp4" },
+        { date: "2026-11-08", platform: "快手", workId: "A_KS", title: "漏采不造长尾", publishTime: pub, play: 200, contentKey: "file:/s7fix2/a.mp4" },
+        // 内容 B：抖音仅 D7 有值（缺 D1/D3）、快手仅 D3/D7 有值（缺 D1）→ 不存在在 D1/D3/D7 均有值的平台 → 「数据不足」（修前会按 null/100/300 误判为「长尾型」）
+        { date: "2026-11-08", platform: "抖音", workId: "B_DY", title: "无可比平台", publishTime: pub, play: 100, contentKey: "file:/s7fix2/b.mp4" },
+        { date: "2026-11-04", platform: "快手", workId: "B_KS", title: "无可比平台", publishTime: pub, play: 100, contentKey: "file:/s7fix2/b.mp4" },
+        { date: "2026-11-08", platform: "快手", workId: "B_KS", title: "无可比平台", publishTime: pub, play: 200, contentKey: "file:/s7fix2/b.mp4" },
+      ],
+      summaryRows: [],
+      to: "2026-11-10",
+      period: 30,
+      now: Date.parse("2026-11-15T10:00:00+08:00"),
+    });
+    const itemA = rComp.newWorks.items.find((x) => x.contentKey === "file:/s7fix2/a.mp4");
+    const itemB = rComp.newWorks.items.find((x) => x.contentKey === "file:/s7fix2/b.mp4");
+    assert.strictEqual(itemA.d1Play, 100);
+    assert.strictEqual(itemA.d3Play, 100);
+    assert.strictEqual(itemA.d7Play, 300);
+    assert.strictEqual(itemA.d7ToD3, 1, "可比平台（仅抖音）的 D7/D3 应为 1");
+    assert.strictEqual(itemA.category, "爆发后平稳", "快手漏采 D1/D3 不得制造长尾");
+    assert.strictEqual(rComp.newWorks.categoryCounts.长尾型, 0);
+    assert.strictEqual(itemB.category, "数据不足", "不存在 D1/D3/D7 均有值的平台必须标「数据不足」");
+    console.log("✓ S7-fix#2(testS7Fix2TrajectoryUsesComparablePlatformsOnly) 通过");
+  }
+
+  // testS7Fix3SharedWorkMilestonesSection4And5Consistent（评审 #3：同平台双号手工合并，11/1 D7=100、11/4 11/8=200 D7=800，截止 11/12）
+  {
+    const pub1 = Date.parse("2026-11-01T10:00:00+08:00");
+    const pub2 = Date.parse("2026-11-04T10:00:00+08:00");
+    const mergeDeps = {
+      now: Date.parse("2026-11-12T18:00:00+08:00"),
+      listAccounts: () => [
+        { group: "账号一", platform: "抖音" },
+        { group: "账号二", platform: "抖音" },
+      ],
+      readWorks: (g) =>
+        g === "账号一"
+          ? [{ workId: "DY_M1", title: "双号同款", publishTime: pub1 }]
+          : [{ workId: "DY_M2", title: "双号同款", publishTime: pub2 }],
+      readWorksDaily: (g) =>
+        g === "账号一"
+          ? { DY_M1: { "2026-11-08": { play: 100 } } }
+          : { DY_M2: { "2026-11-08": { play: 200 }, "2026-11-11": { play: 800 } } },
+      readDaily: () => ({}),
+      readPushRecords: () => [],
+      readLinkOverrides: () => ({
+        version: 1,
+        updatedAt: Date.parse("2026-11-12T10:00:00+08:00"),
+        contents: {
+          "manual:s7fix3": { title: "双号同款", createdAt: Date.parse("2026-11-12T10:00:00+08:00") },
+        },
+        excludedAuto: {},
+        overrides: {
+          "抖音|DY_M1": { action: "assign", contentKey: "manual:s7fix3" },
+          "抖音|DY_M2": { action: "assign", contentKey: "manual:s7fix3" },
+        },
+      }),
+    };
+    const rMerge = buildStatsAnalysisData({ period: 30, to: "2026-11-12" }, mergeDeps);
+    assert.strictEqual(rMerge.newWorks.items.length, 1);
+    assert.strictEqual(rMerge.newWorks.items[0].d7Play, 900, "第 4 节内容 D7 应按各自作品发布日算得 100+800=900");
+    assert.strictEqual(rMerge.newWorks.items[0].platforms[0].d7Play, 900, "第 4 节平台 D7 应为 900");
+    assert.strictEqual(rMerge.publishTime.groups.length, 1);
+    assert.strictEqual(rMerge.publishTime.groups[0].avgD7Play, 900, "第 5 节 D7 必须与第 4 节完全一致（900）");
+    console.log("✓ S7-fix#3(testS7Fix3SharedWorkMilestonesSection4And5Consistent) 通过");
+  }
+
+  // testS7Fix4RepublishUsesEarliestS6PublishTimeNotNewWork（评审 #4：10/30 抖音首发无快照，11/17 补发快手并采集）
+  {
+    const dyFirstMs = Date.parse("2026-10-30T10:00:00+08:00"); // 2026-10-30 周五 6-12
+    const recOnlyFirstMs = Date.parse("2026-10-30T14:00:00+08:00"); // 2026-10-30 周五 12-18
+    const ksRepubMs = Date.parse("2026-11-17T20:00:00+08:00"); // 2026-11-17 周二 18-24
+    const repubDeps = {
+      now: Date.parse("2026-11-20T12:00:00+08:00"),
+      listAccounts: () => [
+        { group: "创作组", platform: "抖音" },
+        { group: "创作组", platform: "快手" },
+      ],
+      readWorks: (_g, p) =>
+        p === "抖音"
+          ? [
+              // 仅作品元数据有 10/30 首发，无日快照
+              { workId: "DY_OLD1", title: "老作品A", url: "https://www.douyin.com/video/old1", publishTime: dyFirstMs },
+            ]
+          : [
+              { workId: "KS_NEW1", title: "老作品A", url: "https://www.kuaishou.com/short-video/new1", publishTime: ksRepubMs },
+              { workId: "KS_NEW2", title: "老作品B", url: "https://www.kuaishou.com/short-video/new2", publishTime: ksRepubMs },
+            ],
+      readWorksDaily: (_g, p) =>
+        p === "抖音"
+          ? {} // 抖音完全无日快照
+          : {
+              KS_NEW1: { "2026-11-18": { play: 500 }, "2026-11-20": { play: 700 } },
+              KS_NEW2: { "2026-11-18": { play: 300 }, "2026-11-20": { play: 400 } },
+            },
+      readDaily: () => ({}),
+      readPushRecords: () => [
+        // A：抖音 10/30 首发（无 lastPublishAt 也可靠 works.json 的 dyFirstMs），快手 11/17 补发同文件
+        {
+          id: "p-a1",
+          pt: "抖音",
+          group: "创作组",
+          publishStatus: "success",
+          title: "老作品A",
+          filePath: "/videos/repub_a.mp4",
+          videoLink: "https://www.douyin.com/video/old1",
+          lastPublishAt: dyFirstMs,
+        },
+        {
+          id: "p-a2",
+          pt: "快手",
+          group: "创作组",
+          publishStatus: "success",
+          title: "老作品A",
+          filePath: "/videos/repub_a.mp4",
+          videoLink: "https://www.kuaishou.com/short-video/new1",
+          lastPublishAt: ksRepubMs,
+        },
+        // B：抖音仅存在于发布记录（无 works.json 元数据也无快照），快手 11/17 补发同文件
+        {
+          id: "p-b1",
+          pt: "抖音",
+          group: "创作组",
+          publishStatus: "success",
+          title: "老作品B",
+          filePath: "/videos/repub_b.mp4",
+          videoLink: "https://www.douyin.com/video/old2",
+          lastPublishAt: recOnlyFirstMs,
+        },
+        {
+          id: "p-b2",
+          pt: "快手",
+          group: "创作组",
+          publishStatus: "success",
+          title: "老作品B",
+          filePath: "/videos/repub_b.mp4",
+          videoLink: "https://www.kuaishou.com/short-video/new2",
+          lastPublishAt: ksRepubMs,
+        },
+      ],
+    };
+    const rRepub7 = buildStatsAnalysisData({ period: 7, to: "2026-11-20" }, repubDeps);
+    assert.strictEqual(rRepub7.newWorks.totalCount, 0, "10/30 首发、11/17 补发的内容不得算作近 7 天新作品");
+    const slotKeys = rRepub7.publishTime.groups.map((g) => `${g.weekdayLabel}|${g.slot}`);
+    assert.ok(slotKeys.includes("周五|6-12"), "老作品A 应按 10/30 10:00 归入周五 6-12");
+    assert.ok(slotKeys.includes("周五|12-18"), "老作品B 应按发布记录 10/30 14:00 归入周五 12-18");
+    assert.strictEqual(
+      slotKeys.includes("周二|18-24"),
+      false,
+      "发布时间不得误归到 11/17 20:00 补发时段"
+    );
+    console.log("✓ S7-fix#4(testS7Fix4RepublishUsesEarliestS6PublishTimeNotNewWork) 通过");
+  }
+
+  // testS7Fix5BjhAndXhsExplicitUtc8PublishTimeParsing（评审 #5：百家号/小红书 "2026-11-17 18:30:00" 在 UTC+8 与 UTC 主机结果完全一致）
+  {
+    const dataDate = "2026-11-17 18:30:00";
+    const mkResp = (obj) => ({ status: 200, text: async () => JSON.stringify(obj) });
+    async function runAdapterCollect(platform) {
+      const fetch = async (url) => {
+        if (url.includes("/pcui/home/index")) return mkResp({ data: { coreData: { fansCount: 100, viewCount: 200 } } });
+        if (url.includes("/pcui/article/lists")) {
+          return mkResp({
+            list: [{ article_id: "123", title: "城里的一天", publish_time: dataDate, read_amount: 100 }],
+            page: { totalPage: 1 },
+          });
+        }
+        if (url.includes("/personal_info")) return mkResp({ code: 0, data: { fans_count: 10 } });
+        if (url.includes("/posted")) {
+          return mkResp({
+            code: 0,
+            data: { notes: [{ id: "456", display_title: "城里的一天", time: dataDate, view_count: 100 }], page: -1 },
+          });
+        }
+        throw new Error(`unexpected url: ${url}`);
+      };
+      return (
+        await vm.runInNewContext(ADAPTERS[platform].collectScript(), {
+          fetch,
+          window: { _webmsxyw: () => ({}) },
+          Date,
+          setTimeout,
+        })
+      ).works[0];
+    }
+    const oldTz = process.env.TZ;
+    try {
+      for (const zone of ["Asia/Shanghai", "UTC"]) {
+        process.env.TZ = zone;
+        for (const p of ["百家号", "小红书"]) {
+          const work = await runAdapterCollect(p);
+          assert.strictEqual(
+            new Date(work.publishTime).toISOString(),
+            "2026-11-17T10:30:00.000Z",
+            `${zone} 下 ${p} 解析 "${dataDate}" 必须固定为 UTC+8（2026-11-17T10:30:00.000Z）`
+          );
+          const a = buildStatsAnalysis({
+            dailyRows: [{ ...work, platform: p, date: "2026-11-18" }],
+            summaryRows: [],
+            to: "2026-11-18",
+            now: Date.parse("2026-11-20T10:00:00+08:00"),
+          });
+          assert.strictEqual(a.newWorks.items[0].publishDate, "2026-11-17");
+          assert.strictEqual(a.newWorks.items[0].d1Play, 100);
+          assert.strictEqual(a.publishTime.groups[0].weekdayLabel, "周二");
+          assert.strictEqual(a.publishTime.groups[0].slot, "18-24");
+        }
+      }
+    } finally {
+      if (oldTz === undefined) delete process.env.TZ;
+      else process.env.TZ = oldTz;
+    }
+    console.log("✓ S7-fix#5(testS7Fix5BjhAndXhsExplicitUtc8PublishTimeParsing) 通过");
+  }
+
+  // testS7Fix6RecommendSpikeStrict7DayWindowAndGapProration（评审 #6：11/1=100, 11/14=140, 11/19=2600, 11/20=4100）
+  {
+    const baseGapRows = [
+      { date: "2026-11-01", platform: "抖音", workId: "GAP1", title: "断档基线", play: 100 },
+      { date: "2026-11-14", platform: "抖音", workId: "GAP1", title: "断档基线", play: 140 },
+      { date: "2026-11-19", platform: "抖音", workId: "GAP1", title: "断档基线", play: 2600 },
+      { date: "2026-11-20", platform: "抖音", workId: "GAP1", title: "断档基线", play: 4100 }, // +1500 < 5 * 352.31
+    ];
+    const rNoFalseAlarm = buildStatsAnalysis({
+      dailyRows: baseGapRows,
+      summaryRows: [],
+      to: "2026-11-20",
+      period: 7,
+      now: Date.parse("2026-11-20T12:00:00+08:00"),
+    });
+    assert.strictEqual(
+      rNoFalseAlarm.anomalies.recommendSpikes.length,
+      0,
+      "7 日窗内均摊日均约 352.31，5 倍为 1761.54，11/20 新增 1500 不得误报上推荐"
+    );
+
+    // 同一基线下 11/20 新增 1800 (>= 1761.54) 应精准命中且基线天数严格为 7 天
+    const rTrueSpike = buildStatsAnalysis({
+      dailyRows: [
+        ...baseGapRows.slice(0, 3),
+        { date: "2026-11-20", platform: "抖音", workId: "GAP1", title: "断档基线", play: 4400 },
+      ],
+      summaryRows: [],
+      to: "2026-11-20",
+      period: 7,
+      now: Date.parse("2026-11-20T12:00:00+08:00"),
+    });
+    assert.strictEqual(rTrueSpike.anomalies.recommendSpikes.length, 1);
+    assert.strictEqual(rTrueSpike.anomalies.recommendSpikes[0].baselineDays, 7);
+    assert.strictEqual(rTrueSpike.anomalies.recommendSpikes[0].baselineAvg, 352.31);
+    assert.strictEqual(rTrueSpike.anomalies.recommendSpikes[0].dailyPlayDelta, 1800);
+
+    // 断档后首日（span > 1）增量不得当作单日实测触发上推荐
+    const rGapFirstDay = buildStatsAnalysis({
+      dailyRows: [
+        { date: "2026-11-14", platform: "抖音", workId: "GAP2", title: "断档首日", play: 100 },
+        { date: "2026-11-15", platform: "抖音", workId: "GAP2", title: "断档首日", play: 200 },
+        { date: "2026-11-20", platform: "抖音", workId: "GAP2", title: "断档首日", play: 10200 }, // span=5
+      ],
+      summaryRows: [],
+      to: "2026-11-20",
+      period: 7,
+      now: Date.parse("2026-11-20T12:00:00+08:00"),
+    });
+    assert.strictEqual(
+      rGapFirstDay.anomalies.recommendSpikes.length,
+      0,
+      "断档后首日跨天增量不得触发疑似上推荐"
+    );
+    console.log("✓ S7-fix#6(testS7Fix6RecommendSpikeStrict7DayWindowAndGapProration) 通过");
+  }
+
+  // testS7Fix8EngagementRankingSortsByRawRateBeforeRounding（评审 #8：250/4996 vs 250/5005）
+  {
+    const rs = Array.from({ length: 9 }, (_, i) => ({
+      contentKey: `file:h${i}`,
+      title: `榜单前九${i}`,
+      totalPlay: 2000,
+      totalLike: 600,
+    }));
+    rs.push(
+      { contentKey: "file:alpha", title: "甲", totalPlay: 4996, totalLike: 250 },
+      { contentKey: "file:beta", title: "乙", totalPlay: 5005, totalLike: 250 }
+    );
+    const rRank = buildStatsAnalysis({
+      dailyRows: [],
+      summaryRows: rs,
+      to: "2026-11-20",
+      now: Date.parse("2026-11-20T12:00:00+08:00"),
+    }).rankings.byEngagement;
+    assert.strictEqual(rRank.top.length, 10);
+    assert.strictEqual(rRank.top[9].title, "甲", "原始互动率 250/4996 高于 250/5005，甲必须排进第 10 名");
+    assert.strictEqual(rRank.top[9].engagementRate, 0.05);
+    assert.strictEqual(rRank.top[9].engagementRatePct, 5);
+    assert.strictEqual(rRank.bottom[0].title, "乙", "乙互动率最低，应居 Bottom 首位");
+    console.log("✓ S7-fix#8(testS7Fix8EngagementRankingSortsByRawRateBeforeRounding) 通过");
+  }
+
+  // testS7Fix9PlatformComparisonCloseAvgPlaySaysClose（评审 #9：均播相差 <5% 视为并列，文案写「播放接近」）
+  {
+    const runCmp = (dyPlay, ksPlay) => {
+      const perPlatform = {
+        "抖音|创作组": { play: dyPlay, like: Math.round(dyPlay * 0.05) },
+        "快手|创作组": { play: ksPlay, like: Math.round(ksPlay * 0.1) },
+      };
+      return buildStatsAnalysis({
+        dailyRows: [],
+        summaryRows: [1, 2, 3].map((x) => ({ contentKey: `file:cmp${x}`, perPlatform })),
+        to: "2026-11-20",
+        now: Date.parse("2026-11-20T12:00:00+08:00"),
+      });
+    };
+    const rEq = runCmp(1000, 1000);
+    assert.ok(
+      rEq.platformComparison.conclusions[0].includes("播放接近"),
+      `均播 1000 vs 1000 必须写「播放接近」，实际：${rEq.platformComparison.conclusions[0]}`
+    );
+    assert.strictEqual(rEq.platformComparison.conclusions[0].includes("播放低于"), false);
+    assert.ok(rEq.summary.text.includes("播放接近"));
+    assert.strictEqual(rEq.summary.text.includes("播放低于"), false);
+
+    // 4% 差值 (<5%) 同样视为并列写「播放接近」
+    const r4Pct = runCmp(1000, 960);
+    assert.ok(r4Pct.platformComparison.conclusions[0].includes("播放接近"));
+    assert.strictEqual(r4Pct.platformComparison.conclusions[0].includes("播放低于"), false);
+
+    // 5% 差值 (不 <5%) 仍写「播放低于」
+    const r5Pct = runCmp(1000, 950);
+    assert.ok(r5Pct.platformComparison.conclusions[0].includes("快手播放低于抖音"));
+    console.log("✓ S7-fix#9(testS7Fix9PlatformComparisonCloseAvgPlaySaysClose) 通过");
+  }
+
+  // testS7FixPerf2000Contents90Days（性能验收：2000 内容 × 90 天 GUI 入口 & Excel 构建，测试上限 5s 并打印实测）
+  {
+    const accounts = ["抖音", "快手", "视频号"].flatMap((platform) =>
+      ["创作组A", "创作组B", "创作组C"].map((group) => ({ group, platform }))
+    );
+    const gpKey = (g, p) => `${g}|${p}`;
+    const workLists = new Map(accounts.map(({ group, platform }) => [gpKey(group, platform), []]));
+    const snapshotMaps = new Map(accounts.map(({ group, platform }) => [gpKey(group, platform), {}]));
+    const dates = Array.from({ length: 90 }, (_, i) => shiftDate("2026-08-23", i));
+    const to = dates[dates.length - 1];
+    const perfRows = [];
+    const perfSummaryRows = [];
+    const perfRecords = [];
+    const pubMs = Date.parse("2026-08-22T13:00:00+08:00");
+
+    for (let i = 0; i < 2000; i++) {
+      const { group, platform } = accounts[i % accounts.length];
+      const workId = String(70000000 + i);
+      const title = `城市观光系列第${i + 1}集`;
+      const url = `https://example.org/video/${workId}`;
+      const filePath = `/videos/travel-${i}.mp4`;
+      const contentKey = `file:${filePath}`;
+      workLists.get(gpKey(group, platform)).push({ workId, title, publishTime: pubMs, url });
+      perfRecords.push({
+        id: workId,
+        pt: platform,
+        group,
+        publishStatus: "success",
+        title,
+        filePath,
+        videoLink: url,
+        lastPublishAt: pubMs,
+      });
+      const dateMap = (snapshotMaps.get(gpKey(group, platform))[workId] = {});
+      for (let j = 0; j < dates.length; j++) {
+        const snap = {
+          play: 700 + i + 7 * j,
+          like: 100 + 3 * j,
+          comment: 80 + j,
+          share: 50 + j,
+          favorite: 10 + j,
+          fansDelta: j,
+        };
+        dateMap[dates[j]] = snap;
+        perfRows.push({
+          group,
+          platform,
+          workId,
+          title,
+          publishTime: pubMs,
+          date: dates[j],
+          ...snap,
+          contentKey,
+        });
+      }
+      const s = dateMap[to];
+      perfSummaryRows.push({
+        contentKey,
+        title,
+        firstPublishDate: "2026-08-22",
+        totalPlay: s.play,
+        totalLike: s.like,
+        totalComment: s.comment,
+        totalShare: s.share,
+        totalFavorite: s.favorite,
+        totalFansDelta: s.fansDelta,
+        perPlatform: { [`${platform}|${group}`]: { ...s, workIds: [workId] } },
+      });
+    }
+    const perfDeps = {
+      now: Date.parse("2026-11-20T12:00:00+08:00"),
+      listAccounts: () => accounts,
+      readWorks: (g, p) => workLists.get(gpKey(g, p)),
+      readWorksDaily: (g, p) => snapshotMaps.get(gpKey(g, p)),
+      readDaily: () => ({}),
+      readPushRecords: () => perfRecords,
+    };
+
+    const tCore0 = performance.now();
+    const coreRes = buildStatsAnalysis({
+      dailyRows: perfRows,
+      summaryRows: perfSummaryRows,
+      to,
+      now: perfDeps.now,
+    });
+    const coreMs = Math.round(performance.now() - tCore0);
+
+    const tGui0 = performance.now();
+    const guiRes = buildStatsAnalysisData({}, perfDeps);
+    const guiMs = Math.round(performance.now() - tGui0);
+
+    const tWb0 = performance.now();
+    const wbRes = buildStatsWorkbookData({}, perfDeps);
+    const wbMs = Math.round(performance.now() - tWb0);
+
+    assert.strictEqual(coreRes.rankings.byPlay.eligibleCount, 2000);
+    assert.strictEqual(coreRes.overview.metrics.play.current, 420000);
+    assert.strictEqual(guiRes.rankings.byPlay.eligibleCount, 2000);
+    assert.strictEqual(guiRes.overview.metrics.play.current, 420000);
+    assert.strictEqual(wbRes.analysis.rankings.byPlay.eligibleCount, 2000);
+    assert.strictEqual(wbRes.analysis.overview.metrics.play.current, 420000);
+
+    console.log(
+      `✓ S7-fix-perf(testS7FixPerf2000Contents90Days) 实测：core=${coreMs}ms, gui=${guiMs}ms, workbook=${wbMs}ms（2000 内容 × 90 天 = 180000 观测）`
+    );
+    assert.ok(coreMs < 5000, `纯计算超时：${coreMs}ms >= 5000ms`);
+    assert.ok(guiMs < 5000, `GUI 入口超时：${guiMs}ms >= 5000ms`);
+    assert.ok(wbMs < 5000, `Excel 构建超时：${wbMs}ms >= 5000ms`);
   }
 
   console.log("\ntest-stats-analysis: 全部断言通过");

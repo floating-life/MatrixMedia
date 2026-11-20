@@ -610,6 +610,7 @@
                   size="mini"
                   class="analysis-date-picker"
                   value-format="yyyy-MM-dd"
+                  :picker-options="analysisDatePickerOptions"
                   clearable
                   :editable="false"
                   placeholder="默认最新快照日"
@@ -1361,6 +1362,19 @@ const PLATFORM_ORDER = [
   "头条",
 ];
 
+function formatLocalYmd(date) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+function getUtc8TodayYmd(now = Date.now()) {
+  const ms = now instanceof Date ? now.getTime() : Number(now);
+  const safeMs = Number.isFinite(ms) ? ms : Date.now();
+  return new Date(safeMs + 8 * 3600e3).toISOString().slice(0, 10);
+}
+
 function compareNullableMetric(a, b, key) {
   const av = a && a[key];
   const bv = b && b[key];
@@ -1394,6 +1408,12 @@ export default {
       reassignTargetKey: "",
       analysisPeriod: 30,
       analysisTo: "",
+      analysisDatePickerOptions: {
+        disabledDate(time) {
+          if (!(time instanceof Date) || !Number.isFinite(time.getTime())) return false;
+          return formatLocalYmd(time) > getUtc8TodayYmd();
+        },
+      },
       analysisData: null,
       loadingAnalysis: false,
       analysisRankMetric: "play",
@@ -1664,6 +1684,9 @@ export default {
           return;
         }
         this.analysisData = res;
+        if (this.analysisTo && res.to && this.analysisTo > res.to) {
+          this.analysisTo = res.to;
+        }
       } catch (err) {
         if (reqId !== this._analysisReqId) return;
         this.$message.error(`读取数据分析失败：${(err && err.message) || err}`);

@@ -291,6 +291,39 @@ const ADAPTERS = {
   if (!core) throw new Error("home/index: 未取到 coreData（可能未登录）");
   out.overview = { fans: __num(core.fansCount), plays: __num(core.viewCount) };
   // 2) 内容列表（页码分页；video_set 合集跳过）
+  const __parseUtc8Time = (raw) => {
+    if (raw == null || raw === "") return 0;
+    if (typeof raw === "number") {
+      if (!Number.isFinite(raw) || raw <= 0) return 0;
+      return raw < 1e12 ? raw * 1000 : raw;
+    }
+    const s = String(raw).trim();
+    if (!s) return 0;
+    if (/^\\d+$/.test(s)) {
+      const n = Number(s);
+      if (!Number.isFinite(n) || n <= 0) return 0;
+      return n < 1e12 ? n * 1000 : n;
+    }
+    if (/(?:[Zz]|[+-]\\d{2}:?\\d{2})$/.test(s)) {
+      const t = Date.parse(s.replace(/\\//g, "-").replace(" ", "T"));
+      return Number.isFinite(t) ? t : 0;
+    }
+    const m = s.match(
+      /^(\\d{4})[-/年](\\d{1,2})[-/月](\\d{1,2})日?(?:[T\\s]+(\\d{1,2}):(\\d{1,2})(?::(\\d{1,2})(?:\\.(\\d{1,3}))?)?)?$/
+    );
+    if (m) {
+      const y = Number(m[1]), mo = Number(m[2]), d = Number(m[3]);
+      const hh = m[4] ? Number(m[4]) : 0, mm = m[5] ? Number(m[5]) : 0, ss = m[6] ? Number(m[6]) : 0;
+      const ms = m[7] ? Number(m[7].padEnd(3, "0")) : 0;
+      if (mo < 1 || mo > 12 || d < 1 || d > 31 || hh > 23 || mm > 59 || ss > 59) return 0;
+      const utcMs = Date.UTC(y, mo - 1, d, hh, mm, ss, ms);
+      const check = new Date(utcMs);
+      if (check.getUTCFullYear() !== y || check.getUTCMonth() !== mo - 1 || check.getUTCDate() !== d) return 0;
+      return utcMs - 8 * 3600000;
+    }
+    const t = Date.parse(s.replace(/-/g, "/"));
+    return Number.isFinite(t) ? t : 0;
+  };
   let page = 1, guard = 0;
   let likes = 0, comments = 0, shares = 0, favorites = 0;
   while (guard++ < 50) {
@@ -307,7 +340,7 @@ const ADAPTERS = {
         workId: String(it.article_id || it.nid || ""),
         url: it.url || "",
         title: it.title || "(无标题)",
-        publishTime: it.publish_time ? new Date(String(it.publish_time).replace(/-/g, "/")).getTime() : 0,
+        publishTime: __parseUtc8Time(it.publish_time),
         play: __num(it.read_amount),
         like: __num(it.like_amount),
         comment: __num(it.comment_amount),
@@ -517,6 +550,39 @@ const ADAPTERS = {
   if (info.json.code !== 0) throw new Error("personal_info: code=" + info.json.code);
   out.overview.fans = __num(d.fans_count);
   // 2) 笔记列表（page 递增，响应 page=-1 终止）
+  const __parseUtc8Time = (raw) => {
+    if (raw == null || raw === "") return 0;
+    if (typeof raw === "number") {
+      if (!Number.isFinite(raw) || raw <= 0) return 0;
+      return raw < 1e12 ? raw * 1000 : raw;
+    }
+    const s = String(raw).trim();
+    if (!s) return 0;
+    if (/^\\d+$/.test(s)) {
+      const n = Number(s);
+      if (!Number.isFinite(n) || n <= 0) return 0;
+      return n < 1e12 ? n * 1000 : n;
+    }
+    if (/(?:[Zz]|[+-]\\d{2}:?\\d{2})$/.test(s)) {
+      const t = Date.parse(s.replace(/\\//g, "-").replace(" ", "T"));
+      return Number.isFinite(t) ? t : 0;
+    }
+    const m = s.match(
+      /^(\\d{4})[-/年](\\d{1,2})[-/月](\\d{1,2})日?(?:[T\\s]+(\\d{1,2}):(\\d{1,2})(?::(\\d{1,2})(?:\\.(\\d{1,3}))?)?)?$/
+    );
+    if (m) {
+      const y = Number(m[1]), mo = Number(m[2]), d = Number(m[3]);
+      const hh = m[4] ? Number(m[4]) : 0, mm = m[5] ? Number(m[5]) : 0, ss = m[6] ? Number(m[6]) : 0;
+      const ms = m[7] ? Number(m[7].padEnd(3, "0")) : 0;
+      if (mo < 1 || mo > 12 || d < 1 || d > 31 || hh > 23 || mm > 59 || ss > 59) return 0;
+      const utcMs = Date.UTC(y, mo - 1, d, hh, mm, ss, ms);
+      const check = new Date(utcMs);
+      if (check.getUTCFullYear() !== y || check.getUTCMonth() !== mo - 1 || check.getUTCDate() !== d) return 0;
+      return utcMs - 8 * 3600000;
+    }
+    const t = Date.parse(s.replace(/-/g, "/"));
+    return Number.isFinite(t) ? t : 0;
+  };
   let page = 0, guard = 0;
   let plays = 0, likes = 0, comments = 0, shares = 0, favorites = 0;
   while (guard++ < 50) {
@@ -529,7 +595,7 @@ const ADAPTERS = {
         workId: String(n.id || ""),
         url: n.id ? "https://www.xiaohongshu.com/explore/" + n.id : "",
         title: n.display_title || "(无标题)",
-        publishTime: n.time ? new Date(String(n.time).replace(/-/g, "/")).getTime() : 0,
+        publishTime: __parseUtc8Time(n.time),
         play: __num(n.view_count),
         like: __num(n.likes),
         comment: __num(n.comments_count),

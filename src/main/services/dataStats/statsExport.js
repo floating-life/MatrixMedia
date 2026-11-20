@@ -13,11 +13,12 @@
 const fs = require("fs");
 const path = require("path");
 const xlsx = require("xlsx");
-const { WORK_STAT_KEYS, DELETED_WORK_TITLE, normalizeMetric, buildWorkDailyRows } = require("./statsTable");
+const { WORK_STAT_KEYS, DELETED_WORK_TITLE, normalizeMetric } = require("./statsTable");
 const {
   buildContentIndex,
   linkWorks,
   buildContentSummaryRows,
+  isManagementUrl,
   isValidAutoContentKey,
   isUnstableRecordKey,
   makeWorkKey,
@@ -55,6 +56,11 @@ const PLATFORM_ORDER = [
   "百家号",
   "头条",
 ];
+const PLATFORM_RANK_MAP = new Map(PLATFORM_ORDER.map((p, i) => [p, i]));
+
+const DATE_DAYNUM_CACHE = new Map();
+const DAYNUM_DATE_CACHE = new Map();
+const MAX_DATE_CACHE_SIZE = 8192;
 
 const ACCOUNT_METRIC_KEYS = [
   "fans",
@@ -154,14 +160,65 @@ function hasOwn(obj, key) {
   return Boolean(obj && Object.prototype.hasOwnProperty.call(obj, key));
 }
 
+function safeOwnGet(obj, key) {
+  if (key === "__proto__") {
+    const desc = Object.getOwnPropertyDescriptor(obj, key);
+    return desc ? desc.value : undefined;
+  }
+  return obj[key];
+}
+
+function fastNormalizeMetric(v) {
+  if (typeof v === "number") {
+    if (!Number.isFinite(v)) return null;
+    return v === 0 ? 0 : v;
+  }
+  if (v === null || v === undefined) return null;
+  return normalizeMetric(v);
+}
+
+function dateStrToDayNum(s) {
+  if (typeof s !== "string") return null;
+  const cached = DATE_DAYNUM_CACHE.get(s);
+  if (cached !== undefined) return cached;
+  if (!DATE_RE.test(s)) return null;
+  const y = Number(s.slice(0, 4));
+  const m = Number(s.slice(5, 7));
+  const d = Number(s.slice(8, 10));
+  if (m < 1 || m > 12 || d < 1 || d > 31) {
+    if (DATE_DAYNUM_CACHE.size < MAX_DATE_CACHE_SIZE) DATE_DAYNUM_CACHE.set(s, null);
+    return null;
+  }
+  const ms = Date.UTC(y, m - 1, d);
+  const dt = new Date(ms);
+  const valid =
+    dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+  const res = valid ? Math.floor(ms / DAY_MS) : null;
+  if (DATE_DAYNUM_CACHE.size >= MAX_DATE_CACHE_SIZE) DATE_DAYNUM_CACHE.clear();
+  DATE_DAYNUM_CACHE.set(s, res);
+  if (res !== null && DAYNUM_DATE_CACHE.size < MAX_DATE_CACHE_SIZE) {
+    DAYNUM_DATE_CACHE.set(res, s);
+  }
+  return res;
+}
+
+function dayNumToDateStr(dayNum) {
+  const cached = DAYNUM_DATE_CACHE.get(dayNum);
+  if (cached !== undefined) return cached;
+  const s = new Date(dayNum * DAY_MS).toISOString().slice(0, 10);
+  if (DAYNUM_DATE_CACHE.size >= MAX_DATE_CACHE_SIZE) DAYNUM_DATE_CACHE.clear();
+  DAYNUM_DATE_CACHE.set(dayNum, s);
+  if (DATE_DAYNUM_CACHE.size < MAX_DATE_CACHE_SIZE) DATE_DAYNUM_CACHE.set(s, dayNum);
+  return s;
+}
+
 function isValidDateStr(s) {
-  if (typeof s !== "string" || !DATE_RE.test(s)) return false;
-  const ms = Date.parse(`${s}T00:00:00Z`);
-  if (!Number.isFinite(ms)) return false;
-  return new Date(ms).toISOString().slice(0, 10) === s;
+  return dateStrToDayNum(s) !== null;
 }
 
 function shiftDateStr(ymd, deltaDays) {
+  const dn = dateStrToDayNum(ymd);
+  if (dn !== null) return dayNumToDateStr(dn + deltaDays);
   const ms = Date.parse(`${ymd}T00:00:00Z`);
   return new Date(ms + deltaDays * DAY_MS).toISOString().slice(0, 10);
 }
@@ -169,7 +226,7 @@ function shiftDateStr(ymd, deltaDays) {
 function formatUtc8Date(now = Date.now()) {
   const ms = now instanceof Date ? now.getTime() : Number(now);
   const safeMs = Number.isFinite(ms) ? ms : Date.now();
-  return new Date(safeMs + UTC8_MS).toISOString().slice(0, 10);
+  return dayNumToDateStr(Math.floor((safeMs + UTC8_MS) / DAY_MS));
 }
 
 function formatUtc8DateTime(now = Date.now()) {
@@ -218,11 +275,11 @@ function compareText(a, b) {
 }
 
 function comparePlatform(a, b) {
-  const ia = PLATFORM_ORDER.indexOf(a);
-  const ib = PLATFORM_ORDER.indexOf(b);
-  if (ia !== -1 && ib !== -1) return ia - ib;
-  if (ia !== -1) return -1;
-  if (ib !== -1) return 1;
+  const ia = PLATFORM_RANK_MAP.get(a);
+  const ib = PLATFORM_RANK_MAP.get(b);
+  if (ia !== undefined && ib !== undefined) return ia - ib;
+  if (ia !== undefined) return -1;
+  if (ib !== undefined) return 1;
   return compareText(a, b);
 }
 
@@ -352,22 +409,23 @@ function reduceWorksDailyAsOf(rawWorksDaily, cutoffDate) {
   const worksDaily = Object.create(null);
   let latestDate = "";
   if (!isPlainObject(rawWorksDaily)) return { worksDaily, latestDate };
-  for (const workId of Object.keys(rawWorksDaily)) {
-    const desc = Object.getOwnPropertyDescriptor(rawWorksDaily, workId);
-    const dateMap = desc ? desc.value : null;
+  const workIds = Object.keys(rawWorksDaily);
+  for (let wi = 0; wi < workIds.length; wi++) {
+    const workId = workIds[wi];
+    const dateMap = safeOwnGet(rawWorksDaily, workId);
     if (!isPlainObject(dateMap)) continue;
     let bestDate = "";
     let bestSnap = null;
-    for (const d of Object.keys(dateMap)) {
+    const dates = Object.keys(dateMap);
+    for (let di = 0; di < dates.length; di++) {
+      const d = dates[di];
       if (!isValidDateStr(d)) continue;
       if (cutoffDate && d > cutoffDate) continue;
-      const snapDesc = Object.getOwnPropertyDescriptor(dateMap, d);
-      const snap = snapDesc ? snapDesc.value : null;
+      if (bestDate && d <= bestDate) continue;
+      const snap = safeOwnGet(dateMap, d);
       if (!isPlainObject(snap)) continue;
-      if (!bestDate || d > bestDate) {
-        bestDate = d;
-        bestSnap = snap;
-      }
+      bestDate = d;
+      bestSnap = snap;
     }
     if (bestSnap) {
       worksDaily[workId] = { [bestDate]: bestSnap };
@@ -375,6 +433,16 @@ function reduceWorksDailyAsOf(rawWorksDaily, cutoffDate) {
     }
   }
   return { worksDaily, latestDate };
+}
+
+function reduceAllWorksDailyByGpAsOf(allWorksDailyByGp, cutoffDate) {
+  const reduced = Object.create(null);
+  if (!isPlainObject(allWorksDailyByGp)) return reduced;
+  for (const gpKey of Object.keys(allWorksDailyByGp)) {
+    const raw = safeOwnGet(allWorksDailyByGp, gpKey);
+    reduced[gpKey] = reduceWorksDailyAsOf(raw, cutoffDate).worksDaily;
+  }
+  return reduced;
 }
 
 /**
@@ -386,11 +454,18 @@ function resolveDefaultCutoffDate(accountsData, getFallbackDaily) {
   let latestWorksDate = "";
   for (const acc of Array.isArray(accountsData) ? accountsData : []) {
     if (!isPlainObject(acc) || !isPlainObject(acc.worksDaily)) continue;
-    for (const dateMap of Object.values(acc.worksDaily)) {
+    const workIds = Object.keys(acc.worksDaily);
+    for (let wi = 0; wi < workIds.length; wi++) {
+      const dateMap = safeOwnGet(acc.worksDaily, workIds[wi]);
       if (!isPlainObject(dateMap)) continue;
-      for (const [d, snap] of Object.entries(dateMap)) {
-        if (!isPlainObject(snap) || !isValidDateStr(d)) continue;
-        if (!latestWorksDate || d > latestWorksDate) latestWorksDate = d;
+      const dates = Object.keys(dateMap);
+      for (let di = 0; di < dates.length; di++) {
+        const d = dates[di];
+        if (!isValidDateStr(d)) continue;
+        if (latestWorksDate && d <= latestWorksDate) continue;
+        const snap = safeOwnGet(dateMap, d);
+        if (!isPlainObject(snap)) continue;
+        latestWorksDate = d;
       }
     }
   }
@@ -405,9 +480,14 @@ function resolveDefaultCutoffDate(accountsData, getFallbackDaily) {
       if (isPlainObject(loaded)) daily = loaded;
     }
     if (!daily) continue;
-    for (const [d, snap] of Object.entries(daily)) {
-      if (!isPlainObject(snap) || !isValidDateStr(d)) continue;
-      if (!latestDailyDate || d > latestDailyDate) latestDailyDate = d;
+    const dates = Object.keys(daily);
+    for (let di = 0; di < dates.length; di++) {
+      const d = dates[di];
+      if (!isValidDateStr(d)) continue;
+      if (latestDailyDate && d <= latestDailyDate) continue;
+      const snap = safeOwnGet(daily, d);
+      if (!isPlainObject(snap)) continue;
+      latestDailyDate = d;
     }
   }
   return latestDailyDate;
@@ -645,16 +725,18 @@ function countWorkDailyRows(accountsData, from, to) {
   let count = 0;
   for (const acc of Array.isArray(accountsData) ? accountsData : []) {
     if (!isPlainObject(acc) || !isPlainObject(acc.worksDaily)) continue;
-    for (const workId of Object.keys(acc.worksDaily)) {
-      const desc = Object.getOwnPropertyDescriptor(acc.worksDaily, workId);
-      const dateMap = desc ? desc.value : null;
+    const workIds = Object.keys(acc.worksDaily);
+    for (let wi = 0; wi < workIds.length; wi++) {
+      const dateMap = safeOwnGet(acc.worksDaily, workIds[wi]);
       if (!isPlainObject(dateMap)) continue;
-      for (const d of Object.keys(dateMap)) {
+      const dates = Object.keys(dateMap);
+      for (let di = 0; di < dates.length; di++) {
+        const d = dates[di];
         if (!isValidDateStr(d)) continue;
         if (from && d < from) continue;
         if (to && d > to) continue;
-        const snapDesc = Object.getOwnPropertyDescriptor(dateMap, d);
-        if (!snapDesc || !isPlainObject(snapDesc.value)) continue;
+        const snap = safeOwnGet(dateMap, d);
+        if (!isPlainObject(snap)) continue;
         count += 1;
       }
     }
@@ -999,39 +1081,240 @@ function resolveLinkValidationContext(options = {}, depsArg) {
   };
 }
 
-/** Sheet 1: 作品日明细（单次构建截至 to 全历史供分析复用，按 from 过滤输出本表） */
-function buildWorkDailySheet(accountsData, link, from, to) {
-  const allRows = [];
-  for (const acc of accountsData) {
-    const rows = buildWorkDailyRows({
-      group: acc.group,
-      platform: acc.platform,
-      works: acc.works,
-      worksDaily: acc.worksDaily,
-      to,
-      link,
-    });
-    for (const r of rows) allRows.push(r);
+function parsePublishTimeForTable(raw) {
+  if (raw == null || raw === "") return { ms: 0, iso: "", utc8Date: null };
+  let ms = NaN;
+  if (typeof raw === "number") {
+    ms = raw;
+  } else if (raw instanceof Date) {
+    ms = raw.getTime();
+  } else if (typeof raw === "string") {
+    const s = raw.trim();
+    if (!s) return { ms: 0, iso: "", utc8Date: null };
+    ms = /^\d+$/.test(s) ? Number(s) : Date.parse(s);
+  }
+  if (!Number.isFinite(ms) || ms <= 0) return { ms: 0, iso: "", utc8Date: null };
+  const d = new Date(ms);
+  const t = d.getTime();
+  if (!Number.isFinite(t) || t <= 0) return { ms: 0, iso: "", utc8Date: null };
+  const shiftedMs = t + UTC8_MS;
+  const shiftedDate = new Date(shiftedMs);
+  const y = shiftedDate.getUTCFullYear();
+  const utc8Date =
+    Number.isFinite(shiftedDate.getTime()) && y >= 1970 && y <= 9999
+      ? dayNumToDateStr(Math.floor(shiftedMs / DAY_MS))
+      : null;
+  return { ms: t, iso: d.toISOString(), utc8Date };
+}
+
+/**
+ * 拆出的作品日明细结构化读取函数（单遍扫描，按需产出 Sheet 1 行与分析用全量行）：
+ * - GUI 入口（needSheetRows: false, needAnalysisRows: true）不排序全历史、不生成 Excel 二维表
+ * - Excel 导出（needSheetRows: true, needAnalysisRows: true）单遍同时产出 [from, to] 的 Sheet 1 行（仅对该范围排序）
+ *   以及全历史 analysisRows（含 >to 恢复快照，供分析层识别掉 0 异常）
+ */
+function collectWorkDailyStructured(
+  accountsData,
+  link,
+  { from = "", to = "", needSheetRows = false, needAnalysisRows = false } = {}
+) {
+  const hasLink = link instanceof Map;
+  const fromDayNum = from ? dateStrToDayNum(from) : null;
+  const toDayNum = to ? dateStrToDayNum(to) : null;
+  const sheetRows = needSheetRows ? [] : null;
+  const analysisRows = needAnalysisRows ? [] : null;
+
+  for (const acc of Array.isArray(accountsData) ? accountsData : []) {
+    if (!isPlainObject(acc) || !isPlainObject(acc.worksDaily)) continue;
+    const groupStr = acc.group == null ? "" : String(acc.group);
+    const platformStr = acc.platform == null ? "" : String(acc.platform);
+    const platformRankVal = PLATFORM_RANK_MAP.get(platformStr);
+    const platformRank = platformRankVal !== undefined ? platformRankVal : 999;
+
+    const workById = new Map();
+    if (Array.isArray(acc.works)) {
+      for (let i = 0; i < acc.works.length; i++) {
+        const w = acc.works[i];
+        if (w && w.workId != null && w.workId !== "") {
+          workById.set(String(w.workId), w);
+        }
+      }
+    }
+
+    const workIds = Object.keys(acc.worksDaily);
+    for (let wi = 0; wi < workIds.length; wi++) {
+      const workId = workIds[wi];
+      const dateMap = safeOwnGet(acc.worksDaily, workId);
+      if (!isPlainObject(dateMap)) continue;
+
+      const linkInfo = hasLink
+        ? link.get(`${groupStr}|${platformStr}|${workId}`) ||
+          link.get(`${platformStr}|${workId}`) ||
+          null
+        : null;
+      const contentKey =
+        hasLink && linkInfo && linkInfo.contentKey != null ? linkInfo.contentKey : null;
+      const matchedBy =
+        hasLink && linkInfo && linkInfo.matchedBy != null ? linkInfo.matchedBy : null;
+      const matchScore =
+        hasLink &&
+        linkInfo &&
+        linkInfo.matchedBy === "fuzzy" &&
+        typeof linkInfo.score === "number" &&
+        Number.isFinite(linkInfo.score)
+          ? linkInfo.score
+          : null;
+
+      const meta = workById.get(workId);
+      const title = meta ? meta.title || "(无标题)" : DELETED_WORK_TITLE;
+      const url = meta ? meta.url || "" : "";
+      const { ms: publishTimeMs, iso: publishTimeIso, utc8Date: publishDateStr } = meta
+        ? parsePublishTimeForTable(meta.publishTime)
+        : { ms: 0, iso: "", utc8Date: null };
+
+      const rawDates = Object.keys(dateMap);
+      const points = [];
+      let sorted = true;
+      let lastDayNum = -Infinity;
+      for (let di = 0; di < rawDates.length; di++) {
+        const date = rawDates[di];
+        const dayNum = dateStrToDayNum(date);
+        if (dayNum === null) continue;
+        const snap = safeOwnGet(dateMap, date);
+        if (!isPlainObject(snap)) continue;
+        if (dayNum < lastDayNum) sorted = false;
+        lastDayNum = dayNum;
+        points.push({ date, dayNum, snap });
+      }
+      if (!points.length) continue;
+      if (!sorted && points.length > 1) {
+        points.sort((a, b) => a.dayNum - b.dayNum);
+      }
+
+      let prevDayNum = -1;
+      let prevPlay = null;
+      let prevLike = null;
+      let prevComment = null;
+      let prevShare = null;
+      let prevFavorite = null;
+      let prevFansDelta = null;
+      let hasPrev = false;
+
+      for (let pi = 0; pi < points.length; pi++) {
+        const pt = points[pi];
+        const snap = pt.snap;
+        const play = hasOwn(snap, "play") ? fastNormalizeMetric(snap.play) : null;
+        const like = hasOwn(snap, "like") ? fastNormalizeMetric(snap.like) : null;
+        const comment = hasOwn(snap, "comment") ? fastNormalizeMetric(snap.comment) : null;
+        const share = hasOwn(snap, "share") ? fastNormalizeMetric(snap.share) : null;
+        const favorite = hasOwn(snap, "favorite") ? fastNormalizeMetric(snap.favorite) : null;
+        const fansDelta = hasOwn(snap, "fansDelta") ? fastNormalizeMetric(snap.fansDelta) : null;
+
+        if (needAnalysisRows) {
+          analysisRows.push({
+            date: pt.date,
+            dayNum: pt.dayNum,
+            group: groupStr,
+            platform: platformStr,
+            workId,
+            title,
+            url,
+            publishTime: publishTimeMs || "",
+            publishTimeMs,
+            publishDate: publishDateStr || "",
+            contentKey,
+            play,
+            like,
+            comment,
+            share,
+            favorite,
+            fansDelta,
+          });
+        }
+
+        if (needSheetRows) {
+          const playDelta = hasPrev && play !== null && prevPlay !== null ? play - prevPlay : null;
+          const likeDelta = hasPrev && like !== null && prevLike !== null ? like - prevLike : null;
+          const commentDelta =
+            hasPrev && comment !== null && prevComment !== null ? comment - prevComment : null;
+          const shareDelta =
+            hasPrev && share !== null && prevShare !== null ? share - prevShare : null;
+          const favoriteDelta =
+            hasPrev && favorite !== null && prevFavorite !== null ? favorite - prevFavorite : null;
+          const fansDeltaDelta =
+            hasPrev && fansDelta !== null && prevFansDelta !== null
+              ? fansDelta - prevFansDelta
+              : null;
+          const gapDays = hasPrev ? pt.dayNum - prevDayNum - 1 : null;
+
+          hasPrev = true;
+          prevDayNum = pt.dayNum;
+          prevPlay = play;
+          prevLike = like;
+          prevComment = comment;
+          prevShare = share;
+          prevFavorite = favorite;
+          prevFansDelta = fansDelta;
+
+          if (fromDayNum !== null && pt.dayNum < fromDayNum) continue;
+          if (toDayNum !== null && pt.dayNum > toDayNum) continue;
+
+          sheetRows.push({
+            date: pt.date,
+            dayNum: pt.dayNum,
+            platformRank,
+            group: groupStr,
+            platform: platformStr,
+            workId,
+            title,
+            url,
+            publishTime: publishTimeIso,
+            publishDateStr,
+            play,
+            like,
+            comment,
+            share,
+            favorite,
+            fansDelta,
+            playDelta,
+            likeDelta,
+            commentDelta,
+            shareDelta,
+            favoriteDelta,
+            fansDeltaDelta,
+            gapDays,
+            contentKey,
+            matchedBy,
+            matchScore,
+          });
+        }
+      }
+    }
   }
 
-  allRows.sort((a, b) => {
-    if (a.date !== b.date) return compareText(a.date, b.date);
-    const pc = comparePlatform(a.platform, b.platform);
-    if (pc !== 0) return pc;
-    const gc = compareText(a.group, b.group);
-    if (gc !== 0) return gc;
-    if (a.publishTime !== b.publishTime) {
-      if (!a.publishTime) return 1;
-      if (!b.publishTime) return -1;
-      return a.publishTime > b.publishTime ? -1 : 1;
-    }
-    return compareText(a.workId, b.workId);
-  });
+  if (needSheetRows && sheetRows.length > 1) {
+    sheetRows.sort((a, b) => {
+      if (a.dayNum !== b.dayNum) return a.dayNum - b.dayNum;
+      if (a.platformRank !== b.platformRank) return a.platformRank - b.platformRank;
+      if (a.platform !== b.platform) return compareText(a.platform, b.platform);
+      if (a.group !== b.group) return compareText(a.group, b.group);
+      if (a.publishTime !== b.publishTime) {
+        if (!a.publishTime) return 1;
+        if (!b.publishTime) return -1;
+        return a.publishTime > b.publishTime ? -1 : 1;
+      }
+      return compareText(a.workId, b.workId);
+    });
+  }
 
-  const rows = from ? allRows.filter((r) => r.date >= from) : allRows;
+  return { sheetRows, analysisRows };
+}
 
+/** Sheet 1: 将排序后的结构化作品日明细行序列化为 Excel 二维数组（仅 Excel 导出调用） */
+function formatWorkDailyAoa(rows) {
   const aoa = [WORK_DAILY_HEADERS.map(sanitizeTextCell)];
-  for (const r of rows) {
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
     const matchedByExport =
       r.contentKey != null && VALID_EXPORT_MATCH_METHODS.has(r.matchedBy)
         ? sanitizeTextCell(r.matchedBy)
@@ -1050,7 +1333,7 @@ function buildWorkDailySheet(accountsData, link, from, to) {
       sanitizeTextCell(r.workId),
       sanitizeTextCell(r.title),
       sanitizeTextCell(r.url),
-      sanitizeTextCell(rawTimestampToUtc8Date(r.publishTime)),
+      sanitizeTextCell(r.publishDateStr),
       sanitizeNumberCell(r.play),
       sanitizeNumberCell(r.like),
       sanitizeNumberCell(r.comment),
@@ -1066,8 +1349,202 @@ function buildWorkDailySheet(accountsData, link, from, to) {
       sanitizeNumberCell(r.gapDays),
     ]);
   }
+  return aoa;
+}
 
-  return { aoa, rows, allRows };
+function normalizeFullPathForKey(raw) {
+  if (typeof raw !== "string") return "";
+  let s = raw.trim().replace(/\\/g, "/");
+  if (!s) return "";
+  const isUnc = s.startsWith("//");
+  s = isUnc ? `//${s.slice(2).replace(/\/+/g, "/")}` : s.replace(/\/+/g, "/");
+  if (s.endsWith("/")) return "";
+  if (
+    /^[a-zA-Z]:\/.+/.test(s) ||
+    (!isUnc && /^\/.+/.test(s)) ||
+    (isUnc && /^\/\/[^/]+\/[^/]+\/.+/.test(s))
+  ) {
+    return s;
+  }
+  return "";
+}
+
+function extractPushRecordTimestampMs(rec, status) {
+  const baseDate =
+    typeof rec.date === "string" && isValidDateStr(rec.date.trim()) ? rec.date.trim() : "";
+  const lastMs = parseRawTimestampMs(rec.lastPublishAt);
+  const lastDate = lastMs !== null ? formatUtc8Date(lastMs) : "";
+  if (status === "success" && lastMs !== null && (!baseDate || lastDate >= baseDate)) {
+    return { ms: lastMs, date: lastDate };
+  }
+  if (baseDate) {
+    if (lastMs !== null && lastDate === baseDate) return { ms: lastMs, date: baseDate };
+    const createMs = parseRawTimestampMs(rec.createTime);
+    if (createMs !== null && formatUtc8Date(createMs) === baseDate) {
+      return { ms: createMs, date: baseDate };
+    }
+    return { ms: null, date: baseDate };
+  }
+  if (lastMs !== null) return { ms: lastMs, date: lastDate };
+  const createMs = parseRawTimestampMs(rec.createTime);
+  if (createMs !== null) return { ms: createMs, date: formatUtc8Date(createMs) };
+  return { ms: null, date: "" };
+}
+
+/**
+ * 基于 S6 关联结果（含无快照的作品元数据与发布记录）收集每条内容截至 cutoffTo 的最早已知发布时间，
+ * 返回带 firstPublishDate / firstPublishTime(ms) 的浅拷贝汇总行供分析层使用（不改写原 summaryRows）。
+ */
+function enrichSummaryRowsWithEarliestPublishTime(
+  summaryRows,
+  allContents,
+  allAccountsData,
+  link,
+  cutoffTo,
+  allPushRecords
+) {
+  if (!Array.isArray(summaryRows) || summaryRows.length === 0) return [];
+  const linkMeta = link instanceof Map ? getLinkResultMeta(link) : null;
+  const byWorkIdentity = linkMeta && linkMeta.byWorkIdentity ? linkMeta.byWorkIdentity : null;
+  const excludedFuturePwKeys =
+    linkMeta && linkMeta.excludedFuturePwKeys ? linkMeta.excludedFuturePwKeys : null;
+
+  const infoByContentKey = new Map();
+  const record = (ck, pubMs, pubDate) => {
+    if (!ck) return;
+    let info = infoByContentKey.get(ck);
+    if (!info) {
+      info = { pubMs: null, pubDate: "" };
+      infoByContentKey.set(ck, info);
+    }
+    if (pubMs !== null) {
+      const msDate = formatUtc8Date(pubMs);
+      if (!cutoffTo || msDate <= cutoffTo) {
+        if (info.pubMs === null || pubMs < info.pubMs) info.pubMs = pubMs;
+        if (!info.pubDate || msDate < info.pubDate) info.pubDate = msDate;
+      }
+    }
+    if (pubDate && isValidDateStr(pubDate) && (!cutoffTo || pubDate <= cutoffTo)) {
+      if (!info.pubDate || pubDate < info.pubDate) info.pubDate = pubDate;
+    }
+  };
+
+  // 1. 发布记录索引（日期口径）
+  const contentKeySet = new Set();
+  for (const c of Array.isArray(allContents) ? allContents : []) {
+    if (!isPlainObject(c) || !c.contentKey) continue;
+    const ck = String(c.contentKey);
+    contentKeySet.add(ck);
+    const rawContentDate = typeof c.firstPublishDate === "string" ? c.firstPublishDate.trim() : "";
+    const contentDate = isValidDateStr(rawContentDate) ? rawContentDate : "";
+    const rawTargets = Array.isArray(c.targets) ? c.targets.filter(isPlainObject) : [];
+    if (rawTargets.length > 0) {
+      for (const t of rawTargets) {
+        const tMs = parseRawTimestampMs(t.lastPublishAt);
+        const tMsDate = tMs !== null ? formatUtc8Date(tMs) : "";
+        const rawTDate = typeof t.recordDate === "string" ? t.recordDate.trim() : "";
+        const tDate = isValidDateStr(rawTDate) ? rawTDate : tMsDate || contentDate;
+        if (cutoffTo && tDate && tDate > cutoffTo) continue;
+        record(ck, tMs, tDate);
+      }
+    } else if (!cutoffTo || !contentDate || contentDate <= cutoffTo) {
+      record(ck, null, contentDate);
+    }
+  }
+
+  // 1b. 从原始 pushRecords 补齐 buildContentIndex 未保留的精确毫秒时间戳（lastPublishAt / createTime）
+  if (Array.isArray(allPushRecords) && allPushRecords.length > 0 && contentKeySet.size > 0) {
+    for (let idx = 0; idx < allPushRecords.length; idx++) {
+      const rec = allPushRecords[idx];
+      if (!isPlainObject(rec)) continue;
+      const textType = typeof rec.textType === "string" ? rec.textType.trim().toLowerCase() : "";
+      if (textType === "article") continue;
+      const hasStatusField = hasOwn(rec, "publishStatus") && rec.publishStatus !== undefined;
+      const status =
+        typeof rec.publishStatus === "string" ? rec.publishStatus.trim().toLowerCase() : "";
+      if (hasStatusField && status !== "success") continue;
+      if (!hasStatusField) {
+        const rawLink = typeof rec.videoLink === "string" ? rec.videoLink.trim() : "";
+        const repubCnt = fastNormalizeMetric(rec.republishCount);
+        const attCnt = fastNormalizeMetric(rec.publishAttemptCount);
+        const isRepub =
+          (repubCnt !== null && repubCnt > 0) ||
+          (repubCnt === null && attCnt !== null && attCnt > 1);
+        const hasDirectLink =
+          !isRepub && /^https?:\/\//i.test(rawLink) && !isManagementUrl(rawLink);
+        if (!hasDirectLink) continue;
+      }
+
+      const fullPath =
+        normalizeFullPathForKey(rec.filePath) || normalizeFullPathForKey(rec.selectedFile);
+      const recId = typeof rec.id === "string" || typeof rec.id === "number"
+        ? String(rec.id).trim()
+        : "";
+      let ck = "";
+      if (fullPath) {
+        const cand = `file:${fullPath.toLowerCase()}`;
+        if (contentKeySet.has(cand)) ck = cand;
+      } else {
+        const cands = recId
+          ? [`record:id:${recId}`, `record:id:${recId}:pos:${idx}`, `record:pos:${idx}`]
+          : [`record:pos:${idx}`];
+        for (const cand of cands) {
+          if (contentKeySet.has(cand)) {
+            ck = cand;
+            break;
+          }
+        }
+      }
+      if (!ck) continue;
+      const { ms, date } = extractPushRecordTimestampMs(rec, status);
+      if (cutoffTo && date && date > cutoffTo) continue;
+      record(ck, ms, date);
+    }
+  }
+
+  // 2. 全量作品元数据（含无日快照但已关联到同一内容的首发作品）
+  for (const acc of Array.isArray(allAccountsData) ? allAccountsData : []) {
+    if (!isPlainObject(acc)) continue;
+    const group = acc.group == null ? "" : String(acc.group);
+    const platform = acc.platform == null ? "" : String(acc.platform);
+    for (const w of Array.isArray(acc.works) ? acc.works : []) {
+      if (!isPlainObject(w) || w.workId == null || w.workId === "") continue;
+      const workId = String(w.workId);
+      const pwKey = makeWorkIdentityKey(platform, workId);
+      if (excludedFuturePwKeys && excludedFuturePwKeys.has(pwKey)) continue;
+      const pubMs = parseRawTimestampMs(w.publishTime);
+      const pubDate = pubMs !== null ? formatUtc8Date(pubMs) : "";
+      if (cutoffTo && pubDate && pubDate > cutoffTo) continue;
+
+      const linkEntry =
+        (byWorkIdentity && byWorkIdentity.get(pwKey)) ||
+        (link instanceof Map ? link.get(makeWorkKey(group, platform, workId)) : null);
+      const ck =
+        linkEntry && linkEntry.contentKey
+          ? String(linkEntry.contentKey)
+          : `unlinked:${platform}:${workId}`;
+      record(ck, pubMs, pubDate);
+    }
+  }
+
+  return summaryRows.map((row) => {
+    if (!isPlainObject(row) || !row.contentKey) return row;
+    const info = infoByContentKey.get(String(row.contentKey));
+    if (!info) return row;
+    const curDate =
+      typeof row.firstPublishDate === "string" && isValidDateStr(row.firstPublishDate.trim())
+        ? row.firstPublishDate.trim()
+        : "";
+    let bestDate = curDate;
+    if (info.pubDate && (!bestDate || info.pubDate < bestDate)) {
+      bestDate = info.pubDate;
+    }
+    return {
+      ...row,
+      firstPublishDate: bestDate,
+      firstPublishTime: info.pubMs,
+    };
+  });
 }
 
 /** Sheet 2: 作品跨平台汇总 */
@@ -1245,23 +1722,25 @@ function buildPlatformDailySheet(workDailyRows) {
   return { aoa, rows };
 }
 
-/** Sheet 4: 账号日快照（daily.json，日增=与上一有记录日之差；保留截至 to 全历史供分析复用） */
-function buildAccountDailySheet(accountsData, from, to) {
+/** 拆出的账号日快照结构化读取函数（daily.json，日增=与上一有记录日之差，不生成 Excel 二维表） */
+function collectAccountDailyRows(accountsData, from, to, { sortRows = true } = {}) {
   const allRows = [];
 
   for (const acc of accountsData) {
+    if (!isPlainObject(acc.daily)) continue;
     const dates = Object.keys(acc.daily)
-      .filter((d) => isValidDateStr(d) && isPlainObject(acc.daily[d]))
+      .filter((d) => isValidDateStr(d) && isPlainObject(safeOwnGet(acc.daily, d)))
       .sort(compareText);
 
     let prevFans = null;
     let prevPlays = null;
 
-    for (const date of dates) {
-      const snap = acc.daily[date];
+    for (let di = 0; di < dates.length; di++) {
+      const date = dates[di];
+      const snap = safeOwnGet(acc.daily, date);
       const vals = {};
       for (const k of ACCOUNT_METRIC_KEYS) {
-        vals[k] = hasOwn(snap, k) ? normalizeMetric(snap[k]) : null;
+        vals[k] = hasOwn(snap, k) ? fastNormalizeMetric(snap[k]) : null;
       }
 
       const fansDelta =
@@ -1290,17 +1769,24 @@ function buildAccountDailySheet(accountsData, from, to) {
     }
   }
 
-  allRows.sort((a, b) => {
-    if (a.date !== b.date) return compareText(a.date, b.date);
-    const pc = comparePlatform(a.platform, b.platform);
-    if (pc !== 0) return pc;
-    return compareText(a.group, b.group);
-  });
+  if (sortRows && allRows.length > 1) {
+    allRows.sort((a, b) => {
+      if (a.date !== b.date) return compareText(a.date, b.date);
+      const pc = comparePlatform(a.platform, b.platform);
+      if (pc !== 0) return pc;
+      return compareText(a.group, b.group);
+    });
+  }
 
   const rows = from ? allRows.filter((r) => r.date >= from) : allRows;
+  return { rows, allRows };
+}
 
+/** Sheet 4: 账号日快照 Excel 二维表格式化（仅 Excel 导出调用） */
+function formatAccountDailyAoa(rows) {
   const aoa = [ACCOUNT_DAILY_HEADERS.map(sanitizeTextCell)];
-  for (const r of rows) {
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
     aoa.push([
       sanitizeTextCell(r.date),
       sanitizeTextCell(r.platform),
@@ -1315,8 +1801,7 @@ function buildAccountDailySheet(accountsData, from, to) {
       sanitizeNumberCell(r.playsDelta),
     ]);
   }
-
-  return { aoa, rows, allRows };
+  return aoa;
 }
 
 /** Sheet 5: 分析（首块为文字小结，其后按 1–6 节输出长表，节间空一行，数值保持 number） */
@@ -1982,31 +2467,31 @@ function buildSchemaSheet(dynamicSchemaEntries) {
       "分析",
       "平台对比与互动率公式",
       "platformComparison",
-      "仅取覆盖 ≥2 个去重平台的同款内容，按平台统计平均播放、互动率(%)、平均涨粉与样本数。互动率公式 = (点赞 + 评论 + 分享) / 播放（单条播放为 0 或空时不计入，输出为百分数）；样本数 <3 时标注「样本少，仅供参考」。",
+      "仅取覆盖 ≥2 个去重平台的同款内容，按平台统计平均播放、互动率(%)、平均涨粉与样本数。互动率公式 = (点赞 + 评论 + 分享) / 播放（单条播放为 0 或空时不计入，输出为百分数）；均播相差 <5% 视为并列并标注「播放接近」；样本数 <3 时标注「样本少，仅供参考」。",
     ],
     [
       "分析",
       "作品排行与平台偏科",
       "rankings",
-      "按跨平台合并后的内容截至 to 的总播放 / 互动率（总播放 ≥100 才参与）/ 总涨粉各取 Top10、Bottom10。平台偏科：同一内容某平台播放 ≥ 其它平台平均播放 × 3 且该平台播放 ≥ 500 时列出。",
+      "按跨平台合并后的内容截至 to 的总播放 / 互动率（总播放 ≥100 才参与，按原始比率排序后输出舍入值）/ 总涨粉各取 Top10、Bottom10。平台偏科：同一内容某平台播放 ≥ 其它平台平均播放 × 3 且该平台播放 ≥ 500 时列出。",
     ],
     [
       "分析",
       "新作品走势（D1/D3/D7与分类阈值）",
       "newWorks",
-      "周期内发布的内容按发布日（UTC+8 日历日）起算发布后第 1/3/7 天（D1/D3/D7，即发布日 +1/+3/+7 天）各平台累计播放；无该天快照取 ≤ 该天最近一次有效快照，仍无为空；未到第 N 天为空。分类阈值：长尾型（D7/D3 ≥ 1.5）、爆发后平稳（D3/D1 < 1.3 且 D7/D3 < 1.1）、数据不足、其它。",
+      "周期内发布的内容（首发日取 S6 关联最早已知发布时间，补发不算新作品）按作品各自发布日（UTC+8 日历日）起算发布后第 1/3/7 天（D1/D3/D7）累计播放再汇总到平台与内容（与发布时间共用里程碑）；无该天快照取 ≤ 该天最近一次有效快照，截止日上限为 UTC+8 今天，未到第 N 天为空。分类阈值：长尾型（D7/D3 ≥ 1.5）、爆发后平稳（D3/D1 < 1.3 且 D7/D3 < 1.1）、数据不足、其它；跨平台分类仅使用在 D1/D3/D7 三个里程碑均有值的同一组平台，不存在可比平台时标「数据不足」。",
     ],
     [
       "分析",
       "发布时间",
       "publishTime",
-      "按内容最早发布时间（UTC+8）的星期几 × 时段（0-6 / 6-12 / 12-18 / 18-24）分组，计算各组平均 D7 播放（不足 7 天用截至 to 的最新累计并标注）与样本数；样本 <3 的组标「样本少」。",
+      "按 S6 关联最早已知发布时间（含无快照作品元数据与发布记录，UTC+8）的星期几 × 时段（0-6 / 6-12 / 12-18 / 18-24）分组，与新作品走势共用按作品发布日期计算的 D7 里程碑再汇总（不足 7 天用截至 to 的最新累计并标注）；样本 <3 的组标「样本少」。",
     ],
     [
       "分析",
       "异常提醒与剔除说明",
       "anomalies",
-      "异常规则：①疑似采集异常：某作品某指标某日为 0 或缺失，而前后有记录日都 >0（掉 0 又涨回）；剔除说明：此类异常点在第 1–5 节全部计算中剔除，并按剔除后的有效快照序列重算日增与 D1/D3/D7。②疑似上推荐：某作品单日播放日增 ≥ 前 7 天日均 × 5 且 ≥ 1000。",
+      "异常规则：①疑似采集异常：某作品某指标某日为 0 或缺失，而前后有记录日都 >0（掉 0 又涨回），使用全历史快照（含截止日之后恢复快照）识别；剔除说明：此类异常点在第 1–5 节全部计算中剔除，并按截止日内有效快照重算日增、走势与排行。②疑似上推荐：仅对单日实测日增（断档后首日不触发）判定，单日播放日增 ≥ 前 7 个日历日窗口日均 × 5 且 ≥ 1000（窗内跨断档增量按天数均摊）。",
     ],
 
     // 6. 字段说明
@@ -2067,7 +2552,9 @@ function resolveAnalysisPeriodFromRange(from, to) {
 
 /**
  * 构建数据分析结果（供 GUI「数据分析」tab / IPC stats:get-analysis 复用）。
- * 与 Excel 导出共用同一个默认截止日（resolveDefaultCutoffDate）、S6 关联逻辑与 buildStatsAnalysis。
+ * - 与 Excel 导出共用同一个默认截止日（resolveDefaultCutoffDate）、S6 关联逻辑与 buildStatsAnalysis
+ * - 截止日上限为 UTC+8 今天（未来 to 自动夹到今天）
+ * - 直接读取结构化行，不生成 Excel 二维表、不做全历史表格排序
  */
 function buildStatsAnalysisData(options = {}, depsArg) {
   const opts = isPlainObject(options) ? options : {};
@@ -2082,14 +2569,25 @@ function buildStatsAnalysisData(options = {}, depsArg) {
 
   const dataset = loadRawDataset(opts, depsArg);
   const nowVal = dataset.io.now !== undefined ? dataset.io.now : Date.now();
-  const fallbackToday = formatUtc8Date(nowVal);
-  const resolvedTo = explicitTo || dataset.latestDataDate || fallbackToday;
+  const todayUtc8 = formatUtc8Date(nowVal);
+  let resolvedTo = explicitTo || dataset.latestDataDate || todayUtc8;
+  if (resolvedTo > todayUtc8) resolvedTo = todayUtc8;
+  const clampedDefaultCutoff =
+    dataset.latestDataDate && dataset.latestDataDate > todayUtc8
+      ? todayUtc8
+      : dataset.latestDataDate || "";
+
+  // 预归约截至 resolvedTo 的单日最新快照，避免 linkWorks / buildContentSummaryRows 重复遍历全历史
+  const latestWorksDailyByGp = reduceAllWorksDailyByGpAsOf(
+    dataset.allWorksDailyByGp,
+    resolvedTo
+  );
 
   const allContents = buildContentIndex(dataset.allPushRecords);
   const link = linkWorks({
     contents: allContents,
     accounts: dataset.allAccountsData,
-    worksDaily: dataset.allWorksDailyByGp,
+    worksDaily: latestWorksDailyByGp,
     date: resolvedTo,
     overrides: dataset.linkOverrides,
   });
@@ -2097,7 +2595,7 @@ function buildStatsAnalysisData(options = {}, depsArg) {
     contents: allContents,
     accounts: dataset.allAccountsData,
     link,
-    worksDaily: dataset.allWorksDailyByGp,
+    worksDaily: latestWorksDailyByGp,
     date: resolvedTo,
     overrides: dataset.linkOverrides,
     groups: dataset.groupSet,
@@ -2113,21 +2611,26 @@ function buildStatsAnalysisData(options = {}, depsArg) {
     );
   }
 
-  const workDaily = buildWorkDailySheet(
-    dataset.outputAccountsData,
+  // 仅收集分析用结构化全量行（含截止日后快照供掉 0 恢复识别；不生成 Excel 二维表）
+  const { analysisRows } = collectWorkDailyStructured(dataset.outputAccountsData, link, {
+    needSheetRows: false,
+    needAnalysisRows: true,
+  });
+  const accountDaily = collectAccountDailyRows(dataset.outputAccountsData, "", resolvedTo, {
+    sortRows: false,
+  });
+  const analysisSummaryRows = enrichSummaryRowsWithEarliestPublishTime(
+    summaryRows,
+    allContents,
+    dataset.allAccountsData,
     link,
-    "",
-    resolvedTo
-  );
-  const accountDaily = buildAccountDailySheet(
-    dataset.outputAccountsData,
-    "",
-    resolvedTo
+    resolvedTo,
+    dataset.allPushRecords
   );
 
   const analysis = buildStatsAnalysis({
-    dailyRows: workDaily.allRows,
-    summaryRows,
+    dailyRows: analysisRows,
+    summaryRows: analysisSummaryRows,
     accountRows: accountDaily.allRows,
     to: resolvedTo,
     period,
@@ -2136,7 +2639,7 @@ function buildStatsAnalysisData(options = {}, depsArg) {
 
   return {
     ...analysis,
-    defaultCutoffDate: dataset.latestDataDate || "",
+    defaultCutoffDate: clampedDefaultCutoff,
   };
 }
 
@@ -2189,12 +2692,18 @@ function buildStatsWorkbookData(options = {}, deps) {
     throw createRowLimitError(estAccountDailyRows, maxRows, "账号日快照");
   }
 
+  // 预归约截至 resolvedTo 的单日最新快照，避免 linkWorks / buildContentSummaryRows 重复遍历全历史
+  const latestWorksDailyByGp = reduceAllWorksDailyByGpAsOf(
+    dataset.allWorksDailyByGp,
+    resolvedTo
+  );
+
   // 在全量分组上按作品身份做一次归属裁决，日明细与跨平台汇总共用该结果，之后再按导出分组裁剪
   const allContents = buildContentIndex(dataset.allPushRecords);
   const link = linkWorks({
     contents: allContents,
     accounts: dataset.allAccountsData,
-    worksDaily: dataset.allWorksDailyByGp,
+    worksDaily: latestWorksDailyByGp,
     date: resolvedTo,
     overrides: dataset.linkOverrides,
   });
@@ -2202,7 +2711,7 @@ function buildStatsWorkbookData(options = {}, deps) {
     contents: allContents,
     accounts: dataset.allAccountsData,
     link,
-    worksDaily: dataset.allWorksDailyByGp,
+    worksDaily: latestWorksDailyByGp,
     date: resolvedTo,
     overrides: dataset.linkOverrides,
     groups: dataset.groupSet,
@@ -2221,25 +2730,41 @@ function buildStatsWorkbookData(options = {}, deps) {
     throw createRowLimitError(summaryRows.length, maxRows, "作品跨平台汇总");
   }
 
-  const workDaily = buildWorkDailySheet(
+  const { sheetRows: workDailyRows, analysisRows } = collectWorkDailyStructured(
     dataset.outputAccountsData,
     link,
-    resolvedFrom,
-    resolvedTo
+    {
+      from: resolvedFrom,
+      to: resolvedTo,
+      needSheetRows: true,
+      needAnalysisRows: true,
+    }
   );
+  const workDailyAoa = formatWorkDailyAoa(workDailyRows);
   const contentSummary = buildContentSummarySheet(summaryRows);
-  const platformDaily = buildPlatformDailySheet(workDaily.rows);
-  const accountDaily = buildAccountDailySheet(
+  const platformDaily = buildPlatformDailySheet(workDailyRows);
+  const accountDaily = collectAccountDailyRows(
     dataset.outputAccountsData,
     resolvedFrom,
-    resolvedTo
+    resolvedTo,
+    { sortRows: true }
   );
-  const analysisPeriod = resolveAnalysisPeriodFromRange(resolvedFrom, resolvedTo);
-  const analysis = buildStatsAnalysis({
-    dailyRows: workDaily.allRows,
+  const accountDailyAoa = formatAccountDailyAoa(accountDaily.rows);
+  const analysisCutoffTo = resolvedTo > fallbackToday ? fallbackToday : resolvedTo;
+  const analysisPeriod = resolveAnalysisPeriodFromRange(resolvedFrom, analysisCutoffTo);
+  const analysisSummaryRows = enrichSummaryRowsWithEarliestPublishTime(
     summaryRows,
+    allContents,
+    dataset.allAccountsData,
+    link,
+    analysisCutoffTo,
+    dataset.allPushRecords
+  );
+  const analysis = buildStatsAnalysis({
+    dailyRows: analysisRows,
+    summaryRows: analysisSummaryRows,
     accountRows: accountDaily.allRows,
-    to: resolvedTo,
+    to: analysisCutoffTo,
     period: analysisPeriod,
     now: nowVal,
   });
@@ -2252,7 +2777,7 @@ function buildStatsWorkbookData(options = {}, deps) {
     works: workCounts.works,
     contents: summaryRows.length,
     unlinkedWorks: workCounts.unlinkedWorks,
-    workDailyRows: workDaily.rows.length,
+    workDailyRows: workDailyRows.length,
     platformDailyRows: platformDaily.rows.length,
     accountDailyRows: accountDaily.rows.length,
   };
@@ -2269,10 +2794,10 @@ function buildStatsWorkbookData(options = {}, deps) {
   });
 
   const sheets = {
-    作品日明细: workDaily.aoa,
+    作品日明细: workDailyAoa,
     作品跨平台汇总: contentSummary.aoa,
     平台日汇总: platformDaily.aoa,
-    账号日快照: accountDaily.aoa,
+    账号日快照: accountDailyAoa,
     分析: analysisAoa,
     字段说明: schemaAoa,
     导出信息: metaAoa,

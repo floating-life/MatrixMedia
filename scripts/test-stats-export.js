@@ -2723,6 +2723,56 @@ async function main() {
       console.log("✓ S6-r4#1(testS6r4SphReplayAltTitlesEndToEnd) & S6-r4#8(testS6r4DefaultExportFileNameWithoutDates) 通过");
     }
 
+    /* ---------- 11. S7-fix 导出同步校验（历史掉0全历史识别不污染 Sheet1 + 未来截止日夹紧） ---------- */
+    {
+      const pubDrop = Date.parse("2026-11-12T10:00:00+08:00");
+      const s7ExportDeps = {
+        now: Date.parse("2026-11-17T10:00:00+08:00"),
+        listAccounts: () => [{ group: "导出组", platform: "抖音" }],
+        readWorks: () => [{ workId: "EXP_D0", title: "导出掉0回溯", publishTime: pubDrop }],
+        readWorksDaily: () => ({
+          EXP_D0: {
+            "2026-11-14": { play: 1000, like: 50 },
+            "2026-11-15": { play: 0, like: 50 },
+            "2026-11-16": { play: 1300, like: 60 },
+          },
+        }),
+        readDaily: () => ({}),
+        readPushRecords: () => [],
+      };
+      const wbDrop = buildStatsWorkbookData({ from: "2026-11-12", to: "2026-11-15" }, s7ExportDeps);
+      // Sheet 1 作品日明细不得泄漏截止日 11/15 之后的 11/16 快照
+      assert.strictEqual(
+        wbDrop.sheets["作品日明细"].slice(1).every((r) => r[0] <= "2026-11-15"),
+        true,
+        "作品日明细 sheet 必须严格截至 to=2026-11-15"
+      );
+      // Sheet「分析」必须利用 11/16 恢复快照识别并剔除 11/15 掉 0
+      assert.strictEqual(wbDrop.analysis.anomalies.collectionAnomalies.length, 1);
+      assert.strictEqual(wbDrop.analysis.overview.metrics.play.current, null);
+      assert.strictEqual(wbDrop.analysis.rankings.byPlay.top[0].totalPlay, 1000);
+      assert.strictEqual(wbDrop.analysis.newWorks.items[0].d3Play, 1000);
+      const analysisPlayRow = wbDrop.sheets["分析"].find((r) => r[0] === "播放");
+      assert.strictEqual(analysisPlayRow[1], null, "Excel 分析 sheet 总览播放日增不得为 -1000");
+
+      // 导出分析 sheet 同样把未来 to 夹到 UTC+8 今天，不提前填充 D3/D7
+      const s7FutureDeps = {
+        now: Date.parse("2026-11-20T10:00:00+08:00"),
+        listAccounts: () => [{ group: "导出组", platform: "抖音" }],
+        readWorks: () => [
+          { workId: "EXP_F1", title: "未来截止测试", publishTime: Date.parse("2026-11-19T18:00:00+08:00") },
+        ],
+        readWorksDaily: () => ({ EXP_F1: { "2026-11-20": { play: 1000 } } }),
+        readDaily: () => ({}),
+        readPushRecords: () => [],
+      };
+      const wbFuture = buildStatsWorkbookData({ from: "2026-11-19", to: "2026-11-29" }, s7FutureDeps);
+      assert.strictEqual(wbFuture.analysis.to, "2026-11-20");
+      assert.strictEqual(wbFuture.analysis.newWorks.items[0].d3Play, null);
+      assert.strictEqual(wbFuture.analysis.newWorks.items[0].d7Play, null);
+      console.log("✓ S7-fix 导出同步校验(testS7FixExportAnalysisSync) 通过");
+    }
+
     // 恢复 require.cache
     if (origElectronCache) require.cache[electronId] = origElectronCache;
     else delete require.cache[electronId];
