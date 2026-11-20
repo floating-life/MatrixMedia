@@ -1741,7 +1741,14 @@ function minNonEmptyDate(a, b) {
   return a <= b ? a : b;
 }
 
-/** 4. 新作品走势（本周期发布内容，按作品发布日期计算 D1/D3/D7 再汇总到平台与内容；分类仅用三里程碑均有值的同一组平台） */
+function computeMilestoneRatios(d1, d3, d7) {
+  return {
+    d3ToD1: d1 !== null && d1 > 0 && d3 !== null ? round2(d3 / d1) : null,
+    d7ToD3: d3 !== null && d3 > 0 && d7 !== null ? round2(d7 / d3) : null,
+  };
+}
+
+/** 4. 新作品走势（本周期发布内容，按作品发布日期计算 D1/D3/D7 再汇总到平台与内容；同行倍数按同行累计值计算，分类仅用三里程碑均有值的可比样本并标明分类依据） */
 function buildNewWorksSection(contentMetaByKey, worksByContent, { currentStart, to }) {
   const allKeys = new Set([...contentMetaByKey.keys(), ...worksByContent.keys()]);
   const items = [];
@@ -1812,11 +1819,22 @@ function buildNewWorksSection(contentMetaByKey, worksByContent, { currentStart, 
         latestPlay = addNullable(latestPlay, we.latestPlay);
       }
 
-      // 平台内可比作品（D1/D3/D7 三个里程碑均有值）
+      // 同行倍数严格按同一行显示的 D1/D3/D7 累计值计算
+      const { d3ToD1, d7ToD3 } = computeMilestoneRatios(
+        milestoneVals[1],
+        milestoneVals[3],
+        milestoneVals[7]
+      );
+
+      // 平台内可比作品（D1/D3/D7 三个里程碑均有值），仅用于走势分类与分类依据
       const compWorks = pEntries.filter((we) => we.hasAllMilestones);
-      let d3ToD1 = null;
-      let d7ToD3 = null;
       let category = "数据不足";
+      let comparableD1Play = null;
+      let comparableD3Play = null;
+      let comparableD7Play = null;
+      let comparableD3ToD1 = null;
+      let comparableD7ToD3 = null;
+      let classificationBasis = "";
 
       if (compWorks.length > 0) {
         let cD1 = 0;
@@ -1827,35 +1845,27 @@ function buildNewWorksSection(contentMetaByKey, worksByContent, { currentStart, 
           cD3 += we.milestones[3];
           cD7 += we.milestones[7];
         }
-        d3ToD1 = cD1 > 0 ? round2(cD3 / cD1) : null;
-        d7ToD3 = cD3 > 0 ? round2(cD7 / cD3) : null;
+        comparableD1Play = cD1;
+        comparableD3Play = cD3;
+        comparableD7Play = cD7;
+        comparableD3ToD1 = cD1 > 0 ? round2(cD3 / cD1) : null;
+        comparableD7ToD3 = cD3 > 0 ? round2(cD7 / cD3) : null;
         category = classifyTrajectory(cD1, cD3, cD7);
-        platformComparable.set(platform, { d1: cD1, d3: cD3, d7: cD7 });
-      } else {
-        const d1d3Works = pEntries.filter(
-          (we) => we.milestones[1] !== null && we.milestones[3] !== null
-        );
-        if (d1d3Works.length > 0) {
-          let s1 = 0;
-          let s3 = 0;
-          for (const we of d1d3Works) {
-            s1 += we.milestones[1];
-            s3 += we.milestones[3];
-          }
-          d3ToD1 = s1 > 0 ? round2(s3 / s1) : null;
+        const basisLabel =
+          compWorks.length === pEntries.length
+            ? platform
+            : `${platform}（${compWorks.length}/${pEntries.length}条）`;
+        if (category !== "数据不足") {
+          classificationBasis = basisLabel;
         }
-        const d3d7Works = pEntries.filter(
-          (we) => we.milestones[3] !== null && we.milestones[7] !== null
-        );
-        if (d3d7Works.length > 0) {
-          let s3 = 0;
-          let s7 = 0;
-          for (const we of d3d7Works) {
-            s3 += we.milestones[3];
-            s7 += we.milestones[7];
-          }
-          d7ToD3 = s3 > 0 ? round2(s7 / s3) : null;
-        }
+        platformComparable.set(platform, {
+          d1: cD1,
+          d3: cD3,
+          d7: cD7,
+          basisLabel,
+          comparableWorkCount: compWorks.length,
+          totalWorkCount: pEntries.length,
+        });
       }
 
       platformRows.push({
@@ -1868,6 +1878,14 @@ function buildNewWorksSection(contentMetaByKey, worksByContent, { currentStart, 
         d3ToD1,
         d7ToD3,
         category,
+        comparableWorkCount: compWorks.length,
+        totalWorkCount: pEntries.length,
+        comparableD1Play,
+        comparableD3Play,
+        comparableD7Play,
+        comparableD3ToD1,
+        comparableD7ToD3,
+        classificationBasis,
       });
     }
 
@@ -1895,56 +1913,48 @@ function buildNewWorksSection(contentMetaByKey, worksByContent, { currentStart, 
       totalLatestPlay = addNullable(totalLatestPlay, pr.latestPlay);
     }
 
-    // 内容级走势分类：严格只用在 D1/D3/D7 三个里程碑都有值的同一组可比平台；不存在可比平台 → 「数据不足」
-    const comparablePlatforms = platformRows.filter(
-      (pr) =>
-        pr.d1Play !== null &&
-        pr.d3Play !== null &&
-        pr.d7Play !== null &&
-        platformComparable.has(pr.platform)
+    // 内容行倍数严格按同一行显示的 D1/D3/D7 累计值计算
+    const { d3ToD1, d7ToD3 } = computeMilestoneRatios(
+      totalMilestones[1],
+      totalMilestones[3],
+      totalMilestones[7]
     );
 
-    let d3ToD1 = null;
-    let d7ToD3 = null;
+    // 内容级走势分类：严格只用在 D1/D3/D7 三个里程碑都有值的同一组可比平台样本；不存在可比样本 → 「数据不足」
+    const comparablePlatforms = platformRows.filter((pr) =>
+      platformComparable.has(pr.platform)
+    );
+
     let category = "数据不足";
+    let comparableD1Play = null;
+    let comparableD3Play = null;
+    let comparableD7Play = null;
+    let comparableD3ToD1 = null;
+    let comparableD7ToD3 = null;
+    let classificationBasis = "";
+    const comparablePlatformNames = [];
 
     if (comparablePlatforms.length > 0) {
       let compD1 = 0;
       let compD3 = 0;
       let compD7 = 0;
+      const basisLabels = [];
       for (const pr of comparablePlatforms) {
         const comp = platformComparable.get(pr.platform);
         compD1 += comp.d1;
         compD3 += comp.d3;
         compD7 += comp.d7;
+        comparablePlatformNames.push(pr.platform);
+        basisLabels.push(comp.basisLabel);
       }
-      d3ToD1 = compD1 > 0 ? round2(compD3 / compD1) : null;
-      d7ToD3 = compD3 > 0 ? round2(compD7 / compD3) : null;
+      comparableD1Play = compD1;
+      comparableD3Play = compD3;
+      comparableD7Play = compD7;
+      comparableD3ToD1 = compD1 > 0 ? round2(compD3 / compD1) : null;
+      comparableD7ToD3 = compD3 > 0 ? round2(compD7 / compD3) : null;
       category = classifyTrajectory(compD1, compD3, compD7);
-    } else {
-      const d1d3Platforms = platformRows.filter(
-        (pr) => pr.d1Play !== null && pr.d3Play !== null
-      );
-      if (d1d3Platforms.length > 0) {
-        let s1 = 0;
-        let s3 = 0;
-        for (const pr of d1d3Platforms) {
-          s1 += pr.d1Play;
-          s3 += pr.d3Play;
-        }
-        d3ToD1 = s1 > 0 ? round2(s3 / s1) : null;
-      }
-      const d3d7Platforms = platformRows.filter(
-        (pr) => pr.d3Play !== null && pr.d7Play !== null
-      );
-      if (d3d7Platforms.length > 0) {
-        let s3 = 0;
-        let s7 = 0;
-        for (const pr of d3d7Platforms) {
-          s3 += pr.d3Play;
-          s7 += pr.d7Play;
-        }
-        d7ToD3 = s3 > 0 ? round2(s7 / s3) : null;
+      if (category !== "数据不足") {
+        classificationBasis = basisLabels.join("、");
       }
     }
 
@@ -1967,6 +1977,13 @@ function buildNewWorksSection(contentMetaByKey, worksByContent, { currentStart, 
       d3ToD1,
       d7ToD3,
       category,
+      comparablePlatforms: category !== "数据不足" ? comparablePlatformNames : [],
+      comparableD1Play,
+      comparableD3Play,
+      comparableD7Play,
+      comparableD3ToD1,
+      comparableD7ToD3,
+      classificationBasis,
       platforms: platformRows,
     });
   }

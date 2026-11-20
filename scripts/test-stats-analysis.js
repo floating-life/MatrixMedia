@@ -1301,10 +1301,14 @@ async function main() {
     assert.strictEqual(itemA.d1Play, 100);
     assert.strictEqual(itemA.d3Play, 100);
     assert.strictEqual(itemA.d7Play, 300);
-    assert.strictEqual(itemA.d7ToD3, 1, "可比平台（仅抖音）的 D7/D3 应为 1");
+    assert.strictEqual(itemA.d3ToD1, 1, "同行倍数 D3/D1 应与本行累计值 100/100 一致");
+    assert.strictEqual(itemA.d7ToD3, 3, "同行倍数 D7/D3 应与本行累计值 300/100 一致");
+    assert.strictEqual(itemA.comparableD7ToD3, 1, "可比平台（仅抖音）的分类口径 D7/D3 应为 1");
+    assert.strictEqual(itemA.classificationBasis, "抖音", "分类依据应标明可比平台样本：抖音");
     assert.strictEqual(itemA.category, "爆发后平稳", "快手漏采 D1/D3 不得制造长尾");
     assert.strictEqual(rComp.newWorks.categoryCounts.长尾型, 0);
     assert.strictEqual(itemB.category, "数据不足", "不存在 D1/D3/D7 均有值的平台必须标「数据不足」");
+    assert.strictEqual(itemB.classificationBasis, "", "数据不足时分类依据为空");
     console.log("✓ S7-fix#2(testS7Fix2TrajectoryUsesComparablePlatformsOnly) 通过");
   }
 
@@ -1723,6 +1727,386 @@ async function main() {
     assert.ok(coreMs < 5000, `纯计算超时：${coreMs}ms >= 5000ms`);
     assert.ok(guiMs < 5000, `GUI 入口超时：${guiMs}ms >= 5000ms`);
     assert.ok(wbMs < 5000, `Excel 构建超时：${wbMs}ms >= 5000ms`);
+  }
+
+  /* ---------- 10. S7-r3 专项回归用例（4 条，用评审原数字） ---------- */
+
+  // testS7r3TrajectoryRatiosMatchRowAndShowClassificationBasis（评审 S7-review2 #1）
+  {
+    const pubMs = Date.parse("2026-11-01T10:00:00+08:00");
+    const r3TrajDeps = {
+      now: Date.parse("2026-11-20T10:00:00+08:00"),
+      listAccounts: () => [
+        { group: "创作组", platform: "抖音" },
+        { group: "创作组", platform: "快手" },
+        { group: "账号一", platform: "抖音" },
+        { group: "账号二", platform: "抖音" },
+      ],
+      readWorks: (g, p) => {
+        if (g === "创作组" && p === "抖音") {
+          return [{ workId: "1", title: "秋季城市街拍夜景实录", url: "https://www.douyin.com/video/1", publishTime: pubMs }];
+        }
+        if (g === "创作组" && p === "快手") {
+          return [{ workId: "2", title: "秋季城市街拍夜景实录", url: "https://www.kuaishou.com/short-video/2", publishTime: pubMs }];
+        }
+        if (g === "账号一" && p === "抖音") {
+          return [{ workId: "21", title: "双抖音账号同款视频", url: "https://www.douyin.com/video/21", publishTime: pubMs }];
+        }
+        if (g === "账号二" && p === "抖音") {
+          return [{ workId: "22", title: "双抖音账号同款视频", url: "https://www.douyin.com/video/22", publishTime: pubMs }];
+        }
+        return [];
+      },
+      readWorksDaily: (g, p) => {
+        if (g === "创作组" && p === "抖音") {
+          return { 1: { "2026-11-02": { play: 100 }, "2026-11-04": { play: 100 }, "2026-11-08": { play: 100 } } };
+        }
+        if (g === "创作组" && p === "快手") {
+          return { 2: { "2026-11-08": { play: 200 } } };
+        }
+        if (g === "账号一" && p === "抖音") {
+          return { 21: { "2026-11-02": { play: 100 }, "2026-11-04": { play: 100 }, "2026-11-08": { play: 100 } } };
+        }
+        if (g === "账号二" && p === "抖音") {
+          return { 22: { "2026-11-08": { play: 200 } } };
+        }
+        return {};
+      },
+      readDaily: () => ({}),
+      readPushRecords: () => [],
+      readLinkOverrides: () => ({
+        version: 1,
+        updatedAt: Date.parse("2026-11-08T10:00:00+08:00"),
+        contents: {
+          "manual:r3_dual": { title: "双抖音账号同款视频", createdAt: Date.parse("2026-11-08T10:00:00+08:00") },
+        },
+        excludedAuto: {},
+        overrides: {
+          "抖音|21": { action: "assign", contentKey: "manual:r3_dual" },
+          "抖音|22": { action: "assign", contentKey: "manual:r3_dual" },
+        },
+      }),
+    };
+    const guiRes = buildStatsAnalysisData({ to: "2026-11-08" }, r3TrajDeps);
+    const wbRes = buildStatsWorkbookData({ to: "2026-11-08" }, r3TrajDeps);
+    assert.deepStrictEqual(wbRes.analysis.newWorks, guiRes.newWorks, "GUI 与 Excel 走势数据必须完全同步");
+
+    // 1) 抖音 100/100/100 + 快手仅 D7=200：同行显示 D1=100, D3=100, D7=300, D3/D1=1, D7/D3=3（不再出现 1× 矛盾），分类=爆发后平稳，分类依据=抖音
+    const crossItem = guiRes.newWorks.items.find((it) => it.title === "秋季城市街拍夜景实录");
+    assert.ok(crossItem);
+    assert.strictEqual(crossItem.d1Play, 100);
+    assert.strictEqual(crossItem.d3Play, 100);
+    assert.strictEqual(crossItem.d7Play, 300);
+    assert.strictEqual(crossItem.d3ToD1, 1);
+    assert.strictEqual(crossItem.d7ToD3, 3, "同行倍数 D7/D3 必须按本行 300/100=3 计算");
+    assert.strictEqual(crossItem.comparableD7ToD3, 1);
+    assert.strictEqual(crossItem.category, "爆发后平稳");
+    assert.strictEqual(crossItem.classificationBasis, "抖音");
+    assert.strictEqual(guiRes.newWorks.categoryCounts.长尾型, 0);
+
+    // 2) 同款合并到两个抖音账号：账号一 100/100/100、账号二仅 D7=200 → 平台行与内容行均 D3=100, D7=300, D7/D3=3，分类依据=抖音（1/2条）
+    const dualItem = guiRes.newWorks.items.find((it) => it.contentKey === "manual:r3_dual");
+    assert.ok(dualItem);
+    assert.strictEqual(dualItem.d3Play, 100);
+    assert.strictEqual(dualItem.d7Play, 300);
+    assert.strictEqual(dualItem.d7ToD3, 3);
+    assert.strictEqual(dualItem.category, "爆发后平稳");
+    assert.strictEqual(dualItem.classificationBasis, "抖音（1/2条）");
+    assert.strictEqual(dualItem.platforms.length, 1);
+    assert.strictEqual(dualItem.platforms[0].d3Play, 100);
+    assert.strictEqual(dualItem.platforms[0].d7Play, 300);
+    assert.strictEqual(dualItem.platforms[0].d7ToD3, 3);
+    assert.strictEqual(dualItem.platforms[0].category, "爆发后平稳");
+    assert.strictEqual(dualItem.platforms[0].classificationBasis, "抖音（1/2条）");
+
+    // 3) Vue 模板主表与展开表均包含「分类依据」列
+    const vueSrc = fs.readFileSync(
+      path.resolve(__dirname, "../src/renderer/views/dataStats/index.vue"),
+      "utf8"
+    );
+    const basisColMatches = vueSrc.match(/label="分类依据"/g) || [];
+    assert.ok(basisColMatches.length >= 2, "GUI 走势表主表与展开表均必须展示「分类依据」列");
+    console.log("✓ S7-r3#1(testS7r3TrajectoryRatiosMatchRowAndShowClassificationBasis) 通过");
+  }
+
+  // testS7r3PublishTimePriorityPerWorkAndRepublishRule（评审 S7-review2 #2）
+  {
+    const create1600 = Date.parse("2026-11-17T16:00:00+08:00"); // 周二 12-18
+    const confirm1700 = Date.parse("2026-11-17T17:00:00+08:00"); // 周二 12-18
+    const confirm1830 = Date.parse("2026-11-17T18:30:00+08:00"); // 周二 18-24
+    const actual1830 = Date.parse("2026-11-17T18:30:00+08:00"); // 周二 18-24
+    const oldFirst1030 = Date.parse("2026-10-30T14:00:00+08:00"); // 周五 12-18
+
+    // 2a) 评审原数字：11/17 16:00 创建旧记录（无 lastPublishAt、无 publishStatus 带直链），平台实采 18:30，截至 11/20 播放 250 → 必须归周二 18-24（而非 12-18）
+    const legacyRecDeps = {
+      now: Date.parse("2026-11-20T12:00:00+08:00"),
+      listAccounts: () => [{ group: "创作组", platform: "抖音" }],
+      readWorks: () => [
+        {
+          workId: "LEGACY_W1",
+          title: "旧记录优先级回归",
+          url: "https://www.douyin.com/video/legacy_w1",
+          publishTime: actual1830,
+        },
+      ],
+      readWorksDaily: () => ({
+        LEGACY_W1: { "2026-11-20": { play: 250 } },
+      }),
+      readDaily: () => ({}),
+      readPushRecords: () => [
+        {
+          id: "legacy-rec-1",
+          date: "2026-11-17",
+          pt: "抖音",
+          group: "创作组",
+          title: "旧记录优先级回归",
+          filePath: "/videos/legacy_priority.mp4",
+          videoLink: "https://www.douyin.com/video/legacy_w1",
+          createTime: create1600,
+        },
+      ],
+    };
+    const rLegacy = buildStatsAnalysisData({ period: 30, to: "2026-11-20" }, legacyRecDeps);
+    assert.strictEqual(rLegacy.publishTime.groups.length, 1);
+    assert.strictEqual(rLegacy.publishTime.groups[0].weekdayLabel, "周二");
+    assert.strictEqual(
+      rLegacy.publishTime.groups[0].slot,
+      "18-24",
+      "同一作品必须优先采用平台实采发布时间 18:30（18-24），不得被旧记录创建时间 16:00 拉到 12-18"
+    );
+    assert.strictEqual(rLegacy.publishTime.groups[0].avgD7Play, 250);
+
+    // 2b) 完整三级优先级验证：平台实采 publishTime > 已确认 lastPublishAt > createTime，且补发不算新作品
+    const priorityDeps = {
+      now: Date.parse("2026-11-20T12:00:00+08:00"),
+      listAccounts: () => [
+        { group: "创作组", platform: "抖音" },
+        { group: "创作组", platform: "快手" },
+      ],
+      readWorks: (_g, p) =>
+        p === "抖音"
+          ? [
+              // P1：平台实采 18:30 > 已确认 lastPublishAt 17:00 > createTime 16:00 → 18-24
+              { workId: "P1", title: "优先级一-平台实采胜出", url: "https://www.douyin.com/video/p1", publishTime: actual1830 },
+              // P2：无平台实采 publishTime(=0) → 已确认 lastPublishAt 18:30 > createTime 16:00 → 18-24
+              { workId: "P2", title: "优先级二-确认发布时间胜出", url: "https://www.douyin.com/video/p2", publishTime: 0 },
+              // P3：无平台实采(=0)且无 lastPublishAt → 兜底 createTime 16:00 → 12-18
+              { workId: "P3", title: "优先级三-创建时间兜底", url: "https://www.douyin.com/video/p3", publishTime: 0 },
+            ]
+          : [
+              // P4：10/30 抖音首发仅在发布记录，11/17 快手补发 → 最早已知首发仍是 10/30 14:00（补发不算近 7 天新作品）
+              { workId: "P4_KS", title: "补发仍按最早首发", url: "https://www.kuaishou.com/short-video/p4", publishTime: actual1830 },
+            ],
+      readWorksDaily: (_g, p) =>
+        p === "抖音"
+          ? {
+              P1: { "2026-11-20": { play: 100 } },
+              P2: { "2026-11-20": { play: 200 } },
+              P3: { "2026-11-20": { play: 300 } },
+            }
+          : {
+              P4_KS: { "2026-11-20": { play: 400 } },
+            },
+      readDaily: () => ({}),
+      readPushRecords: () => [
+        {
+          id: "pr-1",
+          date: "2026-11-17",
+          pt: "抖音",
+          group: "创作组",
+          publishStatus: "success",
+          title: "优先级一-平台实采胜出",
+          filePath: "/videos/prio1.mp4",
+          videoLink: "https://www.douyin.com/video/p1",
+          createTime: create1600,
+          lastPublishAt: confirm1700,
+        },
+        {
+          id: "pr-2",
+          date: "2026-11-17",
+          pt: "抖音",
+          group: "创作组",
+          publishStatus: "success",
+          title: "优先级二-确认发布时间胜出",
+          filePath: "/videos/prio2.mp4",
+          videoLink: "https://www.douyin.com/video/p2",
+          createTime: create1600,
+          lastPublishAt: confirm1830,
+        },
+        {
+          id: "pr-3",
+          date: "2026-11-17",
+          pt: "抖音",
+          group: "创作组",
+          publishStatus: "success",
+          title: "优先级三-创建时间兜底",
+          filePath: "/videos/prio3.mp4",
+          videoLink: "https://www.douyin.com/video/p3",
+          createTime: create1600,
+        },
+        {
+          id: "pr-4a",
+          date: "2026-10-30",
+          pt: "抖音",
+          group: "创作组",
+          publishStatus: "success",
+          title: "补发仍按最早首发",
+          filePath: "/videos/prio4.mp4",
+          videoLink: "https://www.douyin.com/video/p4_old",
+          createTime: Date.parse("2026-10-30T10:00:00+08:00"),
+          lastPublishAt: oldFirst1030,
+        },
+        {
+          id: "pr-4b",
+          date: "2026-11-17",
+          pt: "快手",
+          group: "创作组",
+          publishStatus: "success",
+          title: "补发仍按最早首发",
+          filePath: "/videos/prio4.mp4",
+          videoLink: "https://www.kuaishou.com/short-video/p4",
+          lastPublishAt: actual1830,
+        },
+      ],
+    };
+    const rPrio7 = buildStatsAnalysisData({ period: 7, to: "2026-11-20" }, priorityDeps);
+    assert.strictEqual(
+      rPrio7.newWorks.items.some((it) => it.contentKey === "file:/videos/prio4.mp4"),
+      false,
+      "10/30 首发、11/17 补发的内容不得算作近 7 天新作品"
+    );
+    const grpTueEve = rPrio7.publishTime.groups.find((g) => g.weekdayLabel === "周二" && g.slot === "18-24");
+    const grpTueAft = rPrio7.publishTime.groups.find((g) => g.weekdayLabel === "周二" && g.slot === "12-18");
+    const grpFriAft = rPrio7.publishTime.groups.find((g) => g.weekdayLabel === "周五" && g.slot === "12-18");
+    assert.ok(grpTueEve && grpTueEve.sampleCount === 2 && grpTueEve.avgD7Play === 150, "P1(100) 与 P2(200) 均应归周二 18-24");
+    assert.ok(grpTueAft && grpTueAft.sampleCount === 1 && grpTueAft.avgD7Play === 300, "P3(300) 缺实采与确认时间，应兜底 createTime 归周二 12-18");
+    assert.ok(grpFriAft && grpFriAft.sampleCount === 1 && grpFriAft.avgD7Play === 400, "P4(400) 应按 10/30 首发确认时间 14:00 归周五 12-18");
+    console.log("✓ S7-r3#2(testS7r3PublishTimePriorityPerWorkAndRepublishRule) 通过");
+  }
+
+  // testS7r3MergeWorksUpdatesExistingPublishTimeOnRecollect（评审 S7-review2 #5：UTC 主机旧存量重采后自动修正 publishTime）
+  {
+    const tmpStoreRoot = fs.mkdtempSync(path.join(os.tmpdir(), "mm-s7r3-store-"));
+    const electronId = require.resolve("electron");
+    const storeId = require.resolve("../src/main/services/dataStats/store.js");
+    const origElectronCache = require.cache[electronId];
+    const oldTz = process.env.TZ;
+    try {
+      require.cache[electronId] = {
+        id: electronId,
+        filename: electronId,
+        loaded: true,
+        exports: { app: { getPath: () => tmpStoreRoot } },
+      };
+      delete require.cache[storeId];
+      const store = require(storeId);
+
+      // 模拟旧版 UTC 主机误把 "2026-11-17 18:30:00" 当作 UTC 写入存量 works.json（对应 UTC+8 2026-11-18 02:30，周三 0-6）
+      const wrongUtcMs = Date.parse("2026-11-17T18:30:00.000Z");
+      const correctUtc8Ms = Date.parse("2026-11-17T10:30:00.000Z"); // UTC+8 2026-11-17 18:30，周二 18-24
+      const snap18Ms = Date.parse("2026-11-18T12:00:00+08:00");
+      store.mergeWorks("旧存量组", "百家号", [
+        { workId: "123", title: "城里的一天", publishTime: wrongUtcMs, play: 100 },
+      ], snap18Ms);
+      store.mergeWorks("旧存量组", "小红书", [
+        { workId: "456", title: "城里的一天", publishTime: wrongUtcMs, play: 100 },
+      ], snap18Ms);
+
+      const storeDeps = {
+        now: Date.parse("2026-11-20T10:00:00+08:00"),
+        listAccounts: () => [
+          { group: "旧存量组", platform: "百家号" },
+          { group: "旧存量组", platform: "小红书" },
+        ],
+        readWorks: (g, p) => store.readWorks(g, p),
+        readWorksDaily: (g, p) => store.readWorksDaily(g, p),
+        readDaily: () => ({}),
+        readPushRecords: () => [],
+      };
+
+      // 重采前：旧存量在 11/18 归周三 0-6 且 D1 为空
+      const beforeRecollect = buildStatsAnalysisData({ to: "2026-11-18" }, storeDeps);
+      assert.strictEqual(beforeRecollect.publishTime.groups[0].weekdayLabel, "周三");
+      assert.strictEqual(beforeRecollect.publishTime.groups[0].slot, "0-6");
+      assert.strictEqual(beforeRecollect.newWorks.items[0].d1Play, null);
+
+      // 在 UTC 主机下用新版适配器重采 "2026-11-17 18:30:00" 并写入 store.mergeWorks
+      process.env.TZ = "UTC";
+      const dataDate = "2026-11-17 18:30:00";
+      const mkResp = (obj) => ({ status: 200, text: async () => JSON.stringify(obj) });
+      async function recollectPlatform(platform) {
+        const fetch = async (url) => {
+          if (url.includes("/pcui/home/index")) return mkResp({ data: { coreData: { fansCount: 100, viewCount: 200 } } });
+          if (url.includes("/pcui/article/lists")) {
+            return mkResp({
+              list: [{ article_id: "123", title: "城里的一天", publish_time: dataDate, read_amount: 100 }],
+              page: { totalPage: 1 },
+            });
+          }
+          if (url.includes("/personal_info")) return mkResp({ code: 0, data: { fans_count: 10 } });
+          if (url.includes("/posted")) {
+            return mkResp({
+              code: 0,
+              data: { notes: [{ id: "456", display_title: "城里的一天", time: dataDate, view_count: 100 }], page: -1 },
+            });
+          }
+          throw new Error(`unexpected url: ${url}`);
+        };
+        return (
+          await vm.runInNewContext(ADAPTERS[platform].collectScript(), {
+            fetch,
+            window: { _webmsxyw: () => ({}) },
+            Date,
+            setTimeout,
+          })
+        ).works;
+      }
+
+      for (const p of ["百家号", "小红书"]) {
+        const freshWorks = await recollectPlatform(p);
+        store.mergeWorks("旧存量组", p, freshWorks, snap18Ms);
+        const saved = store.readWorks("旧存量组", p).works[0];
+        assert.strictEqual(
+          saved.publishTime,
+          correctUtc8Ms,
+          `${p} 重采得到有效 publishTime 时 mergeWorks 必须更新已有作品的 publishTime`
+        );
+      }
+
+      // 重采后：两个平台均自动修正为周二 18-24，截至 11/18 的 D1 均为 100（跨平台合为 200）
+      const afterRecollect = buildStatsAnalysisData({ to: "2026-11-18" }, storeDeps);
+      assert.strictEqual(afterRecollect.publishTime.groups.length, 1);
+      assert.strictEqual(afterRecollect.publishTime.groups[0].weekdayLabel, "周二");
+      assert.strictEqual(afterRecollect.publishTime.groups[0].slot, "18-24");
+      assert.strictEqual(afterRecollect.newWorks.items[0].publishDate, "2026-11-17");
+      assert.strictEqual(afterRecollect.newWorks.items[0].d1Play, 200);
+      for (const pr of afterRecollect.newWorks.items[0].platforms) {
+        assert.strictEqual(pr.d1Play, 100, `${pr.platform} 重采修正后截至 11/18 的 D1 应为 100`);
+      }
+
+      // 无效或 <=0 的 publishTime（0 / -1 / null / undefined / "bad"）不得覆盖已有有效 publishTime
+      for (const invalidPub of [0, -100, null, undefined, NaN, "not-a-date", ""]) {
+        store.mergeWorks(
+          "旧存量组",
+          "百家号",
+          [{ workId: "123", title: "城里的一天", publishTime: invalidPub, play: 105 }],
+          snap18Ms
+        );
+        assert.strictEqual(
+          store.readWorks("旧存量组", "百家号").works[0].publishTime,
+          correctUtc8Ms,
+          `无效 publishTime (${String(invalidPub)}) 不得覆盖已有有效 publishTime`
+        );
+      }
+      console.log("✓ S7-r3#4(testS7r3MergeWorksUpdatesExistingPublishTimeOnRecollect) 通过");
+    } finally {
+      if (oldTz === undefined) delete process.env.TZ;
+      else process.env.TZ = oldTz;
+      if (origElectronCache) require.cache[electronId] = origElectronCache;
+      else delete require.cache[electronId];
+      delete require.cache[storeId];
+      fs.rmSync(tmpStoreRoot, { recursive: true, force: true });
+    }
   }
 
   console.log("\ntest-stats-analysis: 全部断言通过");

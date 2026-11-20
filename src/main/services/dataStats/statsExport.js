@@ -18,6 +18,7 @@ const {
   buildContentIndex,
   linkWorks,
   buildContentSummaryRows,
+  normalizeUrl,
   isManagementUrl,
   isValidAutoContentKey,
   isUnstableRecordKey,
@@ -36,6 +37,7 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const DEFAULT_RANGE_DAYS = 29; // 含起止日共 30 天
 const MAX_SHEET_ROWS = 200000;
 const ROW_LIMIT_EXCEEDED_CODE = "ROW_LIMIT_EXCEEDED";
+const FUTURE_DATE_RANGE_ERROR = "所选日期都在未来";
 
 const SHEET_NAMES = [
   "作品日明细",
@@ -797,6 +799,31 @@ function validateExportDateRange(from, to) {
   return { from: validFrom, to: validTo };
 }
 
+/**
+ * 校验导出日期区间与「≤ UTC+8 今天」的交集非空；
+ * 若所选区间全部晚于今天则抛出明确错误「所选日期都在未来」。
+ */
+function assertExportRangeNotAllFuture(from, to, nowVal = Date.now()) {
+  const todayUtc8 = formatUtc8Date(nowVal);
+  if (from && from > todayUtc8) {
+    throw new Error(FUTURE_DATE_RANGE_ERROR);
+  }
+  if (!from && to) {
+    const impliedFrom = shiftDateStr(to, -DEFAULT_RANGE_DAYS);
+    if (impliedFrom > todayUtc8) {
+      throw new Error(FUTURE_DATE_RANGE_ERROR);
+    }
+    if (to > todayUtc8) {
+      return { from: impliedFrom, to: todayUtc8, todayUtc8 };
+    }
+  }
+  return {
+    from: from || "",
+    to: to && to > todayUtc8 ? todayUtc8 : to || "",
+    todayUtc8,
+  };
+}
+
 function buildDefaultExportFileName(from, to) {
   const f = typeof from === "string" ? from.trim() : "";
   const t = typeof to === "string" ? to.trim() : "";
@@ -1369,33 +1396,72 @@ function normalizeFullPathForKey(raw) {
   return "";
 }
 
-function extractPushRecordTimestampMs(rec, status) {
+function normalizeDirectUrlForExport(raw) {
+  if (typeof raw !== "string") return "";
+  const trimmed = raw.trim();
+  if (!trimmed) return "";
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "";
+  } catch (_) {
+    return "";
+  }
+  if (isManagementUrl(trimmed)) return "";
+  return normalizeUrl(trimmed);
+}
+
+/**
+ * 提取单条发布记录的发布时间（按优先级）：
+ * - tier 2：已确认的发布时间（lastPublishAt / 成功时间）
+ * - tier 3：记录创建时间（createTime）
+ * - tier 4：仅记录日期（date，无时分秒）
+ */
+function extractPushRecordPublishTime(rec, status, hasStatusField) {
   const baseDate =
     typeof rec.date === "string" && isValidDateStr(rec.date.trim()) ? rec.date.trim() : "";
   const lastMs = parseRawTimestampMs(rec.lastPublishAt);
   const lastDate = lastMs !== null ? formatUtc8Date(lastMs) : "";
-  if (status === "success" && lastMs !== null && (!baseDate || lastDate >= baseDate)) {
-    return { ms: lastMs, date: lastDate };
+  const isConfirmedRecord = status === "success" || !hasStatusField;
+  if (isConfirmedRecord && lastMs !== null && (!baseDate || lastDate >= baseDate)) {
+    return { ms: lastMs, date: lastDate, tier: 2 };
   }
-  if (baseDate) {
-    if (lastMs !== null && lastDate === baseDate) return { ms: lastMs, date: baseDate };
-    const createMs = parseRawTimestampMs(rec.createTime);
-    if (createMs !== null && formatUtc8Date(createMs) === baseDate) {
-      return { ms: createMs, date: baseDate };
-    }
-    return { ms: null, date: baseDate };
-  }
-  if (lastMs !== null) return { ms: lastMs, date: lastDate };
   const createMs = parseRawTimestampMs(rec.createTime);
-  if (createMs !== null) return { ms: createMs, date: formatUtc8Date(createMs) };
-  return { ms: null, date: "" };
+  const createDate = createMs !== null ? formatUtc8Date(createMs) : "";
+  if (baseDate) {
+    if (isConfirmedRecord && lastMs !== null && lastDate === baseDate) {
+      return { ms: lastMs, date: baseDate, tier: 2 };
+    }
+    if (createMs !== null && createDate === baseDate) {
+      return { ms: createMs, date: baseDate, tier: 3 };
+    }
+    return { ms: null, date: baseDate, tier: 4 };
+  }
+  if (isConfirmedRecord && lastMs !== null) {
+    return { ms: lastMs, date: lastDate, tier: 2 };
+  }
+  if (createMs !== null) {
+    return { ms: createMs, date: createDate, tier: 3 };
+  }
+  return { ms: null, date: "", tier: 5 };
+}
+
+function compareFallbackRecordTime(a, b) {
+  if (a.tier !== b.tier) return a.tier - b.tier;
+  if (a.ms !== null && b.ms !== null && a.ms !== b.ms) return a.ms - b.ms;
+  if (a.ms !== null && b.ms === null) return -1;
+  if (a.ms === null && b.ms !== null) return 1;
+  if (a.date && b.date && a.date !== b.date) return a.date < b.date ? -1 : 1;
+  return 0;
 }
 
 /**
- * 基于 S6 关联结果（含无快照的作品元数据与发布记录）收集每条内容截至 cutoffTo 的最早已知发布时间，
- * 返回带 firstPublishDate / firstPublishTime(ms) 的浅拷贝汇总行供分析层使用（不改写原 summaryRows）。
+ * 按「作品」解析发布时间优先级并汇总每条内容截至 cutoffTo 的最早已知首发时间：
+ * - 单作品优先级：平台实采 publishTime（tier 1） > 发布记录已确认发布时间 lastPublishAt（tier 2） > 记录创建时间 createTime（tier 3） > 仅日期（tier 4）
+ * - 同一作品的发布记录（直链匹配或同组同平台且日期窗 ≤2 天无冲突直链）不得覆盖该作品的平台实采 publishTime
+ * - 未匹配到已采集作品的发布记录视为独立作品（例如旧平台首发未采集、新平台后补发），继续参与内容级最早已知首发判定（补发不算新作品）
+ * - 若已采集作品缺失平台 publishTime，返回 workFallbackByPwKey 供分析用 analysisRows 补齐
  */
-function enrichSummaryRowsWithEarliestPublishTime(
+function resolveAnalysisPublishTimes(
   summaryRows,
   allContents,
   allAccountsData,
@@ -1403,56 +1469,80 @@ function enrichSummaryRowsWithEarliestPublishTime(
   cutoffTo,
   allPushRecords
 ) {
-  if (!Array.isArray(summaryRows) || summaryRows.length === 0) return [];
+  if (!Array.isArray(summaryRows) || summaryRows.length === 0) {
+    return { summaryRows: [], workFallbackByPwKey: new Map() };
+  }
   const linkMeta = link instanceof Map ? getLinkResultMeta(link) : null;
   const byWorkIdentity = linkMeta && linkMeta.byWorkIdentity ? linkMeta.byWorkIdentity : null;
   const excludedFuturePwKeys =
     linkMeta && linkMeta.excludedFuturePwKeys ? linkMeta.excludedFuturePwKeys : null;
 
-  const infoByContentKey = new Map();
-  const record = (ck, pubMs, pubDate) => {
-    if (!ck) return;
-    let info = infoByContentKey.get(ck);
-    if (!info) {
-      info = { pubMs: null, pubDate: "" };
-      infoByContentKey.set(ck, info);
-    }
-    if (pubMs !== null) {
-      const msDate = formatUtc8Date(pubMs);
-      if (!cutoffTo || msDate <= cutoffTo) {
-        if (info.pubMs === null || pubMs < info.pubMs) info.pubMs = pubMs;
-        if (!info.pubDate || msDate < info.pubDate) info.pubDate = msDate;
-      }
-    }
-    if (pubDate && isValidDateStr(pubDate) && (!cutoffTo || pubDate <= cutoffTo)) {
-      if (!info.pubDate || pubDate < info.pubDate) info.pubDate = pubDate;
-    }
-  };
-
-  // 1. 发布记录索引（日期口径）
   const contentKeySet = new Set();
   for (const c of Array.isArray(allContents) ? allContents : []) {
-    if (!isPlainObject(c) || !c.contentKey) continue;
-    const ck = String(c.contentKey);
-    contentKeySet.add(ck);
-    const rawContentDate = typeof c.firstPublishDate === "string" ? c.firstPublishDate.trim() : "";
-    const contentDate = isValidDateStr(rawContentDate) ? rawContentDate : "";
-    const rawTargets = Array.isArray(c.targets) ? c.targets.filter(isPlainObject) : [];
-    if (rawTargets.length > 0) {
-      for (const t of rawTargets) {
-        const tMs = parseRawTimestampMs(t.lastPublishAt);
-        const tMsDate = tMs !== null ? formatUtc8Date(tMs) : "";
-        const rawTDate = typeof t.recordDate === "string" ? t.recordDate.trim() : "";
-        const tDate = isValidDateStr(rawTDate) ? rawTDate : tMsDate || contentDate;
-        if (cutoffTo && tDate && tDate > cutoffTo) continue;
-        record(ck, tMs, tDate);
+    if (isPlainObject(c) && c.contentKey) contentKeySet.add(String(c.contentKey));
+  }
+
+  // 1. 收集全量已采集作品（按 platform|workId 去重，归到 S6 关联后的 contentKey）
+  const worksByContent = new Map();
+  const workByPwKey = new Map();
+  for (const acc of Array.isArray(allAccountsData) ? allAccountsData : []) {
+    if (!isPlainObject(acc)) continue;
+    const group = acc.group == null ? "" : String(acc.group).trim();
+    const rawGroup = acc.group == null ? "" : String(acc.group);
+    const platform = acc.platform == null ? "" : String(acc.platform).trim();
+    const rawPlatform = acc.platform == null ? "" : String(acc.platform);
+    for (const w of Array.isArray(acc.works) ? acc.works : []) {
+      if (!isPlainObject(w) || w.workId == null || w.workId === "") continue;
+      const workId = String(w.workId);
+      const pwKey = makeWorkIdentityKey(rawPlatform, workId);
+      if (excludedFuturePwKeys && excludedFuturePwKeys.has(pwKey)) continue;
+      const pubMs = parseRawTimestampMs(w.publishTime);
+      const pubDate = pubMs !== null ? formatUtc8Date(pubMs) : "";
+      if (cutoffTo && pubDate && pubDate > cutoffTo) continue;
+
+      const linkEntry =
+        (byWorkIdentity && byWorkIdentity.get(pwKey)) ||
+        (link instanceof Map ? link.get(makeWorkKey(rawGroup, rawPlatform, workId)) : null);
+      const ck =
+        linkEntry && linkEntry.contentKey
+          ? String(linkEntry.contentKey)
+          : `unlinked:${rawPlatform}:${workId}`;
+
+      const normUrl = normalizeDirectUrlForExport(w.url);
+      let workInfo = workByPwKey.get(pwKey);
+      if (!workInfo) {
+        workInfo = {
+          pwKey,
+          contentKey: ck,
+          platform,
+          groups: new Set(),
+          normUrl,
+          pubMs,
+          pubDate,
+          dayNum: pubDate ? dateStrToDayNum(pubDate) : null,
+          fallbackRec: null,
+        };
+        workByPwKey.set(pwKey, workInfo);
+        let arr = worksByContent.get(ck);
+        if (!arr) {
+          arr = [];
+          worksByContent.set(ck, arr);
+        }
+        arr.push(workInfo);
+      } else {
+        if (!workInfo.normUrl && normUrl) workInfo.normUrl = normUrl;
+        if (pubMs !== null && (workInfo.pubMs === null || pubMs < workInfo.pubMs)) {
+          workInfo.pubMs = pubMs;
+          workInfo.pubDate = pubDate;
+          workInfo.dayNum = dateStrToDayNum(pubDate);
+        }
       }
-    } else if (!cutoffTo || !contentDate || contentDate <= cutoffTo) {
-      record(ck, null, contentDate);
+      if (group) workInfo.groups.add(group);
     }
   }
 
-  // 1b. 从原始 pushRecords 补齐 buildContentIndex 未保留的精确毫秒时间戳（lastPublishAt / createTime）
+  // 2. 收集全部有效发布记录（与 buildContentIndex 相同口径），按 contentKey 分组
+  const recsByContent = new Map();
   if (Array.isArray(allPushRecords) && allPushRecords.length > 0 && contentKeySet.size > 0) {
     for (let idx = 0; idx < allPushRecords.length; idx++) {
       const rec = allPushRecords[idx];
@@ -1463,23 +1553,20 @@ function enrichSummaryRowsWithEarliestPublishTime(
       const status =
         typeof rec.publishStatus === "string" ? rec.publishStatus.trim().toLowerCase() : "";
       if (hasStatusField && status !== "success") continue;
-      if (!hasStatusField) {
-        const rawLink = typeof rec.videoLink === "string" ? rec.videoLink.trim() : "";
-        const repubCnt = fastNormalizeMetric(rec.republishCount);
-        const attCnt = fastNormalizeMetric(rec.publishAttemptCount);
-        const isRepub =
-          (repubCnt !== null && repubCnt > 0) ||
-          (repubCnt === null && attCnt !== null && attCnt > 1);
-        const hasDirectLink =
-          !isRepub && /^https?:\/\//i.test(rawLink) && !isManagementUrl(rawLink);
-        if (!hasDirectLink) continue;
-      }
+
+      const rawLink = typeof rec.videoLink === "string" ? rec.videoLink.trim() : "";
+      const repubCnt = fastNormalizeMetric(rec.republishCount);
+      const attCnt = fastNormalizeMetric(rec.publishAttemptCount);
+      const isRepub =
+        (repubCnt !== null && repubCnt > 0) ||
+        (repubCnt === null && attCnt !== null && attCnt > 1);
+      const normUrl = !isRepub ? normalizeDirectUrlForExport(rawLink) : "";
+      if (!hasStatusField && !normUrl) continue;
 
       const fullPath =
         normalizeFullPathForKey(rec.filePath) || normalizeFullPathForKey(rec.selectedFile);
-      const recId = typeof rec.id === "string" || typeof rec.id === "number"
-        ? String(rec.id).trim()
-        : "";
+      const recId =
+        typeof rec.id === "string" || typeof rec.id === "number" ? String(rec.id).trim() : "";
       let ck = "";
       if (fullPath) {
         const cand = `file:${fullPath.toLowerCase()}`;
@@ -1496,38 +1583,138 @@ function enrichSummaryRowsWithEarliestPublishTime(
         }
       }
       if (!ck) continue;
-      const { ms, date } = extractPushRecordTimestampMs(rec, status);
-      if (cutoffTo && date && date > cutoffTo) continue;
-      record(ck, ms, date);
+
+      const recTime = extractPushRecordPublishTime(rec, status, hasStatusField);
+      if (cutoffTo && recTime.date && recTime.date > cutoffTo) continue;
+      if (!recTime.date && recTime.ms === null) continue;
+
+      const platform = typeof rec.pt === "string" ? rec.pt.trim() : "";
+      const group = resolveRecordGroup(rec);
+      let arr = recsByContent.get(ck);
+      if (!arr) {
+        arr = [];
+        recsByContent.set(ck, arr);
+      }
+      arr.push({
+        platform,
+        group,
+        normUrl,
+        ms: recTime.ms,
+        date: recTime.date,
+        dayNum: recTime.date ? dateStrToDayNum(recTime.date) : null,
+        tier: recTime.tier,
+      });
     }
   }
 
-  // 2. 全量作品元数据（含无日快照但已关联到同一内容的首发作品）
-  for (const acc of Array.isArray(allAccountsData) ? allAccountsData : []) {
-    if (!isPlainObject(acc)) continue;
-    const group = acc.group == null ? "" : String(acc.group);
-    const platform = acc.platform == null ? "" : String(acc.platform);
-    for (const w of Array.isArray(acc.works) ? acc.works : []) {
-      if (!isPlainObject(w) || w.workId == null || w.workId === "") continue;
-      const workId = String(w.workId);
-      const pwKey = makeWorkIdentityKey(platform, workId);
-      if (excludedFuturePwKeys && excludedFuturePwKeys.has(pwKey)) continue;
-      const pubMs = parseRawTimestampMs(w.publishTime);
-      const pubDate = pubMs !== null ? formatUtc8Date(pubMs) : "";
-      if (cutoffTo && pubDate && pubDate > cutoffTo) continue;
+  // 3. 逐内容将发布记录匹配到对应作品，按「作品」决定优先级后再取内容最早已知首发时间
+  const infoByContentKey = new Map();
+  const workFallbackByPwKey = new Map();
+  const allContentKeys = new Set([...worksByContent.keys(), ...recsByContent.keys()]);
 
-      const linkEntry =
-        (byWorkIdentity && byWorkIdentity.get(pwKey)) ||
-        (link instanceof Map ? link.get(makeWorkKey(group, platform, workId)) : null);
-      const ck =
-        linkEntry && linkEntry.contentKey
-          ? String(linkEntry.contentKey)
-          : `unlinked:${platform}:${workId}`;
-      record(ck, pubMs, pubDate);
+  for (const ck of allContentKeys) {
+    const works = worksByContent.get(ck) || [];
+    const recs = recsByContent.get(ck) || [];
+    const matchedWorkPwKeys = new Set();
+    const unmatchedRecs = [];
+    const remainingRecs = [];
+
+    // Pass 1：直链精确 1:1 匹配同一作品
+    for (const rec of recs) {
+      if (rec.normUrl) {
+        const urlMatch = works.find(
+          (w) => w.normUrl && w.normUrl === rec.normUrl && (!rec.platform || w.platform === rec.platform)
+        );
+        if (urlMatch) {
+          matchedWorkPwKeys.add(urlMatch.pwKey);
+          if (
+            urlMatch.pubMs === null &&
+            (!urlMatch.fallbackRec || compareFallbackRecordTime(rec, urlMatch.fallbackRec) < 0)
+          ) {
+            urlMatch.fallbackRec = rec;
+          }
+          continue;
+        }
+      }
+      remainingRecs.push(rec);
+    }
+
+    // Pass 2：同平台同分组（无冲突直链、日期窗 ≤2 天或任一端缺日期）匹配同一作品
+    for (const rec of remainingRecs) {
+      let bestWork = null;
+      let bestUnmatched = false;
+      let bestDayDiff = Infinity;
+      for (const w of works) {
+        if (rec.platform && w.platform !== rec.platform) continue;
+        if (rec.group && w.groups.size > 0 && !w.groups.has(rec.group)) continue;
+        if (rec.normUrl && w.normUrl && rec.normUrl !== w.normUrl) continue;
+        let dayDiff = 3;
+        if (w.dayNum !== null && rec.dayNum !== null) {
+          dayDiff = Math.abs(w.dayNum - rec.dayNum);
+          if (dayDiff > 2) continue;
+        }
+        const isUnmatched = !matchedWorkPwKeys.has(w.pwKey);
+        if (
+          !bestWork ||
+          (isUnmatched && !bestUnmatched) ||
+          (isUnmatched === bestUnmatched && dayDiff < bestDayDiff)
+        ) {
+          bestWork = w;
+          bestUnmatched = isUnmatched;
+          bestDayDiff = dayDiff;
+        }
+      }
+      if (bestWork) {
+        matchedWorkPwKeys.add(bestWork.pwKey);
+        if (
+          bestWork.pubMs === null &&
+          (!bestWork.fallbackRec || compareFallbackRecordTime(rec, bestWork.fallbackRec) < 0)
+        ) {
+          bestWork.fallbackRec = rec;
+        }
+      } else {
+        unmatchedRecs.push(rec);
+      }
+    }
+
+    // 汇总本内容全部作品（已采集作品 + 未采集到的发布记录作品）的发布时间
+    const resolvedWorkTimes = [];
+    for (const w of works) {
+      if (w.pubMs !== null) {
+        // tier 1：平台实采 publishTime 优先级最高
+        resolvedWorkTimes.push({ ms: w.pubMs, date: w.pubDate });
+      } else if (w.fallbackRec) {
+        const fb = { ms: w.fallbackRec.ms, date: w.fallbackRec.date };
+        resolvedWorkTimes.push(fb);
+        workFallbackByPwKey.set(w.pwKey, fb);
+      }
+    }
+    for (const rec of unmatchedRecs) {
+      resolvedWorkTimes.push({ ms: rec.ms, date: rec.date });
+    }
+
+    let earliestDate = "";
+    for (const wt of resolvedWorkTimes) {
+      if (wt.date && (!earliestDate || wt.date < earliestDate)) {
+        earliestDate = wt.date;
+      }
+    }
+    let earliestMs = null;
+    if (earliestDate) {
+      for (const wt of resolvedWorkTimes) {
+        if (wt.date === earliestDate && wt.ms !== null) {
+          if (earliestMs === null || wt.ms < earliestMs) {
+            earliestMs = wt.ms;
+          }
+        }
+      }
+    }
+    if (earliestDate || earliestMs !== null) {
+      infoByContentKey.set(ck, { pubDate: earliestDate, pubMs: earliestMs });
     }
   }
 
-  return summaryRows.map((row) => {
+  const enrichedSummaryRows = summaryRows.map((row) => {
     if (!isPlainObject(row) || !row.contentKey) return row;
     const info = infoByContentKey.get(String(row.contentKey));
     if (!info) return row;
@@ -1535,16 +1722,33 @@ function enrichSummaryRowsWithEarliestPublishTime(
       typeof row.firstPublishDate === "string" && isValidDateStr(row.firstPublishDate.trim())
         ? row.firstPublishDate.trim()
         : "";
-    let bestDate = curDate;
-    if (info.pubDate && (!bestDate || info.pubDate < bestDate)) {
-      bestDate = info.pubDate;
-    }
     return {
       ...row,
-      firstPublishDate: bestDate,
+      firstPublishDate: info.pubDate || curDate,
       firstPublishTime: info.pubMs,
     };
   });
+
+  return { summaryRows: enrichedSummaryRows, workFallbackByPwKey };
+}
+
+function applyWorkFallbackPublishTimes(analysisRows, workFallbackByPwKey) {
+  if (!Array.isArray(analysisRows) || !(workFallbackByPwKey instanceof Map) || workFallbackByPwKey.size === 0) {
+    return;
+  }
+  for (let i = 0; i < analysisRows.length; i++) {
+    const row = analysisRows[i];
+    if (row.publishTimeMs > 0 || row.publishDate) continue;
+    const fb = workFallbackByPwKey.get(`${row.platform}|${row.workId}`);
+    if (!fb) continue;
+    if (fb.ms !== null) {
+      row.publishTimeMs = fb.ms;
+      row.publishTime = fb.ms;
+    }
+    if (fb.date) {
+      row.publishDate = fb.date;
+    }
+  }
 }
 
 /** Sheet 2: 作品跨平台汇总 */
@@ -1973,6 +2177,7 @@ function buildAnalysisSheet(analysis) {
       "D3/D1",
       "D7/D3",
       "走势分类",
+      "分类依据",
     ].map(sanitizeTextCell)
   );
   const nw = isPlainObject(a.newWorks) && Array.isArray(a.newWorks.items) ? a.newWorks.items : [];
@@ -1990,6 +2195,7 @@ function buildAnalysisSheet(analysis) {
         sanitizeNumberCell(item.d3ToD1),
         sanitizeNumberCell(item.d7ToD3),
         sanitizeTextCell(item.category),
+        sanitizeTextCell(item.classificationBasis || null),
       ]);
       continue;
     }
@@ -2005,6 +2211,7 @@ function buildAnalysisSheet(analysis) {
         sanitizeNumberCell(p.d3ToD1),
         sanitizeNumberCell(p.d7ToD3),
         sanitizeTextCell(p.category),
+        sanitizeTextCell(p.classificationBasis || null),
       ]);
     }
     if (plist.length > 1) {
@@ -2019,6 +2226,7 @@ function buildAnalysisSheet(analysis) {
         sanitizeNumberCell(item.d3ToD1),
         sanitizeNumberCell(item.d7ToD3),
         sanitizeTextCell(item.category),
+        sanitizeTextCell(item.classificationBasis || null),
       ]);
     }
   }
@@ -2479,13 +2687,13 @@ function buildSchemaSheet(dynamicSchemaEntries) {
       "分析",
       "新作品走势（D1/D3/D7与分类阈值）",
       "newWorks",
-      "周期内发布的内容（首发日取 S6 关联最早已知发布时间，补发不算新作品）按作品各自发布日（UTC+8 日历日）起算发布后第 1/3/7 天（D1/D3/D7）累计播放再汇总到平台与内容（与发布时间共用里程碑）；无该天快照取 ≤ 该天最近一次有效快照，截止日上限为 UTC+8 今天，未到第 N 天为空。分类阈值：长尾型（D7/D3 ≥ 1.5）、爆发后平稳（D3/D1 < 1.3 且 D7/D3 < 1.1）、数据不足、其它；跨平台分类仅使用在 D1/D3/D7 三个里程碑均有值的同一组平台，不存在可比平台时标「数据不足」。",
+      "周期内发布的内容（单作品发布时间优先级：平台实采 publishTime > 发布记录已确认发布时间 lastPublishAt > 记录创建时间 createTime，内容首发日取各作品最早已知首发，补发不算新作品）按作品各自发布日（UTC+8 日历日）起算发布后第 1/3/7 天（D1/D3/D7）累计播放再汇总到平台与内容（与发布时间共用里程碑）；无该天快照取 ≤ 该天最近一次有效快照，截止日上限为 UTC+8 今天，未到第 N 天为空。同行 D3/D1、D7/D3 按该行累计播放计算；分类阈值：长尾型（D7/D3 ≥ 1.5）、爆发后平稳（D3/D1 < 1.3 且 D7/D3 < 1.1）、数据不足、其它；走势分类仅使用在 D1/D3/D7 三个里程碑均有值的可比样本并在「分类依据」列注明，不存在可比样本时标「数据不足」。",
     ],
     [
       "分析",
       "发布时间",
       "publishTime",
-      "按 S6 关联最早已知发布时间（含无快照作品元数据与发布记录，UTC+8）的星期几 × 时段（0-6 / 6-12 / 12-18 / 18-24）分组，与新作品走势共用按作品发布日期计算的 D7 里程碑再汇总（不足 7 天用截至 to 的最新累计并标注）；样本 <3 的组标「样本少」。",
+      "按单作品发布时间优先级（平台实采 publishTime > 发布记录已确认发布时间 lastPublishAt > 记录创建时间 createTime）汇总出的内容最早已知首发时间（UTC+8）的星期几 × 时段（0-6 / 6-12 / 12-18 / 18-24）分组，与新作品走势共用按作品发布日期计算的 D7 里程碑再汇总（不足 7 天用截至 to 的最新累计并标注）；样本 <3 的组标「样本少」。",
     ],
     [
       "分析",
@@ -2619,7 +2827,7 @@ function buildStatsAnalysisData(options = {}, depsArg) {
   const accountDaily = collectAccountDailyRows(dataset.outputAccountsData, "", resolvedTo, {
     sortRows: false,
   });
-  const analysisSummaryRows = enrichSummaryRowsWithEarliestPublishTime(
+  const { summaryRows: analysisSummaryRows, workFallbackByPwKey } = resolveAnalysisPublishTimes(
     summaryRows,
     allContents,
     dataset.allAccountsData,
@@ -2627,6 +2835,7 @@ function buildStatsAnalysisData(options = {}, depsArg) {
     resolvedTo,
     dataset.allPushRecords
   );
+  applyWorkFallbackPublishTimes(analysisRows, workFallbackByPwKey);
 
   const analysis = buildStatsAnalysis({
     dailyRows: analysisRows,
@@ -2664,15 +2873,38 @@ function buildStatsWorkbookData(options = {}, deps) {
   );
   const maxRows = resolveMaxRows(opts.maxRows);
 
-  const dataset = loadRawDataset(opts, deps);
-  const nowVal = dataset.io.now !== undefined ? dataset.io.now : Date.now();
-  const fallbackToday = formatUtc8Date(nowVal);
+  const earlyIo = resolveIoDeps(opts, deps);
+  const earlyNowVal = earlyIo.now !== undefined ? earlyIo.now : Date.now();
+  assertExportRangeNotAllFuture(explicitFrom, explicitTo, earlyNowVal);
 
-  let resolvedTo = explicitTo || dataset.latestDataDate || fallbackToday;
-  if (!explicitTo && explicitFrom && resolvedTo < explicitFrom) {
-    resolvedTo = explicitFrom;
+  const dataset = loadRawDataset(opts, deps);
+  const nowVal = dataset.io.now !== undefined ? dataset.io.now : earlyNowVal;
+  const todayUtc8 = formatUtc8Date(nowVal);
+
+  let rawFrom;
+  let rawTo;
+  if (explicitFrom && explicitTo) {
+    rawFrom = explicitFrom;
+    rawTo = explicitTo;
+  } else if (explicitFrom && !explicitTo) {
+    rawFrom = explicitFrom;
+    rawTo = dataset.latestDataDate || todayUtc8;
+    if (rawTo < rawFrom) rawTo = rawFrom;
+  } else if (!explicitFrom && explicitTo) {
+    rawTo = explicitTo;
+    rawFrom = shiftDateStr(rawTo, -DEFAULT_RANGE_DAYS);
+  } else {
+    rawTo = dataset.latestDataDate || todayUtc8;
+    if (rawTo > todayUtc8) rawTo = todayUtc8;
+    rawFrom = shiftDateStr(rawTo, -DEFAULT_RANGE_DAYS);
   }
-  const resolvedFrom = explicitFrom || shiftDateStr(resolvedTo, -DEFAULT_RANGE_DAYS);
+
+  // 导出区间先与「≤ UTC+8 今天」取交集；交集为空直接报错
+  const resolvedFrom = rawFrom;
+  const resolvedTo = rawTo > todayUtc8 ? todayUtc8 : rawTo;
+  if (resolvedFrom > resolvedTo) {
+    throw new Error(FUTURE_DATE_RANGE_ERROR);
+  }
 
   // 构建前先计数「作品日明细」与「账号日快照」行数，超限直接拒绝，避免无谓排序与高内存占用
   const estWorkDailyRows = countWorkDailyRows(
@@ -2750,21 +2982,21 @@ function buildStatsWorkbookData(options = {}, deps) {
     { sortRows: true }
   );
   const accountDailyAoa = formatAccountDailyAoa(accountDaily.rows);
-  const analysisCutoffTo = resolvedTo > fallbackToday ? fallbackToday : resolvedTo;
-  const analysisPeriod = resolveAnalysisPeriodFromRange(resolvedFrom, analysisCutoffTo);
-  const analysisSummaryRows = enrichSummaryRowsWithEarliestPublishTime(
+  const analysisPeriod = resolveAnalysisPeriodFromRange(resolvedFrom, resolvedTo);
+  const { summaryRows: analysisSummaryRows, workFallbackByPwKey } = resolveAnalysisPublishTimes(
     summaryRows,
     allContents,
     dataset.allAccountsData,
     link,
-    analysisCutoffTo,
+    resolvedTo,
     dataset.allPushRecords
   );
+  applyWorkFallbackPublishTimes(analysisRows, workFallbackByPwKey);
   const analysis = buildStatsAnalysis({
     dailyRows: analysisRows,
     summaryRows: analysisSummaryRows,
     accountRows: accountDaily.allRows,
-    to: analysisCutoffTo,
+    to: resolvedTo,
     period: analysisPeriod,
     now: nowVal,
   });
@@ -2909,6 +3141,7 @@ module.exports = {
   SHEET_NAMES,
   MAX_SHEET_ROWS,
   ROW_LIMIT_EXCEEDED_CODE,
+  FUTURE_DATE_RANGE_ERROR,
   WORK_DAILY_HEADERS,
   SUMMARY_BASE_HEADERS,
   PLATFORM_DAILY_HEADERS,
@@ -2919,6 +3152,7 @@ module.exports = {
   sanitizeTextCell,
   sanitizeNumberCell,
   validateExportDateRange,
+  assertExportRangeNotAllFuture,
   buildDefaultExportFileName,
   resolveDefaultCutoffDate,
   resolveLinkValidationContext,

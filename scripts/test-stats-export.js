@@ -2767,10 +2767,203 @@ async function main() {
         readPushRecords: () => [],
       };
       const wbFuture = buildStatsWorkbookData({ from: "2026-11-19", to: "2026-11-29" }, s7FutureDeps);
+      assert.strictEqual(wbFuture.from, "2026-11-19");
+      assert.strictEqual(wbFuture.to, "2026-11-20", "导出区间与 ≤ UTC+8 今天取交集后 to 应为 2026-11-20");
+      assert.strictEqual(wbFuture.analysisPeriod, 2, "交集为 11/19~11/20 共 2 天，analysisPeriod 应为 2");
       assert.strictEqual(wbFuture.analysis.to, "2026-11-20");
       assert.strictEqual(wbFuture.analysis.newWorks.items[0].d3Play, null);
       assert.strictEqual(wbFuture.analysis.newWorks.items[0].d7Play, null);
       console.log("✓ S7-fix 导出同步校验(testS7FixExportAnalysisSync) 通过");
+    }
+
+    /* ---------- 12. S7-r3#1 & #3 专项回归：走势表同行倍数+分类依据同步 Excel、未来日期交集校验 ---------- */
+    {
+      // testS7r3ExportDateRangeIntersectTodayAndRejectFuture（评审 S7-review2 #3：当前 11/20，作品 11/19=100、11/20=250，选 11/21 单日）
+      const r3FutureDeps = {
+        now: Date.parse("2026-11-20T10:00:00+08:00"),
+        listAccounts: () => [{ group: "创作组", platform: "抖音" }],
+        readWorks: () => [
+          {
+            workId: "R3_F1",
+            title: "未来日期导出校验",
+            publishTime: Date.parse("2026-11-18T10:00:00+08:00"),
+          },
+        ],
+        readWorksDaily: () => ({
+          R3_F1: {
+            "2026-11-19": { play: 100 },
+            "2026-11-20": { play: 250 },
+          },
+        }),
+        readDaily: () => ({}),
+        readPushRecords: () => [],
+      };
+
+      // 1) 选明天单日（11/21 ~ 11/21）→ 交集为空 → 报错「所选日期都在未来」，不生成文件
+      assert.throws(
+        () => buildStatsWorkbookData({ from: "2026-11-21", to: "2026-11-21" }, r3FutureDeps),
+        (err) => err && err.message === "所选日期都在未来",
+        "S7-r3#3: 仅选未来单日 11/21 必须报错「所选日期都在未来」"
+      );
+      // 2) 全在未来的多日区间、仅 from 在未来、仅 to 远在未来（to-29 > today）均报错「所选日期都在未来」
+      for (const badRange of [
+        { from: "2026-11-21", to: "2026-11-25" },
+        { from: "2026-11-21" },
+        { to: "2026-12-31" },
+      ]) {
+        assert.throws(
+          () => buildStatsWorkbookData(badRange, r3FutureDeps),
+          (err) => err && err.message === "所选日期都在未来",
+          `S7-r3#3: 全未来区间 ${JSON.stringify(badRange)} 必须报错「所选日期都在未来」`
+        );
+      }
+
+      // 3) IPC 层选 11/21 单日 → 直接返回 { ok: false, message: "所选日期都在未来" }，不弹保存框、不生成文件
+      const beforeDialogsR3 = saveDialogCalls.length;
+      const neverWrittenFile = path.join(tmpRoot, "r3-future-never-written.xlsx");
+      registerDataStatsIpc({ exportDeps: r3FutureDeps });
+      const r3ExportHandler = ipcHandlers.get("stats:export-xlsx");
+      mockDialogResult = { canceled: false, filePath: neverWrittenFile };
+      const ipcFutureRes = await r3ExportHandler(
+        { sender: {}, senderFrame: { url: "file:///app/index.html" } },
+        { from: "2026-11-21", to: "2026-11-21" }
+      );
+      assert.strictEqual(ipcFutureRes.ok, false);
+      assert.strictEqual(ipcFutureRes.message, "所选日期都在未来");
+      assert.strictEqual(saveDialogCalls.length, beforeDialogsR3, "S7-r3#3: 全未来区间不得弹出保存框");
+      assert.strictEqual(fs.existsSync(neverWrittenFile), false, "S7-r3#3: 全未来区间不得生成文件");
+
+      // 4) 部分跨未来区间：11/19 ~ 11/25 与 ≤11/20 取交集 → 11/19 ~ 11/20，analysisPeriod=2，新增播放 150
+      const wbIntersect2 = buildStatsWorkbookData(
+        { from: "2026-11-19", to: "2026-11-25" },
+        r3FutureDeps
+      );
+      assert.strictEqual(wbIntersect2.from, "2026-11-19");
+      assert.strictEqual(wbIntersect2.to, "2026-11-20");
+      assert.strictEqual(wbIntersect2.analysisPeriod, 2);
+      assert.strictEqual(wbIntersect2.analysis.to, "2026-11-20");
+      assert.strictEqual(wbIntersect2.analysis.period, 2);
+      assert.strictEqual(wbIntersect2.analysis.overview.metrics.play.current, 150);
+      const intersectMetaMap = new Map(
+        wbIntersect2.sheets["导出信息"].slice(1).map((r) => [r[0], r[1]])
+      );
+      assert.strictEqual(intersectMetaMap.get("日期范围"), "2026-11-19 ~ 2026-11-20");
+      assert.strictEqual(intersectMetaMap.get("analysisPeriod"), 2);
+
+      // 5) 跨未来且交集超过 30 天（10/01 ~ 11/25 → 交集 51 天）→ analysisPeriod 上限 30
+      const wbIntersectCap = buildStatsWorkbookData(
+        { from: "2026-10-01", to: "2026-11-25" },
+        r3FutureDeps
+      );
+      assert.strictEqual(wbIntersectCap.from, "2026-10-01");
+      assert.strictEqual(wbIntersectCap.to, "2026-11-20");
+      assert.strictEqual(wbIntersectCap.analysisPeriod, 30);
+
+      // 6) GUI 导出日期选择器同步绑定禁选未来日期 picker-options
+      const vueSrc = fs.readFileSync(
+        path.resolve(__dirname, "../src/renderer/views/dataStats/index.vue"),
+        "utf8"
+      );
+      const exportPickerMatch = vueSrc.match(/class="export-date-picker"[\s\S]*?\/>/);
+      assert.ok(
+        exportPickerMatch && exportPickerMatch[0].includes(':picker-options="analysisDatePickerOptions"'),
+        "S7-r3#3: 导出日期选择器应绑定禁选 UTC+8 未来日期的 picker-options"
+      );
+      console.log("✓ S7-r3#3(testS7r3ExportDateRangeIntersectTodayAndRejectFuture) 通过");
+
+      // testS7r3ExportTrajectoryExcelSync（评审 S7-review2 #1：Excel「分析」sheet 同行倍数与分类依据列同步）
+      const pubMs = Date.parse("2026-11-01T10:00:00+08:00");
+      const r3TrajDeps = {
+        now: Date.parse("2026-11-20T10:00:00+08:00"),
+        listAccounts: () => [
+          { group: "账号一", platform: "抖音" },
+          { group: "账号二", platform: "抖音" },
+          { group: "创作组", platform: "抖音" },
+          { group: "创作组", platform: "快手" },
+        ],
+        readWorks: (g, p) => {
+          if (g === "账号一" && p === "抖音") {
+            return [{ workId: "M_DY1", title: "双号同款走势", publishTime: pubMs }];
+          }
+          if (g === "账号二" && p === "抖音") {
+            return [{ workId: "M_DY2", title: "双号同款走势", publishTime: pubMs }];
+          }
+          if (g === "创作组" && p === "抖音") {
+            return [{ workId: "C_DY", title: "跨平台走势", url: "https://www.douyin.com/video/cdy", publishTime: pubMs }];
+          }
+          if (g === "创作组" && p === "快手") {
+            return [{ workId: "C_KS", title: "跨平台走势", url: "https://www.kuaishou.com/short-video/cks", publishTime: pubMs }];
+          }
+          return [];
+        },
+        readWorksDaily: (g, p) => {
+          if (g === "账号一" && p === "抖音") {
+            return { M_DY1: { "2026-11-02": { play: 100 }, "2026-11-04": { play: 100 }, "2026-11-08": { play: 100 } } };
+          }
+          if (g === "账号二" && p === "抖音") {
+            return { M_DY2: { "2026-11-08": { play: 200 } } };
+          }
+          if (g === "创作组" && p === "抖音") {
+            return { C_DY: { "2026-11-02": { play: 100 }, "2026-11-04": { play: 100 }, "2026-11-08": { play: 100 } } };
+          }
+          if (g === "创作组" && p === "快手") {
+            return { C_KS: { "2026-11-08": { play: 200 } } };
+          }
+          return {};
+        },
+        readDaily: () => ({}),
+        readPushRecords: () => [],
+        readLinkOverrides: () => ({
+          version: 1,
+          updatedAt: Date.parse("2026-11-08T12:00:00+08:00"),
+          contents: {
+            "manual:r3_dual_dy": { title: "双号同款走势", createdAt: Date.parse("2026-11-08T12:00:00+08:00") },
+          },
+          excludedAuto: {},
+          overrides: {
+            "抖音|M_DY1": { action: "assign", contentKey: "manual:r3_dual_dy" },
+            "抖音|M_DY2": { action: "assign", contentKey: "manual:r3_dual_dy" },
+          },
+        }),
+      };
+      const wbTraj = buildStatsWorkbookData({ to: "2026-11-08" }, r3TrajDeps);
+      const trajSheet = wbTraj.sheets["分析"];
+      const trajHeader = trajSheet.find((r) => r[0] === "内容ID" && r[4] === "D1播放");
+      assert.deepStrictEqual(
+        trajHeader,
+        ["内容ID", "标题", "平台", "发布日期", "D1播放", "D3播放", "D7播放", "D3/D1", "D7/D3", "走势分类", "分类依据"]
+      );
+      // 跨平台「全平台合计」行：D1=100, D3=100, D7=300, D3/D1=1, D7/D3=3（不再是 1），分类=爆发后平稳，分类依据=抖音
+      const crossTotalRow = trajSheet.find((r) => r[1] === "跨平台走势" && r[2] === "全平台合计");
+      assert.ok(crossTotalRow, "Excel 分析 sheet 应有跨平台全平台合计行");
+      assert.strictEqual(crossTotalRow[4], 100);
+      assert.strictEqual(crossTotalRow[5], 100);
+      assert.strictEqual(crossTotalRow[6], 300);
+      assert.strictEqual(crossTotalRow[7], 1);
+      assert.strictEqual(crossTotalRow[8], 3);
+      assert.strictEqual(crossTotalRow[9], "爆发后平稳");
+      assert.strictEqual(crossTotalRow[10], "抖音");
+
+      // 双抖音号合并行：D1=100, D3=100, D7=300, D3/D1=1, D7/D3=3，分类=爆发后平稳，分类依据=抖音（1/2条）
+      const dualDyRow = trajSheet.find((r) => r[0] === "manual:r3_dual_dy" && r[2] === "抖音");
+      assert.ok(dualDyRow, "Excel 分析 sheet 应有双抖音号合并行");
+      assert.strictEqual(dualDyRow[4], 100);
+      assert.strictEqual(dualDyRow[5], 100);
+      assert.strictEqual(dualDyRow[6], 300);
+      assert.strictEqual(dualDyRow[7], 1);
+      assert.strictEqual(dualDyRow[8], 3);
+      assert.strictEqual(dualDyRow[9], "爆发后平稳");
+      assert.strictEqual(dualDyRow[10], "抖音（1/2条）");
+
+      // 写出并读回验证数字单元格与分类依据文本列
+      const r3TrajXlsx = path.join(tmpRoot, "r3-traj-sync.xlsx");
+      writeStatsXlsx(wbTraj, r3TrajXlsx);
+      const readTrajWb = xlsx.readFile(r3TrajXlsx);
+      const readTrajRows = xlsx.utils.sheet_to_json(readTrajWb.Sheets["分析"], { header: 1 });
+      const readCrossRow = readTrajRows.find((r) => r[1] === "跨平台走势" && r[2] === "全平台合计");
+      assert.strictEqual(readCrossRow[8], 3);
+      assert.strictEqual(readCrossRow[10], "抖音");
+      console.log("✓ S7-r3#1(testS7r3ExportTrajectoryExcelSync) 通过");
     }
 
     // 恢复 require.cache

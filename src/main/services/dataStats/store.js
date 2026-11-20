@@ -118,10 +118,59 @@ function pickStats(w) {
   return out;
 }
 
+const NAIVE_PUBLISH_TIME_RE =
+  /^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[T\s]+(\d{1,2}):(\d{1,2})(?::(\d{1,2})(?:\.(\d{1,3}))?)?)?$/;
+const TZ_SUFFIX_RE = /(?:[Zz]|[+-]\d{2}:?\d{2})$/;
+
+function parseValidPublishTime(raw) {
+  if (raw == null || raw === "") return null;
+  let ms = NaN;
+  if (typeof raw === "number") {
+    ms = raw;
+  } else if (raw instanceof Date) {
+    ms = raw.getTime();
+  } else if (typeof raw === "string") {
+    const s = raw.trim();
+    if (!s) return null;
+    if (/^\d+$/.test(s)) {
+      ms = Number(s);
+    } else if (TZ_SUFFIX_RE.test(s)) {
+      ms = Date.parse(s.replace(/\//g, "-").replace(" ", "T"));
+    } else {
+      const m = NAIVE_PUBLISH_TIME_RE.exec(s);
+      if (m) {
+        const y = Number(m[1]);
+        const mo = Number(m[2]);
+        const d = Number(m[3]);
+        const hh = m[4] ? Number(m[4]) : 0;
+        const mm = m[5] ? Number(m[5]) : 0;
+        const ss = m[6] ? Number(m[6]) : 0;
+        const frac = m[7] ? Number(m[7].padEnd(3, "0")) : 0;
+        if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31 && hh <= 23 && mm <= 59 && ss <= 59) {
+          const utcMs = Date.UTC(y, mo - 1, d, hh, mm, ss, frac);
+          const check = new Date(utcMs);
+          if (
+            check.getUTCFullYear() === y &&
+            check.getUTCMonth() === mo - 1 &&
+            check.getUTCDate() === d
+          ) {
+            ms = utcMs - 8 * 3600e3;
+          }
+        }
+      } else {
+        ms = Date.parse(s);
+      }
+    }
+  }
+  if (!Number.isFinite(ms) || ms <= 0) return null;
+  if (!Number.isFinite(new Date(ms).getTime())) return null;
+  return ms;
+}
+
 /**
  * 合并作品列表，实现「发布增长」口径：
  * - 新出现的作品：登记基线（首次见到时的值），并封闭「比它早且尚未封闭」的最近一条
- * - 已有作品：更新当前累计值
+ * - 已有作品：更新当前累计值；若重采得到有效 publishTime（>0 且可解析）同步更新
  * - 展示时优先用封闭值（closedStats），未封闭用当前值
  */
 function mergeWorks(group, platform, newWorks, now = Date.now()) {
@@ -134,14 +183,16 @@ function mergeWorks(group, platform, newWorks, now = Date.now()) {
   // 接口返回按发布时间倒序；先升序处理，便于「上一条」封闭逻辑
   const sorted = [...(newWorks || [])]
     .filter((w) => w && w.workId)
-    .sort((a, b) => (a.publishTime || 0) - (b.publishTime || 0));
+    .sort((a, b) => (parseValidPublishTime(a.publishTime) || 0) - (parseValidPublishTime(b.publishTime) || 0));
 
   for (const w of sorted) {
+    const validPubTime = parseValidPublishTime(w.publishTime);
     const existing = byId.get(w.workId);
     if (existing) {
       Object.assign(existing, pickStats(w), { updatedAt: now });
       if (w.title) existing.title = w.title;
       if (w.url) existing.url = w.url;
+      if (validPubTime !== null) existing.publishTime = validPubTime;
       if (Array.isArray(w.altTitles)) {
         existing.altTitles = normalizeAltTitles(w.altTitles);
       } else if (!Array.isArray(existing.altTitles)) {
@@ -150,9 +201,10 @@ function mergeWorks(group, platform, newWorks, now = Date.now()) {
       continue;
     }
     // 新作品：封闭比它早的最近一条未封闭作品（仅非首次导入时）
+    const newPubTime = validPubTime !== null ? validPubTime : 0;
     if (!isFirstImport) {
       const earlier = data.works
-        .filter((x) => !x.closedStats && (x.publishTime || 0) < (w.publishTime || 0))
+        .filter((x) => !x.closedStats && (x.publishTime || 0) < newPubTime)
         .sort((a, b) => (b.publishTime || 0) - (a.publishTime || 0))[0];
       if (earlier) {
         earlier.closedStats = pickStats(earlier);
@@ -164,7 +216,7 @@ function mergeWorks(group, platform, newWorks, now = Date.now()) {
       title: w.title || "(无标题)",
       altTitles: normalizeAltTitles(w.altTitles),
       url: w.url || "",
-      publishTime: w.publishTime || 0,
+      publishTime: newPubTime,
       ...pickStats(w),
       baselineStats: pickStats(w),
       closedStats: null,

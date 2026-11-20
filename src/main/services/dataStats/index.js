@@ -36,6 +36,7 @@ const {
 } = require("./contentLink");
 const {
   validateExportDateRange,
+  assertExportRangeNotAllFuture,
   buildDefaultExportFileName,
   resolveLinkValidationContext,
   buildContentSummaryData,
@@ -882,10 +883,17 @@ function registerDataStatsIpc(options = {}) {
         return { ok: false, message: "导出参数无效" };
       }
       const payload = args || {};
-      // 纯参数校验（不读任何数据）：日期非法或 from > to 直接拒绝，不弹保存框
+      // 纯参数校验（不读任何数据）：日期非法、from > to 或所选日期都在未来时直接拒绝，不弹保存框
       const { from: validFrom, to: validTo } = validateExportDateRange(
         payload.from,
         payload.to
+      );
+      const exportNow =
+        exportDeps && exportDeps.now !== undefined ? exportDeps.now : Date.now();
+      const { from: effectiveFrom, to: effectiveTo } = assertExportRangeNotAllFuture(
+        validFrom,
+        validTo,
+        exportNow
       );
 
       const { BrowserWindow, dialog, app } = electron;
@@ -896,7 +904,7 @@ function registerDataStatsIpc(options = {}) {
       if (!win) return { ok: false, message: "窗口已关闭" };
 
       // 先弹保存对话框，用户取消则不读任何数据
-      const defaultName = buildDefaultExportFileName(validFrom, validTo);
+      const defaultName = buildDefaultExportFileName(effectiveFrom, effectiveTo);
       const result = await dialog.showSaveDialog(win, {
         title: "导出作品数据 Excel",
         defaultPath: path.join(app.getPath("documents"), defaultName),

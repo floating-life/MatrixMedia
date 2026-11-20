@@ -10,6 +10,7 @@
           size="small"
           class="export-date-picker"
           value-format="yyyy-MM-dd"
+          :picker-options="analysisDatePickerOptions"
           range-separator="至"
           start-placeholder="默认近30天"
           end-placeholder="默认最新日"
@@ -1040,52 +1041,73 @@
                             </span>
                           </template>
                         </el-table-column>
-                        <el-table-column label="分类" width="106">
+                        <el-table-column label="分类" width="102">
                           <template #default="{ row: p }">
                             <el-tag :type="trajectoryTagType(p.category)" size="mini">
                               {{ p.category }}
                             </el-tag>
                           </template>
                         </el-table-column>
+                        <el-table-column label="分类依据" min-width="116" show-overflow-tooltip>
+                          <template #default="{ row: p }">
+                            <span :class="{ muted: !p.classificationBasis }">
+                              {{ p.classificationBasis || "-" }}
+                            </span>
+                          </template>
+                        </el-table-column>
                       </el-table>
                     </div>
                   </template>
                 </el-table-column>
-                <el-table-column prop="title" label="内容标题" min-width="190" show-overflow-tooltip />
+                <el-table-column prop="title" label="内容标题" min-width="180" show-overflow-tooltip />
                 <el-table-column prop="publishDate" label="首发日期" width="102" />
-                <el-table-column label="D1 播放" align="right" width="92">
+                <el-table-column label="D1 播放" align="right" width="90">
                   <template #default="{ row }">
                     <span class="num" :class="{ muted: row.d1Play == null }">
                       {{ showNum(row.d1Play) }}
                     </span>
                   </template>
                 </el-table-column>
-                <el-table-column label="D3 播放" align="right" width="92">
+                <el-table-column label="D3 播放" align="right" width="90">
                   <template #default="{ row }">
                     <span class="num" :class="{ muted: row.d3Play == null }">
                       {{ showNum(row.d3Play) }}
                     </span>
                   </template>
                 </el-table-column>
-                <el-table-column label="D7 播放" align="right" width="92">
+                <el-table-column label="D7 播放" align="right" width="90">
                   <template #default="{ row }">
                     <span class="num" :class="{ muted: row.d7Play == null }">
                       {{ showNum(row.d7Play) }}
                     </span>
                   </template>
                 </el-table-column>
-                <el-table-column label="D7/D3" align="right" width="78">
+                <el-table-column label="D3/D1" align="right" width="74">
+                  <template #default="{ row }">
+                    <span class="num" :class="{ muted: row.d3ToD1 == null }">
+                      {{ row.d3ToD1 != null ? row.d3ToD1 + "x" : "-" }}
+                    </span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="D7/D3" align="right" width="74">
                   <template #default="{ row }">
                     <span class="num" :class="{ muted: row.d7ToD3 == null }">
                       {{ row.d7ToD3 != null ? row.d7ToD3 + "x" : "-" }}
                     </span>
                   </template>
                 </el-table-column>
-                <el-table-column label="分类" width="106">
+                <el-table-column label="分类" width="102">
                   <template #default="{ row }">
                     <el-tag :type="trajectoryTagType(row.category)" size="mini">
                       {{ row.category }}
                     </el-tag>
+                  </template>
+                </el-table-column>
+                <el-table-column label="分类依据" min-width="120" show-overflow-tooltip>
+                  <template #default="{ row }">
+                    <span :class="{ muted: !row.classificationBasis }">
+                      {{ row.classificationBasis || "-" }}
+                    </span>
                   </template>
                 </el-table-column>
                 <template #empty>
