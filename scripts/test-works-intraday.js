@@ -723,6 +723,460 @@ async function main() {
       assert.deepStrictEqual(okRes.totalPlayDelta, intra3.totalPlayDelta);
       console.log("✓ 7. buildContentIntradayData、stats:get-content-intraday 与汇总关联及 lastCollectedAt 一致");
     }
+
+    /* ---------- 8. S9-fix #4/#5/#6/#7 专项回归（使用评审时刻与数字，修前失败、修后通过） ---------- */
+    {
+      // testS9Fix4_PersistedRetentionDaysAcrossRestartAndAllEntries
+      // 评审 #4：已保存 retentionDays=90 并关闭自动采集，重启后首次手动同步不得按 60 天删除 70 天前分时快照
+      {
+        const fix4Root = fs.mkdtempSync(path.join(os.tmpdir(), "mm-s9fix4-"));
+        const origGetPath = require.cache[electronId].exports.app.getPath;
+        const origHandle = require.cache[electronId].exports.ipcMain.handle;
+        const origCollector = require.cache[collectorId].exports.collectAccount;
+        const origDateNow = Date.now;
+        const fix4Handlers = new Map();
+        const tToday = cnTime(2026, 11, 20, 11, 0, 0);
+        try {
+          require.cache[electronId].exports.app.getPath = (name) =>
+            name === "documents" ? docsDir : fix4Root;
+          require.cache[electronId].exports.ipcMain.handle = (ch, fn) => fix4Handlers.set(ch, fn);
+          require.cache[collectorId].exports.collectAccount = async () => ({
+            overview: { plays: 100 },
+            fansHistory: [],
+            works: [{ workId: "R4_W1", title: "保留期测试", play: 100 }],
+          });
+          Date.now = () => tToday;
+
+          delete require.cache[storeId];
+          delete require.cache[indexId];
+          const store4a = require(storeId);
+          require(indexId).registerDataStatsIpc();
+
+          // 预置 70 天前（2026-09-11）和 95 天前（2026-08-17）分时快照
+          const dir4 = store4a.worksIntradayDir("保留组", "抖音");
+          fs.mkdirSync(dir4, { recursive: true });
+          const oldSnap = (d) =>
+            JSON.stringify({
+              date: d,
+              slots: { "10:00": { collectedAt: cnTime(2026, 9, 1, 10, 0), works: { R4_W1: { play: 10 } } } },
+            });
+          fs.writeFileSync(path.join(dir4, "2026-09-11.json"), oldSnap("2026-09-11")); // 70 天前
+          fs.writeFileSync(path.join(dir4, "2026-08-17.json"), oldSnap("2026-08-17")); // 95 天前
+
+          // 保存 retentionDays=90 并关闭自动采集（验证落盘在与 auto-run.json 同目录）
+          const saveRes = await fix4Handlers.get("stats:save-auto-settings")(
+            { senderFrame: { url: "file:///app/index.html" } },
+            { enabled: false, mode: "daily", retentionDays: 90 }
+          );
+          assert.strictEqual(saveRes.ok, true);
+          assert.strictEqual(saveRes.settings.retentionDays, 90);
+          assert.strictEqual(
+            path.dirname(store4a.autoSettingsFile()),
+            path.dirname(store4a.autoRunFile()),
+            "retentionDays 设置文件须与 auto-run.json 同目录"
+          );
+          assert.strictEqual(fs.existsSync(store4a.autoSettingsFile()), true);
+
+          // 模拟进程重启：清 require.cache 并重新注册 IPC，直接手动同步（不传 retentionDays）
+          fix4Handlers.clear();
+          delete require.cache[storeId];
+          delete require.cache[indexId];
+          require(indexId).registerDataStatsIpc();
+
+          const colRes = await fix4Handlers.get("stats:collect")(
+            { sender: { send: () => {} } },
+            { accounts: [{ group: "保留组", platform: "抖音", partition: "persist:r4-dy" }], trigger: "manual" }
+          );
+          assert.strictEqual(colRes.results[0].success, true);
+          assert.strictEqual(
+            fs.existsSync(path.join(dir4, "2026-09-11.json")),
+            true,
+            "重启后手动同步必须沿用持久化 retentionDays=90，不得删除 70 天前快照"
+          );
+          assert.strictEqual(
+            fs.existsSync(path.join(dir4, "2026-08-17.json")),
+            false,
+            "超过 90 天的 95 天前快照应被清理"
+          );
+
+          // stats:match-works 入口同样共用持久化 retentionDays=90
+          const dir4b = store4a.worksIntradayDir("匹配保留组", "快手");
+          fs.mkdirSync(dir4b, { recursive: true });
+          fs.writeFileSync(path.join(dir4b, "2026-09-11.json"), oldSnap("2026-09-11")); // 70 天前
+          fs.writeFileSync(path.join(dir4b, "2026-08-17.json"), oldSnap("2026-08-17")); // 95 天前
+          await fix4Handlers.get("stats:match-works")(
+            {},
+            {
+              tasks: [
+                { key: "k1", group: "匹配保留组", platform: "快手", partition: "persist:r4-ks", title: "保留期测试" },
+              ],
+            }
+          );
+          assert.strictEqual(fs.existsSync(path.join(dir4b, "2026-09-11.json")), true, "match-works 须共用 retentionDays=90");
+          assert.strictEqual(fs.existsSync(path.join(dir4b, "2026-08-17.json")), false);
+
+          // 未设置过的新 userData 目录回退默认 60 天（删除 65 天前，保留 55 天前）
+          const defaultRoot = fs.mkdtempSync(path.join(os.tmpdir(), "mm-s9fix4-def-"));
+          try {
+            require.cache[electronId].exports.app.getPath = (name) =>
+              name === "documents" ? docsDir : defaultRoot;
+            fix4Handlers.clear();
+            delete require.cache[storeId];
+            delete require.cache[indexId];
+            const storeDef = require(storeId);
+            require(indexId).registerDataStatsIpc();
+            const dirDef = storeDef.worksIntradayDir("默认组", "抖音");
+            fs.mkdirSync(dirDef, { recursive: true });
+            fs.writeFileSync(path.join(dirDef, "2026-09-16.json"), oldSnap("2026-09-16")); // 65 天前 → 删
+            fs.writeFileSync(path.join(dirDef, "2026-09-26.json"), oldSnap("2026-09-26")); // 55 天前 → 留
+            await fix4Handlers.get("stats:collect")(
+              { sender: { send: () => {} } },
+              { accounts: [{ group: "默认组", platform: "抖音", partition: "persist:def-dy" }], trigger: "manual" }
+            );
+            assert.strictEqual(fs.existsSync(path.join(dirDef, "2026-09-16.json")), false, "未设置 retentionDays 默认 60 天，65 天前应清理");
+            assert.strictEqual(fs.existsSync(path.join(dirDef, "2026-09-26.json")), true, "55 天前应保留");
+          } finally {
+            fs.rmSync(defaultRoot, { recursive: true, force: true });
+          }
+        } finally {
+          Date.now = origDateNow;
+          require.cache[electronId].exports.app.getPath = origGetPath;
+          require.cache[electronId].exports.ipcMain.handle = origHandle;
+          require.cache[collectorId].exports.collectAccount = origCollector;
+          delete require.cache[storeId];
+          delete require.cache[indexId];
+          fs.rmSync(fix4Root, { recursive: true, force: true });
+        }
+        console.log("✓ [S9-fix #4] testS9Fix4_PersistedRetentionDaysAcrossRestartAndAllEntries 通过");
+      }
+
+      // testS9Fix5_MidnightGuardCoversMergeDailyToIntraday
+      // 评审 #5：采集在零点前返回，mergeDaily 跨过零点后，整次放弃写入（不改写昨日 daily/works/works-daily/works-intraday）并 warn
+      {
+        const fix5Root = fs.mkdtempSync(path.join(os.tmpdir(), "mm-s9fix5-"));
+        const origGetPath = require.cache[electronId].exports.app.getPath;
+        const origHandle = require.cache[electronId].exports.ipcMain.handle;
+        const origCollector = require.cache[collectorId].exports.collectAccount;
+        const origDateNow = Date.now;
+        const origFsync = fs.fsyncSync;
+        const fix5Handlers = new Map();
+        try {
+          require.cache[electronId].exports.app.getPath = (name) =>
+            name === "documents" ? docsDir : fix5Root;
+          require.cache[electronId].exports.ipcMain.handle = (ch, fn) => fix5Handlers.set(ch, fn);
+          require.cache[collectorId].exports.collectAccount = async () => ({
+            overview: { plays: 999, fans: 99 },
+            fansHistory: [],
+            works: [{ workId: "M5", title: "原片", play: 999 }],
+          });
+          delete require.cache[storeId];
+          delete require.cache[indexId];
+          const store5 = require(storeId);
+          require(indexId).registerDataStatsIpc();
+
+          const g = "跨零点全链路组";
+          const p = "抖音";
+          const tInit = cnTime(2026, 11, 20, 22, 0, 0);
+          Date.now = () => tInit;
+          store5.mergeDaily(g, p, { plays: 100, fans: 10 }, [], tInit);
+          store5.mergeWorks(g, p, [{ workId: "M5", title: "原片", play: 100 }], tInit, {
+            slot: "2026-11-20 22:00",
+          });
+
+          const accDir = path.join(fix5Root, "data-stats", g, p);
+          const dailyJsonFile = path.join(accDir, "daily.json");
+          const worksJsonFile = path.join(accDir, "works.json");
+          const worksDailyFile = path.join(accDir, "works-daily", "2026-11-20.json");
+          const worksIntradayFile = path.join(accDir, "works-intraday", "2026-11-20.json");
+
+          const beforeDaily = fs.readFileSync(dailyJsonFile);
+          const beforeWorks = fs.readFileSync(worksJsonFile);
+          const beforeWD = fs.readFileSync(worksDailyFile);
+          const beforeWI = fs.readFileSync(worksIntradayFile);
+
+          // 情形 A：collectAccount 在 23:59:59 返回，mergeDaily 落盘 fsync 期间时钟跨过零点到 2026-11-21 00:00:02
+          let mockNow = cnTime(2026, 11, 20, 23, 59, 59);
+          Date.now = () => mockNow;
+          let bumped = false;
+          fs.fsyncSync = function (fd) {
+            origFsync.call(this, fd);
+            if (!bumped) {
+              bumped = true;
+              mockNow = cnTime(2026, 11, 21, 0, 0, 2);
+            }
+          };
+
+          const { res: r5a, warns: warns5a } = await captureWarns(() =>
+            fix5Handlers.get("stats:collect")(
+              { sender: { send: () => {} } },
+              { accounts: [{ group: g, platform: p, partition: "persist:m5-a" }], trigger: "manual" }
+            )
+          );
+          fs.fsyncSync = origFsync;
+
+          assert.strictEqual(r5a.results[0].dayRolled, true);
+          assert.ok(warns5a.some((w) => w.includes("跨过零点")), "跨零点放弃写入必须 warn");
+          assert.strictEqual(Buffer.compare(fs.readFileSync(dailyJsonFile), beforeDaily), 0, "跨零点不得改写 daily.json");
+          assert.strictEqual(Buffer.compare(fs.readFileSync(worksJsonFile), beforeWorks), 0, "跨零点不得改写 works.json");
+          assert.strictEqual(Buffer.compare(fs.readFileSync(worksDailyFile), beforeWD), 0, "跨零点不得改写昨日 works-daily");
+          assert.strictEqual(Buffer.compare(fs.readFileSync(worksIntradayFile), beforeWI), 0, "跨零点不得向昨日 works-intraday 写新记录");
+          assert.strictEqual(fs.readdirSync(accDir).some((f) => f.endsWith(".tmp")), false);
+          assert.strictEqual(fs.readdirSync(path.dirname(worksDailyFile)).some((f) => f.endsWith(".tmp")), false);
+          assert.strictEqual(fs.readdirSync(path.dirname(worksIntradayFile)).some((f) => f.endsWith(".tmp")), false);
+
+          // 情形 B：mergeDaily 完成后、mergeWorks 开始前已跨零点 → mergeWorks/works-daily/works-intraday 全部放弃并 warn
+          mockNow = cnTime(2026, 11, 20, 23, 59, 59);
+          const origMergeDaily = store5.mergeDaily;
+          store5.mergeDaily = (...args) => {
+            const out = origMergeDaily(...args);
+            mockNow = cnTime(2026, 11, 21, 0, 0, 2);
+            return out;
+          };
+          const { res: r5b, warns: warns5b } = await captureWarns(() =>
+            fix5Handlers.get("stats:collect")(
+              { sender: { send: () => {} } },
+              { accounts: [{ group: g, platform: p, partition: "persist:m5-b" }], trigger: "manual" }
+            )
+          );
+          store5.mergeDaily = origMergeDaily;
+          assert.strictEqual(r5b.results[0].dayRolled, true);
+          assert.ok(warns5b.some((w) => w.includes("跨过零点")));
+          assert.strictEqual(Buffer.compare(fs.readFileSync(worksJsonFile), beforeWorks), 0, "mergeDaily 后跨零点不得改写 works.json");
+          assert.strictEqual(Buffer.compare(fs.readFileSync(worksDailyFile), beforeWD), 0, "mergeDaily 后跨零点不得改写昨日 works-daily");
+          assert.strictEqual(Buffer.compare(fs.readFileSync(worksIntradayFile), beforeWI), 0, "mergeDaily 后跨零点不得改写昨日 works-intraday");
+        } finally {
+          fs.fsyncSync = origFsync;
+          Date.now = origDateNow;
+          require.cache[electronId].exports.app.getPath = origGetPath;
+          require.cache[electronId].exports.ipcMain.handle = origHandle;
+          require.cache[collectorId].exports.collectAccount = origCollector;
+          delete require.cache[storeId];
+          delete require.cache[indexId];
+          fs.rmSync(fix5Root, { recursive: true, force: true });
+        }
+        console.log("✓ [S9-fix #5] testS9Fix5_MidnightGuardCoversMergeDailyToIntraday 通过");
+      }
+
+      // testS9Fix6_IntradayTrendAndRowsSortByActualCollectedAt
+      // 评审 #6：10:30 自动槽在 10:31 采到 100 播放，10:40 手动采到 150（归入 10:00）；按实际 collectedAt 排序 → 增量 +50、距上次 0.15h
+      {
+        const fix6Root = fs.mkdtempSync(path.join(os.tmpdir(), "mm-s9fix6-"));
+        const origGetPath = require.cache[electronId].exports.app.getPath;
+        try {
+          require.cache[electronId].exports.app.getPath = (name) =>
+            name === "documents" ? docsDir : fix6Root;
+          delete require.cache[storeId];
+          delete require.cache[exportId];
+          const store6 = require(storeId);
+          const export6 = require(exportId);
+
+          const pub = cnTime(2026, 11, 20, 8, 0, 0);
+          const t1031 = cnTime(2026, 11, 20, 10, 31, 0);
+          const t1040 = cnTime(2026, 11, 20, 10, 40, 0);
+          // 10:30 自动槽 @ 10:31 采到 100
+          store6.mergeWorks(
+            "排序组",
+            "抖音",
+            [{ workId: "W6", title: "短片", publishTime: pub, play: 100, like: 10, comment: 2 }],
+            t1031,
+            { slot: "2026-11-20 10:30" }
+          );
+          // 10:40 手动采集（无 slot → 归入 10:00）采到 150
+          store6.mergeWorks(
+            "排序组",
+            "抖音",
+            [{ workId: "W6", title: "短片", publishTime: pub, play: 150, like: 15, comment: 3 }],
+            t1040
+          );
+
+          const read6 = store6.readWorksIntraday("排序组", "抖音");
+          assert.deepStrictEqual(
+            read6.W6.map((x) => `${x.slot}@${x.play}`),
+            ["10:30@100", "10:00@150"],
+            "readWorksIntraday 须按实际 collectedAt 升序"
+          );
+
+          const rows6 = buildWorkIntradayRows({
+            group: "排序组",
+            platform: "抖音",
+            works: [{ workId: "W6", title: "短片", publishTime: pub }],
+            worksIntraday: read6,
+          });
+          assert.strictEqual(rows6.length, 2);
+          assert.strictEqual(rows6[0].slot, "10:30");
+          assert.strictEqual(rows6[0].play, 100);
+          assert.strictEqual(rows6[0].playDelta, null);
+          assert.strictEqual(rows6[0].hoursSincePrev, null);
+          assert.strictEqual(rows6[1].slot, "10:00");
+          assert.strictEqual(rows6[1].play, 150);
+          assert.strictEqual(rows6[1].playDelta, 50, "10:40 手动采集相对 10:31 应为 +50 而非 -50");
+          assert.strictEqual(rows6[1].likeDelta, 5);
+          assert.strictEqual(rows6[1].commentDelta, 1);
+          assert.strictEqual(rows6[1].hoursSincePrev, 0.15, "9 分钟 = 0.15 小时");
+
+          const trend6 = export6.buildContentIntradayData({
+            contentKey: "unlinked:抖音:W6",
+            pushDataDir,
+          });
+          assert.strictEqual(trend6.found, true);
+          assert.deepStrictEqual(trend6.timePoints, ["2026-11-20 10:30", "2026-11-20 10:00"]);
+          assert.deepStrictEqual(trend6.collectedAts, [t1031, t1040]);
+          assert.deepStrictEqual(trend6.platforms[0].play, [100, 150]);
+          assert.deepStrictEqual(trend6.platforms[0].playDelta, [null, 50]);
+          assert.deepStrictEqual(trend6.totalPlayDelta, [null, 50]);
+        } finally {
+          require.cache[electronId].exports.app.getPath = origGetPath;
+          delete require.cache[storeId];
+          delete require.cache[exportId];
+          fs.rmSync(fix6Root, { recursive: true, force: true });
+        }
+        console.log("✓ [S9-fix #6] testS9Fix6_IntradayTrendAndRowsSortByActualCollectedAt 通过");
+      }
+
+      // testS9Fix7_First24hNormalizedFirstPublishTimeAndCutoffByCollectedAt
+      // 评审 #7：抖音 11-19 08:00 首发（仅旧日快照），快手次日 10:00 补发，12:00 采集（距首发 28h > 24h 不画）；
+      // 跨零点 23:00 槽于 11-21 00:05 采集，分析截止日 11-20 不得纳入该点
+      {
+        const fix7Root = fs.mkdtempSync(path.join(os.tmpdir(), "mm-s9fix7-"));
+        const fix7Push = path.join(fix7Root, "pushData");
+        fs.mkdirSync(fix7Push, { recursive: true });
+        const origGetPath = require.cache[electronId].exports.app.getPath;
+        try {
+          require.cache[electronId].exports.app.getPath = (name) =>
+            name === "documents" ? docsDir : fix7Root;
+          delete require.cache[storeId];
+          delete require.cache[exportId];
+          const store7 = require(storeId);
+          const export7 = require(exportId);
+
+          const firstPub = cnTime(2026, 11, 19, 8, 0, 0);
+          const secondPub = cnTime(2026, 11, 20, 10, 0, 0);
+          const collectNoon = cnTime(2026, 11, 20, 12, 0, 0);
+          const firstUrl = "https://www.douyin.com/video/fix7dy1";
+          const secondUrl = "https://www.kuaishou.com/short-video/fix7ks1";
+
+          fs.writeFileSync(
+            path.join(fix7Push, "2026-11-19.json"),
+            JSON.stringify([
+              {
+                id: "fix7-first",
+                filePath: "/v/fix7-sample.mp4",
+                title: "样片",
+                pt: "抖音",
+                group: "示例",
+                videoLink: firstUrl,
+                publishStatus: "success",
+                lastPublishAt: firstPub,
+              },
+            ])
+          );
+          fs.writeFileSync(
+            path.join(fix7Push, "2026-11-20.json"),
+            JSON.stringify([
+              {
+                id: "fix7-repost",
+                filePath: "/v/fix7-sample.mp4",
+                title: "样片",
+                pt: "快手",
+                group: "示例",
+                videoLink: secondUrl,
+                publishStatus: "success",
+                lastPublishAt: secondPub,
+              },
+            ])
+          );
+
+          // 抖音仅有旧版 works-daily + works.json，无 intraday
+          const dyDailyDir = store7.worksDailyDir("示例", "抖音");
+          fs.mkdirSync(dyDailyDir, { recursive: true });
+          fs.writeFileSync(
+            path.join(dyDailyDir, "2026-11-19.json"),
+            JSON.stringify({
+              date: "2026-11-19",
+              updatedAt: cnTime(2026, 11, 19, 10, 0, 0),
+              works: { dy1: { play: 100 } },
+            })
+          );
+          fs.writeFileSync(
+            path.join(path.dirname(dyDailyDir), "works.json"),
+            JSON.stringify({
+              works: [{ workId: "dy1", title: "样片", url: firstUrl, publishTime: firstPub, play: 100 }],
+            })
+          );
+
+          // 快手 11-20 10:00 补发，12:00 采集（距内容首发 11-19 08:00 已 28h）
+          store7.mergeWorks(
+            "示例",
+            "快手",
+            [{ workId: "ks1", title: "样片", url: secondUrl, publishTime: secondPub, play: 250 }],
+            collectNoon
+          );
+
+          const analysisRepub = export7.buildStatsAnalysisData({
+            pushDataDir: fix7Push,
+            now: collectNoon,
+          });
+          assert.strictEqual(
+            analysisRepub.newWorksFirst24h.items.find((r) => r.contentKey === "file:/v/fix7-sample.mp4"),
+            undefined,
+            "实际距最早首发已 28 小时 > 24 小时，不得以补发时间作为起点画出 2h 点"
+          );
+
+          // 跨零点截止日校验：作品 11-20 22:00 发布，11-21 00:05 采集归入 11-20 23:00 槽
+          const nightPub = cnTime(2026, 11, 20, 22, 0, 0);
+          const t2310 = cnTime(2026, 11, 20, 23, 10, 0);
+          const t0005 = cnTime(2026, 11, 21, 0, 5, 0);
+          store7.mergeWorks(
+            "示例",
+            "抖音",
+            [{ workId: "night1", title: "跨夜作品", publishTime: nightPub, play: 120 }],
+            t2310,
+            { slot: "2026-11-20 22:00" }
+          );
+          store7.mergeWorks(
+            "示例",
+            "抖音",
+            [{ workId: "night1", title: "跨夜作品", publishTime: nightPub, play: 350 }],
+            t0005,
+            { slot: "2026-11-20 23:00" }
+          );
+
+          // 截止日选 2026-11-20：只含 23:10 点，不得纳入 11-21 00:05 采集点
+          const analysisTo20 = export7.buildStatsAnalysisData({
+            pushDataDir: fix7Push,
+            to: "2026-11-20",
+            now: cnTime(2026, 11, 21, 10, 0, 0),
+          });
+          const nightItem20 = analysisTo20.newWorksFirst24h.items.find(
+            (r) => r.contentKey === "unlinked:抖音:night1"
+          );
+          assert.ok(nightItem20, "11-20 23:10 采集点应在截止日 11-20 内");
+          assert.strictEqual(nightItem20.points.length, 1, "11-21 00:05 采集点不得出现在截止日 11-20 的前 24h 曲线中");
+          assert.strictEqual(nightItem20.points[0].play, 120);
+
+          // 截止日选 2026-11-21：两个点均包含
+          const analysisTo21 = export7.buildStatsAnalysisData({
+            pushDataDir: fix7Push,
+            to: "2026-11-21",
+            now: cnTime(2026, 11, 21, 10, 0, 0),
+          });
+          const nightItem21 = analysisTo21.newWorksFirst24h.items.find(
+            (r) => r.contentKey === "unlinked:抖音:night1"
+          );
+          assert.ok(nightItem21);
+          assert.deepStrictEqual(
+            nightItem21.points.map((x) => x.play),
+            [120, 350]
+          );
+        } finally {
+          require.cache[electronId].exports.app.getPath = origGetPath;
+          delete require.cache[storeId];
+          delete require.cache[exportId];
+          fs.rmSync(fix7Root, { recursive: true, force: true });
+        }
+        console.log("✓ [S9-fix #7] testS9Fix7_First24hNormalizedFirstPublishTimeAndCutoffByCollectedAt 通过");
+      }
+    }
   } finally {
     if (origElectronCache) require.cache[electronId] = origElectronCache;
     else delete require.cache[electronId];

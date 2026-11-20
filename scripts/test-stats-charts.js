@@ -2194,6 +2194,136 @@ async function testS9_IntradayAndFirst24hCharts() {
     cleanup();
   }
   console.log("✓ [S9] 分时段趋势 option、新作品前 24 小时 option 与 dataStats/index.vue 联动通过");
+
+  // 4. testS9Fix6And7_IntradayOptionOrderAndFirst24hStartAndCutoff
+  // 评审 #6/#7 图表层回归：按实际 collectedAt 排序出图（+50 非 -50）、首发用归一化 firstPublishTimeMs（>24h 不画）、按 collectedAt 校验分析截止日
+  {
+    const cnMs2 = (d, hh, mm = 0) =>
+      Date.parse(`${d}T${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}:00+08:00`);
+
+    // #6：10:30 自动槽 @ 10:31 (100) + 10:00 手动槽 @ 10:40 (150) → 图表折线 [100, 150]、增量柱 [null, 50]
+    const sortDeps = {
+      now: cnMs2("2026-11-20", 12, 0),
+      listAccounts: () => [{ group: "G1", platform: "抖音" }],
+      readWorks: () => [{ workId: "W_C6", title: "短片", publishTime: cnMs2("2026-11-20", 8, 0) }],
+      readWorksDaily: () => ({ W_C6: { "2026-11-20": { play: 150 } } }),
+      readWorksIntraday: () => ({
+        W_C6: [
+          { date: "2026-11-20", slot: "10:00", collectedAt: cnMs2("2026-11-20", 10, 40), play: 150 },
+          { date: "2026-11-20", slot: "10:30", collectedAt: cnMs2("2026-11-20", 10, 31), play: 100 },
+        ],
+      }),
+      readDaily: () => ({}),
+      readPushRecords: () => [],
+    };
+    const { buildContentIntradayData } = require("../src/main/services/dataStats/statsExport.js");
+    const intra6 = buildContentIntradayData({ contentKey: "unlinked:抖音:W_C6" }, sortDeps);
+    const opt6 = buildContentIntradayOption(intra6);
+    assert.deepStrictEqual(opt6.xAxis.data, ["2026-11-20 10:30", "2026-11-20 10:00"]);
+    assert.deepStrictEqual(opt6.series[0].data, [100, 150]);
+    assert.deepStrictEqual(opt6.series[1].data, [null, 50]);
+
+    // #7a：归一化 firstPublishTimeMs（11-19 08:00 首发，11-20 10:00 补发，11-20 12:00 采集距首发 28h）→ 超过 24h 不画
+    const firstPub = cnMs2("2026-11-19", 8, 0);
+    const repostPub = cnMs2("2026-11-20", 10, 0);
+    const analysis7a = buildStatsAnalysis({
+      summaryRows: [
+        {
+          contentKey: "file:/v/repost.mp4",
+          title: "补发测试",
+          firstPublishDate: "2026-11-19",
+          firstPublishTime: firstPub,
+          perPlatform: {
+            "抖音|G1": { play: 100, workIds: ["DY_19"] },
+            "快手|G1": { play: 250, workIds: ["KS_20"] },
+          },
+          totalPlay: 350,
+        },
+      ],
+      dailyRows: [
+        {
+          date: "2026-11-19",
+          group: "G1",
+          platform: "抖音",
+          workId: "DY_19",
+          title: "补发测试",
+          publishTime: firstPub,
+          contentKey: "file:/v/repost.mp4",
+          play: 100,
+        },
+      ],
+      intradayRows: [
+        {
+          date: "2026-11-20",
+          slot: "12:00",
+          collectedAt: cnMs2("2026-11-20", 12, 0),
+          group: "G1",
+          platform: "快手",
+          workId: "KS_20",
+          title: "补发测试",
+          publishTime: repostPub,
+          publishTimeMs: repostPub,
+          publishDate: "2026-11-20",
+          contentKey: "file:/v/repost.mp4",
+          play: 250,
+        },
+      ],
+      to: "2026-11-20",
+      now: cnMs2("2026-11-20", 12, 0),
+    });
+    assert.strictEqual(analysis7a.newWorksFirst24h.items.length, 0, "距最早首发 28h 超过 24h 不得产出曲线");
+    assert.strictEqual(isEmptyChartOption(buildNewWorksFirst24hOption(analysis7a)), true);
+
+    // #7b：23:00-05:00 跨零点，11-21 00:05 采集归入 11-20 23:00 槽，分析截止日 11-20 时不得纳入该点
+    const pub20 = cnMs2("2026-11-20", 22, 0);
+    const analysis7b = buildStatsAnalysis({
+      intradayRows: [
+        {
+          date: "2026-11-20",
+          slot: "23:00",
+          collectedAt: cnMs2("2026-11-21", 0, 5),
+          group: "G1",
+          platform: "抖音",
+          workId: "CROSS_23",
+          title: "跨零点截止测试",
+          publishTime: pub20,
+          publishTimeMs: pub20,
+          publishDate: "2026-11-20",
+          contentKey: "file:/v/cross23.mp4",
+          play: 300,
+        },
+      ],
+      to: "2026-11-20",
+      now: cnMs2("2026-11-21", 10, 0),
+    });
+    assert.strictEqual(analysis7b.newWorksFirst24h.items.length, 0, "collectedAt 在 11-21 的点不得出现在截止日 11-20 分析中");
+    assert.strictEqual(isEmptyChartOption(buildNewWorksFirst24hOption(analysis7b)), true);
+
+    const analysis7bNext = buildStatsAnalysis({
+      intradayRows: [
+        {
+          date: "2026-11-20",
+          slot: "23:00",
+          collectedAt: cnMs2("2026-11-21", 0, 5),
+          group: "G1",
+          platform: "抖音",
+          workId: "CROSS_23",
+          title: "跨零点截止测试",
+          publishTime: pub20,
+          publishTimeMs: pub20,
+          publishDate: "2026-11-20",
+          contentKey: "file:/v/cross23.mp4",
+          play: 300,
+        },
+      ],
+      to: "2026-11-21",
+      now: cnMs2("2026-11-21", 10, 0),
+    });
+    assert.strictEqual(analysis7bNext.newWorksFirst24h.items.length, 1);
+    assert.strictEqual(analysis7bNext.newWorksFirst24h.items[0].points[0].hours, 2.08);
+    assert.strictEqual(isEmptyChartOption(buildNewWorksFirst24hOption(analysis7bNext)), false);
+    console.log("✓ [S9-fix #6/#7] testS9Fix6And7_IntradayOptionOrderAndFirst24hStartAndCutoff 通过");
+  }
 }
 
 async function runS8FixRegressions(analysis) {

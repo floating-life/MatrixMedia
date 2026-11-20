@@ -3058,30 +3058,9 @@ async function main() {
       assert.strictEqual(wbS9.counts.workIntradayRows, 3);
       assert.strictEqual(sIntra.length, 4);
 
-      // 第 1 行：2026-11-20 08:00 抖音 DY_S9（跨边界减 11-19 22:00：+120, +12, +3, 10.5h）
+      // 按实际 collectedAt 升序：
+      // 第 1 行：2026-11-20 08:00 快手 KS_S9（08:15:00，首次记录，增量与距上次小时数均为 null）
       assert.deepStrictEqual(sIntra[1], [
-        "2026-11-20",
-        "08:00",
-        "2026-11-20 08:30:00",
-        "抖音",
-        "G1",
-        "file:/v/s9.mp4",
-        "link",
-        "DY_S9",
-        "'=红烧肉分时段",
-        220,
-        22,
-        5,
-        2,
-        6,
-        3,
-        120,
-        12,
-        3,
-        10.5,
-      ]);
-      // 第 2 行：2026-11-20 08:00 快手 KS_S9（首次记录，增量与距上次小时数均为 null）
-      assert.deepStrictEqual(sIntra[2], [
         "2026-11-20",
         "08:00",
         "2026-11-20 08:15:00",
@@ -3101,6 +3080,28 @@ async function main() {
         null,
         null,
         null,
+      ]);
+      // 第 2 行：2026-11-20 08:00 抖音 DY_S9（08:30:00，跨边界减 11-19 22:00：+120, +12, +3, 10.5h）
+      assert.deepStrictEqual(sIntra[2], [
+        "2026-11-20",
+        "08:00",
+        "2026-11-20 08:30:00",
+        "抖音",
+        "G1",
+        "file:/v/s9.mp4",
+        "link",
+        "DY_S9",
+        "'=红烧肉分时段",
+        220,
+        22,
+        5,
+        2,
+        6,
+        3,
+        120,
+        12,
+        3,
+        10.5,
       ]);
       // 第 3 行：2026-11-20 10:00 抖音 DY_S9（减 08:30：+100, +13, +2, 1.5h）
       assert.deepStrictEqual(sIntra[3], [
@@ -3140,10 +3141,11 @@ async function main() {
       const wsIntra = readS9Wb.Sheets["作品时段明细"];
       assert.strictEqual(wsIntra["A2"].v, "2026-11-20");
       assert.strictEqual(wsIntra["B2"].v, "08:00");
-      assert.strictEqual(wsIntra["P2"].t, "n");
-      assert.strictEqual(wsIntra["P2"].v, 120);
-      assert.strictEqual(wsIntra["S2"].t, "n");
-      assert.strictEqual(wsIntra["S2"].v, 10.5);
+      assert.strictEqual(wsIntra["C2"].v, "2026-11-20 08:15:00");
+      assert.strictEqual(wsIntra["P3"].t, "n");
+      assert.strictEqual(wsIntra["P3"].v, 120);
+      assert.strictEqual(wsIntra["S3"].t, "n");
+      assert.strictEqual(wsIntra["S3"].v, 10.5);
 
       // 行上限：作品时段明细超过 maxRows（3 > 2）应直接抛 ROW_LIMIT_EXCEEDED 并提示缩短区间
       assert.throws(
@@ -3162,7 +3164,40 @@ async function main() {
           return true;
         }
       );
-      console.log("✓ S9 作品时段明细 sheet（顺序/19列/跨边界增量/距上次小时数/字段说明/行上限）通过");
+
+      // testS9Fix6_ExcelIntradaySheetSortedByActualCollectedAt
+      // 评审 #6：10:30 自动槽在 10:31 采到 100，10:40 手动采到 150 归入 10:00 → Excel 按实际 collectedAt 排序，增量 +50、距上次 0.15 小时
+      const fix6Deps = {
+        now: ts("2026-11-20", 12, 0),
+        listAccounts: () => [{ group: "G1", platform: "抖音" }],
+        readWorks: () => [{ workId: "W_SORT", title: "短片", publishTime: ts("2026-11-20", 8, 0) }],
+        readWorksDaily: () => ({ W_SORT: { "2026-11-20": { play: 150, like: 15, comment: 3 } } }),
+        readWorksIntraday: () => ({
+          W_SORT: [
+            // 故意以槽字符串顺序传入（10:00 在 10:30 前）验证按实际 collectedAt 排序
+            { date: "2026-11-20", slot: "10:00", collectedAt: ts("2026-11-20", 10, 40), play: 150, like: 15, comment: 3 },
+            { date: "2026-11-20", slot: "10:30", collectedAt: ts("2026-11-20", 10, 31), play: 100, like: 10, comment: 2 },
+          ],
+        }),
+        readDaily: () => ({}),
+        readPushRecords: () => [],
+      };
+      const wbFix6 = buildStatsWorkbookData({ from: "2026-11-20", to: "2026-11-20" }, fix6Deps);
+      const fix6Sheet = wbFix6.sheets["作品时段明细"];
+      assert.strictEqual(fix6Sheet.length, 3);
+      assert.strictEqual(fix6Sheet[1][1], "10:30");
+      assert.strictEqual(fix6Sheet[1][2], "2026-11-20 10:31:00");
+      assert.strictEqual(fix6Sheet[1][9], 100);
+      assert.strictEqual(fix6Sheet[1][15], null);
+      assert.strictEqual(fix6Sheet[1][18], null);
+      assert.strictEqual(fix6Sheet[2][1], "10:00");
+      assert.strictEqual(fix6Sheet[2][2], "2026-11-20 10:40:00");
+      assert.strictEqual(fix6Sheet[2][9], 150);
+      assert.strictEqual(fix6Sheet[2][15], 50, "播放较上次增量必须为 +50 而非 -50");
+      assert.strictEqual(fix6Sheet[2][16], 5);
+      assert.strictEqual(fix6Sheet[2][17], 1);
+      assert.strictEqual(fix6Sheet[2][18], 0.15, "距上次小时数必须为 0.15");
+      console.log("✓ S9 作品时段明细 sheet（顺序/19列/跨边界增量/距上次小时数/字段说明/行上限）与 [S9-fix #6] 通过");
     }
 
     // 恢复 require.cache

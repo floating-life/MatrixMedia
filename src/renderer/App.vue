@@ -24,6 +24,15 @@ onMounted(() => {
     isMainWindowLocation(window.location)
   ) {
     schedulerStarted = true;
+    try {
+      const rawStored =
+        typeof localStorage !== "undefined" && localStorage
+          ? localStorage.getItem(statsScheduler.STORAGE_KEY)
+          : null;
+      if (rawStored && typeof statsScheduler.syncSettingsToMain === "function") {
+        statsScheduler.syncSettingsToMain(statsScheduler.loadSettings(), { initOnly: true });
+      }
+    } catch (_) {}
     statsScheduler.start({
       notify: (options) => {
         if (

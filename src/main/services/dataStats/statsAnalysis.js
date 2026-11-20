@@ -2647,11 +2647,13 @@ function buildNewWorksFirst24hSection(
     if (play === null) continue;
 
     const group = r.group == null ? "" : String(r.group).trim();
+    const collectedAt = parseTimestampMs(r.collectedAt);
+    const collectedDate = collectedAt !== null ? formatUtc8Date(collectedAt) : "";
+    if (collectedDate && collectedDate > cutoffTo) continue;
     const pwKey = `${platform}|${workId}`;
     const slotKey = `${pwKey}\0${date}\0${slot}`;
     const existing = dedupByWorkSlot.get(slotKey);
     if (!existing || compareText(group, existing.group) < 0) {
-      const collectedAt = parseTimestampMs(r.collectedAt);
       const tsMs = collectedAt !== null ? collectedAt : slotToUtc8Ms(date, slot);
       if (tsMs === null) continue;
       dedupByWorkSlot.set(slotKey, {
@@ -2727,12 +2729,21 @@ function buildNewWorksFirst24hSection(
     });
   }
 
-  // 收集 seriesByWork 中每个内容的已知最早作品发布日（确保未在 intraday 出现过的旧平台首发仍参与判定）
+  // 收集 seriesByWork 中每个内容的已知最早作品发布日与精确发布时间戳
+  // （确保仅有旧版日快照、未在 intraday 出现过的最早平台首发仍作为起点参与判定）
   const seriesMinPubDateByContent = new Map();
+  const seriesMinPubMsByContent = new Map();
   for (const s of seriesByWork.values()) {
-    if (!s.publishDate) continue;
-    const prev = seriesMinPubDateByContent.get(s.contentKey) || "";
-    seriesMinPubDateByContent.set(s.contentKey, minNonEmptyDate(prev, s.publishDate));
+    if (s.publishDate) {
+      const prevDate = seriesMinPubDateByContent.get(s.contentKey) || "";
+      seriesMinPubDateByContent.set(s.contentKey, minNonEmptyDate(prevDate, s.publishDate));
+    }
+    if (s.publishTimeMs !== null && s.publishTimeMs > 0) {
+      const prevMs = seriesMinPubMsByContent.get(s.contentKey);
+      if (prevMs === undefined || s.publishTimeMs < prevMs) {
+        seriesMinPubMsByContent.set(s.contentKey, s.publishTimeMs);
+      }
+    }
   }
 
   const worksByContent = new Map();
@@ -2750,45 +2761,43 @@ function buildNewWorksFirst24hSection(
     arr.push(wb);
   }
 
-  // 3. 逐内容构建前 24 小时起量曲线
+  // 3. 逐内容构建前 24 小时起量曲线（起点与 S7 最早已知首发一致：归一化 firstPublishTimeMs）
   const items = [];
   for (const [contentKey, workEntries] of worksByContent.entries()) {
     const meta = contentMetaByKey.get(contentKey) || null;
-    let minWorkPubDate = seriesMinPubDateByContent.get(contentKey) || "";
-    for (const we of workEntries) {
-      if (we.pubDate) minWorkPubDate = minNonEmptyDate(minWorkPubDate, we.pubDate);
+    let earliestPubMs =
+      meta && meta.firstPublishTimeMs !== null && meta.firstPublishTimeMs > 0
+        ? meta.firstPublishTimeMs
+        : null;
+    let earliestPubDate = minNonEmptyDate(
+      meta && meta.firstPublishDate,
+      seriesMinPubDateByContent.get(contentKey) || ""
+    );
+    const seriesMinMs = seriesMinPubMsByContent.get(contentKey);
+    if (
+      seriesMinMs !== undefined &&
+      seriesMinMs > 0 &&
+      (earliestPubMs === null || seriesMinMs < earliestPubMs)
+    ) {
+      earliestPubMs = seriesMinMs;
     }
-    const contentPubDate = minNonEmptyDate(meta && meta.firstPublishDate, minWorkPubDate);
+    for (const we of workEntries) {
+      if (we.pubDate) earliestPubDate = minNonEmptyDate(earliestPubDate, we.pubDate);
+      if (we.pubMs !== null && we.pubMs > 0 && (earliestPubMs === null || we.pubMs < earliestPubMs)) {
+        earliestPubMs = we.pubMs;
+      }
+    }
+    if (earliestPubMs === null) continue;
+    const msPubDate = formatUtc8Date(earliestPubMs);
+    const contentPubDate = minNonEmptyDate(earliestPubDate, msPubDate);
     if (!contentPubDate || contentPubDate < recent7Start || contentPubDate > cutoffTo) {
       continue;
     }
-
-    // 确定内容参考发布时间戳（优先首发日内最早精确发布时间）
-    let contentPubMs = null;
-    if (meta && meta.firstPublishTime !== null && meta.firstPublishTime > 0) {
-      const metaDate = formatUtc8Date(meta.firstPublishTime);
-      if (metaDate === contentPubDate) {
-        contentPubMs = meta.firstPublishTime;
-      }
+    // 若已知更早首发日期但该日期仅有日期无时分秒，不得误把后续补发时间当作首发起点
+    if (msPubDate && contentPubDate < msPubDate) {
+      continue;
     }
-    for (const we of workEntries) {
-      if (we.pubMs !== null && (!we.pubDate || we.pubDate === contentPubDate)) {
-        if (contentPubMs === null || we.pubMs < contentPubMs) {
-          contentPubMs = we.pubMs;
-        }
-      }
-    }
-    if (contentPubMs === null) {
-      for (const we of workEntries) {
-        if (we.pubMs !== null && (contentPubMs === null || we.pubMs < contentPubMs)) {
-          contentPubMs = we.pubMs;
-        }
-      }
-    }
-    if (contentPubMs === null && meta && meta.firstPublishTime !== null && meta.firstPublishTime > 0) {
-      contentPubMs = meta.firstPublishTime;
-    }
-    if (contentPubMs === null) continue;
+    const contentPubMs = earliestPubMs;
 
     const byPlatform = new Map();
     for (const we of workEntries) {
@@ -2804,18 +2813,11 @@ function buildNewWorksFirst24hSection(
     const platformSeries = [];
     for (const platform of sortedPlatforms) {
       const pWorks = byPlatform.get(platform);
-      let pPubMs = null;
-      for (const we of pWorks) {
-        if (we.pubMs !== null && (pPubMs === null || we.pubMs < pPubMs)) {
-          pPubMs = we.pubMs;
-        }
-      }
-      if (pPubMs === null) pPubMs = contentPubMs;
-      const pCurve = build24hCurve(pWorks, pPubMs);
+      const pCurve = build24hCurve(pWorks, contentPubMs);
       if (!pCurve.length) continue;
       platformSeries.push({
         platform,
-        publishTimeMs: pPubMs,
+        publishTimeMs: contentPubMs,
         latestPlay24h: pCurve[pCurve.length - 1].play,
         points: pCurve,
       });

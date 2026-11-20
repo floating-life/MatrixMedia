@@ -905,6 +905,7 @@ function loadLatestCollectedAtByPwKey(accountsData, io, cutoffDate) {
         if (cutoffDate && d && d > cutoffDate) continue;
         const ts = parseRawTimestampMs(pt.collectedAt);
         if (ts === null) continue;
+        if (cutoffDate && formatUtc8Date(ts) > cutoffDate) continue;
         const prev = latestByPwKey.get(pwKey);
         if (prev === undefined || ts > prev) latestByPwKey.set(pwKey, ts);
       }
@@ -1577,11 +1578,26 @@ function formatWorkDailyAoa(rows) {
   return aoa;
 }
 
+function slotToUtc8Ms(dateStr, slotStr) {
+  const dn = dateStrToDayNum(dateStr);
+  if (dn === null) return null;
+  const m = SLOT_TIME_RE.exec(typeof slotStr === "string" ? slotStr.trim() : "");
+  if (!m) return null;
+  return dn * DAY_MS + (Number(m[1]) * 60 + Number(m[2])) * 60000 - UTC8_MS;
+}
+
+function resolveIntradaySortTsMs(dateStr, slotStr, collectedAt) {
+  if (typeof collectedAt === "number" && Number.isFinite(collectedAt) && collectedAt > 0) {
+    return collectedAt;
+  }
+  return slotToUtc8Ms(dateStr, slotStr);
+}
+
 /**
  * 作品分时段明细结构化收集：
  * - worksIntraday 为空的账号立即跳过（不读取 acc.works 标题等元数据）
- * - sheetRows 复用 buildWorkIntradayRows（保留跨 from 边界增量与距上次小时数），跨账号按日期/时段/平台/分组排序
- * - analysisRows 仅保留 [analysisFrom, analysisTo] 区间（近 7 天），供「新作品前 24 小时」分析使用
+ * - sheetRows 复用 buildWorkIntradayRows（按实际 collectedAt 排序算增量与距上次小时数，保留跨 from 边界增量），跨账号按实际采集时间排序
+ * - analysisRows 仅保留 [analysisFrom, analysisTo] 区间（近 7 天），且按实际 collectedAt 校验 UTC+8 日期 <= analysisTo
  */
 function collectWorkIntradayStructured(
   accountsWithIntraday,
@@ -1622,7 +1638,11 @@ function collectWorkIntradayStructured(
       });
       for (let i = 0; i < accRows.length; i++) {
         const r = accRows[i];
-        sheetRows.push({ ...r, platformRank });
+        sheetRows.push({
+          ...r,
+          platformRank,
+          sortTsMs: resolveIntradaySortTsMs(r.date, r.slot, r.collectedAt),
+        });
       }
     }
 
@@ -1662,12 +1682,16 @@ function collectWorkIntradayStructured(
           if (!isValidDateStr(date) || !SLOT_TIME_RE.test(slot)) continue;
           if (analysisFrom && date < analysisFrom) continue;
           if (analysisTo && date > analysisTo) continue;
+          const collectedAt = parseRawTimestampMs(pt.collectedAt);
+          if (analysisTo && collectedAt !== null && formatUtc8Date(collectedAt) > analysisTo) {
+            continue;
+          }
           const play = hasOwn(pt, "play") ? fastNormalizeMetric(pt.play) : null;
           if (play === null) continue;
           analysisRows.push({
             date,
             slot,
-            collectedAt: parseRawTimestampMs(pt.collectedAt),
+            collectedAt,
             group: groupStr,
             platform: platformStr,
             workId,
@@ -1685,6 +1709,11 @@ function collectWorkIntradayStructured(
 
   if (needSheetRows && sheetRows.length > 1) {
     sheetRows.sort((a, b) => {
+      if (a.sortTsMs !== null && b.sortTsMs !== null && a.sortTsMs !== b.sortTsMs) {
+        return a.sortTsMs - b.sortTsMs;
+      }
+      if (a.sortTsMs !== null && b.sortTsMs === null) return -1;
+      if (a.sortTsMs === null && b.sortTsMs !== null) return 1;
       if (a.date !== b.date) return compareText(a.date, b.date);
       if (a.slot !== b.slot) return compareText(a.slot, b.slot);
       if (a.platformRank !== b.platformRank) return a.platformRank - b.platformRank;
@@ -4075,7 +4104,11 @@ function buildContentIntradayData(options = {}, depsArg) {
         if (bucket.byTimeKey.has(timeKey)) continue;
         const play = hasOwn(pt, "play") ? fastNormalizeMetric(pt.play) : null;
         const collectedAt = parseRawTimestampMs(pt.collectedAt);
-        bucket.byTimeKey.set(timeKey, { date: d, slot: s, timeKey, collectedAt, play });
+        if (explicitTo && collectedAt !== null && formatUtc8Date(collectedAt) > explicitTo) {
+          continue;
+        }
+        const sortTsMs = resolveIntradaySortTsMs(d, s, collectedAt);
+        bucket.byTimeKey.set(timeKey, { date: d, slot: s, timeKey, collectedAt, sortTsMs, play });
         if (!latestIntradayDate || d > latestIntradayDate) {
           latestIntradayDate = d;
         }
@@ -4091,11 +4124,18 @@ function buildContentIntradayData(options = {}, depsArg) {
   const platformDeltaMap = new Map();
   const timePointSet = new Set();
   const collectedAtByTimeKey = new Map();
+  const sortTsByTimeKey = new Map();
 
   for (const bucket of rawByWork.values()) {
-    const pts = [...bucket.byTimeKey.values()].sort((a, b) =>
-      compareText(a.timeKey, b.timeKey)
-    );
+    // 按实际 collectedAt（缺省回退槽时刻）升序排列并计算较上次增量
+    const pts = [...bucket.byTimeKey.values()].sort((a, b) => {
+      if (a.sortTsMs !== null && b.sortTsMs !== null && a.sortTsMs !== b.sortTsMs) {
+        return a.sortTsMs - b.sortTsMs;
+      }
+      if (a.sortTsMs !== null && b.sortTsMs === null) return -1;
+      if (a.sortTsMs === null && b.sortTsMs !== null) return 1;
+      return compareText(a.timeKey, b.timeKey);
+    });
     let worksList = platformWorksMap.get(bucket.platform);
     if (!worksList) {
       worksList = [];
@@ -4123,6 +4163,12 @@ function buildContentIntradayData(options = {}, depsArg) {
           collectedAtByTimeKey.set(pt.timeKey, pt.collectedAt);
         }
       }
+      if (pt.sortTsMs !== null) {
+        const prevSortTs = sortTsByTimeKey.get(pt.timeKey);
+        if (prevSortTs === undefined || pt.sortTsMs > prevSortTs) {
+          sortTsByTimeKey.set(pt.timeKey, pt.sortTsMs);
+        }
+      }
 
       let activeTimes = platformActiveTimes.get(bucket.platform);
       if (!activeTimes) {
@@ -4144,7 +4190,14 @@ function buildContentIntradayData(options = {}, depsArg) {
     }
   }
 
-  const timePoints = [...timePointSet].sort(compareText);
+  const timePoints = [...timePointSet].sort((a, b) => {
+    const ta = sortTsByTimeKey.has(a) ? sortTsByTimeKey.get(a) : null;
+    const tb = sortTsByTimeKey.has(b) ? sortTsByTimeKey.get(b) : null;
+    if (ta !== null && tb !== null && ta !== tb) return ta - tb;
+    if (ta !== null && tb === null) return -1;
+    if (ta === null && tb !== null) return 1;
+    return compareText(a, b);
+  });
   if (!timePoints.length) {
     return {
       found: true,
@@ -4166,12 +4219,38 @@ function buildContentIntradayData(options = {}, depsArg) {
   const collectedAts = timePoints.map((tk) =>
     collectedAtByTimeKey.has(tk) ? collectedAtByTimeKey.get(tk) : null
   );
+  const timeKeyOrder = new Map(timePoints.map((tk, idx) => [tk, idx]));
+  const firstWindowTs = sortTsByTimeKey.has(timePoints[0])
+    ? sortTsByTimeKey.get(timePoints[0])
+    : null;
   const sortedPlatforms = [...platformActiveTimes.keys()].sort(comparePlatform);
   const totalPlay = new Array(timePoints.length).fill(null);
   const totalPlayDelta = new Array(timePoints.length).fill(null);
 
   const platforms = sortedPlatforms.map((platform) => {
-    const worksList = platformWorksMap.get(platform) || [];
+    const rawWorksList = platformWorksMap.get(platform) || [];
+    const worksList = rawWorksList.map((pts) =>
+      pts
+        .map((pt) => {
+          let order;
+          if (timeKeyOrder.has(pt.timeKey)) {
+            order = timeKeyOrder.get(pt.timeKey);
+          } else if (
+            (firstWindowTs !== null && pt.sortTsMs !== null && pt.sortTsMs <= firstWindowTs) ||
+            (fromDate && pt.date < fromDate)
+          ) {
+            order = -1;
+          } else {
+            order = Infinity;
+          }
+          return { order, sortTsMs: pt.sortTsMs, play: pt.play };
+        })
+        .sort((a, b) => {
+          if (a.order !== b.order) return a.order - b.order;
+          if (a.sortTsMs !== null && b.sortTsMs !== null) return a.sortTsMs - b.sortTsMs;
+          return 0;
+        })
+    );
     const activeTimes = platformActiveTimes.get(platform);
     const deltaMap = platformDeltaMap.get(platform) || null;
     const workCount = worksList.length;
@@ -4185,7 +4264,7 @@ function buildContentIntradayData(options = {}, depsArg) {
       for (let w = 0; w < workCount; w++) {
         const pts = worksList[w];
         let p = ptrs[w];
-        while (p < pts.length && pts[p].timeKey <= tk) {
+        while (p < pts.length && pts[p].order <= i) {
           curPlays[w] = pts[p].play;
           p += 1;
         }

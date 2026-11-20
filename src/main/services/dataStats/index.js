@@ -55,6 +55,10 @@ const {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const VALID_TRIGGERS = new Set(["auto", "manual"]);
+const VALID_INTERVAL_HOURS = new Set([1, 2, 3, 4, 6]);
+const RATE_LIMIT_GRACE_MINUTES = 10;
+const SLOT_STR_RE = /^(\d{4})-(\d{2})-(\d{2}) ([01]\d|2[0-3]):([0-5]\d)$/;
+const TIME_HHMM_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
 const PNG_DATA_URL_PREFIX = "data:image/png;base64,";
 const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 const MAX_CHART_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -65,9 +69,16 @@ const BASE64_BODY_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 let collecting = false;
 let cancelled = false;
 let collectedToday = { date: "", partitions: new Set() };
-// 按时段槽记录本进程内已采集分区（slot -> Set<partition>，保留最近 128 个槽防无限增长）
-const collectedBySlot = new Map();
-const MAX_COLLECTED_SLOTS = 128;
+// 每个分区最近一次成功采集时间戳（手动与自动共用，用于同槽 [槽开始, 下一槽开始) 跳重）
+const lastCollectedAtByPartition = new Map();
+const MAX_COLLECTED_PARTITIONS = 1024;
+// 本进程内全局与各分区最近一次自动采集时间戳（用于防高频硬下限）
+let lastGlobalAutoRunAt = 0;
+const lastAutoRunAtByPartition = new Map();
+// 本进程内已因高频跳过且不再重复触发的槽
+const skippedAutoSlots = new Set();
+// 最近一次在 stats:auto-run 中观察到的 interval 调度参数（用于兜底检测未走 save-auto-settings 的参数变化）
+let lastSeenAutoRunSchedule = null;
 let lastRetentionDays = store.DEFAULT_INTRADAY_RETENTION_DAYS || 60;
 // auto-run.json 读写失败时的兜底：本进程内已自动跑过的日期/时段槽（防止持久化失败导致每分钟重采）
 const autoRanInMemory = new Set();
@@ -439,23 +450,48 @@ function syncCollectedToday(date) {
   }
 }
 
-function markPartitionCollected(partition, date = getTodayStr(), slot = "") {
+function parseSlotStartMs(slot) {
+  if (typeof slot !== "string") return null;
+  const m = SLOT_STR_RE.exec(slot.trim());
+  if (!m) return null;
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  const d = Number(m[3]);
+  const hh = Number(m[4]);
+  const mm = Number(m[5]);
+  const utcMs = Date.UTC(y, mo - 1, d, hh, mm, 0, 0);
+  const check = new Date(utcMs);
+  if (
+    check.getUTCFullYear() !== y ||
+    check.getUTCMonth() !== mo - 1 ||
+    check.getUTCDate() !== d
+  ) {
+    return null;
+  }
+  return utcMs - 8 * 3600e3;
+}
+
+function setBoundedMap(map, key, val, maxSize) {
+  if (map.has(key)) map.delete(key);
+  map.set(key, val);
+  if (map.size > maxSize) {
+    const oldestKey = map.keys().next().value;
+    if (oldestKey !== undefined) map.delete(oldestKey);
+  }
+}
+
+function markPartitionCollected(partition, collectedAtMs = Date.now(), isAuto = false) {
   const key = normalizePartition(partition);
   if (!key) return;
-  syncCollectedToday(date);
+  const ts =
+    typeof collectedAtMs === "number" && Number.isFinite(collectedAtMs) && collectedAtMs > 0
+      ? collectedAtMs
+      : Date.now();
+  syncCollectedToday(getTodayStr(ts));
   collectedToday.partitions.add(key);
-  if (typeof slot === "string" && slot.trim()) {
-    const slotKey = slot.trim();
-    let set = collectedBySlot.get(slotKey);
-    if (!set) {
-      set = new Set();
-      collectedBySlot.set(slotKey, set);
-      if (collectedBySlot.size > MAX_COLLECTED_SLOTS) {
-        const oldestKey = collectedBySlot.keys().next().value;
-        if (oldestKey !== undefined) collectedBySlot.delete(oldestKey);
-      }
-    }
-    set.add(key);
+  setBoundedMap(lastCollectedAtByPartition, key, ts, MAX_COLLECTED_PARTITIONS);
+  if (isAuto) {
+    setBoundedMap(lastAutoRunAtByPartition, key, ts, MAX_COLLECTED_PARTITIONS);
   }
 }
 
@@ -466,12 +502,36 @@ function hasPartitionCollected(partition, date = getTodayStr()) {
   return collectedToday.partitions.has(key);
 }
 
-function hasPartitionCollectedForSlot(partition, slot) {
+/**
+ * 判断该分区最近一次成功采集时间（手动与自动共用）是否落在当前槽 [slotStartMs, slotEndMs) 内。
+ */
+function hasPartitionCollectedInSlot(partition, slotStartMs, slotEndMs) {
   const key = normalizePartition(partition);
-  const slotKey = typeof slot === "string" ? slot.trim() : "";
-  if (!key || !slotKey) return false;
-  const set = collectedBySlot.get(slotKey);
-  return Boolean(set && set.has(key));
+  if (!key || !Number.isFinite(slotStartMs)) return false;
+  const lastAt = lastCollectedAtByPartition.get(key);
+  if (typeof lastAt !== "number" || !Number.isFinite(lastAt)) return false;
+  if (lastAt < slotStartMs) return false;
+  if (Number.isFinite(slotEndMs) && lastAt >= slotEndMs) return false;
+  return true;
+}
+
+function hasPartitionAutoRanRecently(partition, nowMs, minIntervalMs, persistedMap) {
+  if (!Number.isFinite(minIntervalMs) || minIntervalMs <= 0) return false;
+  const key = normalizePartition(partition);
+  if (!key) return false;
+  let lastAutoAt = 0;
+  const memTs = lastAutoRunAtByPartition.get(key);
+  if (typeof memTs === "number" && Number.isFinite(memTs) && memTs > 0 && memTs <= nowMs) {
+    lastAutoAt = Math.max(lastAutoAt, memTs);
+  }
+  if (persistedMap && typeof persistedMap === "object") {
+    const desc = Object.getOwnPropertyDescriptor(persistedMap, key);
+    const diskTs = desc ? desc.value : null;
+    if (typeof diskTs === "number" && Number.isFinite(diskTs) && diskTs > 0 && diskTs <= nowMs) {
+      lastAutoAt = Math.max(lastAutoAt, diskTs);
+    }
+  }
+  return lastAutoAt > 0 && nowMs - lastAutoAt < minIntervalMs;
 }
 
 function normalizeRetentionDaysArg(raw) {
@@ -480,16 +540,105 @@ function normalizeRetentionDaysArg(raw) {
   return null;
 }
 
+function normalizeIntervalHoursArg(raw) {
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (Number.isInteger(n) && VALID_INTERVAL_HOURS.has(n)) return n;
+  return null;
+}
+
+function resolveEffectiveRetentionDays(args) {
+  const persisted =
+    typeof store.readAutoSettings === "function"
+      ? store.readAutoSettings()
+      : { retentionDays: store.DEFAULT_INTRADAY_RETENTION_DAYS || 60 };
+  const persistedDays =
+    normalizeRetentionDaysArg(persisted && persisted.retentionDays) ||
+    store.DEFAULT_INTRADAY_RETENTION_DAYS ||
+    60;
+  const reqRetention = normalizeRetentionDaysArg(args && args.retentionDays);
+  if (reqRetention !== null) {
+    lastRetentionDays = reqRetention;
+    if (
+      reqRetention !== persistedDays &&
+      typeof store.writeAutoSettings === "function"
+    ) {
+      try {
+        store.writeAutoSettings({ retentionDays: reqRetention }, Date.now());
+      } catch (err) {
+        console.warn(
+          "[dataStats] 持久化 retentionDays 失败:",
+          (err && err.message) || err
+        );
+      }
+    }
+    return reqRetention;
+  }
+  lastRetentionDays = persistedDays;
+  return persistedDays;
+}
+
+function resolveEffectiveIntervalHours(args, autoSettings, slotStartMs, rawSlotEndMs) {
+  const argHours = normalizeIntervalHoursArg(args && args.intervalHours);
+  if (argHours !== null) return argHours;
+  if (autoSettings && autoSettings.mode === "interval") {
+    const cfgHours = normalizeIntervalHoursArg(autoSettings.intervalHours);
+    if (cfgHours !== null) return cfgHours;
+  }
+  const slotEndMs =
+    rawSlotEndMs !== undefined && rawSlotEndMs !== null ? Number(rawSlotEndMs) : NaN;
+  if (Number.isFinite(slotStartMs) && Number.isFinite(slotEndMs) && slotEndMs > slotStartMs) {
+    const diffHours = (slotEndMs - slotStartMs) / 3600000;
+    if (Number.isInteger(diffHours) && VALID_INTERVAL_HOURS.has(diffHours)) {
+      return diffHours;
+    }
+  }
+  return (
+    normalizeIntervalHoursArg(autoSettings && autoSettings.intervalHours) || 2
+  );
+}
+
+function resolveEffectiveSlotEndMs(args, slotStartMs, intervalHours) {
+  const rawEnd =
+    args && args.slotEndMs !== undefined && args.slotEndMs !== null
+      ? Number(args.slotEndMs)
+      : NaN;
+  if (Number.isFinite(rawEnd) && rawEnd > slotStartMs) {
+    return rawEnd;
+  }
+  return slotStartMs + intervalHours * 3600000;
+}
+
 async function collectAccounts(accounts, sender, options = {}) {
   const results = [];
   const total = accounts.length;
   const startedAt = Date.now();
+  const isAutoTrigger = Boolean(options && options.trigger === "auto");
   const skipCollectedToday = Boolean(options && options.skipCollectedToday);
   const slot =
     options && typeof options.slot === "string" ? options.slot.trim() : "";
-  const skipCollectedSlot = Boolean(options && options.skipCollectedSlot && slot);
+  const slotStartMs =
+    options && Number.isFinite(options.slotStartMs)
+      ? options.slotStartMs
+      : slot
+      ? parseSlotStartMs(slot)
+      : null;
+  const slotEndMs =
+    options && Number.isFinite(options.slotEndMs) ? options.slotEndMs : null;
+  const skipCollectedSlot = Boolean(
+    options && options.skipCollectedSlot && slot && Number.isFinite(slotStartMs)
+  );
+  const minAutoIntervalMs =
+    isAutoTrigger && options && Number.isFinite(options.minAutoIntervalMs)
+      ? options.minAutoIntervalMs
+      : 0;
+  const persistedPartitionAutoRunAt =
+    options && options.persistedPartitionAutoRunAt
+      ? options.persistedPartitionAutoRunAt
+      : null;
   const retentionDays =
-    normalizeRetentionDaysArg(options && options.retentionDays) || lastRetentionDays;
+    normalizeRetentionDaysArg(options && options.retentionDays) ||
+    resolveEffectiveRetentionDays(null);
+  const collectedAutoPartitions = Object.create(null);
   let hasCollectedAny = false;
 
   for (let i = 0; i < total; i++) {
@@ -514,17 +663,29 @@ async function collectAccounts(accounts, sender, options = {}) {
       }
     };
 
-    const shouldSkip = skipCollectedSlot
-      ? hasPartitionCollectedForSlot(acc.partition, slot)
+    const nowCheck = Date.now();
+    const skippedBySlot = skipCollectedSlot
+      ? hasPartitionCollectedInSlot(acc.partition, slotStartMs, slotEndMs)
       : skipCollectedToday
       ? hasPartitionCollected(acc.partition)
       : false;
-    if (shouldSkip) {
+    const skippedByRateLimit =
+      !skippedBySlot &&
+      isAutoTrigger &&
+      minAutoIntervalMs > 0 &&
+      hasPartitionAutoRanRecently(
+        acc.partition,
+        nowCheck,
+        minAutoIntervalMs,
+        persistedPartitionAutoRunAt
+      );
+    if (skippedBySlot || skippedByRateLimit) {
       results.push({
         group: acc.group,
         platform: acc.platform,
         success: true,
         skipped: true,
+        ...(skippedByRateLimit ? { skipReason: "rate-limited" } : {}),
       });
       progress("skipped");
       continue;
@@ -543,27 +704,67 @@ async function collectAccounts(accounts, sender, options = {}) {
         platform: acc.platform,
       });
       const collectNow = Date.now();
-      store.mergeDaily(acc.group, acc.platform, data.overview, data.fansHistory);
-      store.mergeWorks(acc.group, acc.platform, data.works, collectNow, {
-        slot: slot || undefined,
-        retentionDays,
-      });
+      const ensureSameDay =
+        typeof store.createSameDayGuard === "function"
+          ? store.createSameDayGuard(collectNow, collectNow)
+          : () => {};
+      let dayRolled = false;
+      try {
+        ensureSameDay();
+        store.mergeDaily(
+          acc.group,
+          acc.platform,
+          data.overview,
+          data.fansHistory,
+          collectNow,
+          { ensureSameDay, throwOnDayRoll: true }
+        );
+        ensureSameDay();
+        store.mergeWorks(acc.group, acc.platform, data.works, collectNow, {
+          slot: slot || undefined,
+          retentionDays,
+          ensureSameDay,
+          throwOnDayRoll: true,
+        });
+        ensureSameDay();
+      } catch (persistErr) {
+        if (persistErr && persistErr.code === "EDAYROLL") {
+          dayRolled = true;
+          console.warn(
+            `[dataStats] 采集落盘跨过零点，整次放弃写入 (${acc.group}/${acc.platform}):`,
+            persistErr.message
+          );
+        } else {
+          throw persistErr;
+        }
+      }
+      if (dayRolled) {
+        results.push({
+          group: acc.group,
+          platform: acc.platform,
+          success: false,
+          dayRolled: true,
+          error: "写入跨过零点，已放弃本次保存",
+        });
+        progress("failed", { error: "写入跨过零点，已放弃本次保存" });
+        continue;
+      }
       store.writeMeta(acc.group, acc.platform, {
         lastCollectAt: collectNow,
         lastError: "",
         workCount: data.works.length,
       });
-      const effectiveSlot =
-        slot ||
-        (typeof store.formatManualSlotKey === "function"
-          ? store.formatManualSlotKey(collectNow)
-          : "");
-      markPartitionCollected(acc.partition, getTodayStr(collectNow), effectiveSlot);
+      markPartitionCollected(acc.partition, collectNow, isAutoTrigger);
+      if (isAutoTrigger) {
+        const normPart = normalizePartition(acc.partition);
+        if (normPart) collectedAutoPartitions[normPart] = collectNow;
+      }
       results.push({
         group: acc.group,
         platform: acc.platform,
         success: true,
         workCount: data.works.length,
+        collectedAt: collectNow,
       });
       progress("success");
     } catch (err) {
@@ -609,7 +810,7 @@ async function collectAccounts(accounts, sender, options = {}) {
       (err && err.message) || err
     );
   }
-  return { results, cancelled };
+  return { results, cancelled, collectedAutoPartitions };
 }
 
 function isLocalFrameEvent(event) {
@@ -730,6 +931,77 @@ function registerDataStatsIpc(options = {}) {
     options && options.exportDeps && typeof options.exportDeps === "object"
       ? options.exportDeps
       : undefined;
+
+  // 主进程启动时预读持久化的保留期与自动采集设置（未设置回退 60）
+  try {
+    if (typeof store.readAutoSettings === "function") {
+      const loaded = store.readAutoSettings();
+      const loadedRetention = normalizeRetentionDaysArg(loaded && loaded.retentionDays);
+      lastRetentionDays =
+        loadedRetention || store.DEFAULT_INTRADAY_RETENTION_DAYS || 60;
+    }
+  } catch (_) {}
+
+  ipcMain.handle("stats:get-auto-settings", async (event) => {
+    if (event && event.senderFrame && !isLocalFrameEvent(event)) {
+      return { ok: false, error: "不允许外部页面读取自动采集设置" };
+    }
+    try {
+      const settings =
+        typeof store.readAutoSettings === "function"
+          ? store.readAutoSettings()
+          : { retentionDays: lastRetentionDays };
+      return { ok: true, settings };
+    } catch (err) {
+      return {
+        ok: false,
+        error: (err && err.message) || "读取自动采集设置失败",
+      };
+    }
+  });
+
+  ipcMain.handle("stats:save-auto-settings", async (event, args) => {
+    if (event && event.senderFrame && !isLocalFrameEvent(event)) {
+      return { ok: false, error: "不允许外部页面修改自动采集设置" };
+    }
+    if (!args || typeof args !== "object" || Array.isArray(args)) {
+      return { ok: false, error: "设置参数无效" };
+    }
+    try {
+      const prev =
+        typeof store.readAutoSettings === "function"
+          ? store.readAutoSettings()
+          : null;
+      const saved =
+        typeof store.writeAutoSettings === "function"
+          ? store.writeAutoSettings(args, Date.now(), {
+              initOnly: Boolean(args.initOnly),
+            })
+          : { retentionDays: normalizeRetentionDaysArg(args.retentionDays) || lastRetentionDays };
+      const savedRetention = normalizeRetentionDaysArg(saved && saved.retentionDays);
+      if (savedRetention !== null) {
+        lastRetentionDays = savedRetention;
+      }
+      if (
+        prev &&
+        saved &&
+        saved.scheduleUpdatedAt !== prev.scheduleUpdatedAt
+      ) {
+        skippedAutoSlots.clear();
+        lastSeenAutoRunSchedule =
+          saved.mode === "interval"
+            ? `${saved.startTime}|${saved.endTime}|${saved.intervalHours}`
+            : null;
+      }
+      return { ok: true, settings: saved };
+    } catch (err) {
+      return {
+        ok: false,
+        error: (err && err.message) || "保存自动采集设置失败",
+      };
+    }
+  });
+
   ipcMain.handle("stats:collect", async (event, args) => {
     if (collecting) {
       return { results: [], error: "已有采集任务进行中" };
@@ -738,15 +1010,15 @@ function registerDataStatsIpc(options = {}) {
     if (!accounts.length) return { results: [], error: "没有可采集的账号" };
     const trigger =
       args && VALID_TRIGGERS.has(args.trigger) ? args.trigger : undefined;
-    const reqRetention = normalizeRetentionDaysArg(args && args.retentionDays);
-    if (reqRetention !== null) lastRetentionDays = reqRetention;
+    const retentionDays = resolveEffectiveRetentionDays(args);
     collecting = true;
     cancelled = false;
     try {
-      return await collectAccounts(accounts, event && event.sender, {
+      const out = await collectAccounts(accounts, event && event.sender, {
         trigger,
-        retentionDays: lastRetentionDays,
+        retentionDays,
       });
+      return { results: out.results, cancelled: out.cancelled };
     } finally {
       collecting = false;
     }
@@ -755,15 +1027,15 @@ function registerDataStatsIpc(options = {}) {
   /**
    * 定时自动采集单一操作（认领与采集合并）：
    * - interval 模式（传入 args.slot = "YYYY-MM-DD HH:mm"）：
-   *   按槽去重与落盘 auto-run.json，支持 slotEndMs 过槽放弃，跳过本槽已采分区
+   *   按槽去重与落盘 auto-run.json，支持 slotEndMs 过槽放弃、设置变更生效边界、
+   *   主进程防高频硬下限（< intervalHours*60-10 分钟跳过本槽）、以及同槽 [槽开始, 下一槽开始) 分区跳重
    * - daily 模式（未传 slot，兼容旧调用）：
    *   today = store.todayStr()（UTC+8，由主进程计算），行为与历史完全一致
    * - 均遵守：auto-run.json 已含目标 → already-ran；collecting 中 → busy（不写入）；
    *   开跑前原子追加目标到 runs（写失败返回 store-failed、不采集），结束后复位 collecting
    */
   ipcMain.handle("stats:auto-run", async (event, args) => {
-    const reqRetention = normalizeRetentionDaysArg(args && args.retentionDays);
-    if (reqRetention !== null) lastRetentionDays = reqRetention;
+    const retentionDays = resolveEffectiveRetentionDays(args);
 
     const hasSlotArg =
       args &&
@@ -774,24 +1046,75 @@ function registerDataStatsIpc(options = {}) {
 
     if (hasSlotArg) {
       const slot = typeof args.slot === "string" ? args.slot.trim() : "";
+      const slotStartMs = parseSlotStartMs(slot);
       const validSlot =
-        typeof store.isValidAutoRunSlot === "function"
+        slotStartMs !== null &&
+        (typeof store.isValidAutoRunSlot === "function"
           ? store.isValidAutoRunSlot(slot)
-          : /^\d{4}-\d{2}-\d{2} ([01]\d|2[0-3]):([0-5]\d)$/.test(slot);
+          : SLOT_STR_RE.test(slot));
       if (!validSlot) {
         return { status: "invalid-slot", error: "非法时段槽" };
       }
       const slotDate = slot.slice(0, 10);
+      const now = Date.now();
+
+      let autoSettings =
+        typeof store.readAutoSettings === "function"
+          ? store.readAutoSettings()
+          : { intervalHours: 2, scheduleUpdatedAt: 0 };
+
+      // 兜底检测：若调用方携带新调度参数且未先调 stats:save-auto-settings，主进程同步生效边界
+      const reqStart =
+        typeof args.startTime === "string" && TIME_HHMM_RE.test(args.startTime.trim())
+          ? args.startTime.trim()
+          : "";
+      const reqEnd =
+        typeof args.endTime === "string" && TIME_HHMM_RE.test(args.endTime.trim())
+          ? args.endTime.trim()
+          : "";
+      const reqInterval = normalizeIntervalHoursArg(args.intervalHours);
+      if (reqStart && reqEnd && reqInterval !== null) {
+        const reqSig = `${reqStart}|${reqEnd}|${reqInterval}`;
+        const hasDiskSettings =
+          typeof store.autoSettingsFile === "function" &&
+          fs.existsSync(store.autoSettingsFile());
+        const prevSig =
+          lastSeenAutoRunSchedule ||
+          (hasDiskSettings && autoSettings.mode === "interval"
+            ? `${autoSettings.startTime}|${autoSettings.endTime}|${autoSettings.intervalHours}`
+            : null);
+        if (prevSig && prevSig !== reqSig && typeof store.writeAutoSettings === "function") {
+          try {
+            autoSettings = store.writeAutoSettings(
+              {
+                mode: "interval",
+                enabled: true,
+                startTime: reqStart,
+                endTime: reqEnd,
+                intervalHours: reqInterval,
+              },
+              now
+            );
+            skippedAutoSlots.clear();
+          } catch (_) {}
+        }
+        lastSeenAutoRunSchedule = reqSig;
+      }
+
       if (autoRanInMemory.has(slot)) {
         return { status: "already-ran", date: slotDate, slot };
       }
-      let runs = [];
+      let autoRunState;
       try {
-        runs = store.readAutoRuns();
+        autoRunState =
+          typeof store.readAutoRunState === "function"
+            ? store.readAutoRunState()
+            : { runs: store.readAutoRuns(), lastAutoRunAt: 0, partitionAutoRunAt: {} };
       } catch (err) {
         console.warn("[dataStats] 读取 auto-run.json 失败:", (err && err.message) || err);
         return { status: "busy" };
       }
+      const runs = autoRunState.runs || [];
       if (runs.includes(slot)) {
         autoRanInMemory.add(slot);
         return { status: "already-ran", date: slotDate, slot };
@@ -800,10 +1123,66 @@ function registerDataStatsIpc(options = {}) {
         args.slotEndMs !== undefined &&
         args.slotEndMs !== null &&
         Number.isFinite(Number(args.slotEndMs)) &&
-        Date.now() >= Number(args.slotEndMs)
+        now >= Number(args.slotEndMs)
       ) {
         return { status: "expired", date: slotDate, slot };
       }
+
+      // 生效边界：设置变更后不补跑槽开始时刻早于设置变更时刻的更早槽
+      if (
+        autoSettings &&
+        typeof autoSettings.scheduleUpdatedAt === "number" &&
+        autoSettings.scheduleUpdatedAt > 0 &&
+        slotStartMs < autoSettings.scheduleUpdatedAt
+      ) {
+        return {
+          status: "skipped",
+          reason: "before-settings-change",
+          date: slotDate,
+          slot,
+        };
+      }
+
+      // 主进程防高频硬下限：距上次自动采集 < intervalHours*60 - 10 分钟 → 跳过本槽
+      const intervalHours = resolveEffectiveIntervalHours(
+        args,
+        autoSettings,
+        slotStartMs,
+        args.slotEndMs
+      );
+      const effectiveSlotEndMs = resolveEffectiveSlotEndMs(
+        args,
+        slotStartMs,
+        intervalHours
+      );
+      const minAutoIntervalMs =
+        Math.max(0, intervalHours * 60 - RATE_LIMIT_GRACE_MINUTES) * 60000;
+      if (skippedAutoSlots.has(slot)) {
+        return {
+          status: "skipped",
+          reason: "rate-limited",
+          date: slotDate,
+          slot,
+        };
+      }
+      let prevGlobalAutoAt = 0;
+      if (lastGlobalAutoRunAt > 0 && lastGlobalAutoRunAt <= now) {
+        prevGlobalAutoAt = Math.max(prevGlobalAutoAt, lastGlobalAutoRunAt);
+      }
+      if (autoRunState.lastAutoRunAt > 0 && autoRunState.lastAutoRunAt <= now) {
+        prevGlobalAutoAt = Math.max(prevGlobalAutoAt, autoRunState.lastAutoRunAt);
+      }
+      if (prevGlobalAutoAt > 0 && now - prevGlobalAutoAt < minAutoIntervalMs) {
+        skippedAutoSlots.add(slot);
+        return {
+          status: "skipped",
+          reason: "rate-limited",
+          date: slotDate,
+          slot,
+          retryAfterMs: minAutoIntervalMs - (now - prevGlobalAutoAt),
+        };
+      }
+
       if (collecting) {
         return { status: "busy" };
       }
@@ -812,7 +1191,7 @@ function registerDataStatsIpc(options = {}) {
         return { status: "empty", date: slotDate, slot, results: [] };
       }
       try {
-        store.appendAutoRun(slot);
+        store.appendAutoRun(slot, { autoRunAt: now });
       } catch (err) {
         console.warn(
           "[dataStats] 写入 auto-run.json 失败，本轮不自动采集:",
@@ -821,6 +1200,7 @@ function registerDataStatsIpc(options = {}) {
         return { status: "store-failed" };
       }
       autoRanInMemory.add(slot);
+      lastGlobalAutoRunAt = now;
       collecting = true;
       cancelled = false;
       try {
@@ -828,8 +1208,29 @@ function registerDataStatsIpc(options = {}) {
           trigger: "auto",
           skipCollectedSlot: true,
           slot,
-          retentionDays: lastRetentionDays,
+          slotStartMs,
+          slotEndMs: effectiveSlotEndMs,
+          minAutoIntervalMs,
+          persistedPartitionAutoRunAt: autoRunState.partitionAutoRunAt,
+          retentionDays,
         });
+        if (
+          out.collectedAutoPartitions &&
+          Object.keys(out.collectedAutoPartitions).length > 0 &&
+          typeof store.updateAutoRunTimestamps === "function"
+        ) {
+          try {
+            store.updateAutoRunTimestamps({
+              lastAutoRunAt: now,
+              partitionAutoRunAt: out.collectedAutoPartitions,
+            });
+          } catch (tsErr) {
+            console.warn(
+              "[dataStats] 更新 auto-run.json 分区时间戳失败:",
+              (tsErr && tsErr.message) || tsErr
+            );
+          }
+        }
         return {
           status: "done",
           date: slotDate,
@@ -879,7 +1280,7 @@ function registerDataStatsIpc(options = {}) {
       const out = await collectAccounts(accounts, event && event.sender, {
         trigger: "auto",
         skipCollectedToday: true,
-        retentionDays: lastRetentionDays,
+        retentionDays,
       });
       return {
         status: "done",
@@ -1432,6 +1833,7 @@ function registerDataStatsIpc(options = {}) {
       groupsMap.get(gk).tasks.push(t);
     }
 
+    const retentionDays = resolveEffectiveRetentionDays(args);
     collecting = true;
     try {
       const entries = [...groupsMap.values()];
@@ -1440,21 +1842,48 @@ function registerDataStatsIpc(options = {}) {
         try {
           const data = await collectAccount({ partition, platform });
           const collectNow = Date.now();
-          // 顺带落库（与「同步数据」同效果）
-          store.mergeDaily(group, platform, data.overview, data.fansHistory);
-          store.mergeWorks(group, platform, data.works, collectNow, {
-            retentionDays: lastRetentionDays,
-          });
-          store.writeMeta(group, platform, {
-            lastCollectAt: collectNow,
-            lastError: "",
-            workCount: data.works.length,
-          });
-          const effectiveSlot =
-            typeof store.formatManualSlotKey === "function"
-              ? store.formatManualSlotKey(collectNow)
-              : "";
-          markPartitionCollected(partition, getTodayStr(collectNow), effectiveSlot);
+          const ensureSameDay =
+            typeof store.createSameDayGuard === "function"
+              ? store.createSameDayGuard(collectNow, collectNow)
+              : () => {};
+          let dayRolled = false;
+          try {
+            ensureSameDay();
+            // 顺带落库（与「同步数据」同效果），全过程共享同一个 collectNow 与 ensureSameDay
+            store.mergeDaily(
+              group,
+              platform,
+              data.overview,
+              data.fansHistory,
+              collectNow,
+              { ensureSameDay, throwOnDayRoll: true }
+            );
+            ensureSameDay();
+            store.mergeWorks(group, platform, data.works, collectNow, {
+              retentionDays,
+              ensureSameDay,
+              throwOnDayRoll: true,
+            });
+            ensureSameDay();
+          } catch (persistErr) {
+            if (persistErr && persistErr.code === "EDAYROLL") {
+              dayRolled = true;
+              console.warn(
+                `[dataStats] 状态匹配落盘跨过零点，整次放弃写入 (${group}/${platform}):`,
+                persistErr.message
+              );
+            } else {
+              throw persistErr;
+            }
+          }
+          if (!dayRolled) {
+            store.writeMeta(group, platform, {
+              lastCollectAt: collectNow,
+              lastError: "",
+              workCount: data.works.length,
+            });
+            markPartitionCollected(partition, collectNow, false);
+          }
           const byTitle = buildTitleIndex(data.works, normalizeStatusTitle);
           for (const t of groupTasks) {
             const key = normalizeStatusTitle(t.title);

@@ -2252,12 +2252,27 @@ export default {
         startTime: this.autoCollect.startTime,
         endTime: this.autoCollect.endTime,
         intervalHours: this.autoCollect.intervalHours,
+        retentionDays: this.autoCollect.retentionDays,
       });
       this.autoCollect = normalizeAutoCollectView(res.settings);
       if (!res.ok) {
         this.$message.error(
           `保存自动采集设置失败${res.error ? "：" + res.error : ""}`
         );
+        return;
+      }
+      if (ipcRenderer && typeof ipcRenderer.invoke === "function") {
+        Promise.resolve(
+          ipcRenderer.invoke("stats:save-auto-settings", {
+            enabled: this.autoCollect.enabled,
+            mode: this.autoCollect.mode,
+            time: this.autoCollect.time,
+            startTime: this.autoCollect.startTime,
+            endTime: this.autoCollect.endTime,
+            intervalHours: this.autoCollect.intervalHours,
+            retentionDays: this.autoCollect.retentionDays,
+          })
+        ).catch(() => {});
       }
     },
     async refresh() {

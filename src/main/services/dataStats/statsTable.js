@@ -211,7 +211,27 @@ function buildWorkDailyRows({ group, platform, works, worksDaily, from, to, link
 }
 
 const HOUR_MS = 3600000;
+const UTC8_MS = 8 * HOUR_MS;
 const SLOT_TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
+
+function slotToUtc8Ms(dateStr, slotStr) {
+  const dayMs = parseDateDayMs(dateStr);
+  if (dayMs === null) return null;
+  const m = SLOT_TIME_RE.exec(typeof slotStr === "string" ? slotStr.trim() : "");
+  if (!m) return null;
+  return dayMs + (Number(m[1]) * 60 + Number(m[2])) * 60000 - UTC8_MS;
+}
+
+function compareIntradayPointTime(a, b) {
+  const ta = a.sortTsMs;
+  const tb = b.sortTsMs;
+  if (ta !== null && tb !== null && ta !== tb) return ta - tb;
+  if (ta !== null && tb === null) return -1;
+  if (ta === null && tb !== null) return 1;
+  if (a.date !== b.date) return a.date < b.date ? -1 : 1;
+  if (a.slot !== b.slot) return a.slot < b.slot ? -1 : 1;
+  return 0;
+}
 
 function round2(val) {
   if (typeof val !== "number" || !Number.isFinite(val)) return null;
@@ -287,34 +307,28 @@ function buildWorkIntradayRows({ group, platform, works, worksIntraday, from, to
       ? parsePublishTime(meta.publishTime)
       : { ms: 0, iso: "" };
 
-    // 按 (date, slot, collectedAt) 升序整理，同 (date, slot) 保留较晚记录
-    const validPoints = [];
+    // 按 (date, slot) 去重保留较晚记录，再按实际 collectedAt 升序计算增量与距上次小时数
+    const byDateSlot = new Map();
     for (const pt of rawList) {
       if (!pt || typeof pt !== "object" || Array.isArray(pt)) continue;
       const date = typeof pt.date === "string" ? pt.date.trim() : "";
       const slot = typeof pt.slot === "string" ? pt.slot.trim() : "";
       if (parseDateDayMs(date) === null || !SLOT_TIME_RE.test(slot)) continue;
       const collectedAt = normalizeCollectedAtMs(pt.collectedAt);
-      validPoints.push({ date, slot, collectedAt, snap: pt });
-    }
-    if (!validPoints.length) continue;
-
-    validPoints.sort((a, b) => {
-      if (a.date !== b.date) return a.date < b.date ? -1 : 1;
-      if (a.slot !== b.slot) return a.slot < b.slot ? -1 : 1;
-      return (a.collectedAt || 0) - (b.collectedAt || 0);
-    });
-
-    // 同 (date, slot) 去重保留最后一条
-    const deduped = [];
-    for (const pt of validPoints) {
-      const last = deduped.length ? deduped[deduped.length - 1] : null;
-      if (last && last.date === pt.date && last.slot === pt.slot) {
-        deduped[deduped.length - 1] = pt;
-      } else {
-        deduped.push(pt);
+      const sortTsMs = collectedAt !== null ? collectedAt : slotToUtc8Ms(date, slot);
+      const key = `${date} ${slot}`;
+      const prev = byDateSlot.get(key);
+      if (
+        !prev ||
+        (collectedAt !== null && (prev.collectedAt === null || collectedAt >= prev.collectedAt)) ||
+        (collectedAt === null && prev.collectedAt === null)
+      ) {
+        byDateSlot.set(key, { date, slot, collectedAt, sortTsMs, snap: pt });
       }
     }
+    if (!byDateSlot.size) continue;
+
+    const deduped = [...byDateSlot.values()].sort(compareIntradayPointTime);
 
     let prevPoint = null;
     let prevValues = null;
@@ -381,11 +395,16 @@ function buildWorkIntradayRows({ group, platform, works, worksIntraday, from, to
           linkInfo && linkInfo.matchedBy != null ? linkInfo.matchedBy : null;
       }
 
-      entries.push({ publishTimeMs, row });
+      entries.push({ publishTimeMs, sortTsMs: point.sortTsMs, row });
     }
   }
 
   entries.sort((a, b) => {
+    const ta = a.sortTsMs;
+    const tb = b.sortTsMs;
+    if (ta !== null && tb !== null && ta !== tb) return ta - tb;
+    if (ta !== null && tb === null) return -1;
+    if (ta === null && tb !== null) return 1;
     if (a.row.date !== b.row.date) return a.row.date < b.row.date ? -1 : 1;
     if (a.row.slot !== b.row.slot) return a.row.slot < b.row.slot ? -1 : 1;
     if (b.publishTimeMs !== a.publishTimeMs) return b.publishTimeMs - a.publishTimeMs;

@@ -48,20 +48,55 @@ function todayStr(now = Date.now()) {
   return d.toISOString().slice(0, 10);
 }
 
+/**
+ * 创建跨零点保护校验器：覆盖从取得 collectNow 到各文件原子替换的全过程。
+ * 用「注入的 now + 实际流逝时间」推算当前时刻，兼容测试注入时间与真实系统时钟。
+ */
+function createSameDayGuard(now = Date.now(), startedRealArg, label = "") {
+  const safeNow = typeof now === "number" && Number.isFinite(now) ? now : Date.now();
+  const startedDay = todayStr(safeNow);
+  const startedReal =
+    typeof startedRealArg === "number" && Number.isFinite(startedRealArg)
+      ? startedRealArg
+      : Date.now();
+  const ensureSameDay = () => {
+    if (todayStr(safeNow + (Date.now() - startedReal)) !== startedDay) {
+      const err = new Error(`写入跨过零点，放弃改写 ${label || startedDay} 的快照`);
+      err.code = "EDAYROLL";
+      throw err;
+    }
+  };
+  ensureSameDay.now = safeNow;
+  ensureSameDay.startedDay = startedDay;
+  ensureSameDay.startedReal = startedReal;
+  return ensureSameDay;
+}
+
 /* ---------------- daily ---------------- */
 
 function readDaily(group, platform) {
   return readJson(path.join(accountDir(group, platform), "daily.json"), {});
 }
 
-function writeDaily(group, platform, daily) {
-  writeJson(path.join(accountDir(group, platform), "daily.json"), daily);
+function writeDaily(group, platform, daily, beforeRename) {
+  const file = path.join(accountDir(group, platform), "daily.json");
+  writeWorksDailyAtomic(file, daily, beforeRename);
 }
 
 /**
  * 合并一次采集到 daily：写入当日总量快照；fansHistory 只回填缺失日期。
+ * 支持传入统一 ensureSameDay 跨零点保护（跨零点则放弃写入并 warn，若 throwOnDayRoll=true 则上抛 EDAYROLL）。
  */
-function mergeDaily(group, platform, overview, fansHistory, now = Date.now()) {
+function mergeDaily(group, platform, overview, fansHistory, now = Date.now(), options = null) {
+  const opts = isPlainObject(options) ? options : null;
+  const ensureSameDay =
+    opts && typeof opts.ensureSameDay === "function"
+      ? opts.ensureSameDay
+      : createSameDayGuard(
+          now,
+          opts && typeof opts._startedReal === "number" ? opts._startedReal : undefined
+        );
+  const throwOnDayRoll = Boolean(opts && opts.throwOnDayRoll);
   const daily = readDaily(group, platform);
   const today = todayStr(now);
   const snap = {};
@@ -69,16 +104,30 @@ function mergeDaily(group, platform, overview, fansHistory, now = Date.now()) {
     const v = Number(overview && overview[k]);
     if (Number.isFinite(v)) snap[k] = v;
   }
-  daily[today] = { ...daily[today], ...snap };
+  const nextDaily = { ...daily, [today]: { ...daily[today], ...snap } };
   for (const point of fansHistory || []) {
     if (!point || !point.date) continue;
-    if (!daily[point.date]) daily[point.date] = {};
-    if (daily[point.date].fans == null) {
-      daily[point.date].fans = Number(point.value) || 0;
+    if (!nextDaily[point.date]) nextDaily[point.date] = {};
+    else nextDaily[point.date] = { ...nextDaily[point.date] };
+    if (nextDaily[point.date].fans == null) {
+      nextDaily[point.date].fans = Number(point.value) || 0;
     }
   }
-  writeDaily(group, platform, daily);
-  return daily;
+  try {
+    ensureSameDay();
+    writeDaily(group, platform, nextDaily, ensureSameDay);
+    return nextDaily;
+  } catch (err) {
+    if (err && err.code === "EDAYROLL") {
+      if (throwOnDayRoll) throw err;
+      console.warn(
+        `[dataStats] 写入 daily.json 跨过零点，放弃本次写入 (${group}/${platform}):`,
+        err.message
+      );
+      return daily;
+    }
+    throw err;
+  }
 }
 
 /* ---------------- works（发布增长） ---------------- */
@@ -174,7 +223,15 @@ function parseValidPublishTime(raw) {
  * - 展示时优先用封闭值（closedStats），未封闭用当前值
  */
 function mergeWorks(group, platform, newWorks, now = Date.now(), options = null) {
-  const startedReal = Date.now();
+  const opts = isPlainObject(options) ? options : null;
+  const startedReal =
+    opts && typeof opts._startedReal === "number" ? opts._startedReal : Date.now();
+  const ensureSameDay =
+    opts && typeof opts.ensureSameDay === "function"
+      ? opts.ensureSameDay
+      : createSameDayGuard(now, startedReal);
+  const throwOnDayRoll = Boolean(opts && opts.throwOnDayRoll);
+
   const data = readWorks(group, platform);
   const byId = new Map(data.works.map((w) => [w.workId, w]));
   // 首次全量导入时不做封闭：封闭语义是「两次采集之间出现了新发布」，
@@ -231,12 +288,35 @@ function mergeWorks(group, platform, newWorks, now = Date.now(), options = null)
 
   // 展示按发布时间倒序
   data.works.sort((a, b) => (b.publishTime || 0) - (a.publishTime || 0));
+
+  // 跨零点校验覆盖 works.json / works-daily / works-intraday 全过程
+  try {
+    ensureSameDay();
+  } catch (err) {
+    if (err && err.code === "EDAYROLL") {
+      if (throwOnDayRoll) throw err;
+      console.warn(
+        `[dataStats] 写入 works.json 跨过零点，放弃本次写入 (${group}/${platform}):`,
+        err.message
+      );
+      return readWorks(group, platform);
+    }
+    throw err;
+  }
+
   writeWorks(group, platform, data);
-  recordWorksDaily(group, platform, sorted, now, startedReal);
+  const dailyOut = recordWorksDaily(group, platform, sorted, now, ensureSameDay, {
+    throwOnDayRoll,
+  });
+  if (dailyOut && dailyOut.dayRolled) {
+    return data;
+  }
   recordWorksIntraday(group, platform, sorted, {
-    ...(isPlainObject(options) ? options : {}),
+    ...(opts || {}),
     now,
     _startedReal: startedReal,
+    ensureSameDay,
+    throwOnDayRoll,
   });
   return data;
 }
@@ -569,27 +649,24 @@ function readWorksDailyLatestAsOf(group, platform, cutoffDate = "") {
  * 写入作品当日累计快照（UTC+8，只读写当天 YYYY-MM-DD.json，不加锁、不写非当天文件）。
  * 读当天文件（不存在/损坏视为空，损坏时 warn）→ 按 workId 合并 → 原子写；失败仅 warn，不影响 mergeWorks。
  */
-function recordWorksDaily(group, platform, works, now = Date.now(), startedRealArg) {
-  if (!works || !works.length) return;
+function recordWorksDaily(group, platform, works, now = Date.now(), startedRealOrGuard, extraOpts) {
+  if (!works || !works.length) return { dayRolled: false };
   const validWorks = [];
   for (const w of works) {
     if (w && w.workId) validWorks.push(w);
   }
-  if (!validWorks.length) return;
+  if (!validWorks.length) return { dayRolled: false };
 
   const today = todayStr(now);
   const file = path.join(worksDailyDir(group, platform), `${today}.json`);
-  // 跨零点保护：写入耗时内若 UTC+8 日期已变，放弃替换，绝不改写已成为「昨天」的文件。
-  // 用「注入的 now + 实际流逝时间」推算当前时刻，兼容测试注入时间。
-  const startedReal = typeof startedRealArg === "number" ? startedRealArg : Date.now();
-  const ensureSameDay = () => {
-    if (todayStr(now + (Date.now() - startedReal)) !== today) {
-      const err = new Error(`写入跨过零点，放弃改写 ${today} 的快照`);
-      err.code = "EDAYROLL";
-      throw err;
-    }
-  };
+  const throwOnDayRoll = Boolean(isPlainObject(extraOpts) && extraOpts.throwOnDayRoll);
+  // 跨零点保护：优先复用调用方传入的统一 ensureSameDay；否则按 startedReal + now 新建。
+  const ensureSameDay =
+    typeof startedRealOrGuard === "function"
+      ? startedRealOrGuard
+      : createSameDayGuard(now, startedRealOrGuard, today);
   try {
+    ensureSameDay();
     const dayWorks = parseDayWorksFile(file) || Object.create(null);
     for (const w of validWorks) {
       dayWorks[String(w.workId)] = pickWorkDailyStats(w);
@@ -599,11 +676,21 @@ function recordWorksDaily(group, platform, works, now = Date.now(), startedRealA
       updatedAt: now,
       works: dayWorks,
     }, ensureSameDay);
+    return { dayRolled: false };
   } catch (err) {
+    if (err && err.code === "EDAYROLL") {
+      if (throwOnDayRoll) throw err;
+      console.warn(
+        `[dataStats] 写入 works-daily/${today}.json 失败 (${group}/${platform}):`,
+        (err && err.message) || err
+      );
+      return { dayRolled: true };
+    }
     console.warn(
       `[dataStats] 写入 works-daily/${today}.json 失败 (${group}/${platform}):`,
       (err && err.message) || err
     );
+    return { dayRolled: false };
   }
 }
 
@@ -773,7 +860,12 @@ function recordWorksIntraday(group, platform, works, optionsOrNow, extraOpts) {
   }
   const now =
     typeof opts.now === "number" && Number.isFinite(opts.now) ? opts.now : Date.now();
-  const retentionDays = normalizeRetentionDaysOption(opts.retentionDays);
+  const hasExplicitRetention =
+    opts.retentionDays !== undefined && opts.retentionDays !== null && opts.retentionDays !== "";
+  const retentionDays = hasExplicitRetention
+    ? normalizeRetentionDaysOption(opts.retentionDays)
+    : readAutoSettings().retentionDays;
+  const throwOnDayRoll = Boolean(opts.throwOnDayRoll);
 
   let targetDate;
   let slotTime;
@@ -791,20 +883,20 @@ function recordWorksIntraday(group, platform, works, optionsOrNow, extraOpts) {
   }
 
   const startedDay = todayStr(now);
-  const startedReal =
-    typeof opts._startedReal === "number" ? opts._startedReal : Date.now();
-  const ensureSameDay = () => {
-    if (todayStr(now + (Date.now() - startedReal)) !== startedDay) {
-      const err = new Error(`写入跨过零点，放弃改写 ${targetDate} 的分时段快照`);
-      err.code = "EDAYROLL";
-      throw err;
-    }
-  };
+  const ensureSameDay =
+    typeof opts.ensureSameDay === "function"
+      ? opts.ensureSameDay
+      : createSameDayGuard(
+          now,
+          typeof opts._startedReal === "number" ? opts._startedReal : undefined,
+          `${targetDate} 的分时段`
+        );
 
   const dir = worksIntradayDir(group, platform);
   const file = path.join(dir, `${targetDate}.json`);
 
   try {
+    ensureSameDay();
     const existingSlots = parseIntradayDayFile(file) || Object.create(null);
     const slotWorks = Object.create(null);
     for (const w of validWorks) {
@@ -830,6 +922,9 @@ function recordWorksIntraday(group, platform, works, optionsOrNow, extraOpts) {
       cleanupWorksIntraday(group, platform, now, retentionDays);
     }
   } catch (err) {
+    if (err && err.code === "EDAYROLL" && throwOnDayRoll) {
+      throw err;
+    }
     console.warn(
       `[dataStats] 写入 works-intraday/${targetDate}.json 失败 (${group}/${platform}):`,
       (err && err.message) || err
@@ -837,10 +932,18 @@ function recordWorksIntraday(group, platform, works, optionsOrNow, extraOpts) {
   }
 }
 
+function slotToUtc8Ms(dateStr, slotStr) {
+  const dayNum = dateStrToDayNum(dateStr);
+  if (dayNum === null) return null;
+  const m = SLOT_TIME_RE.exec(typeof slotStr === "string" ? slotStr.trim() : "");
+  if (!m) return null;
+  return dayNum * DAY_MS + (Number(m[1]) * 60 + Number(m[2])) * 60000 - 8 * 3600e3;
+}
+
 /**
  * 读取作品分时段快照，返回无原型字典：
  * `{ workId: [{ date, slot, collectedAt, play, like, comment, share, favorite, fansDelta }] }`
- * 按时间升序（date → slot → collectedAt）；支持 { from, to } 日期范围过滤；损坏/读失败文件 warn 并跳过。
+ * 按实际 collectedAt 升序（缺省回退槽时刻，再按 date → slot）；支持 { from, to } 日期范围过滤；损坏/读失败文件 warn 并跳过。
  */
 function readWorksIntraday(group, platform, range = {}) {
   const result = Object.create(null);
@@ -910,9 +1013,20 @@ function readWorksIntraday(group, platform, range = {}) {
 
   for (const workId of Object.keys(result)) {
     result[workId].sort((a, b) => {
+      const ta =
+        typeof a.collectedAt === "number" && Number.isFinite(a.collectedAt) && a.collectedAt > 0
+          ? a.collectedAt
+          : slotToUtc8Ms(a.date, a.slot);
+      const tb =
+        typeof b.collectedAt === "number" && Number.isFinite(b.collectedAt) && b.collectedAt > 0
+          ? b.collectedAt
+          : slotToUtc8Ms(b.date, b.slot);
+      if (ta !== null && tb !== null && ta !== tb) return ta - tb;
+      if (ta !== null && tb === null) return -1;
+      if (ta === null && tb !== null) return 1;
       if (a.date !== b.date) return a.date < b.date ? -1 : 1;
       if (a.slot !== b.slot) return a.slot < b.slot ? -1 : 1;
-      return (a.collectedAt || 0) - (b.collectedAt || 0);
+      return 0;
     });
   }
 
@@ -921,6 +1035,7 @@ function readWorksIntraday(group, platform, range = {}) {
 
 /**
  * 仅读取截至 cutoffDate 每个作品在 works-intraday 中最近一次 collectedAt（用于作品汇总「最近采集」列）。
+ * 若指定 cutoffDate，同时校验 collectedAt 的 UTC+8 日期 <= cutoffDate。
  * 返回无原型字典 `{ [workId]: maxCollectedAtMs }`。
  */
 function readWorksIntradayLatestCollectedAt(group, platform, cutoffDate = "") {
@@ -972,6 +1087,7 @@ function readWorksIntradayLatestCollectedAt(group, platform, cutoffDate = "") {
       if (!slotEntry || !isPlainObject(slotEntry.works)) continue;
       const ts = slotEntry.collectedAt;
       if (typeof ts !== "number" || !Number.isFinite(ts) || ts <= 0) continue;
+      if (cutoff && todayStr(ts) > cutoff) continue;
       for (const workId of Object.keys(slotEntry.works)) {
         if (out[workId] === undefined || ts > out[workId]) {
           out[workId] = ts;
@@ -1009,12 +1125,160 @@ function readCollectLogs() {
   return readJson(collectLogFile(), []);
 }
 
-/* ---------------- auto-run（每日自动采集运行记录） ---------------- */
+/* ---------------- auto-run（每日/分时段自动采集运行记录） ---------------- */
 
 const MAX_AUTO_RUN_DATES = 14;
+const MAX_AUTO_RUN_PARTITIONS = 256;
+const VALID_AUTO_INTERVAL_HOURS = new Set([1, 2, 3, 4, 6]);
+const DEFAULT_AUTO_SETTINGS = Object.freeze({
+  enabled: true,
+  mode: "daily",
+  startTime: "08:00",
+  endTime: "22:00",
+  intervalHours: 2,
+  time: "10:00",
+  retentionDays: DEFAULT_INTRADAY_RETENTION_DAYS,
+  updatedAt: 0,
+  scheduleUpdatedAt: 0,
+});
 
 function autoRunFile() {
   return path.join(baseDir(), "auto-run.json");
+}
+
+function autoSettingsFile() {
+  return path.join(baseDir(), "auto-settings.json");
+}
+
+function normalizeAutoSettingsDoc(raw) {
+  if (!isPlainObject(raw)) {
+    return { ...DEFAULT_AUTO_SETTINGS };
+  }
+  const mode = raw.mode === "interval" ? "interval" : "daily";
+  const ih = typeof raw.intervalHours === "number" ? raw.intervalHours : Number(raw.intervalHours);
+  const intervalHours =
+    Number.isInteger(ih) && VALID_AUTO_INTERVAL_HOURS.has(ih)
+      ? ih
+      : DEFAULT_AUTO_SETTINGS.intervalHours;
+  const startTime =
+    typeof raw.startTime === "string" && SLOT_TIME_RE.test(raw.startTime.trim())
+      ? raw.startTime.trim()
+      : DEFAULT_AUTO_SETTINGS.startTime;
+  const endTime =
+    typeof raw.endTime === "string" && SLOT_TIME_RE.test(raw.endTime.trim())
+      ? raw.endTime.trim()
+      : DEFAULT_AUTO_SETTINGS.endTime;
+  const time =
+    typeof raw.time === "string" && SLOT_TIME_RE.test(raw.time.trim())
+      ? raw.time.trim()
+      : DEFAULT_AUTO_SETTINGS.time;
+  const retentionDays = normalizeRetentionDaysOption(raw.retentionDays);
+  const updatedAt =
+    typeof raw.updatedAt === "number" && Number.isFinite(raw.updatedAt) && raw.updatedAt >= 0
+      ? raw.updatedAt
+      : 0;
+  const scheduleUpdatedAt =
+    typeof raw.scheduleUpdatedAt === "number" &&
+    Number.isFinite(raw.scheduleUpdatedAt) &&
+    raw.scheduleUpdatedAt >= 0
+      ? raw.scheduleUpdatedAt
+      : 0;
+  return {
+    enabled: typeof raw.enabled === "boolean" ? raw.enabled : DEFAULT_AUTO_SETTINGS.enabled,
+    mode,
+    startTime,
+    endTime,
+    intervalHours,
+    time,
+    retentionDays,
+    updatedAt,
+    scheduleUpdatedAt,
+  };
+}
+
+/**
+ * 读取主进程持久化的自动采集与保留期设置（<userData>/data-stats/auto-settings.json）。
+ * 不存在返回默认值（retentionDays=60）；损坏或结构无效告警并返回默认值。
+ */
+function readAutoSettings() {
+  const file = autoSettingsFile();
+  let raw;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch (err) {
+    if (err && err.code === "ENOENT") return { ...DEFAULT_AUTO_SETTINGS };
+    console.warn(`[dataStats] 读取 auto-settings.json 失败 (${file}):`, (err && err.message) || err);
+    return { ...DEFAULT_AUTO_SETTINGS };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    console.warn(`[dataStats] auto-settings.json JSON 损坏 (${file}):`, (err && err.message) || err);
+    return { ...DEFAULT_AUTO_SETTINGS };
+  }
+  if (!isPlainObject(parsed)) {
+    console.warn(`[dataStats] auto-settings.json 结构无效 (${file})`);
+    return { ...DEFAULT_AUTO_SETTINGS };
+  }
+  return normalizeAutoSettingsDoc(parsed);
+}
+
+/**
+ * 原子持久化自动采集与保留期设置（<userData>/data-stats/auto-settings.json）。
+ * 当调度参数（mode / startTime / endTime / intervalHours 或 enabled 由关到开）变化时，
+ * 自动记录主进程权威生效边界 scheduleUpdatedAt = now。
+ * 若 opts.initOnly=true 且文件已存在，直接返回现有持久化设置，不覆盖。
+ */
+function writeAutoSettings(patch, now = Date.now(), opts = null) {
+  const file = autoSettingsFile();
+  const initOnly = Boolean(isPlainObject(opts) && opts.initOnly);
+  const exists = fs.existsSync(file);
+  if (initOnly && exists) {
+    return readAutoSettings();
+  }
+  const prev = exists ? readAutoSettings() : { ...DEFAULT_AUTO_SETTINGS };
+  const mergedRaw = { ...prev };
+  if (isPlainObject(patch)) {
+    for (const k of [
+      "enabled",
+      "mode",
+      "startTime",
+      "endTime",
+      "intervalHours",
+      "time",
+      "retentionDays",
+    ]) {
+      if (patch[k] !== undefined) mergedRaw[k] = patch[k];
+    }
+  }
+  const next = normalizeAutoSettingsDoc(mergedRaw);
+  const ts = typeof now === "number" && Number.isFinite(now) && now > 0 ? now : Date.now();
+  const scheduleChanged =
+    prev.mode !== next.mode ||
+    prev.startTime !== next.startTime ||
+    prev.endTime !== next.endTime ||
+    prev.intervalHours !== next.intervalHours ||
+    (!prev.enabled && next.enabled);
+
+  if (initOnly) {
+    next.scheduleUpdatedAt = 0;
+  } else if (
+    isPlainObject(patch) &&
+    typeof patch.scheduleUpdatedAt === "number" &&
+    Number.isFinite(patch.scheduleUpdatedAt) &&
+    patch.scheduleUpdatedAt >= 0
+  ) {
+    next.scheduleUpdatedAt = patch.scheduleUpdatedAt;
+  } else if (scheduleChanged) {
+    next.scheduleUpdatedAt = ts;
+  } else {
+    next.scheduleUpdatedAt = prev.scheduleUpdatedAt;
+  }
+  next.updatedAt = ts;
+
+  writeWorksDailyAtomic(file, next);
+  return next;
 }
 
 function isValidAutoRunDate(str) {
@@ -1066,17 +1330,43 @@ function normalizeAutoRuns(list) {
   return deduped.filter((item) => keptDates.has(item.slice(0, 10)));
 }
 
+function normalizePartitionAutoRunAt(raw) {
+  const entries = [];
+  if (isPlainObject(raw)) {
+    for (const key of Object.keys(raw)) {
+      const k = typeof key === "string" ? key.trim() : "";
+      if (!k) continue;
+      const desc = Object.getOwnPropertyDescriptor(raw, key);
+      const ts = desc ? desc.value : null;
+      if (typeof ts === "number" && Number.isFinite(ts) && ts > 0) {
+        entries.push([k, ts]);
+      }
+    }
+  }
+  if (entries.length > MAX_AUTO_RUN_PARTITIONS) {
+    entries.sort((a, b) => b[1] - a[1]);
+    entries.length = MAX_AUTO_RUN_PARTITIONS;
+  }
+  const out = Object.create(null);
+  for (const [k, ts] of entries) {
+    out[k] = ts;
+  }
+  return out;
+}
+
 /**
- * 读取 <userData>/data-stats/auto-run.json 中的已运行日期/时段槽列表。
- * 不存在返回 []；JSON 损坏或结构无效告警并返回 []；读 I/O 错误上抛由调用方处理。
+ * 读取 <userData>/data-stats/auto-run.json 完整状态（runs + lastAutoRunAt + partitionAutoRunAt）。
+ * 兼容旧格式 { runs: [...] }；不存在返回空状态；损坏告警返回空状态；读 I/O 错误上抛。
  */
-function readAutoRuns() {
+function readAutoRunState() {
   const file = autoRunFile();
   let raw;
   try {
     raw = fs.readFileSync(file, "utf8");
   } catch (err) {
-    if (err && err.code === "ENOENT") return [];
+    if (err && err.code === "ENOENT") {
+      return { runs: [], lastAutoRunAt: 0, partitionAutoRunAt: Object.create(null) };
+    }
     throw err;
   }
   let parsed;
@@ -1084,27 +1374,104 @@ function readAutoRuns() {
     parsed = JSON.parse(raw);
   } catch (err) {
     console.warn(`[dataStats] auto-run.json JSON 损坏 (${file}):`, (err && err.message) || err);
-    return [];
+    return { runs: [], lastAutoRunAt: 0, partitionAutoRunAt: Object.create(null) };
   }
   if (!isPlainObject(parsed) || !Array.isArray(parsed.runs)) {
     console.warn(`[dataStats] auto-run.json 结构无效 (${file})`);
-    return [];
+    return { runs: [], lastAutoRunAt: 0, partitionAutoRunAt: Object.create(null) };
   }
-  return normalizeAutoRuns(parsed.runs);
+  const lastAutoRunAt =
+    typeof parsed.lastAutoRunAt === "number" &&
+    Number.isFinite(parsed.lastAutoRunAt) &&
+    parsed.lastAutoRunAt > 0
+      ? parsed.lastAutoRunAt
+      : 0;
+  return {
+    runs: normalizeAutoRuns(parsed.runs),
+    lastAutoRunAt,
+    partitionAutoRunAt: normalizePartitionAutoRunAt(parsed.partitionAutoRunAt),
+  };
+}
+
+/**
+ * 读取 <userData>/data-stats/auto-run.json 中的已运行日期/时段槽列表。
+ * 不存在返回 []；JSON 损坏或结构无效告警并返回 []；读 I/O 错误上抛由调用方处理。
+ */
+function readAutoRuns() {
+  return readAutoRunState().runs;
+}
+
+function buildAutoRunPayload(runs, lastAutoRunAt, partitionAutoRunAt) {
+  const payload = { runs };
+  if (typeof lastAutoRunAt === "number" && Number.isFinite(lastAutoRunAt) && lastAutoRunAt > 0) {
+    payload.lastAutoRunAt = lastAutoRunAt;
+  }
+  const partMap = normalizePartitionAutoRunAt(partitionAutoRunAt);
+  if (Object.keys(partMap).length > 0) {
+    payload.partitionAutoRunAt = partMap;
+  }
+  return payload;
 }
 
 /**
  * 追加运行日期 ("YYYY-MM-DD") 或时段槽 ("YYYY-MM-DD HH:mm") 到 auto-run.json
- * （复用原子写，仅保留最近 14 天的记录）。写入失败直接抛错，保留旧文件完整。
+ * （复用原子写，仅保留最近 14 天的记录）。可选记录本次自动采集时间戳 meta.autoRunAt。
+ * 写入失败直接抛错，保留旧文件完整。
  */
-function appendAutoRun(entry) {
+function appendAutoRun(entry, meta = null) {
   if (!isValidAutoRunEntry(entry)) {
     throw new Error(`非法自动采集记录: ${entry}`);
   }
-  const runs = readAutoRuns();
-  const normalized = normalizeAutoRuns([...runs, entry]);
-  writeWorksDailyAtomic(autoRunFile(), { runs: normalized });
+  const state = readAutoRunState();
+  const normalized = normalizeAutoRuns([...state.runs, entry]);
+  let lastAutoRunAt = state.lastAutoRunAt;
+  if (
+    isPlainObject(meta) &&
+    typeof meta.autoRunAt === "number" &&
+    Number.isFinite(meta.autoRunAt) &&
+    meta.autoRunAt > 0
+  ) {
+    lastAutoRunAt = meta.autoRunAt;
+  }
+  const partMap = state.partitionAutoRunAt;
+  if (isPlainObject(meta) && isPlainObject(meta.partitionAutoRunAt)) {
+    for (const k of Object.keys(meta.partitionAutoRunAt)) {
+      const nk = typeof k === "string" ? k.trim() : "";
+      const ts = meta.partitionAutoRunAt[k];
+      if (nk && typeof ts === "number" && Number.isFinite(ts) && ts > 0) {
+        partMap[nk] = ts;
+      }
+    }
+  }
+  writeWorksDailyAtomic(autoRunFile(), buildAutoRunPayload(normalized, lastAutoRunAt, partMap));
   return normalized;
+}
+
+/**
+ * 更新 auto-run.json 中的全局与分区最近自动采集时间戳（原子写）。
+ */
+function updateAutoRunTimestamps({ lastAutoRunAt, partitionAutoRunAt } = {}) {
+  const state = readAutoRunState();
+  const nextLast =
+    typeof lastAutoRunAt === "number" && Number.isFinite(lastAutoRunAt) && lastAutoRunAt > 0
+      ? lastAutoRunAt
+      : state.lastAutoRunAt;
+  const partMap = state.partitionAutoRunAt;
+  if (isPlainObject(partitionAutoRunAt)) {
+    for (const k of Object.keys(partitionAutoRunAt)) {
+      const nk = typeof k === "string" ? k.trim() : "";
+      const ts = partitionAutoRunAt[k];
+      if (nk && typeof ts === "number" && Number.isFinite(ts) && ts > 0) {
+        partMap[nk] = ts;
+      }
+    }
+  }
+  writeWorksDailyAtomic(autoRunFile(), buildAutoRunPayload(state.runs, nextLast, partMap));
+  return {
+    runs: state.runs,
+    lastAutoRunAt: nextLast,
+    partitionAutoRunAt: partMap,
+  };
 }
 
 /* ---------------- link-overrides（跨平台关联手工矫正） ---------------- */
@@ -1472,11 +1839,18 @@ module.exports = {
   appendCollectLog,
   readCollectLogs,
   MAX_AUTO_RUN_DATES,
+  DEFAULT_AUTO_SETTINGS,
   autoRunFile,
+  autoSettingsFile,
+  readAutoSettings,
+  writeAutoSettings,
   isValidAutoRunDate,
   isValidAutoRunSlot,
+  readAutoRunState,
   readAutoRuns,
   appendAutoRun,
+  updateAutoRunTimestamps,
+  createSameDayGuard,
   LINK_OVERRIDES_VERSION,
   readLinkOverrides,
   writeLinkOverrides,

@@ -15,6 +15,7 @@
 export const STORAGE_KEY = "statsAutoCollect";
 export const CHECK_INTERVAL_MS = 60 * 1000;
 export const STARTUP_DELAY_MS = 2 * 60 * 1000;
+export const END_SLOT_GRACE_MS = 5 * 60 * 1000;
 export const VALID_INTERVAL_HOURS = Object.freeze([1, 2, 3, 4, 6]);
 export const DEFAULT_RETENTION_DAYS = 60;
 
@@ -151,7 +152,8 @@ export function normalizeSettings(raw) {
  * 计算以指定 UTC+8 日历日 baseDate 为起点的固定时段内所有槽：
  * - 从 startTime 起每 intervalHours 小时一个槽，若 endTime 恰好落在槽上则包含 endTime
  * - endTime < startTime 视为跨零点（延续到次日 endTime），每个槽的日期按槽开始时刻的 UTC+8 日历日
- * - 每个槽的有效窗口为 [startMs, endMs)，其中 endMs = startMs + intervalHours * 3600s
+ * - 非末槽有效窗口为 [startMs, 下一槽开始)
+ * - 末槽有效窗口截断到 endTime（[lastSlotStart, endTime)）；若 endTime 恰为槽时刻，该槽有效窗口为 [endTime, endTime + END_SLOT_GRACE_MS(5分钟))
  */
 export function buildScheduleSlots(baseDate, settings) {
   const baseStartMs = utc8DayStartMs(baseDate);
@@ -163,11 +165,20 @@ export function buildScheduleSlots(baseDate, settings) {
 
   const stepMin = cfg.intervalHours * 60;
   const spanMin = endMin < startMin ? endMin + 1440 - startMin : endMin - startMin;
+  const windowEndMs = baseStartMs + (startMin + spanMin) * 60000;
   const slots = [];
 
   for (let offsetMin = 0; offsetMin <= spanMin; offsetMin += stepMin) {
     const startMs = baseStartMs + (startMin + offsetMin) * 60000;
-    const endMs = startMs + stepMin * 60000;
+    const isLastSlot = offsetMin + stepMin > spanMin;
+    let endMs;
+    if (!isLastSlot) {
+      endMs = startMs + stepMin * 60000;
+    } else if (startMs === windowEndMs) {
+      endMs = windowEndMs + END_SLOT_GRACE_MS;
+    } else {
+      endMs = windowEndMs;
+    }
     const shifted = new Date(startMs + UTC8_MS);
     const date = shifted.toISOString().slice(0, 10);
     const time = shifted.toISOString().slice(11, 16);
@@ -363,6 +374,36 @@ export function loadSettings(storage = getDefaultStorage()) {
 }
 
 /**
+ * 将自动采集与保留期设置异步同步到主进程持久化文件（纯 Node 无 Electron 环境安全跳过）。
+ */
+export function syncSettingsToMain(settings, options = {}) {
+  try {
+    const { ipcRenderer } = require("electron");
+    if (!ipcRenderer || typeof ipcRenderer.invoke !== "function") {
+      return Promise.resolve(null);
+    }
+    const normalized = normalizeSettings(settings);
+    const payload = {
+      enabled: normalized.enabled,
+      mode: normalized.mode,
+      startTime: normalized.startTime,
+      endTime: normalized.endTime,
+      intervalHours: normalized.intervalHours,
+      time: normalized.time,
+      retentionDays: normalized.retentionDays,
+    };
+    if (options && options.initOnly) {
+      payload.initOnly = true;
+    }
+    return Promise.resolve(ipcRenderer.invoke("stats:save-auto-settings", payload)).catch(
+      () => null
+    );
+  } catch (_) {
+    return Promise.resolve(null);
+  }
+}
+
+/**
  * 保存配置到 localStorage。
  * 返回 { ok: true, settings } 或 { ok: false, settings: 当前有效配置, error }。
  */
@@ -382,6 +423,7 @@ export function saveSettings(settings, storage = getDefaultStorage()) {
   }
   if (storage === getDefaultStorage()) {
     emitListeners(settingsListeners, { ...normalized });
+    syncSettingsToMain(normalized);
   }
   return { ok: true, settings: normalized };
 }
@@ -423,12 +465,25 @@ function defaultAutoRun(accounts, meta) {
     if (meta && Number.isFinite(meta.slotEndMs)) {
       payload.slotEndMs = meta.slotEndMs;
     }
+    if (meta && Number.isInteger(meta.intervalHours) && meta.intervalHours > 0) {
+      payload.intervalHours = meta.intervalHours;
+    }
+    if (meta && typeof meta.startTime === "string" && isValidTimeStr(meta.startTime)) {
+      payload.startTime = meta.startTime;
+    }
+    if (meta && typeof meta.endTime === "string" && isValidTimeStr(meta.endTime)) {
+      payload.endTime = meta.endTime;
+    }
     if (meta && Number.isInteger(meta.retentionDays) && meta.retentionDays > 0) {
       payload.retentionDays = meta.retentionDays;
     }
     return ipcRenderer.invoke("stats:auto-run", payload);
   }
   return Promise.reject(new Error("ipcRenderer 不可用"));
+}
+
+function buildIntervalScheduleSig(cfg) {
+  return `${cfg.enabled ? 1 : 0}|${cfg.mode}|${cfg.startTime}|${cfg.endTime}|${cfg.intervalHours}`;
 }
 
 /** 创建可测试、可依赖注入的定时自动采集调度器实例 */
@@ -454,6 +509,32 @@ export function createStatsScheduler(options = {}) {
   let stopped = true;
   let doneLocalDate = "";
   let doneSlot = "";
+  let lastScheduleSig = "";
+  let lastScheduleEnabled = false;
+  let scheduleChangedAtMs = 0;
+
+  function syncObservedSettings(cfg, currentNowMs, isInitial = false) {
+    const sig = buildIntervalScheduleSig(cfg);
+    if (isInitial || !lastScheduleSig) {
+      lastScheduleSig = sig;
+      lastScheduleEnabled = Boolean(cfg.enabled);
+      return;
+    }
+    if (sig !== lastScheduleSig) {
+      const wasDisabled = !lastScheduleEnabled;
+      const turnedOffOnly = !cfg.enabled;
+      lastScheduleSig = sig;
+      lastScheduleEnabled = Boolean(cfg.enabled);
+      // 启用态切换或 interval 调度参数变更时记录变更时刻：不立即补跑已开始的更早槽
+      if (!turnedOffOnly && (cfg.mode === "interval" || wasDisabled)) {
+        const ts = currentNowMs instanceof Date ? currentNowMs.getTime() : Number(currentNowMs);
+        if (Number.isFinite(ts)) {
+          scheduleChangedAtMs = ts;
+        }
+        doneSlot = "";
+      }
+    }
+  }
 
   async function tick() {
     if (stopped || running) {
@@ -477,8 +558,18 @@ export function createStatsScheduler(options = {}) {
     }
 
     const settings = loadSettings(storage);
+    syncObservedSettings(settings, currentNow, false);
     const isInterval = settings.mode === "interval";
     const activeSlot = isInterval ? getCurrentSlot(currentNow, settings) : null;
+
+    if (
+      isInterval &&
+      activeSlot &&
+      scheduleChangedAtMs > 0 &&
+      activeSlot.startMs < scheduleChangedAtMs
+    ) {
+      return { ran: false, reason: "before-settings-change", slot: activeSlot.slot };
+    }
 
     if (!shouldRun({ now: currentNow, settings, doneLocalDate, doneSlot })) {
       return { ran: false, reason: "not-due" };
@@ -501,7 +592,11 @@ export function createStatsScheduler(options = {}) {
         ? {
             mode: "interval",
             slot: activeSlot.slot,
+            slotStartMs: activeSlot.startMs,
             slotEndMs: activeSlot.endMs,
+            intervalHours: settings.intervalHours,
+            startTime: settings.startTime,
+            endTime: settings.endTime,
             retentionDays: settings.retentionDays,
           }
         : {
@@ -525,6 +620,14 @@ export function createStatsScheduler(options = {}) {
       }
       if (res.status === "busy") {
         return { ran: false, reason: "busy" };
+      }
+      if (isInterval && (res.status === "skipped" || res.status === "rate-limited")) {
+        doneSlot = activeSlot.slot;
+        return {
+          ran: false,
+          reason: res.reason || res.status,
+          slot: activeSlot.slot,
+        };
       }
       if (res.status !== "done" && res.status !== "already-ran") {
         return { ran: false, reason: res.status || "unknown" };
@@ -608,6 +711,7 @@ export function createStatsScheduler(options = {}) {
     if (timer !== null) return;
     stopped = false;
     startedAtMono = monotonicNow();
+    syncObservedSettings(loadSettings(storage), now(), true);
     timer = setIntervalFn(() => {
       tick();
     }, checkIntervalMs);
@@ -622,7 +726,7 @@ export function createStatsScheduler(options = {}) {
   }
 
   function getState() {
-    return { running, stopped, startedAtMono, doneLocalDate, doneSlot };
+    return { running, stopped, startedAtMono, doneLocalDate, doneSlot, scheduleChangedAtMs };
   }
 
   return { start, stop, tick, getState };
@@ -655,6 +759,7 @@ export default {
   DEFAULT_SETTINGS,
   CHECK_INTERVAL_MS,
   STARTUP_DELAY_MS,
+  END_SLOT_GRACE_MS,
   VALID_INTERVAL_HOURS,
   DEFAULT_RETENTION_DAYS,
   isValidTimeStr,
@@ -672,6 +777,7 @@ export default {
   loadSettings,
   saveSettings,
   updateSettings,
+  syncSettingsToMain,
   subscribeSettings,
   subscribeRunComplete,
   createStatsScheduler,

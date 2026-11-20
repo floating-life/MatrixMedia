@@ -47,6 +47,7 @@ const {
   STORAGE_KEY,
   DEFAULT_SETTINGS,
   STARTUP_DELAY_MS,
+  END_SLOT_GRACE_MS,
   VALID_INTERVAL_HOURS,
   DEFAULT_RETENTION_DAYS,
   formatLocalDate,
@@ -1706,7 +1707,7 @@ async function main() {
             );
 
             await withMockDateNow(
-              () => cnTime(2026, 12, 30, 12, 2, 0),
+              () => cnTime(2026, 12, 30, 12, 6, 0),
               async () => {
                 const before12 = collectedBatches.length;
                 const res12 = await autoRunHandler(fakeEvent, {
@@ -1722,13 +1723,379 @@ async function main() {
                 assert.deepStrictEqual(
                   collectedBatches.slice(before12).map((x) => x.partition),
                   ["persist:slot-p1", "persist:slot-p2"],
-                  "进入下一槽 12:00 后，10:00 槽采过的分区应重新采集"
+                  "进入下一槽 12:00 且满足防高频硬下限后，10:00 槽采过的分区应重新采集"
                 );
               }
             );
           });
         }
         console.log("✓ S9 分时段自动采集（槽计算/跨零点/旧设置迁移/跳槽不补采/按槽 auto-run.json/按槽跳重）通过");
+      }
+
+      /* ---- 8. S9-fix #1/#2/#3 专项回归（使用评审时刻与数字，修前失败、修后通过） ---- */
+      {
+        const saveAutoSettingsHandler = ipcHandlers.get("stats:save-auto-settings");
+        const getAutoSettingsHandler = ipcHandlers.get("stats:get-auto-settings");
+        assert.strictEqual(typeof saveAutoSettingsHandler, "function", "应注册 stats:save-auto-settings IPC");
+        assert.strictEqual(typeof getAutoSettingsHandler, "function", "应注册 stats:get-auto-settings IPC");
+
+        // testS9Fix3_LastSlotCappedAtEndTimeAndGraceWindow
+        // 评审 #3：08:00-21:00 每 2 小时，21:30 恢复运行时不得启动 20:00 槽；endTime 恰落槽上留 5 分钟轮询窗口；跨零点同理
+        {
+          assert.strictEqual(END_SLOT_GRACE_MS, 5 * 60 * 1000);
+          const cfg21 = {
+            enabled: true,
+            mode: "interval",
+            startTime: "08:00",
+            endTime: "21:00",
+            intervalHours: 2,
+          };
+          const slots21 = buildScheduleSlots("2026-11-20", cfg21);
+          const last21 = slots21[slots21.length - 1];
+          assert.strictEqual(last21.slot, "2026-11-20 20:00");
+          assert.strictEqual(last21.startMs, cnTime(2026, 11, 20, 20, 0, 0));
+          assert.strictEqual(last21.endMs, cnTime(2026, 11, 20, 21, 0, 0), "末槽有效期必须截断到 endTime 21:00");
+          assert.strictEqual(getCurrentSlot(cnTime(2026, 11, 20, 20, 59, 0), cfg21).slot, "2026-11-20 20:00");
+          assert.strictEqual(getCurrentSlot(cnTime(2026, 11, 20, 21, 0, 0), cfg21), null, "到达 21:00 末槽应截止");
+          assert.strictEqual(getCurrentSlot(cnTime(2026, 11, 20, 21, 30, 0), cfg21), null, "21:30 恢复运行不得启动 20:00 槽");
+
+          // 调度器 21:30 恢复运行也不得调用 autoRun
+          let callsAt2130 = 0;
+          const s21Storage = createMemoryStorage();
+          saveSettings(cfg21, s21Storage);
+          const s21 = createStatsScheduler({
+            storage: s21Storage,
+            now: () => cnTime(2026, 11, 20, 21, 30, 0),
+            monotonicNow: () => STARTUP_DELAY_MS,
+            startupDelayMs: 0,
+            getAccounts: () => [{ group: "CapG", platform: "抖音", partition: "persist:cap-dy" }],
+            autoRun: async () => {
+              callsAt2130++;
+              return { status: "done", date: "2026-11-20", slot: "2026-11-20 20:00", results: [] };
+            },
+            setIntervalFn: () => 1,
+            clearIntervalFn: () => {},
+          });
+          s21.start();
+          assert.deepStrictEqual(await s21.tick(), { ran: false, reason: "not-due" });
+          assert.strictEqual(callsAt2130, 0);
+          s21.stop();
+
+          // endTime 恰为槽时刻（08:00-22:00 每 2 小时）：末槽 22:00 有效期 [22:00, 22:05)
+          const cfg22 = {
+            enabled: true,
+            mode: "interval",
+            startTime: "08:00",
+            endTime: "22:00",
+            intervalHours: 2,
+          };
+          const slots22 = buildScheduleSlots("2026-11-20", cfg22);
+          const last22 = slots22[slots22.length - 1];
+          assert.strictEqual(last22.slot, "2026-11-20 22:00");
+          assert.strictEqual(last22.endMs, cnTime(2026, 11, 20, 22, 5, 0), "endTime 恰落槽上应给 5 分钟轮询窗口");
+          assert.strictEqual(getCurrentSlot(cnTime(2026, 11, 20, 22, 0, 0), cfg22).slot, "2026-11-20 22:00");
+          assert.strictEqual(getCurrentSlot(cnTime(2026, 11, 20, 22, 4, 59), cfg22).slot, "2026-11-20 22:00");
+          assert.strictEqual(getCurrentSlot(cnTime(2026, 11, 20, 22, 5, 0), cfg22), null);
+
+          // 跨零点不落槽上（22:00-03:00 每 2 小时）：末槽次日 02:00 截断到 03:00
+          const cfgCrossOff = {
+            enabled: true,
+            mode: "interval",
+            startTime: "22:00",
+            endTime: "03:00",
+            intervalHours: 2,
+          };
+          const slotsCrossOff = buildScheduleSlots("2026-11-20", cfgCrossOff);
+          const lastCrossOff = slotsCrossOff[slotsCrossOff.length - 1];
+          assert.strictEqual(lastCrossOff.slot, "2026-11-21 02:00");
+          assert.strictEqual(lastCrossOff.endMs, cnTime(2026, 11, 21, 3, 0, 0));
+          assert.strictEqual(getCurrentSlot(cnTime(2026, 11, 21, 2, 59, 0), cfgCrossOff).slot, "2026-11-21 02:00");
+          assert.strictEqual(getCurrentSlot(cnTime(2026, 11, 21, 3, 0, 0), cfgCrossOff), null);
+          assert.strictEqual(getCurrentSlot(cnTime(2026, 11, 21, 3, 30, 0), cfgCrossOff), null);
+
+          // 跨零点恰落槽上（22:00-04:00 每 2 小时）：末槽次日 04:00 有效期 [04:00, 04:05)
+          const cfgCrossOn = {
+            enabled: true,
+            mode: "interval",
+            startTime: "22:00",
+            endTime: "04:00",
+            intervalHours: 2,
+          };
+          const slotsCrossOn = buildScheduleSlots("2026-11-20", cfgCrossOn);
+          const lastCrossOn = slotsCrossOn[slotsCrossOn.length - 1];
+          assert.strictEqual(lastCrossOn.slot, "2026-11-21 04:00");
+          assert.strictEqual(lastCrossOn.endMs, cnTime(2026, 11, 21, 4, 5, 0));
+          assert.strictEqual(getCurrentSlot(cnTime(2026, 11, 21, 4, 4, 0), cfgCrossOn).slot, "2026-11-21 04:00");
+          assert.strictEqual(getCurrentSlot(cnTime(2026, 11, 21, 4, 5, 0), cfgCrossOn), null);
+          console.log("✓ [S9-fix #3] testS9Fix3_LastSlotCappedAtEndTimeAndGraceWindow 通过");
+        }
+
+        // testS9Fix1_ManualCollectInSameSlotSkippedByAutoRun
+        // 评审 #1：默认每 2 小时（08:00-22:00），11:15 手动同步成功，11:16 首轮自动轮询触发 10:00 槽不得重采同一账号
+        {
+          // 用新子目录与干净 index.js 实例隔离状态
+          const fix1Root = fs.mkdtempSync(path.join(os.tmpdir(), "mm-s9fix1-"));
+          const origGetPath = require.cache[electronId].exports.app.getPath;
+          require.cache[electronId].exports.app.getPath = () => fix1Root;
+          delete require.cache[storeId];
+          delete require.cache[indexId];
+          const localHandlers = new Map();
+          const origHandle = require.cache[electronId].exports.ipcMain.handle;
+          require.cache[electronId].exports.ipcMain.handle = (ch, fn) => localHandlers.set(ch, fn);
+          try {
+            require(indexId).registerDataStatsIpc();
+            const cHandler = localHandlers.get("stats:collect");
+            const aHandler = localHandlers.get("stats:auto-run");
+            const acc1 = { group: "Fix1G", platform: "抖音", partition: "persist:fix1-dy" };
+            const acc2 = { group: "Fix1G", platform: "快手", partition: "persist:fix1-ks" };
+            let mockNow = cnTime(2026, 11, 20, 11, 15, 0);
+            const fix1Storage = createMemoryStorage();
+            saveSettings(
+              { enabled: true, mode: "interval", startTime: "08:00", endTime: "22:00", intervalHours: 2 },
+              fix1Storage
+            );
+            const fix1Sched = createStatsScheduler({
+              storage: fix1Storage,
+              now: () => mockNow,
+              monotonicNow: () => STARTUP_DELAY_MS,
+              startupDelayMs: 0,
+              getAccounts: () => [acc1, acc2],
+              autoRun: (accounts, meta) => aHandler(fakeEvent, { accounts, ...meta }),
+              setIntervalFn: () => 1,
+              clearIntervalFn: () => {},
+            });
+            fix1Sched.start();
+
+            await withImmediateTimers(async () => {
+              await withMockDateNow(() => mockNow, async () => {
+                // 11:15 手动同步 acc1，记录 collectedAt
+                const manRes = await cHandler(fakeEvent, { accounts: [acc1], trigger: "manual" });
+                assert.strictEqual(manRes.results[0].success, true);
+                assert.strictEqual(manRes.results[0].collectedAt, cnTime(2026, 11, 20, 11, 15, 0));
+
+                // 11:16 首轮自动轮询命中 10:00 槽 [10:00, 12:00)：acc1 必须跳过，仅采 acc2
+                mockNow = cnTime(2026, 11, 20, 11, 16, 0);
+                const beforeAuto = collectedBatches.length;
+                const tickRes = await fix1Sched.tick();
+                assert.strictEqual(tickRes.ran, true);
+                assert.strictEqual(tickRes.slot, "2026-11-20 10:00");
+                assert.strictEqual(tickRes.result.results[0].skipped, true, "11:15 手动采集落在 10:00 槽 [10:00,12:00) 内，11:16 自动槽必须跳过");
+                assert.strictEqual(tickRes.result.results[1].skipped, undefined);
+                assert.deepStrictEqual(
+                  collectedBatches.slice(beforeAuto).map((x) => x.partition),
+                  ["persist:fix1-ks"]
+                );
+
+                // 进入 14:00 槽（满足防高频下限）→ acc1 不再跳过
+                mockNow = cnTime(2026, 11, 20, 14, 1, 0);
+                const before14 = collectedBatches.length;
+                const tick14 = await fix1Sched.tick();
+                assert.strictEqual(tick14.ran, true);
+                assert.strictEqual(tick14.slot, "2026-11-20 14:00");
+                assert.deepStrictEqual(
+                  collectedBatches.slice(before14).map((x) => x.partition),
+                  ["persist:fix1-dy", "persist:fix1-ks"]
+                );
+              });
+            });
+            fix1Sched.stop();
+          } finally {
+            require.cache[electronId].exports.app.getPath = origGetPath;
+            require.cache[electronId].exports.ipcMain.handle = origHandle;
+            fs.rmSync(fix1Root, { recursive: true, force: true });
+          }
+          console.log("✓ [S9-fix #1] testS9Fix1_ManualCollectInSameSlotSkippedByAutoRun 通过");
+        }
+
+        // testS9Fix2_RateLimitFloorAndSettingsChangeEffectiveBoundary
+        // 评审 #2：10:01 跑完 10:00 槽，10:02 改 startTime 08:00->08:30，10:02 不补跑 08:30 槽；
+        // 且距上次自动采集 < intervalHours*60-10 分钟（2h -> 110 分钟）硬下限跳过本槽，满 110 分钟后新槽正常跑
+        {
+          const fix2Root = fs.mkdtempSync(path.join(os.tmpdir(), "mm-s9fix2-"));
+          const origGetPath = require.cache[electronId].exports.app.getPath;
+          const origHandle = require.cache[electronId].exports.ipcMain.handle;
+          require.cache[electronId].exports.app.getPath = () => fix2Root;
+          delete require.cache[storeId];
+          delete require.cache[indexId];
+          const localHandlers = new Map();
+          require.cache[electronId].exports.ipcMain.handle = (ch, fn) => localHandlers.set(ch, fn);
+          try {
+            require(indexId).registerDataStatsIpc();
+            const aHandler = localHandlers.get("stats:auto-run");
+            const saveSettingsHandler = localHandlers.get("stats:save-auto-settings");
+            const acc = { group: "Fix2G", platform: "抖音", partition: "persist:fix2-dy" };
+            let mockNow = cnTime(2026, 11, 20, 10, 1, 0);
+
+            const fix2Storage = createMemoryStorage();
+            saveSettings(
+              { enabled: true, mode: "interval", startTime: "08:00", endTime: "22:00", intervalHours: 2 },
+              fix2Storage
+            );
+            const fix2Sched = createStatsScheduler({
+              storage: fix2Storage,
+              now: () => mockNow,
+              monotonicNow: () => STARTUP_DELAY_MS,
+              startupDelayMs: 0,
+              getAccounts: () => [acc],
+              // 模拟评审脚本只传 { accounts, slot, slotEndMs, retentionDays }，也验证主进程独立防高频
+              autoRun: (accounts, { slot, slotEndMs, retentionDays }) =>
+                aHandler(fakeEvent, { accounts, slot, slotEndMs, retentionDays }),
+              setIntervalFn: () => 1,
+              clearIntervalFn: () => {},
+            });
+            fix2Sched.start();
+
+            await withImmediateTimers(async () => {
+              await withMockDateNow(() => mockNow, async () => {
+                // 1) 10:01 跑完 10:00 槽
+                const before10 = collectedBatches.length;
+                const r10 = await fix2Sched.tick();
+                assert.strictEqual(r10.ran, true);
+                assert.strictEqual(r10.slot, "2026-11-20 10:00");
+                assert.strictEqual(collectedBatches.length, before10 + 1);
+
+                // 2) 10:02 修改开始时间 08:00 -> 08:30（并同步主进程设置）
+                mockNow = cnTime(2026, 11, 20, 10, 2, 0);
+                updateSettings({ startTime: "08:30" }, fix2Storage);
+                await saveSettingsHandler(fakeEvent, {
+                  enabled: true,
+                  mode: "interval",
+                  startTime: "08:30",
+                  endTime: "22:00",
+                  intervalHours: 2,
+                });
+
+                // 调度器在 10:02 轮询不得补跑已开始的 08:30 槽
+                const rChange = await fix2Sched.tick();
+                assert.strictEqual(rChange.ran, false);
+                assert.strictEqual(rChange.reason, "before-settings-change");
+                assert.strictEqual(collectedBatches.length, before10 + 1);
+
+                // 即使绕过调度器直接调主进程 stats:auto-run 跑 08:30 槽，主进程必须拒绝（生效边界）
+                const directEarly = await aHandler(fakeEvent, {
+                  accounts: [acc],
+                  slot: "2026-11-20 08:30",
+                  slotEndMs: cnTime(2026, 11, 20, 10, 30, 0),
+                });
+                assert.strictEqual(directEarly.status, "skipped");
+                assert.strictEqual(directEarly.reason, "before-settings-change");
+                assert.strictEqual(collectedBatches.length, before10 + 1);
+
+                // 3) 10:31 进入新槽 10:30（槽开始 10:30 >= 变更时刻 10:02），但距 10:01 仅 30 分钟 < 110 分钟硬下限 → 主进程跳过本槽
+                mockNow = cnTime(2026, 11, 20, 10, 31, 0);
+                const r1030 = await fix2Sched.tick();
+                assert.strictEqual(r1030.ran, false);
+                assert.strictEqual(r1030.reason, "rate-limited");
+                assert.strictEqual(collectedBatches.length, before10 + 1);
+
+                // 11:50（距 10:01 仅 109 分钟 < 110 分钟）即便换未跑过的新槽 11:30 仍被硬下限挡住
+                mockNow = cnTime(2026, 11, 20, 11, 50, 0);
+                const r109m = await aHandler(fakeEvent, {
+                  accounts: [acc],
+                  slot: "2026-11-20 11:30",
+                  slotEndMs: cnTime(2026, 11, 20, 13, 30, 0),
+                });
+                assert.strictEqual(r109m.status, "skipped");
+                assert.strictEqual(r109m.reason, "rate-limited");
+                assert.strictEqual(collectedBatches.length, before10 + 1);
+
+                // 4) 12:30 槽（距 10:01 已 149 分钟 >= 110 分钟）→ 正常采集
+                mockNow = cnTime(2026, 11, 20, 12, 30, 0);
+                const r1230 = await fix2Sched.tick();
+                assert.strictEqual(r1230.ran, true);
+                assert.strictEqual(r1230.slot, "2026-11-20 12:30");
+                assert.strictEqual(collectedBatches.length, before10 + 2);
+
+                // 5) 1 小时间隔硬下限 = 50 分钟：13:19（49 分钟）跳过，13:30 槽在 13:30（60 分钟 >= 50 分钟）放行
+                mockNow = cnTime(2026, 11, 20, 12, 35, 0);
+                await saveSettingsHandler(fakeEvent, {
+                  enabled: true,
+                  mode: "interval",
+                  startTime: "08:30",
+                  endTime: "22:30",
+                  intervalHours: 1,
+                });
+                mockNow = cnTime(2026, 11, 20, 13, 19, 0);
+                const r49m = await aHandler(fakeEvent, {
+                  accounts: [acc],
+                  slot: "2026-11-20 13:00",
+                  slotEndMs: cnTime(2026, 11, 20, 14, 0, 0),
+                  intervalHours: 1,
+                });
+                assert.strictEqual(r49m.status, "skipped");
+                assert.strictEqual(r49m.reason, "rate-limited");
+
+                mockNow = cnTime(2026, 11, 20, 13, 30, 0);
+                const r60m = await aHandler(fakeEvent, {
+                  accounts: [acc],
+                  slot: "2026-11-20 13:30",
+                  slotEndMs: cnTime(2026, 11, 20, 14, 30, 0),
+                  intervalHours: 1,
+                });
+                assert.strictEqual(r60m.status, "done");
+              });
+            });
+            fix2Sched.stop();
+          } finally {
+            require.cache[electronId].exports.app.getPath = origGetPath;
+            require.cache[electronId].exports.ipcMain.handle = origHandle;
+            fs.rmSync(fix2Root, { recursive: true, force: true });
+          }
+          console.log("✓ [S9-fix #2] testS9Fix2_RateLimitFloorAndSettingsChangeEffectiveBoundary 通过");
+        }
+
+        // testS9Fix4_StatsApiCollectAccountsRespectsPersistedRetentionDays
+        // 验证 statsApi.collectAccounts 不传默认值覆盖主进程持久化 retentionDays，且兼容 localStorage 显式 retentionDays
+        {
+          const fix4ApiRoot = fs.mkdtempSync(path.join(os.tmpdir(), "mm-s9fix4-api-"));
+          const origGetPath = require.cache[electronId].exports.app.getPath;
+          const origHandle = require.cache[electronId].exports.ipcMain.handle;
+          const origInvoke = require.cache[electronId].exports.ipcRenderer.invoke;
+          const origLS = global.localStorage;
+          const apiHandlers = new Map();
+          const sentPayloads = [];
+          try {
+            require.cache[electronId].exports.app.getPath = () => fix4ApiRoot;
+            require.cache[electronId].exports.ipcMain.handle = (ch, fn) => apiHandlers.set(ch, fn);
+            require.cache[electronId].exports.ipcRenderer.invoke = async (ch, payload) => {
+              sentPayloads.push({ ch, payload });
+              const fn = apiHandlers.get(ch);
+              return fn ? fn({ sender: { send: () => {} } }, payload) : null;
+            };
+            delete require.cache[storeId];
+            delete require.cache[indexId];
+            delete require.cache[statsApiId];
+            const storeApi = require(storeId);
+            require(indexId).registerDataStatsIpc();
+            const statsApiMod = require(statsApiId);
+
+            // 主进程已持久化 retentionDays=90，而 localStorage 为空 → collectAccounts 不得发送默认 60 覆盖 90
+            storeApi.writeAutoSettings({ enabled: false, retentionDays: 90 });
+            const lsApi = createMemoryStorage();
+            global.localStorage = lsApi;
+            await statsApiMod.collectAccounts([
+              { group: "ApiG", platform: "抖音", partition: "persist:api-r1" },
+            ]);
+            assert.strictEqual(sentPayloads[sentPayloads.length - 1].payload.retentionDays, undefined);
+            assert.strictEqual(storeApi.readAutoSettings().retentionDays, 90);
+
+            // localStorage 显式保存 retentionDays=120 → collectAccounts 透传 120 且主进程持久化为 120
+            lsApi.setItem(STORAGE_KEY, JSON.stringify({ enabled: false, retentionDays: 120 }));
+            await statsApiMod.collectAccounts([
+              { group: "ApiG", platform: "抖音", partition: "persist:api-r2" },
+            ]);
+            assert.strictEqual(sentPayloads[sentPayloads.length - 1].payload.retentionDays, 120);
+            assert.strictEqual(storeApi.readAutoSettings().retentionDays, 120);
+          } finally {
+            if (origLS === undefined) delete global.localStorage;
+            else global.localStorage = origLS;
+            require.cache[electronId].exports.app.getPath = origGetPath;
+            require.cache[electronId].exports.ipcMain.handle = origHandle;
+            require.cache[electronId].exports.ipcRenderer.invoke = origInvoke;
+            fs.rmSync(fix4ApiRoot, { recursive: true, force: true });
+          }
+          console.log("✓ [S9-fix #4] testS9Fix4_StatsApiCollectAccountsRespectsPersistedRetentionDays 通过");
+        }
       }
     } finally {
       if (origGlobalLS === undefined) delete global.localStorage;
