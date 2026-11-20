@@ -91,6 +91,7 @@
     "test:stats-scheduler": "node scripts/test-stats-scheduler.js",
     "test:stats-export": "node scripts/test-stats-export.js",
     "test:stats-analysis": "node scripts/test-stats-analysis.js",
+    "test:stats-charts": "node scripts/test-stats-charts.js",
     "test:ai-content": "node scripts/test-ai-content.js",
     "test:ai-key-store": "node scripts/test-ai-key-store.js",
     "test:ai-content-ipc": "node scripts/test-ai-content-ipc.js",
@@ -214,6 +215,7 @@
   },
   "dependencies": {
     "axios": "^1.6.0",
+    "echarts": "5.5.1",
     "electron-updater": "^5.3.0",
     "express": "4.19.2",
     "fs-extra": "^11.1.0",

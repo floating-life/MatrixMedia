@@ -8,7 +8,10 @@
  * - stats:get-data             读取单账号本地数据（daily + works + meta）
  * - stats:get-overview         全账号按日聚合（所有账号总览页）
  * - stats:get-content-summary  跨平台作品汇总（作品汇总 tab）
+ * - stats:get-content-trend    单条内容各平台播放走势（作品汇总 tab 趋势弹窗）
  * - stats:get-analysis         规则数据分析（数据分析 tab，与 Excel「分析」sheet 共用计算函数）
+ * - stats:save-chart-image     保存单张图表 PNG 图片（含 dataUrl 与大小校验、保存对话框）
+ * - stats:save-chart-images-batch 批量导出全部图表 PNG 到选定目录（一次目录选择对话框）
  * - stats:get-link-overrides   读取作品关联手工矫正配置
  * - stats:set-link-override    设置单条作品手工关联（assign / detach）
  * - stats:merge-works          合并多条未关联作品为同一 manual 内容
@@ -21,6 +24,7 @@
  */
 
 const crypto = require("crypto");
+const fs = require("fs");
 const path = require("path");
 const electron = require("electron");
 const { ipcMain } = electron;
@@ -40,6 +44,7 @@ const {
   buildDefaultExportFileName,
   resolveLinkValidationContext,
   buildContentSummaryData,
+  buildContentTrendData,
   buildStatsAnalysisData,
   buildStatsWorkbookData,
   writeStatsXlsx,
@@ -48,6 +53,12 @@ const {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const VALID_TRIGGERS = new Set(["auto", "manual"]);
+const PNG_DATA_URL_PREFIX = "data:image/png;base64,";
+const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const MAX_CHART_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_CHART_IMAGE_B64_CHARS = Math.ceil(MAX_CHART_IMAGE_BYTES / 3) * 4;
+const MAX_BATCH_CHART_IMAGES = 30;
+const BASE64_BODY_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 
 let collecting = false;
 let cancelled = false;
@@ -561,6 +572,61 @@ function isLocalFrameEvent(event) {
   }
 }
 
+function decodePngDataUrl(rawDataUrl) {
+  if (typeof rawDataUrl !== "string" || !rawDataUrl.startsWith(PNG_DATA_URL_PREFIX)) {
+    throw new Error("仅支持 image/png base64 图片数据");
+  }
+  const rawBody = rawDataUrl.slice(PNG_DATA_URL_PREFIX.length);
+  if (!rawBody) {
+    throw new Error("图片数据为空");
+  }
+  // 解码前做字符串长度上限拦截，防止超大负载占用内存
+  if (rawBody.length > MAX_CHART_IMAGE_B64_CHARS + 1024 * 64) {
+    throw new Error("图片大小超过 10MB 限制");
+  }
+  const cleaned = rawBody.replace(/[\r\n]/g, "");
+  if (!cleaned || cleaned.length % 4 !== 0 || !BASE64_BODY_RE.test(cleaned)) {
+    throw new Error("PNG base64 编码格式无效");
+  }
+  const padding = cleaned.endsWith("==") ? 2 : cleaned.endsWith("=") ? 1 : 0;
+  const decodedBytes = (cleaned.length / 4) * 3 - padding;
+  if (decodedBytes <= 0) {
+    throw new Error("图片数据为空");
+  }
+  if (decodedBytes > MAX_CHART_IMAGE_BYTES) {
+    throw new Error("图片大小超过 10MB 限制");
+  }
+  const buf = Buffer.from(cleaned, "base64");
+  if (buf.length > MAX_CHART_IMAGE_BYTES) {
+    throw new Error("图片大小超过 10MB 限制");
+  }
+  if (buf.length < PNG_MAGIC.length || !buf.subarray(0, PNG_MAGIC.length).equals(PNG_MAGIC)) {
+    throw new Error("图片内容不是有效的 PNG 文件");
+  }
+  return buf;
+}
+
+function sanitizeChartFileName(rawName, fallback = "图表") {
+  const base = typeof rawName === "string" ? rawName.replace(/\.png$/i, "") : "";
+  const cleaned = base
+    .replace(/[\\/:*?"<>|\x00-\x1f]/g, "-")
+    .replace(/\s+/g, " ")
+    .replace(/-+/g, "-")
+    .replace(/^[.\-\s]+|[.\-\s]+$/g, "")
+    .slice(0, 80);
+  if (!cleaned || cleaned === "." || cleaned === "..") {
+    return fallback;
+  }
+  return cleaned;
+}
+
+function buildChartImageFileName(rawName, dateStr) {
+  const safe = sanitizeChartFileName(rawName, "图表");
+  const hasDate = /\d{4}-\d{2}-\d{2}/.test(safe);
+  const stem = hasDate || !dateStr ? safe : `${safe}-${dateStr}`;
+  return `${stem}.png`;
+}
+
 function registerDataStatsIpc(options = {}) {
   const exportMaxRows =
     options && options.exportMaxRows !== undefined ? options.exportMaxRows : undefined;
@@ -681,6 +747,37 @@ function registerDataStatsIpc(options = {}) {
     }
   });
 
+  ipcMain.handle("stats:get-content-trend", async (event, args) => {
+    try {
+      if (!isLocalFrameEvent(event)) {
+        return { ok: false, error: "不允许外部页面读取作品趋势" };
+      }
+      if (!args || typeof args !== "object" || Array.isArray(args)) {
+        return { ok: false, error: "查询参数无效" };
+      }
+      const contentKey = typeof args.contentKey === "string" ? args.contentKey.trim() : "";
+      if (!contentKey) {
+        return { ok: false, error: "contentKey 不能为空" };
+      }
+      await overrideWriteChain;
+      const data = buildContentTrendData(
+        {
+          contentKey,
+          from: args.from !== undefined ? args.from : undefined,
+          to: args.to !== undefined ? args.to : undefined,
+          groups: args.groups,
+        },
+        exportDeps
+      );
+      return { ok: true, ...data };
+    } catch (err) {
+      return {
+        ok: false,
+        error: (err && err.message) || "读取作品趋势失败",
+      };
+    }
+  });
+
   ipcMain.handle("stats:get-analysis", async (event, args) => {
     try {
       if (!isLocalFrameEvent(event)) {
@@ -700,6 +797,145 @@ function registerDataStatsIpc(options = {}) {
         ok: false,
         error: (err && err.message) || "读取数据分析失败",
       };
+    }
+  });
+
+  ipcMain.handle("stats:save-chart-image", async (event, args) => {
+    try {
+      if (!isLocalFrameEvent(event)) {
+        const msg = "不允许外部页面保存图表图片";
+        return { ok: false, error: msg, message: msg };
+      }
+      if (!args || typeof args !== "object" || Array.isArray(args)) {
+        const msg = "保存图表参数无效";
+        return { ok: false, error: msg, message: msg };
+      }
+      const buf = decodePngDataUrl(args.dataUrl);
+      const exportNow =
+        exportDeps && exportDeps.now !== undefined ? exportDeps.now : Date.now();
+      const dateStr =
+        typeof args.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(args.date.trim())
+          ? args.date.trim()
+          : getTodayStr(exportNow);
+      const defaultName = buildChartImageFileName(args.name, dateStr);
+
+      const { BrowserWindow, dialog, app } = electron;
+      const win =
+        BrowserWindow && typeof BrowserWindow.fromWebContents === "function"
+          ? BrowserWindow.fromWebContents(event && event.sender)
+          : null;
+      if (!win) {
+        const msg = "窗口已关闭";
+        return { ok: false, error: msg, message: msg };
+      }
+
+      const result = await dialog.showSaveDialog(win, {
+        title: "保存图表图片",
+        defaultPath: path.join(app.getPath("documents"), defaultName),
+        filters: [{ name: "PNG 图片", extensions: ["png"] }],
+      });
+      if (result.canceled || !result.filePath) {
+        return { ok: false, canceled: true };
+      }
+
+      fs.mkdirSync(path.dirname(result.filePath), { recursive: true });
+      fs.writeFileSync(result.filePath, buf);
+      return {
+        ok: true,
+        filePath: result.filePath,
+        size: buf.length,
+      };
+    } catch (err) {
+      const msg = (err && err.message) || "保存图表图片失败";
+      return { ok: false, error: msg, message: msg };
+    }
+  });
+
+  ipcMain.handle("stats:save-chart-images-batch", async (event, args) => {
+    try {
+      if (!isLocalFrameEvent(event)) {
+        const msg = "不允许外部页面批量导出图表图片";
+        return { ok: false, error: msg, message: msg };
+      }
+      if (!args || typeof args !== "object" || Array.isArray(args)) {
+        const msg = "批量导出参数无效";
+        return { ok: false, error: msg, message: msg };
+      }
+      if (!Array.isArray(args.items) || args.items.length === 0) {
+        const msg = "没有可导出的图表图片";
+        return { ok: false, error: msg, message: msg };
+      }
+      if (args.items.length > MAX_BATCH_CHART_IMAGES) {
+        const msg = `单次最多导出 ${MAX_BATCH_CHART_IMAGES} 张图表`;
+        return { ok: false, error: msg, message: msg };
+      }
+      const exportNow =
+        exportDeps && exportDeps.now !== undefined ? exportDeps.now : Date.now();
+      const dateStr =
+        typeof args.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(args.date.trim())
+          ? args.date.trim()
+          : getTodayStr(exportNow);
+
+      const prepared = [];
+      const usedNames = new Set();
+      for (let i = 0; i < args.items.length; i++) {
+        const item = args.items[i];
+        if (!item || typeof item !== "object" || Array.isArray(item)) {
+          throw new Error(`第 ${i + 1} 张图表参数无效`);
+        }
+        const buf = decodePngDataUrl(item.dataUrl);
+        let fileName = buildChartImageFileName(item.name || `图表-${i + 1}`, dateStr);
+        if (usedNames.has(fileName.toLowerCase())) {
+          const stem = fileName.slice(0, -4);
+          let seq = 2;
+          while (usedNames.has(`${stem}-${seq}.png`.toLowerCase())) {
+            seq += 1;
+          }
+          fileName = `${stem}-${seq}.png`;
+        }
+        usedNames.add(fileName.toLowerCase());
+        prepared.push({ fileName, buf });
+      }
+
+      const { BrowserWindow, dialog, app } = electron;
+      const win =
+        BrowserWindow && typeof BrowserWindow.fromWebContents === "function"
+          ? BrowserWindow.fromWebContents(event && event.sender)
+          : null;
+      if (!win) {
+        const msg = "窗口已关闭";
+        return { ok: false, error: msg, message: msg };
+      }
+
+      const result = await dialog.showOpenDialog(win, {
+        title: "选择图表导出文件夹",
+        defaultPath: app.getPath("documents"),
+        properties: ["openDirectory", "createDirectory"],
+      });
+      if (result.canceled || !Array.isArray(result.filePaths) || !result.filePaths[0]) {
+        return { ok: false, canceled: true };
+      }
+
+      const targetDir = path.resolve(result.filePaths[0]);
+      fs.mkdirSync(targetDir, { recursive: true });
+      const files = [];
+      for (const item of prepared) {
+        const targetPath = path.resolve(targetDir, item.fileName);
+        if (path.dirname(targetPath) !== targetDir) {
+          throw new Error(`非法文件名：${item.fileName}`);
+        }
+        fs.writeFileSync(targetPath, item.buf);
+        files.push(targetPath);
+      }
+      return {
+        ok: true,
+        dir: targetDir,
+        files,
+        count: files.length,
+      };
+    } catch (err) {
+      const msg = (err && err.message) || "批量导出图表失败";
+      return { ok: false, error: msg, message: msg };
     }
   });
 

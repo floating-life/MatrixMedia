@@ -415,6 +415,17 @@
                 <span v-else class="num muted">-</span>
               </template>
             </el-table-column>
+            <el-table-column label="趋势" width="72" align="center">
+              <template #default="{ row }">
+                <el-button
+                  type="text"
+                  size="mini"
+                  @click.stop="openContentTrend(row)"
+                >
+                  趋势
+                </el-button>
+              </template>
+            </el-table-column>
             <template #empty>
               <span class="card-empty-inline">
                 {{ summaryFilter === 'fuzzy' ? '暂无待确认的模糊匹配内容' : '暂无作品汇总数据，请先点击右上角「同步全部数据」采集作品日快照' }}
@@ -485,9 +496,16 @@
                 <span v-else class="num muted">-</span>
               </template>
             </el-table-column>
-            <el-table-column label="操作" width="160">
+            <el-table-column label="操作" width="200">
               <template #default="{ row }">
                 <div class="work-row-actions">
+                  <el-button
+                    type="text"
+                    size="mini"
+                    @click="openContentTrend({ contentKey: 'unlinked:' + row.platform + ':' + row.workId, title: row.title })"
+                  >
+                    趋势
+                  </el-button>
                   <el-button
                     type="text"
                     size="mini"
@@ -591,6 +609,46 @@
             </el-button>
           </template>
         </el-dialog>
+        <el-dialog
+          :title="contentTrendDialogTitle"
+          :visible.sync="contentTrendVisible"
+          width="820px"
+          append-to-body
+          @opened="onContentTrendDialogOpened"
+          @closed="resetContentTrendDialog"
+        >
+          <div class="trend-dialog-head">
+            <span class="trend-dialog-tip">
+              <template v-if="contentTrendData && contentTrendData.from && contentTrendData.to">
+                区间：{{ contentTrendData.from }} ~ {{ contentTrendData.to }}
+              </template>
+              <template v-if="contentTrendData && contentTrendData.date">
+                · 截至 {{ contentTrendData.date }}
+              </template>
+              <template v-else-if="contentSummaryDate">
+                截至 {{ contentSummaryDate }}
+              </template>
+            </span>
+            <el-button
+              type="text"
+              size="mini"
+              icon="el-icon-download"
+              :disabled="loadingContentTrend || isChartOptionEmpty(contentTrendOption)"
+              @click="saveChartImage('chartContentTrend', '作品趋势-' + (contentTrendRow && contentTrendRow.title ? contentTrendRow.title : '内容'))"
+            >
+              保存图片
+            </el-button>
+          </div>
+          <stats-chart
+            ref="chartContentTrend"
+            :option="contentTrendOption"
+            :loading="loadingContentTrend"
+            height="360px"
+          />
+          <template #footer>
+            <el-button size="small" @click="contentTrendVisible = false">关闭</el-button>
+          </template>
+        </el-dialog>
       </el-tab-pane>
       <el-tab-pane label="数据分析" name="analysis" lazy>
         <div v-loading="loadingAnalysis" class="analysis-panel">
@@ -623,6 +681,15 @@
                 </span>
               </div>
               <div class="analysis-actions">
+                <el-button
+                  size="mini"
+                  icon="el-icon-picture-outline"
+                  :loading="exportingAllCharts"
+                  :disabled="!analysisData || exportingAllCharts"
+                  @click="exportAllCharts"
+                >
+                  {{ exportingAllCharts ? "导出中…" : "导出全部图表" }}
+                </el-button>
                 <el-button
                   size="mini"
                   icon="el-icon-document-copy"
@@ -666,6 +733,62 @@
                   对比上周期：{{ analysisData.previousRange.from }} ~
                   {{ analysisData.previousRange.to }}（已剔除疑似采集异常点）
                 </span>
+              </div>
+              <div class="chart-grid-overview">
+                <div class="chart-box">
+                  <div class="chart-box-head">
+                    <div class="chart-box-title-wrap">
+                      <span class="chart-box-title">各平台日增趋势</span>
+                      <div class="chart-inline-controls">
+                        <el-radio-group v-model="overviewTrendMetric" size="mini">
+                          <el-radio-button
+                            v-for="m in overviewTrendMetricOptions"
+                            :key="m.key"
+                            :label="m.key"
+                          >
+                            {{ m.label }}
+                          </el-radio-button>
+                        </el-radio-group>
+                        <el-checkbox v-model="overviewTrendStacked" size="mini">
+                          堆叠面积
+                        </el-checkbox>
+                      </div>
+                    </div>
+                    <el-button
+                      type="text"
+                      size="mini"
+                      icon="el-icon-download"
+                      :disabled="isChartOptionEmpty(overviewTrendOption)"
+                      @click="saveChartImage('chartOverviewTrend', '总览-日趋势-' + overviewTrendMetricLabel)"
+                    >
+                      保存图片
+                    </el-button>
+                  </div>
+                  <stats-chart
+                    ref="chartOverviewTrend"
+                    :option="overviewTrendOption"
+                    height="320px"
+                  />
+                </div>
+                <div class="chart-box">
+                  <div class="chart-box-head">
+                    <span class="chart-box-title">平台播放日增占比</span>
+                    <el-button
+                      type="text"
+                      size="mini"
+                      icon="el-icon-download"
+                      :disabled="isChartOptionEmpty(overviewPieOption)"
+                      @click="saveChartImage('chartOverviewPie', '总览-平台占比')"
+                    >
+                      保存图片
+                    </el-button>
+                  </div>
+                  <stats-chart
+                    ref="chartOverviewPie"
+                    :option="overviewPieOption"
+                    height="320px"
+                  />
+                </div>
               </div>
               <el-table
                 :data="analysisOverviewMetricRows"
@@ -779,6 +902,25 @@
                   {{ line }}
                 </div>
               </div>
+              <div class="chart-box chart-box-block">
+                <div class="chart-box-head">
+                  <span class="chart-box-title">各平台平均播放与互动率对比</span>
+                  <el-button
+                    type="text"
+                    size="mini"
+                    icon="el-icon-download"
+                    :disabled="isChartOptionEmpty(platformCompareOption)"
+                    @click="saveChartImage('chartPlatformCompare', '平台对比')"
+                  >
+                    保存图片
+                  </el-button>
+                </div>
+                <stats-chart
+                  ref="chartPlatformCompare"
+                  :option="platformCompareOption"
+                  height="300px"
+                />
+              </div>
               <el-table
                 :data="analysisPlatformCompareRows"
                 size="mini"
@@ -869,6 +1011,25 @@
                   <el-radio-button label="top">Top 10</el-radio-button>
                   <el-radio-button label="bottom">Bottom 10</el-radio-button>
                 </el-radio-group>
+              </div>
+              <div class="chart-box chart-box-block">
+                <div class="chart-box-head">
+                  <span class="chart-box-title">Top 10 横向对比（按平台堆叠 · {{ analysisRankMetricShortLabel }}）</span>
+                  <el-button
+                    type="text"
+                    size="mini"
+                    icon="el-icon-download"
+                    :disabled="isChartOptionEmpty(rankingTop10Option)"
+                    @click="saveChartImage('chartRankingTop10', '作品排行Top10-' + analysisRankMetricShortLabel)"
+                  >
+                    保存图片
+                  </el-button>
+                </div>
+                <stats-chart
+                  ref="chartRankingTop10"
+                  :option="rankingTop10Option"
+                  height="360px"
+                />
               </div>
               <el-table
                 :data="analysisDisplayedRankRows"
@@ -985,6 +1146,46 @@
                   <el-tag size="mini" type="warning">
                     数据不足 {{ analysisNewWorkCounts.数据不足 }}
                   </el-tag>
+                </div>
+              </div>
+              <div class="chart-grid-newworks">
+                <div class="chart-box">
+                  <div class="chart-box-head">
+                    <span class="chart-box-title">新作品 D1 / D3 / D7 走势（按 D7 Top 10）</span>
+                    <el-button
+                      type="text"
+                      size="mini"
+                      icon="el-icon-download"
+                      :disabled="isChartOptionEmpty(newWorksLineOption)"
+                      @click="saveChartImage('chartNewWorksLine', '新作品走势-D1D3D7')"
+                    >
+                      保存图片
+                    </el-button>
+                  </div>
+                  <stats-chart
+                    ref="chartNewWorksLine"
+                    :option="newWorksLineOption"
+                    height="320px"
+                  />
+                </div>
+                <div class="chart-box">
+                  <div class="chart-box-head">
+                    <span class="chart-box-title">走势分类占比</span>
+                    <el-button
+                      type="text"
+                      size="mini"
+                      icon="el-icon-download"
+                      :disabled="isChartOptionEmpty(newWorksPieOption)"
+                      @click="saveChartImage('chartNewWorksPie', '新作品走势-分类占比')"
+                    >
+                      保存图片
+                    </el-button>
+                  </div>
+                  <stats-chart
+                    ref="chartNewWorksPie"
+                    :option="newWorksPieOption"
+                    height="320px"
+                  />
                 </div>
               </div>
               <el-table
@@ -1126,6 +1327,25 @@
                   条有效内容样本 · 指标为平均 D7 播放
                 </span>
               </div>
+              <div class="chart-box chart-box-block">
+                <div class="chart-box-head">
+                  <span class="chart-box-title">星期 × 时段平均 D7 播放热力图（样本 &lt; 3 半透明）</span>
+                  <el-button
+                    type="text"
+                    size="mini"
+                    icon="el-icon-download"
+                    :disabled="isChartOptionEmpty(publishTimeHeatmapOption)"
+                    @click="saveChartImage('chartPublishTimeHeatmap', '发布时间热力图')"
+                  >
+                    保存图片
+                  </el-button>
+                </div>
+                <stats-chart
+                  ref="chartPublishTimeHeatmap"
+                  :option="publishTimeHeatmapOption"
+                  height="300px"
+                />
+              </div>
               <el-table
                 :data="analysisPublishTimeRows"
                 size="mini"
@@ -1172,10 +1392,49 @@
               </el-table>
             </div>
 
-            <!-- 6. 异常提醒 -->
+            <!-- 6. 粉丝趋势 -->
             <div class="platform-card">
               <div class="card-head">
-                <span class="card-title">6. 异常提醒</span>
+                <span class="card-title">6. 粉丝趋势（各账号日快照）</span>
+                <div class="chart-inline-controls">
+                  <el-select
+                    v-model="fansSelectedAccounts"
+                    multiple
+                    collapse-tags
+                    clearable
+                    size="mini"
+                    class="fans-account-select"
+                    placeholder="全部账号"
+                  >
+                    <el-option
+                      v-for="acc in analysisFansAccountOptions"
+                      :key="acc.accountKey"
+                      :label="acc.label"
+                      :value="acc.accountKey"
+                    />
+                  </el-select>
+                  <el-button
+                    type="text"
+                    size="mini"
+                    icon="el-icon-download"
+                    :disabled="isChartOptionEmpty(fansTrendOption)"
+                    @click="saveChartImage('chartFansTrend', '粉丝趋势')"
+                  >
+                    保存图片
+                  </el-button>
+                </div>
+              </div>
+              <stats-chart
+                ref="chartFansTrend"
+                :option="fansTrendOption"
+                height="320px"
+              />
+            </div>
+
+            <!-- 7. 异常提醒 -->
+            <div class="platform-card">
+              <div class="card-head">
+                <span class="card-title">7. 异常提醒</span>
                 <span class="card-tip">
                   点击展开查看异常作品与具体日期（疑似采集异常已在第 1–5 节剔除）
                 </span>
@@ -1358,7 +1617,21 @@ import StatsOverview from "./components/StatsOverview.vue";
 import PlatformBarChart from "./components/PlatformBarChart.vue";
 import GroupStatsTable from "./components/GroupStatsTable.vue";
 import CollectLogDialog from "./components/CollectLogDialog.vue";
+import StatsChart from "@/components/StatsChart.vue";
 import { dailyToRows } from "./statsUtils";
+import {
+  OVERVIEW_METRIC_OPTIONS,
+  isEmptyChartOption,
+  buildOverviewTrendOption,
+  buildOverviewPieOption,
+  buildPlatformComparisonOption,
+  buildRankingTop10Option,
+  buildNewWorksTrajectoryOption,
+  buildNewWorksCategoryPieOption,
+  buildPublishTimeHeatmapOption,
+  buildFansTrendOption,
+  buildContentTrendOption,
+} from "../../utils/statsChartOptions";
 import {
   buildCollectAccounts,
   collectAccounts,
@@ -1408,7 +1681,7 @@ function compareNullableMetric(a, b, key) {
 
 export default {
   name: "DataStatsAll",
-  components: { StatsOverview, PlatformBarChart, GroupStatsTable, CollectLogDialog },
+  components: { StatsOverview, PlatformBarChart, GroupStatsTable, CollectLogDialog, StatsChart },
   data() {
     return {
       activeTab: "overview",
@@ -1428,6 +1701,10 @@ export default {
       reassignCurrentKey: null,
       reassignKeyword: "",
       reassignTargetKey: "",
+      contentTrendVisible: false,
+      contentTrendRow: null,
+      contentTrendData: null,
+      loadingContentTrend: false,
       analysisPeriod: 30,
       analysisTo: "",
       analysisDatePickerOptions: {
@@ -1438,6 +1715,10 @@ export default {
       },
       analysisData: null,
       loadingAnalysis: false,
+      overviewTrendMetric: "play",
+      overviewTrendStacked: false,
+      fansSelectedAccounts: [],
+      exportingAllCharts: false,
       analysisRankMetric: "play",
       analysisRankOrder: "top",
       analysisAnomalyPanels: ["collection", "recommend"],
@@ -1623,6 +1904,63 @@ export default {
       }
       return max;
     },
+    overviewTrendMetricOptions() {
+      return OVERVIEW_METRIC_OPTIONS;
+    },
+    overviewTrendMetricLabel() {
+      const found = OVERVIEW_METRIC_OPTIONS.find((m) => m.key === this.overviewTrendMetric);
+      return found ? found.label : "播放";
+    },
+    analysisRankMetricShortLabel() {
+      if (this.analysisRankMetric === "engagement") return "互动率";
+      if (this.analysisRankMetric === "fans") return "涨粉";
+      return "播放";
+    },
+    analysisFansAccountOptions() {
+      const ft = this.analysisData && this.analysisData.fansTrend;
+      return ft && Array.isArray(ft.accounts) ? ft.accounts : [];
+    },
+    overviewTrendOption() {
+      return buildOverviewTrendOption(this.analysisData, {
+        metric: this.overviewTrendMetric,
+        stacked: this.overviewTrendStacked,
+      });
+    },
+    overviewPieOption() {
+      return buildOverviewPieOption(this.analysisData);
+    },
+    platformCompareOption() {
+      return buildPlatformComparisonOption(this.analysisData);
+    },
+    rankingTop10Option() {
+      return buildRankingTop10Option(this.analysisData, {
+        metric: this.analysisRankMetric,
+      });
+    },
+    newWorksLineOption() {
+      return buildNewWorksTrajectoryOption(this.analysisData);
+    },
+    newWorksPieOption() {
+      return buildNewWorksCategoryPieOption(this.analysisData);
+    },
+    publishTimeHeatmapOption() {
+      return buildPublishTimeHeatmapOption(this.analysisData);
+    },
+    fansTrendOption() {
+      return buildFansTrendOption(this.analysisData, {
+        selectedAccounts: this.fansSelectedAccounts,
+      });
+    },
+    contentTrendOption() {
+      return buildContentTrendOption(this.contentTrendData);
+    },
+    contentTrendDialogTitle() {
+      const title =
+        (this.contentTrendData && this.contentTrendData.title) ||
+        (this.contentTrendRow && this.contentTrendRow.title) ||
+        "作品播放趋势";
+      return `播放趋势 · ${title}`;
+    },
   },
   watch: {
     activeTab(val) {
@@ -1630,6 +1968,9 @@ export default {
         this.loadContentSummary();
       } else if (val === "analysis") {
         this.loadAnalysis();
+        if (typeof this.$nextTick === "function") {
+          this.$nextTick(() => this.resizeAnalysisCharts());
+        }
       }
     },
     summaryFilter() {
@@ -1665,6 +2006,9 @@ export default {
   },
   activated() {
     this.autoCollect = loadAutoCollectSettings();
+    if (this.activeTab === "analysis" && typeof this.$nextTick === "function") {
+      this.$nextTick(() => this.resizeAnalysisCharts());
+    }
   },
   beforeDestroy() {
     if (this._unsubProgress) this._unsubProgress();
@@ -1709,6 +2053,15 @@ export default {
         if (this.analysisTo && res.to && this.analysisTo > res.to) {
           this.analysisTo = res.to;
         }
+        if (Array.isArray(this.fansSelectedAccounts) && this.fansSelectedAccounts.length) {
+          const validKeys = new Set(
+            ((res.fansTrend && res.fansTrend.accounts) || []).map((a) => a.accountKey)
+          );
+          this.fansSelectedAccounts = this.fansSelectedAccounts.filter((k) => validKeys.has(k));
+        }
+        if (typeof this.$nextTick === "function") {
+          this.$nextTick(() => this.resizeAnalysisCharts());
+        }
       } catch (err) {
         if (reqId !== this._analysisReqId) return;
         this.$message.error(`读取数据分析失败：${(err && err.message) || err}`);
@@ -1717,6 +2070,149 @@ export default {
           this.loadingAnalysis = false;
         }
       }
+    },
+    isChartOptionEmpty(opt) {
+      return isEmptyChartOption(opt);
+    },
+    getAnalysisChartSpecs() {
+      return [
+        { ref: "chartOverviewTrend", name: `1-总览-日趋势-${this.overviewTrendMetricLabel}` },
+        { ref: "chartOverviewPie", name: "1-总览-平台占比" },
+        { ref: "chartPlatformCompare", name: "2-平台对比" },
+        { ref: "chartRankingTop10", name: `3-作品排行Top10-${this.analysisRankMetricShortLabel}` },
+        { ref: "chartNewWorksLine", name: "4-新作品走势-D1D3D7" },
+        { ref: "chartNewWorksPie", name: "4-新作品走势-分类占比" },
+        { ref: "chartPublishTimeHeatmap", name: "5-发布时间热力图" },
+        { ref: "chartFansTrend", name: "6-粉丝趋势" },
+      ];
+    },
+    resizeAnalysisCharts() {
+      if (!this.$refs) return;
+      for (const spec of this.getAnalysisChartSpecs()) {
+        const comp = this.$refs[spec.ref];
+        if (comp && typeof comp.resize === "function") {
+          comp.resize();
+        }
+      }
+    },
+    async saveChartImage(refName, chartName) {
+      const comp = this.$refs && this.$refs[refName];
+      if (!comp || typeof comp.getDataURL !== "function") {
+        this.$message.warning("图表尚未就绪");
+        return;
+      }
+      const dataUrl = comp.getDataURL();
+      if (!dataUrl) {
+        this.$message.warning("当前图表暂无可保存的数据");
+        return;
+      }
+      try {
+        const payload = {
+          dataUrl,
+          name: chartName || "图表",
+        };
+        const chartDate =
+          (this.analysisData && this.analysisData.to) ||
+          (this.contentTrendData && this.contentTrendData.date) ||
+          "";
+        if (chartDate) payload.date = chartDate;
+        const res = await ipcRenderer.invoke("stats:save-chart-image", payload);
+        if (res && res.ok) {
+          this.$message.success(`已保存图片：${res.filePath}`);
+        } else if (res && res.canceled) {
+          // 用户取消保存
+        } else {
+          this.$message.error((res && (res.message || res.error)) || "保存图片失败");
+        }
+      } catch (err) {
+        this.$message.error(`保存图片失败：${(err && err.message) || err}`);
+      }
+    },
+    async exportAllCharts() {
+      if (this.exportingAllCharts) return;
+      this.resizeAnalysisCharts();
+      const items = [];
+      for (const spec of this.getAnalysisChartSpecs()) {
+        const comp = this.$refs && this.$refs[spec.ref];
+        if (!comp || typeof comp.getDataURL !== "function") continue;
+        const dataUrl = comp.getDataURL();
+        if (dataUrl) {
+          items.push({ name: spec.name, dataUrl });
+        }
+      }
+      if (!items.length) {
+        this.$message.warning("当前没有可导出的图表");
+        return;
+      }
+      this.exportingAllCharts = true;
+      try {
+        const payload = { items };
+        if (this.analysisData && this.analysisData.to) {
+          payload.date = this.analysisData.to;
+        }
+        const res = await ipcRenderer.invoke("stats:save-chart-images-batch", payload);
+        if (res && res.ok) {
+          this.$message.success(`已导出 ${res.count} 张图表到：${res.dir}`);
+        } else if (res && res.canceled) {
+          // 用户取消目录选择
+        } else {
+          this.$message.error((res && (res.message || res.error)) || "导出全部图表失败");
+        }
+      } catch (err) {
+        this.$message.error(`导出全部图表失败：${(err && err.message) || err}`);
+      } finally {
+        this.exportingAllCharts = false;
+      }
+    },
+    async openContentTrend(row) {
+      if (!row || !row.contentKey) return;
+      const reqId = (this._contentTrendReqId = (this._contentTrendReqId || 0) + 1);
+      this.contentTrendRow = {
+        contentKey: row.contentKey,
+        title: row.title || "(无标题)",
+      };
+      this.contentTrendData = null;
+      this.contentTrendVisible = true;
+      this.loadingContentTrend = true;
+      try {
+        const payload = { contentKey: row.contentKey };
+        if (this.contentSummaryDate) payload.to = this.contentSummaryDate;
+        const res = await ipcRenderer.invoke("stats:get-content-trend", payload);
+        if (reqId !== this._contentTrendReqId) return;
+        if (!res || res.ok === false || res.error) {
+          this.$message.warning((res && res.error) || "读取作品趋势失败");
+          this.contentTrendData = null;
+          return;
+        }
+        this.contentTrendData = res;
+        if (typeof this.$nextTick === "function") {
+          this.$nextTick(() => {
+            const comp = this.$refs && this.$refs.chartContentTrend;
+            if (comp && typeof comp.resize === "function") comp.resize();
+          });
+        }
+      } catch (err) {
+        if (reqId !== this._contentTrendReqId) return;
+        this.$message.error(`读取作品趋势失败：${(err && err.message) || err}`);
+      } finally {
+        if (reqId === this._contentTrendReqId) {
+          this.loadingContentTrend = false;
+        }
+      }
+    },
+    onContentTrendDialogOpened() {
+      if (typeof this.$nextTick === "function") {
+        this.$nextTick(() => {
+          const comp = this.$refs && this.$refs.chartContentTrend;
+          if (comp && typeof comp.resize === "function") comp.resize();
+        });
+      }
+    },
+    resetContentTrendDialog() {
+      this._contentTrendReqId = (this._contentTrendReqId || 0) + 1;
+      this.contentTrendRow = null;
+      this.contentTrendData = null;
+      this.loadingContentTrend = false;
     },
     async copyAnalysisSummary() {
       const text = this.analysisSummaryText;
@@ -2574,5 +3070,84 @@ export default {
 
 .clickable-rows {
   cursor: pointer;
+}
+
+.analysis-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.chart-grid-overview,
+.chart-grid-newworks {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+@media (max-width: 1080px) {
+  .chart-grid-overview,
+  .chart-grid-newworks {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.chart-box {
+  border: 1px solid #ebeef5;
+  border-radius: 6px;
+  padding: 10px 12px 8px;
+  background: #ffffff;
+}
+
+.chart-box-block {
+  margin-bottom: 12px;
+}
+
+.chart-box-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.chart-box-title-wrap {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.chart-box-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: #303133;
+}
+
+.chart-inline-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.fans-account-select {
+  width: 240px;
+}
+
+.trend-dialog-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.trend-dialog-tip {
+  font-size: 12px;
+  color: #909399;
 }
 </style>

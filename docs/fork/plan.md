@@ -20,6 +20,17 @@
 | S4 | feat/stats-xlsx-export | 导出 .xlsx（作品日明细/作品跨平台汇总/平台日汇总/账号日快照/字段说明），GUI 按钮 + `cli stats-export`，「作品汇总」tab |
 | S6 | feat/stats-fuzzy-link | 跨平台作品模糊匹配自动合并（作品↔target + 无发布记录跨平台聚类）+ 手工矫正持久化（link-overrides.json）+ 界面矫正交互 + 导出新列 |
 | S7 | feat/stats-analysis | 纯规则「数据分析」页（7 节分析 + 采集掉0异常剔除重算 + 上推荐识别 + 文字小结）+ Excel「分析」sheet（与 GUI 共用计算与默认截止日） |
+| S8 | feat/stats-charts | ECharts 5.5.1 按需封装 `StatsChart.vue` +「数据分析」6 节可视化图表 + 导出单图/全部图表 PNG +「作品汇总」单内容播放走势弹窗 |
+
+## S8：数据可视化（`feat/stats-charts`）
+- **依赖与通用组件（`package.json` + `src/renderer/components/StatsChart.vue` + `src/renderer/utils/statsChartOptions.js`）**：引入 `echarts@5.5.1`（本地打包，按需注册 `LineChart`/`BarChart`/`PieChart`/`HeatmapChart` 与必要组件）；自研 `StatsChart.vue` 通用组件（`ResizeObserver` 自适应与 `el-tabs` 隐藏切回重算尺寸、空数据展示「暂无数据」占位、暴露 `getDataURL()` 供导出 PNG）；全页共用固定 7 平台配色常量（`PLATFORM_COLORS` / `getPlatformColor`）；图表 option 全部抽离为纯函数 `statsChartOptions.js`（缺天补空连续日期轴 + `connectNulls: false`、折线数据点 `> 2000` 自动启用 `sampling: "lttb"`）。
+- **后端结构化数据与新 IPC（`statsAnalysis.js` + `statsExport.js` + `dataStats/index.js`）**：
+  - `statsAnalysis.js` 在不改变既有口径的前提下补充：`overview.dailyTrend`（本周期连续日期各平台 6 项日增序列）、`rankings` 各 Top/Bottom 条目的 `platforms` 分平台明细（含互动率贡献占比）以及 `fansTrend`（本周期各账号粉丝日快照序列）。
+  - `statsExport.js` 新增 `buildContentTrendData`，复用与 `buildContentSummaryData` 同一套跨平台关联（自动 + `link-overrides`）与默认截止日，按作品日明细汇总单条内容的各平台累计播放与总播放日增（连续日期补空）。
+  - `dataStats/index.js` 新增 3 个 IPC（均沿用本地页面校验）：`stats:get-content-trend { contentKey, from?, to? }`、`stats:save-chart-image { dataUrl, name }`（严格校验 `data:image/png;base64,` 前缀、PNG 魔数与 `≤10MB` 大小，弹出保存对话框默认 Documents）与 `stats:save-chart-images-batch`（一次目录选择对话框批量导出本页全部图表 PNG）。
+- **GUI 交互（`src/renderer/views/dataStats/index.vue`）**：
+  - 「数据分析」tab 顶部新增「导出全部图表」；6 节全部配图（①总览日趋势折线/堆叠面积+异常空心灰点与上推荐红标+平台占比环形图；②平台对比均播柱+互动率副轴折线；③作品排行 Top10 按平台横向堆叠条形图；④新作品 D1/D3/D7 走势 Top10 折线+分类占比饼图；⑤发布时间星期×时段热力图、样本 `<3` 半透明；⑥账号粉丝趋势折线+多选账号筛选），每张图右上角均支持单独保存 PNG。
+  - 「作品汇总」tab 内容行与未关联行新增「趋势」按钮，弹窗展示该内容各平台累计播放折线 + 播放日增柱并支持保存 PNG。
 
 ## S7：纯规则数据分析 + Excel「分析」sheet（`feat/stats-analysis`）
 - **核心模块（`src/main/services/dataStats/statsAnalysis.js`）**：纯函数 `buildStatsAnalysis({ dailyRows, summaryRows, accountRows, to, period, now })`，不依赖 electron/fs、不调 AI、确定性输出 7 节结构化结果并导出全部阈值常量（`ANALYSIS_THRESHOLDS` 及各单项常量）：

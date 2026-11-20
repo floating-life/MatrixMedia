@@ -3141,6 +3141,244 @@ function writeStatsXlsx(data, filePath, options = {}) {
   return resolvedPath;
 }
 
+/**
+ * 构建单条内容的各平台播放走势数据（供「作品汇总」tab 趋势弹窗 / IPC stats:get-content-trend 复用）。
+ * - 复用与 buildContentSummaryData 同一套跨平台关联（自动 + link-overrides）与默认截止日
+ * - 日播放累计与播放日增取自作品日明细（按 platform|workId 跨组去重，连续日期补空 null）
+ */
+function buildContentTrendData(options = {}, depsArg) {
+  const opts = isPlainObject(options) ? options : {};
+  const contentKey = typeof opts.contentKey === "string" ? opts.contentKey.trim() : "";
+  if (!contentKey) {
+    throw new Error("contentKey 不能为空");
+  }
+  const { from: validFrom, to: validTo } = validateExportDateRange(opts.from, opts.to);
+
+  const dataset = loadRawDataset(opts, depsArg);
+  const cutoffDate = validTo || dataset.latestDataDate || "";
+
+  const latestWorksDailyByGp = reduceAllWorksDailyByGpAsOf(
+    dataset.allWorksDailyByGp,
+    cutoffDate
+  );
+  const allContents = buildContentIndex(dataset.allPushRecords);
+  const link = linkWorks({
+    contents: allContents,
+    accounts: dataset.allAccountsData,
+    worksDaily: latestWorksDailyByGp,
+    date: cutoffDate || undefined,
+    overrides: dataset.linkOverrides,
+  });
+  let summaryRows = buildContentSummaryRows({
+    contents: allContents,
+    accounts: dataset.allAccountsData,
+    link,
+    worksDaily: latestWorksDailyByGp,
+    date: cutoffDate || undefined,
+    overrides: dataset.linkOverrides,
+    groups: dataset.groupSet,
+  });
+  if (dataset.groupSet) {
+    summaryRows = filterSummaryRowsByGroupScope(
+      summaryRows,
+      allContents,
+      link,
+      dataset.outputAccountsData,
+      dataset.groupSet,
+      cutoffDate
+    );
+  }
+
+  const targetRow = summaryRows.find((r) => r && r.contentKey === contentKey) || null;
+  if (!targetRow) {
+    return {
+      found: false,
+      contentKey,
+      title: "",
+      firstPublishDate: "",
+      date: cutoffDate,
+      from: validFrom || "",
+      to: cutoffDate,
+      dates: [],
+      platforms: [],
+      totalPlay: [],
+      totalPlayDelta: [],
+    };
+  }
+
+  const targetPwKeys = new Set();
+  if (isPlainObject(targetRow.perPlatform)) {
+    for (const [pgKey, cell] of Object.entries(targetRow.perPlatform)) {
+      if (!isPlainObject(cell)) continue;
+      const { platform } = parsePgKey(pgKey);
+      if (Array.isArray(cell.workIds)) {
+        for (const wid of cell.workIds) {
+          if (wid != null && wid !== "") {
+            targetPwKeys.add(`${platform}|${String(wid).trim()}`);
+          }
+        }
+      }
+      if (Array.isArray(cell.works)) {
+        for (const w of cell.works) {
+          if (isPlainObject(w) && w.workId != null && w.workId !== "") {
+            const p =
+              typeof w.platform === "string" && w.platform.trim()
+                ? w.platform.trim()
+                : platform;
+            targetPwKeys.add(`${p}|${String(w.workId).trim()}`);
+          }
+        }
+      }
+    }
+  }
+
+  const cutoffDayNum = cutoffDate ? dateStrToDayNum(cutoffDate) : null;
+  const fromDayNum = validFrom ? dateStrToDayNum(validFrom) : null;
+  const rawByWork = new Map();
+
+  for (const acc of dataset.outputAccountsData) {
+    if (!isPlainObject(acc) || !isPlainObject(acc.worksDaily)) continue;
+    const platform = acc.platform == null ? "" : String(acc.platform);
+    const workIds = Object.keys(acc.worksDaily);
+    for (let wi = 0; wi < workIds.length; wi++) {
+      const workId = workIds[wi];
+      const pwKey = `${platform}|${workId}`;
+      if (!targetPwKeys.has(pwKey)) continue;
+      const dateMap = safeOwnGet(acc.worksDaily, workId);
+      if (!isPlainObject(dateMap)) continue;
+
+      let bucket = rawByWork.get(pwKey);
+      if (!bucket) {
+        bucket = { platform, workId, byDayNum: new Map() };
+        rawByWork.set(pwKey, bucket);
+      }
+      const rawDates = Object.keys(dateMap);
+      for (let di = 0; di < rawDates.length; di++) {
+        const d = rawDates[di];
+        const dn = dateStrToDayNum(d);
+        if (dn === null) continue;
+        if (cutoffDayNum !== null && dn > cutoffDayNum) continue;
+        if (bucket.byDayNum.has(dn)) continue;
+        const snap = safeOwnGet(dateMap, d);
+        if (!isPlainObject(snap)) continue;
+        const play = hasOwn(snap, "play") ? fastNormalizeMetric(snap.play) : null;
+        bucket.byDayNum.set(dn, { date: d, dayNum: dn, play });
+      }
+    }
+  }
+
+  const platformDayMap = new Map();
+  let minDayNum = Infinity;
+  let maxDayNum = -Infinity;
+
+  for (const bucket of rawByWork.values()) {
+    const pts = [...bucket.byDayNum.values()].sort((a, b) => a.dayNum - b.dayNum);
+    let prevPlay = null;
+    let hasPrev = false;
+
+    for (let i = 0; i < pts.length; i++) {
+      const pt = pts[i];
+      const play = pt.play;
+      const playDelta = hasPrev && play !== null && prevPlay !== null ? play - prevPlay : null;
+      hasPrev = true;
+      prevPlay = play;
+
+      if (fromDayNum !== null && pt.dayNum < fromDayNum) continue;
+      if (cutoffDayNum !== null && pt.dayNum > cutoffDayNum) continue;
+
+      if (pt.dayNum < minDayNum) minDayNum = pt.dayNum;
+      if (pt.dayNum > maxDayNum) maxDayNum = pt.dayNum;
+
+      let dayMap = platformDayMap.get(bucket.platform);
+      if (!dayMap) {
+        dayMap = new Map();
+        platformDayMap.set(bucket.platform, dayMap);
+      }
+      let cell = dayMap.get(pt.dayNum);
+      if (!cell) {
+        cell = { play: null, playDelta: null };
+        dayMap.set(pt.dayNum, cell);
+      }
+      if (play !== null) {
+        const nextPlay = cell.play === null ? play : cell.play + play;
+        cell.play = nextPlay === 0 ? 0 : nextPlay;
+      }
+      if (playDelta !== null) {
+        const nextDelta = cell.playDelta === null ? playDelta : cell.playDelta + playDelta;
+        cell.playDelta = nextDelta === 0 ? 0 : nextDelta;
+      }
+    }
+  }
+
+  if (minDayNum > maxDayNum) {
+    return {
+      found: true,
+      contentKey,
+      title: targetRow.title || "(无标题)",
+      firstPublishDate: targetRow.firstPublishDate || "",
+      date: cutoffDate,
+      from: validFrom || "",
+      to: cutoffDate,
+      dates: [],
+      platforms: [],
+      totalPlay: [],
+      totalPlayDelta: [],
+    };
+  }
+
+  const rangeStartDay = fromDayNum !== null ? fromDayNum : minDayNum;
+  const rangeEndDay = validTo && cutoffDayNum !== null ? cutoffDayNum : maxDayNum;
+  const spanDays = rangeEndDay - rangeStartDay + 1;
+  const dates = new Array(spanDays);
+  for (let i = 0; i < spanDays; i++) {
+    dates[i] = dayNumToDateStr(rangeStartDay + i);
+  }
+
+  const sortedPlatforms = [...platformDayMap.keys()].sort(comparePlatform);
+  const totalPlay = new Array(spanDays).fill(null);
+  const totalPlayDelta = new Array(spanDays).fill(null);
+
+  const platforms = sortedPlatforms.map((platform) => {
+    const dayMap = platformDayMap.get(platform);
+    const playArr = new Array(spanDays).fill(null);
+    const deltaArr = new Array(spanDays).fill(null);
+    for (let i = 0; i < spanDays; i++) {
+      const cell = dayMap.get(rangeStartDay + i);
+      if (!cell) continue;
+      playArr[i] = cell.play;
+      deltaArr[i] = cell.playDelta;
+      if (cell.play !== null) {
+        const np = totalPlay[i] === null ? cell.play : totalPlay[i] + cell.play;
+        totalPlay[i] = np === 0 ? 0 : np;
+      }
+      if (cell.playDelta !== null) {
+        const nd =
+          totalPlayDelta[i] === null ? cell.playDelta : totalPlayDelta[i] + cell.playDelta;
+        totalPlayDelta[i] = nd === 0 ? 0 : nd;
+      }
+    }
+    return {
+      platform,
+      play: playArr,
+      playDelta: deltaArr,
+    };
+  });
+
+  return {
+    found: true,
+    contentKey,
+    title: targetRow.title || "(无标题)",
+    firstPublishDate: targetRow.firstPublishDate || "",
+    date: cutoffDate,
+    from: dates[0],
+    to: dates[dates.length - 1],
+    dates,
+    platforms,
+    totalPlay,
+    totalPlayDelta,
+  };
+}
+
 module.exports = {
   SHEET_NAMES,
   MAX_SHEET_ROWS,
@@ -3163,6 +3401,7 @@ module.exports = {
   countWorkDailyRows,
   computeWorkCountsFromSummaryRows,
   buildContentSummaryData,
+  buildContentTrendData,
   buildAnalysisSheet,
   buildStatsAnalysisData,
   buildStatsWorkbookData,

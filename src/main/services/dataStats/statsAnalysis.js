@@ -691,7 +691,7 @@ function addNullable(acc, val) {
   return next === 0 ? 0 : next;
 }
 
-/** 1. 总览：本周期 vs 上一周期的 6 项日增合计、环比%、各平台播放贡献占比 */
+/** 1. 总览：本周期 vs 上一周期的 6 项日增合计、环比%、各平台播放贡献占比与分日趋势 */
 function buildOverviewSection(
   seriesByWork,
   accountRows,
@@ -701,6 +701,11 @@ function buildOverviewSection(
   const curEndDay = dateStrToDayNum(currentEnd);
   const prevStartDay = dateStrToDayNum(prevStart);
   const prevEndDay = dateStrToDayNum(prevEnd);
+  const periodDays = curEndDay - curStartDay + 1;
+  const trendDates = new Array(periodDays);
+  for (let d = 0; d < periodDays; d++) {
+    trendDates[d] = dayNumToDateStr(curStartDay + d);
+  }
 
   const curSums = {};
   const prevSums = {};
@@ -710,12 +715,14 @@ function buildOverviewSection(
   }
 
   const byPlatform = new Map();
+  const trendByPlatform = new Map();
 
   for (const series of seriesByWork.values()) {
     const dayNums = series.dayNums;
     const len = series.len;
     const deltas = series.deltas;
     let ptAgg = null;
+    let ptTrend = null;
 
     for (let i = 0; i < len; i++) {
       const dn = dayNums[i];
@@ -740,7 +747,21 @@ function buildOverviewSection(
             };
             byPlatform.set(series.platform, ptAgg);
           }
+          ptTrend = trendByPlatform.get(series.platform);
+          if (!ptTrend) {
+            ptTrend = {
+              platform: series.platform,
+              play: new Array(periodDays).fill(null),
+              like: new Array(periodDays).fill(null),
+              comment: new Array(periodDays).fill(null),
+              share: new Array(periodDays).fill(null),
+              favorite: new Array(periodDays).fill(null),
+              fansDelta: new Array(periodDays).fill(null),
+            };
+            trendByPlatform.set(series.platform, ptTrend);
+          }
         }
+        const dayIdx = dn - curStartDay;
         for (let ki = 0; ki < WORK_STAT_KEYS.length; ki++) {
           const k = WORK_STAT_KEYS[ki];
           const dv = deltas[k][i];
@@ -749,6 +770,9 @@ function buildOverviewSection(
             if (curSums[k] === 0) curSums[k] = 0;
             ptAgg[k] = ptAgg[k] === null ? dv : ptAgg[k] + dv;
             if (ptAgg[k] === 0) ptAgg[k] = 0;
+            const prevDayVal = ptTrend[k][dayIdx];
+            const nextDayVal = prevDayVal === null ? dv : prevDayVal + dv;
+            ptTrend[k][dayIdx] = nextDayVal === 0 ? 0 : nextDayVal;
           }
         }
       } else {
@@ -835,9 +859,17 @@ function buildOverviewSection(
     }
   }
 
+  const trendPlatforms = [...trendByPlatform.values()].sort((a, b) =>
+    comparePlatform(a.platform, b.platform)
+  );
+
   return {
     metrics,
     platformContribution,
+    dailyTrend: {
+      dates: trendDates,
+      platforms: trendPlatforms,
+    },
     accountSummary: {
       fansDelta: {
         current: accFansCur,
@@ -1492,10 +1524,11 @@ function buildRankingsSection(contentRows) {
       totalFansDelta: c.totalFansDelta,
       rawEngagementRate: rawEng,
       engagementEligible,
+      platforms: c.platforms,
     };
   });
 
-  // 排序使用原始比率，输出时再做四舍五入
+  // 排序使用原始比率，输出时再做四舍五入；附按平台明细供 Top10 堆叠图使用
   const toRankItem = (item) => ({
     contentKey: item.contentKey,
     title: item.title,
@@ -1506,6 +1539,25 @@ function buildRankingsSection(contentRows) {
     engagementRatePct:
       item.rawEngagementRate !== null ? round2(item.rawEngagementRate * 100) : null,
     totalFansDelta: item.totalFansDelta,
+    platforms: (Array.isArray(item.platforms) ? item.platforms : []).map((p) => {
+      const pRate = computeItemEngagementRate(p.play, p.like, p.comment, p.share);
+      const hasInt = p.like !== null || p.comment !== null || p.share !== null;
+      const interactions = hasInt ? (p.like || 0) + (p.comment || 0) + (p.share || 0) : null;
+      const engagementContribPct =
+        item.totalPlay !== null && item.totalPlay > 0 && interactions !== null
+          ? round2((interactions / item.totalPlay) * 100)
+          : null;
+      return {
+        platform: p.platform,
+        play: p.play,
+        like: p.like,
+        comment: p.comment,
+        share: p.share,
+        fansDelta: p.fansDelta,
+        engagementRatePct: pRate !== null ? round2(pRate * 100) : null,
+        engagementContribPct,
+      };
+    }),
   });
 
   const playEligible = enriched.filter((x) => x.totalPlay !== null);
@@ -2235,6 +2287,86 @@ function buildAnomaliesSection(seriesByWork, allCollectionAnomalies, { currentSt
   };
 }
 
+/** 账号粉丝趋势（来自账号日快照，覆盖本周期连续日期，按平台与分组确定性排序） */
+function buildFansTrendSection(accountRows, { currentStart, currentEnd }) {
+  const curStartDay = dateStrToDayNum(currentStart);
+  const curEndDay = dateStrToDayNum(currentEnd);
+  const periodDays = curEndDay - curStartDay + 1;
+  const dates = new Array(periodDays);
+  for (let d = 0; d < periodDays; d++) {
+    dates[d] = dayNumToDateStr(curStartDay + d);
+  }
+
+  const byAccount = new Map();
+  for (const ar of Array.isArray(accountRows) ? accountRows : []) {
+    if (!isPlainObject(ar) || typeof ar.date !== "string") continue;
+    const dn = dateStrToDayNum(ar.date.trim());
+    if (dn === null || dn < curStartDay || dn > curEndDay) continue;
+    const platform = ar.platform == null ? "" : String(ar.platform).trim();
+    if (!platform) continue;
+    const group = ar.group == null ? "" : String(ar.group).trim();
+    const fans = fastNormalizeMetric(ar.fans);
+    const fansDelta = fastNormalizeMetric(ar.fansDelta);
+    if (fans === null && fansDelta === null) continue;
+
+    const accountKey = `${platform}|${group}`;
+    let bucket = byAccount.get(accountKey);
+    if (!bucket) {
+      bucket = {
+        accountKey,
+        platform,
+        group,
+        label: group ? `${platform}·${group}` : platform,
+        fans: new Array(periodDays).fill(null),
+        fansDelta: new Array(periodDays).fill(null),
+      };
+      byAccount.set(accountKey, bucket);
+    }
+    const dayIdx = dn - curStartDay;
+    // 确定性合并（避免重复日期受输入顺序影响）
+    if (fans !== null && (bucket.fans[dayIdx] === null || fans > bucket.fans[dayIdx])) {
+      bucket.fans[dayIdx] = fans;
+    }
+    if (
+      fansDelta !== null &&
+      (bucket.fansDelta[dayIdx] === null || fansDelta > bucket.fansDelta[dayIdx])
+    ) {
+      bucket.fansDelta[dayIdx] = fansDelta;
+    }
+  }
+
+  const accounts = [...byAccount.values()]
+    .filter((b) => b.fans.some((v) => v !== null))
+    .map((b) => {
+      let latestFans = null;
+      let periodDelta = null;
+      for (let i = 0; i < periodDays; i++) {
+        if (b.fans[i] !== null) latestFans = b.fans[i];
+        periodDelta = addNullable(periodDelta, b.fansDelta[i]);
+      }
+      return {
+        accountKey: b.accountKey,
+        platform: b.platform,
+        group: b.group,
+        label: b.label,
+        fans: b.fans,
+        fansDelta: b.fansDelta,
+        latestFans,
+        periodDelta,
+      };
+    })
+    .sort((a, b) => {
+      const pc = comparePlatform(a.platform, b.platform);
+      if (pc !== 0) return pc;
+      return compareText(a.group, b.group);
+    });
+
+  return {
+    dates,
+    accounts,
+  };
+}
+
 /** 7. 文字小结：从 1–6 节拼 5–8 行中文要点 + 数据积累不足 14 天提示 */
 function buildSummarySection({
   period,
@@ -2427,6 +2559,10 @@ function buildStatsAnalysis({
     currentStart,
     to: resolvedTo,
   });
+  const fansTrend = buildFansTrendSection(accountRows, {
+    currentStart,
+    currentEnd: resolvedTo,
+  });
   const summary = buildSummarySection({
     period: resolvedPeriod,
     currentStart,
@@ -2452,6 +2588,7 @@ function buildStatsAnalysis({
     rankings,
     newWorks,
     publishTime,
+    fansTrend,
     anomalies,
     summary,
   };
