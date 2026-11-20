@@ -591,12 +591,746 @@
           </template>
         </el-dialog>
       </el-tab-pane>
+      <el-tab-pane label="数据分析" name="analysis" lazy>
+        <div v-loading="loadingAnalysis" class="analysis-panel">
+          <div class="platform-card analysis-toolbar-card">
+            <div class="analysis-toolbar">
+              <div class="analysis-controls">
+                <el-radio-group
+                  v-model="analysisPeriod"
+                  size="mini"
+                  @change="loadAnalysis"
+                >
+                  <el-radio-button :label="7">近7天</el-radio-button>
+                  <el-radio-button :label="30">近30天</el-radio-button>
+                </el-radio-group>
+                <el-date-picker
+                  v-model="analysisTo"
+                  type="date"
+                  size="mini"
+                  class="analysis-date-picker"
+                  value-format="yyyy-MM-dd"
+                  clearable
+                  :editable="false"
+                  placeholder="默认最新快照日"
+                  @change="loadAnalysis"
+                />
+                <span v-if="analysisData && analysisData.currentRange" class="card-tip">
+                  周期：{{ analysisData.currentRange.from }} ~ {{ analysisData.to }} · 已积累
+                  {{ analysisData.snapshotDays }} 天作品快照
+                </span>
+              </div>
+              <div class="analysis-actions">
+                <el-button
+                  size="mini"
+                  icon="el-icon-document-copy"
+                  :disabled="!analysisSummaryText"
+                  @click="copyAnalysisSummary"
+                >
+                  复制小结
+                </el-button>
+              </div>
+            </div>
+          </div>
+
+          <div v-if="analysisData" class="analysis-sections">
+            <!-- 7. 文字小结（置顶） -->
+            <div class="platform-card analysis-summary-card">
+              <div class="card-head">
+                <span class="card-title">分析小结</span>
+                <span class="card-tip">纯规则计算 · 与 Excel「分析」sheet 同口径</span>
+              </div>
+              <ul class="analysis-summary-list">
+                <li
+                  v-for="(line, idx) in analysisSummaryLines"
+                  :key="idx"
+                  :class="{
+                    'is-warning':
+                      analysisData.summary &&
+                      analysisData.summary.lowHistoryNotice &&
+                      idx === analysisSummaryLines.length - 1,
+                  }"
+                >
+                  {{ line }}
+                </li>
+              </ul>
+            </div>
+
+            <!-- 1. 总览 -->
+            <div class="platform-card">
+              <div class="card-head">
+                <span class="card-title">1. 总览（周期对比与平台贡献）</span>
+                <span v-if="analysisData.previousRange" class="card-tip">
+                  对比上周期：{{ analysisData.previousRange.from }} ~
+                  {{ analysisData.previousRange.to }}（已剔除疑似采集异常点）
+                </span>
+              </div>
+              <el-table
+                :data="analysisOverviewMetricRows"
+                size="mini"
+                border
+                stripe
+                class="analysis-table"
+              >
+                <el-table-column prop="label" label="指标" width="100" />
+                <el-table-column label="本周期日增" align="right" min-width="120">
+                  <template #default="{ row }">
+                    <span class="num" :class="{ muted: row.current == null }">
+                      {{ showNum(row.current) }}
+                    </span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="上周期日增" align="right" min-width="120">
+                  <template #default="{ row }">
+                    <span class="num" :class="{ muted: row.previous == null }">
+                      {{ showNum(row.previous) }}
+                    </span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="环比" align="right" width="120">
+                  <template #default="{ row }">
+                    <span
+                      v-if="row.momPct != null"
+                      class="num"
+                      :class="{ up: row.momPct > 0, down: row.momPct < 0 }"
+                    >
+                      {{ row.momPct > 0 ? "+" : "" }}{{ row.momPct }}%
+                    </span>
+                    <span v-else class="num muted">-</span>
+                  </template>
+                </el-table-column>
+              </el-table>
+
+              <div class="sub-block-title">各平台贡献占比（按播放日增）</div>
+              <el-table
+                :data="analysisPlatformContribution"
+                size="mini"
+                border
+                stripe
+                class="analysis-table"
+              >
+                <el-table-column prop="platform" label="平台" width="96" />
+                <el-table-column label="播放日增" align="right" width="110">
+                  <template #default="{ row }">
+                    <span class="num" :class="{ muted: row.play == null }">
+                      {{ showNum(row.play) }}
+                    </span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="播放贡献占比" min-width="200">
+                  <template #default="{ row }">
+                    <div class="bar-cell">
+                      <div class="css-bar-track">
+                        <div
+                          class="css-bar-fill primary"
+                          :style="{ width: calcPercentWidth(row.sharePct, 100) }"
+                        />
+                      </div>
+                      <span class="num bar-val" :class="{ muted: row.sharePct == null }">
+                        {{ row.sharePct != null ? row.sharePct + "%" : "-" }}
+                      </span>
+                    </div>
+                  </template>
+                </el-table-column>
+                <el-table-column label="点赞日增" align="right" width="90">
+                  <template #default="{ row }">
+                    <span class="num" :class="{ muted: row.like == null }">{{ showNum(row.like) }}</span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="评论日增" align="right" width="90">
+                  <template #default="{ row }">
+                    <span class="num" :class="{ muted: row.comment == null }">{{ showNum(row.comment) }}</span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="分享日增" align="right" width="90">
+                  <template #default="{ row }">
+                    <span class="num" :class="{ muted: row.share == null }">{{ showNum(row.share) }}</span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="涨粉日增" align="right" width="90">
+                  <template #default="{ row }">
+                    <span class="num" :class="{ muted: row.fansDelta == null }">{{ showNum(row.fansDelta) }}</span>
+                  </template>
+                </el-table-column>
+                <template #empty>
+                  <span class="card-empty-inline">本周期暂无平台播放日增数据</span>
+                </template>
+              </el-table>
+            </div>
+
+            <!-- 2. 平台对比 -->
+            <div class="platform-card">
+              <div class="card-head">
+                <span class="card-title">2. 平台对比（覆盖 ≥2 平台同款内容）</span>
+                <span class="card-tip">
+                  共
+                  {{
+                    analysisData.platformComparison
+                      ? analysisData.platformComparison.multiPlatformContentCount
+                      : 0
+                  }}
+                  条跨平台内容 · 互动率=(点赞+评论+分享)/播放
+                </span>
+              </div>
+              <div v-if="analysisPlatformConclusions.length" class="conclusion-box">
+                <div v-for="(line, idx) in analysisPlatformConclusions" :key="idx">
+                  {{ line }}
+                </div>
+              </div>
+              <el-table
+                :data="analysisPlatformCompareRows"
+                size="mini"
+                border
+                stripe
+                class="analysis-table"
+              >
+                <el-table-column prop="platform" label="平台" width="96" />
+                <el-table-column label="样本数" width="120">
+                  <template #default="{ row }">
+                    <span class="num">{{ row.sampleCount }}</span>
+                    <el-tag
+                      v-if="row.lowSample"
+                      type="warning"
+                      size="mini"
+                      class="inline-tag"
+                    >
+                      样本少
+                    </el-tag>
+                  </template>
+                </el-table-column>
+                <el-table-column label="平均播放" min-width="190">
+                  <template #default="{ row }">
+                    <div class="bar-cell">
+                      <div class="css-bar-track">
+                        <div
+                          class="css-bar-fill primary"
+                          :style="{ width: calcPercentWidth(row.avgPlay, analysisCompareMaxPlay) }"
+                        />
+                      </div>
+                      <span class="num bar-val" :class="{ muted: row.avgPlay == null }">
+                        {{ showNum(row.avgPlay) }}
+                      </span>
+                    </div>
+                  </template>
+                </el-table-column>
+                <el-table-column label="互动率" min-width="170">
+                  <template #default="{ row }">
+                    <div class="bar-cell">
+                      <div class="css-bar-track">
+                        <div
+                          class="css-bar-fill success"
+                          :style="{
+                            width: calcPercentWidth(
+                              row.engagementRatePct,
+                              analysisCompareMaxEng
+                            ),
+                          }"
+                        />
+                      </div>
+                      <span
+                        class="num bar-val"
+                        :class="{ muted: row.engagementRatePct == null }"
+                      >
+                        {{ row.engagementRatePct != null ? row.engagementRatePct + "%" : "-" }}
+                      </span>
+                    </div>
+                  </template>
+                </el-table-column>
+                <el-table-column label="平均涨粉" align="right" width="100">
+                  <template #default="{ row }">
+                    <span class="num" :class="{ muted: row.avgFansDelta == null }">
+                      {{ showNum(row.avgFansDelta) }}
+                    </span>
+                  </template>
+                </el-table-column>
+                <template #empty>
+                  <span class="card-empty-inline">暂无覆盖 2 个及以上平台的同款内容</span>
+                </template>
+              </el-table>
+            </div>
+
+            <!-- 3. 作品排行与平台偏科 -->
+            <div class="platform-card">
+              <div class="card-head">
+                <span class="card-title">3. 作品排行与平台偏科</span>
+                <span class="card-tip">
+                  跨平台合并后截至 {{ analysisData.to }} · 互动率仅统计总播放 ≥ 100 的内容
+                </span>
+              </div>
+              <div class="analysis-sub-controls">
+                <el-radio-group v-model="analysisRankMetric" size="mini">
+                  <el-radio-button label="play">总播放</el-radio-button>
+                  <el-radio-button label="engagement">互动率</el-radio-button>
+                  <el-radio-button label="fans">总涨粉</el-radio-button>
+                </el-radio-group>
+                <el-radio-group v-model="analysisRankOrder" size="mini">
+                  <el-radio-button label="top">Top 10</el-radio-button>
+                  <el-radio-button label="bottom">Bottom 10</el-radio-button>
+                </el-radio-group>
+              </div>
+              <el-table
+                :data="analysisDisplayedRankRows"
+                size="mini"
+                border
+                stripe
+                class="analysis-table"
+              >
+                <el-table-column label="#" width="50" align="center">
+                  <template #default="{ $index }">
+                    <span class="num">{{ $index + 1 }}</span>
+                  </template>
+                </el-table-column>
+                <el-table-column prop="title" label="内容标题" min-width="200" show-overflow-tooltip />
+                <el-table-column prop="firstPublishDate" label="首发日期" width="102">
+                  <template #default="{ row }">
+                    <span class="num" :class="{ muted: !row.firstPublishDate }">
+                      {{ row.firstPublishDate || "-" }}
+                    </span>
+                  </template>
+                </el-table-column>
+                <el-table-column prop="platformCount" label="平台数" width="68" align="right" />
+                <el-table-column :label="analysisRankMetricLabel" min-width="190">
+                  <template #default="{ row }">
+                    <div class="bar-cell">
+                      <div class="css-bar-track">
+                        <div
+                          class="css-bar-fill primary"
+                          :style="{ width: calcRankBarWidth(row) }"
+                        />
+                      </div>
+                      <span class="num bar-val">
+                        {{ formatRankPrimaryValue(row) }}
+                      </span>
+                    </div>
+                  </template>
+                </el-table-column>
+                <el-table-column label="总播放" width="96" align="right">
+                  <template #default="{ row }">
+                    <span class="num" :class="{ muted: row.totalPlay == null }">
+                      {{ showNum(row.totalPlay) }}
+                    </span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="互动率" width="84" align="right">
+                  <template #default="{ row }">
+                    <span class="num" :class="{ muted: row.engagementRatePct == null }">
+                      {{ row.engagementRatePct != null ? row.engagementRatePct + "%" : "-" }}
+                    </span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="总涨粉" width="84" align="right">
+                  <template #default="{ row }">
+                    <span class="num" :class="{ muted: row.totalFansDelta == null }">
+                      {{ showNum(row.totalFansDelta) }}
+                    </span>
+                  </template>
+                </el-table-column>
+                <template #empty>
+                  <span class="card-empty-inline">暂无符合条件的作品排行数据</span>
+                </template>
+              </el-table>
+
+              <div class="sub-block-title">
+                平台偏科（某平台播放 ≥ 其它平台均值 3 倍且 ≥ 500，共
+                {{ analysisPlatformSkewRows.length }} 条）
+              </div>
+              <el-table
+                :data="analysisPlatformSkewRows"
+                size="mini"
+                border
+                stripe
+                class="analysis-table"
+              >
+                <el-table-column prop="title" label="内容标题" min-width="200" show-overflow-tooltip />
+                <el-table-column prop="platform" label="突出平台" width="96" />
+                <el-table-column label="该平台播放" width="110" align="right">
+                  <template #default="{ row }">
+                    <span class="num">{{ showNum(row.platformPlay) }}</span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="其它平台均播" width="110" align="right">
+                  <template #default="{ row }">
+                    <span class="num">{{ showNum(row.otherAvgPlay) }}</span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="倍数" width="90" align="right">
+                  <template #default="{ row }">
+                    <span class="num">
+                      {{ row.ratio != null ? row.ratio + "x" : "极高(它端0)" }}
+                    </span>
+                  </template>
+                </el-table-column>
+                <template #empty>
+                  <span class="card-empty-inline">暂未发现明显平台偏科内容</span>
+                </template>
+              </el-table>
+            </div>
+
+            <!-- 4. 新作品走势 -->
+            <div class="platform-card">
+              <div class="card-head">
+                <span class="card-title">4. 新作品走势（本周期发布 D1 / D3 / D7）</span>
+                <div class="category-tags">
+                  <el-tag size="mini" type="success">
+                    长尾型 {{ analysisNewWorkCounts.长尾型 }}
+                  </el-tag>
+                  <el-tag size="mini" type="info">
+                    爆发后平稳 {{ analysisNewWorkCounts.爆发后平稳 }}
+                  </el-tag>
+                  <el-tag size="mini" type="primary">
+                    其它 {{ analysisNewWorkCounts.其它 }}
+                  </el-tag>
+                  <el-tag size="mini" type="warning">
+                    数据不足 {{ analysisNewWorkCounts.数据不足 }}
+                  </el-tag>
+                </div>
+              </div>
+              <el-table
+                :data="analysisNewWorkRows"
+                row-key="contentKey"
+                size="mini"
+                border
+                stripe
+                class="analysis-table"
+              >
+                <el-table-column type="expand">
+                  <template #default="{ row }">
+                    <div class="expand-box">
+                      <el-table
+                        :data="row.platforms || []"
+                        size="mini"
+                        border
+                        class="expand-table"
+                      >
+                        <el-table-column prop="platform" label="平台" width="90" />
+                        <el-table-column prop="publishDate" label="发布日期" width="104" />
+                        <el-table-column label="D1 播放" align="right" width="96">
+                          <template #default="{ row: p }">
+                            <span class="num" :class="{ muted: p.d1Play == null }">
+                              {{ showNum(p.d1Play) }}
+                            </span>
+                          </template>
+                        </el-table-column>
+                        <el-table-column label="D3 播放" align="right" width="96">
+                          <template #default="{ row: p }">
+                            <span class="num" :class="{ muted: p.d3Play == null }">
+                              {{ showNum(p.d3Play) }}
+                            </span>
+                          </template>
+                        </el-table-column>
+                        <el-table-column label="D7 播放" align="right" width="96">
+                          <template #default="{ row: p }">
+                            <span class="num" :class="{ muted: p.d7Play == null }">
+                              {{ showNum(p.d7Play) }}
+                            </span>
+                          </template>
+                        </el-table-column>
+                        <el-table-column label="D3/D1" align="right" width="80">
+                          <template #default="{ row: p }">
+                            <span class="num" :class="{ muted: p.d3ToD1 == null }">
+                              {{ p.d3ToD1 != null ? p.d3ToD1 + "x" : "-" }}
+                            </span>
+                          </template>
+                        </el-table-column>
+                        <el-table-column label="D7/D3" align="right" width="80">
+                          <template #default="{ row: p }">
+                            <span class="num" :class="{ muted: p.d7ToD3 == null }">
+                              {{ p.d7ToD3 != null ? p.d7ToD3 + "x" : "-" }}
+                            </span>
+                          </template>
+                        </el-table-column>
+                        <el-table-column label="分类" width="106">
+                          <template #default="{ row: p }">
+                            <el-tag :type="trajectoryTagType(p.category)" size="mini">
+                              {{ p.category }}
+                            </el-tag>
+                          </template>
+                        </el-table-column>
+                      </el-table>
+                    </div>
+                  </template>
+                </el-table-column>
+                <el-table-column prop="title" label="内容标题" min-width="190" show-overflow-tooltip />
+                <el-table-column prop="publishDate" label="首发日期" width="102" />
+                <el-table-column label="D1 播放" align="right" width="92">
+                  <template #default="{ row }">
+                    <span class="num" :class="{ muted: row.d1Play == null }">
+                      {{ showNum(row.d1Play) }}
+                    </span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="D3 播放" align="right" width="92">
+                  <template #default="{ row }">
+                    <span class="num" :class="{ muted: row.d3Play == null }">
+                      {{ showNum(row.d3Play) }}
+                    </span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="D7 播放" align="right" width="92">
+                  <template #default="{ row }">
+                    <span class="num" :class="{ muted: row.d7Play == null }">
+                      {{ showNum(row.d7Play) }}
+                    </span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="D7/D3" align="right" width="78">
+                  <template #default="{ row }">
+                    <span class="num" :class="{ muted: row.d7ToD3 == null }">
+                      {{ row.d7ToD3 != null ? row.d7ToD3 + "x" : "-" }}
+                    </span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="分类" width="106">
+                  <template #default="{ row }">
+                    <el-tag :type="trajectoryTagType(row.category)" size="mini">
+                      {{ row.category }}
+                    </el-tag>
+                  </template>
+                </el-table-column>
+                <template #empty>
+                  <span class="card-empty-inline">本周期内暂无新发布的内容</span>
+                </template>
+              </el-table>
+            </div>
+
+            <!-- 5. 发布时间 -->
+            <div class="platform-card">
+              <div class="card-head">
+                <span class="card-title">5. 发布时间分析（UTC+8 星期几 × 时段）</span>
+                <span class="card-tip">
+                  共
+                  {{ analysisData.publishTime ? analysisData.publishTime.totalSamples : 0 }}
+                  条有效内容样本 · 指标为平均 D7 播放
+                </span>
+              </div>
+              <el-table
+                :data="analysisPublishTimeRows"
+                size="mini"
+                border
+                stripe
+                class="analysis-table"
+              >
+                <el-table-column prop="weekdayLabel" label="星期" width="76" />
+                <el-table-column prop="slot" label="时段(UTC+8)" width="106" />
+                <el-table-column label="样本数" width="80" align="right">
+                  <template #default="{ row }">
+                    <span class="num">{{ row.sampleCount }}</span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="平均 D7 播放" min-width="200">
+                  <template #default="{ row }">
+                    <div class="bar-cell">
+                      <div class="css-bar-track">
+                        <div
+                          class="css-bar-fill primary"
+                          :style="{
+                            width: calcPercentWidth(row.avgD7Play, analysisPublishTimeMaxPlay),
+                          }"
+                        />
+                      </div>
+                      <span class="num bar-val">{{ showNum(row.avgD7Play) }}</span>
+                    </div>
+                  </template>
+                </el-table-column>
+                <el-table-column label="标注" min-width="180">
+                  <template #default="{ row }">
+                    <el-tag v-if="row.lowSample" type="warning" size="mini" class="inline-tag">
+                      样本少
+                    </el-tag>
+                    <el-tag v-if="row.hasFallback" type="info" size="mini" class="inline-tag">
+                      含不足7天最新累计（{{ row.fallbackCount }}）
+                    </el-tag>
+                    <span v-if="!row.lowSample && !row.hasFallback" class="num muted">-</span>
+                  </template>
+                </el-table-column>
+                <template #empty>
+                  <span class="card-empty-inline">暂无带发布时间与快照的内容样本</span>
+                </template>
+              </el-table>
+            </div>
+
+            <!-- 6. 异常提醒 -->
+            <div class="platform-card">
+              <div class="card-head">
+                <span class="card-title">6. 异常提醒</span>
+                <span class="card-tip">
+                  点击展开查看异常作品与具体日期（疑似采集异常已在第 1–5 节剔除）
+                </span>
+              </div>
+              <el-collapse v-model="analysisAnomalyPanels" class="anomaly-collapse">
+                <el-collapse-item name="collection">
+                  <template #title>
+                    <span class="anomaly-panel-title">
+                      疑似采集异常（掉 0 或缺失后回升）
+                      <el-tag
+                        :type="analysisCollectionAnomalies.length ? 'danger' : 'info'"
+                        size="mini"
+                        class="inline-tag"
+                      >
+                        {{ analysisCollectionAnomalies.length }} 条
+                      </el-tag>
+                    </span>
+                  </template>
+                  <el-table
+                    ref="collectionAnomalyTable"
+                    :data="analysisCollectionAnomalies"
+                    size="mini"
+                    border
+                    stripe
+                    class="analysis-table clickable-rows"
+                    @row-click="toggleCollectionAnomalyRow"
+                  >
+                    <el-table-column type="expand">
+                      <template #default="{ row }">
+                        <div class="anomaly-detail-box">
+                          <div>
+                            <strong>作品：</strong>{{ row.title }}（{{ row.platform }} · ID:
+                            {{ row.workId }}）
+                          </div>
+                          <div>
+                            <strong>异常日期：</strong>{{ row.date }} · 指标「{{ row.metricLabel }}」异常值为
+                            {{ row.value == null ? "空" : row.value }}（前有记录日
+                            {{ row.prevDate }} 为 {{ showNum(row.prevValue) }}，后有记录日
+                            {{ row.nextDate }} 为 {{ showNum(row.nextValue) }}）
+                          </div>
+                          <div v-if="row.url">
+                            <strong>作品链接：</strong>
+                            <el-link
+                              v-if="parseSafeHttpUrl(row.url)"
+                              type="primary"
+                              :underline="false"
+                              @click.stop.prevent="openWorkUrl(row.url)"
+                            >
+                              {{ row.url }}
+                            </el-link>
+                            <span v-else>{{ row.url }}</span>
+                          </div>
+                        </div>
+                      </template>
+                    </el-table-column>
+                    <el-table-column prop="date" label="日期" width="104" />
+                    <el-table-column prop="platform" label="平台" width="88" />
+                    <el-table-column prop="title" label="作品标题" min-width="180" show-overflow-tooltip />
+                    <el-table-column prop="metricLabel" label="指标" width="76" />
+                    <el-table-column label="异常值" width="80" align="right">
+                      <template #default="{ row }">
+                        <span class="num down">{{ row.value == null ? "缺失" : row.value }}</span>
+                      </template>
+                    </el-table-column>
+                    <el-table-column label="前后记录" min-width="190">
+                      <template #default="{ row }">
+                        <span class="num">
+                          {{ row.prevDate }}({{ showNum(row.prevValue) }}) → {{ row.nextDate }}({{
+                            showNum(row.nextValue)
+                          }})
+                        </span>
+                      </template>
+                    </el-table-column>
+                    <template #empty>
+                      <span class="card-empty-inline">本周期未发现疑似采集异常</span>
+                    </template>
+                  </el-table>
+                </el-collapse-item>
+
+                <el-collapse-item name="recommend">
+                  <template #title>
+                    <span class="anomaly-panel-title">
+                      疑似上推荐（单日播放日增 ≥ 前 7 天日均 ×5 且 ≥ 1000）
+                      <el-tag
+                        :type="analysisRecommendSpikes.length ? 'success' : 'info'"
+                        size="mini"
+                        class="inline-tag"
+                      >
+                        {{ analysisRecommendSpikes.length }} 条
+                      </el-tag>
+                    </span>
+                  </template>
+                  <el-table
+                    ref="recommendSpikeTable"
+                    :data="analysisRecommendSpikes"
+                    size="mini"
+                    border
+                    stripe
+                    class="analysis-table clickable-rows"
+                    @row-click="toggleRecommendSpikeRow"
+                  >
+                    <el-table-column type="expand">
+                      <template #default="{ row }">
+                        <div class="anomaly-detail-box">
+                          <div>
+                            <strong>作品：</strong>{{ row.title }}（{{ row.platform }} · ID:
+                            {{ row.workId }}）
+                          </div>
+                          <div>
+                            <strong>爆发日期：</strong>{{ row.date }} · 单日播放日增
+                            {{ showNum(row.dailyPlayDelta) }}（前 {{ row.baselineDays }} 天日均
+                            {{ showNum(row.baselineAvg) }}，倍数
+                            {{ row.ratio != null ? row.ratio + "x" : "前7天日均为0" }}）
+                          </div>
+                          <div v-if="row.url">
+                            <strong>作品链接：</strong>
+                            <el-link
+                              v-if="parseSafeHttpUrl(row.url)"
+                              type="primary"
+                              :underline="false"
+                              @click.stop.prevent="openWorkUrl(row.url)"
+                            >
+                              {{ row.url }}
+                            </el-link>
+                            <span v-else>{{ row.url }}</span>
+                          </div>
+                        </div>
+                      </template>
+                    </el-table-column>
+                    <el-table-column prop="date" label="日期" width="104" />
+                    <el-table-column prop="platform" label="平台" width="88" />
+                    <el-table-column prop="title" label="作品标题" min-width="180" show-overflow-tooltip />
+                    <el-table-column label="单日播放日增" min-width="170">
+                      <template #default="{ row }">
+                        <div class="bar-cell">
+                          <div class="css-bar-track">
+                            <div
+                              class="css-bar-fill success"
+                              :style="{
+                                width: calcPercentWidth(row.dailyPlayDelta, analysisMaxSpikeDelta),
+                              }"
+                            />
+                          </div>
+                          <span class="num bar-val up">+{{ showNum(row.dailyPlayDelta) }}</span>
+                        </div>
+                      </template>
+                    </el-table-column>
+                    <el-table-column label="前7天日均" width="100" align="right">
+                      <template #default="{ row }">
+                        <span class="num">{{ showNum(row.baselineAvg) }}</span>
+                      </template>
+                    </el-table-column>
+                    <el-table-column label="倍数" width="90" align="right">
+                      <template #default="{ row }">
+                        <span class="num up">
+                          {{ row.ratio != null ? row.ratio + "x" : "新爆发" }}
+                        </span>
+                      </template>
+                    </el-table-column>
+                    <template #empty>
+                      <span class="card-empty-inline">本周期未发现疑似上推荐爆发</span>
+                    </template>
+                  </el-table>
+                </el-collapse-item>
+              </el-collapse>
+            </div>
+          </div>
+          <div v-else-if="!loadingAnalysis" class="platform-card">
+            <div class="card-empty">暂无数据分析结果，请先点击右上角「同步全部数据」</div>
+          </div>
+        </div>
+      </el-tab-pane>
     </el-tabs>
   </div>
 </template>
 
 <script>
-import { ipcRenderer, shell } from "electron";
+import { ipcRenderer, shell, clipboard } from "electron";
 import StatsOverview from "./components/StatsOverview.vue";
 import PlatformBarChart from "./components/PlatformBarChart.vue";
 import GroupStatsTable from "./components/GroupStatsTable.vue";
@@ -658,6 +1392,13 @@ export default {
       reassignCurrentKey: null,
       reassignKeyword: "",
       reassignTargetKey: "",
+      analysisPeriod: 30,
+      analysisTo: "",
+      analysisData: null,
+      loadingAnalysis: false,
+      analysisRankMetric: "play",
+      analysisRankOrder: "top",
+      analysisAnomalyPanels: ["collection", "recommend"],
       progressText: "",
       logVisible: false,
       logs: [],
@@ -724,11 +1465,129 @@ export default {
         return title.includes(kw) || file.includes(kw) || ck.includes(kw);
       });
     },
+    analysisSummaryLines() {
+      const s = this.analysisData && this.analysisData.summary;
+      return s && Array.isArray(s.lines) ? s.lines : [];
+    },
+    analysisSummaryText() {
+      const s = this.analysisData && this.analysisData.summary;
+      return s && typeof s.text === "string" ? s.text : this.analysisSummaryLines.join("\n");
+    },
+    analysisOverviewMetricRows() {
+      const m =
+        this.analysisData && this.analysisData.overview && this.analysisData.overview.metrics;
+      if (!m) return [];
+      return ["play", "like", "comment", "share", "favorite", "fansDelta"]
+        .map((k) => m[k])
+        .filter(Boolean);
+    },
+    analysisPlatformContribution() {
+      const ov = this.analysisData && this.analysisData.overview;
+      return ov && Array.isArray(ov.platformContribution) ? ov.platformContribution : [];
+    },
+    analysisPlatformCompareRows() {
+      const pc = this.analysisData && this.analysisData.platformComparison;
+      return pc && Array.isArray(pc.platforms) ? pc.platforms : [];
+    },
+    analysisPlatformConclusions() {
+      const pc = this.analysisData && this.analysisData.platformComparison;
+      return pc && Array.isArray(pc.conclusions) ? pc.conclusions : [];
+    },
+    analysisCompareMaxPlay() {
+      let max = 0;
+      for (const r of this.analysisPlatformCompareRows) {
+        if (typeof r.avgPlay === "number" && r.avgPlay > max) max = r.avgPlay;
+      }
+      return max;
+    },
+    analysisCompareMaxEng() {
+      let max = 0;
+      for (const r of this.analysisPlatformCompareRows) {
+        if (typeof r.engagementRatePct === "number" && r.engagementRatePct > max) {
+          max = r.engagementRatePct;
+        }
+      }
+      return max;
+    },
+    analysisDisplayedRankRows() {
+      const rk = this.analysisData && this.analysisData.rankings;
+      if (!rk) return [];
+      const bucket =
+        this.analysisRankMetric === "engagement"
+          ? rk.byEngagement
+          : this.analysisRankMetric === "fans"
+          ? rk.byFans
+          : rk.byPlay;
+      if (!bucket) return [];
+      const list = this.analysisRankOrder === "bottom" ? bucket.bottom : bucket.top;
+      return Array.isArray(list) ? list : [];
+    },
+    analysisRankMetricLabel() {
+      if (this.analysisRankMetric === "engagement") return "互动率（条形）";
+      if (this.analysisRankMetric === "fans") return "总涨粉（条形）";
+      return "总播放（条形）";
+    },
+    analysisRankMaxVal() {
+      let max = 0;
+      for (const r of this.analysisDisplayedRankRows) {
+        const v = this.getRankPrimaryNumber(r);
+        if (typeof v === "number" && Math.abs(v) > max) max = Math.abs(v);
+      }
+      return max;
+    },
+    analysisPlatformSkewRows() {
+      const rk = this.analysisData && this.analysisData.rankings;
+      return rk && Array.isArray(rk.platformSkew) ? rk.platformSkew : [];
+    },
+    analysisNewWorkRows() {
+      const nw = this.analysisData && this.analysisData.newWorks;
+      return nw && Array.isArray(nw.items) ? nw.items : [];
+    },
+    analysisNewWorkCounts() {
+      const cc =
+        this.analysisData && this.analysisData.newWorks && this.analysisData.newWorks.categoryCounts;
+      return {
+        长尾型: (cc && cc.长尾型) || 0,
+        爆发后平稳: (cc && cc.爆发后平稳) || 0,
+        其它: (cc && cc.其它) || 0,
+        数据不足: (cc && cc.数据不足) || 0,
+      };
+    },
+    analysisPublishTimeRows() {
+      const pt = this.analysisData && this.analysisData.publishTime;
+      return pt && Array.isArray(pt.groups) ? pt.groups : [];
+    },
+    analysisPublishTimeMaxPlay() {
+      let max = 0;
+      for (const g of this.analysisPublishTimeRows) {
+        if (typeof g.avgD7Play === "number" && g.avgD7Play > max) max = g.avgD7Play;
+      }
+      return max;
+    },
+    analysisCollectionAnomalies() {
+      const an = this.analysisData && this.analysisData.anomalies;
+      return an && Array.isArray(an.collectionAnomalies) ? an.collectionAnomalies : [];
+    },
+    analysisRecommendSpikes() {
+      const an = this.analysisData && this.analysisData.anomalies;
+      return an && Array.isArray(an.recommendSpikes) ? an.recommendSpikes : [];
+    },
+    analysisMaxSpikeDelta() {
+      let max = 0;
+      for (const r of this.analysisRecommendSpikes) {
+        if (typeof r.dailyPlayDelta === "number" && r.dailyPlayDelta > max) {
+          max = r.dailyPlayDelta;
+        }
+      }
+      return max;
+    },
   },
   watch: {
     activeTab(val) {
       if (val === "works") {
         this.loadContentSummary();
+      } else if (val === "analysis") {
+        this.loadAnalysis();
       }
     },
     summaryFilter() {
@@ -787,6 +1646,107 @@ export default {
       this.overview = await getOverviewStats();
       if (this.activeTab === "works") {
         await this.loadContentSummary();
+      } else if (this.activeTab === "analysis") {
+        await this.loadAnalysis();
+      }
+    },
+    async loadAnalysis() {
+      const reqId = (this._analysisReqId = (this._analysisReqId || 0) + 1);
+      this.loadingAnalysis = true;
+      try {
+        const payload = { period: this.analysisPeriod };
+        if (this.analysisTo) payload.to = this.analysisTo;
+        const res = await ipcRenderer.invoke("stats:get-analysis", payload);
+        if (reqId !== this._analysisReqId) return;
+        if (!res || res.ok === false || res.error) {
+          this.$message.warning((res && res.error) || "读取数据分析失败");
+          this.analysisData = null;
+          return;
+        }
+        this.analysisData = res;
+      } catch (err) {
+        if (reqId !== this._analysisReqId) return;
+        this.$message.error(`读取数据分析失败：${(err && err.message) || err}`);
+      } finally {
+        if (reqId === this._analysisReqId) {
+          this.loadingAnalysis = false;
+        }
+      }
+    },
+    async copyAnalysisSummary() {
+      const text = this.analysisSummaryText;
+      if (!text) return;
+      try {
+        if (clipboard && typeof clipboard.writeText === "function") {
+          clipboard.writeText(text);
+          this.$message.success("已复制分析小结到剪贴板");
+          return;
+        }
+        if (
+          typeof navigator !== "undefined" &&
+          navigator.clipboard &&
+          typeof navigator.clipboard.writeText === "function"
+        ) {
+          await navigator.clipboard.writeText(text);
+          this.$message.success("已复制分析小结到剪贴板");
+          return;
+        }
+        if (typeof document !== "undefined") {
+          const ta = document.createElement("textarea");
+          ta.value = text;
+          ta.style.position = "fixed";
+          ta.style.opacity = "0";
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand("copy");
+          document.body.removeChild(ta);
+          this.$message.success("已复制分析小结到剪贴板");
+          return;
+        }
+        this.$message.warning("当前环境不支持剪贴板写入");
+      } catch (err) {
+        this.$message.error(`复制小结失败：${(err && err.message) || err}`);
+      }
+    },
+    calcPercentWidth(val, max) {
+      if (typeof val !== "number" || !Number.isFinite(val) || val <= 0) return "0%";
+      if (typeof max !== "number" || !Number.isFinite(max) || max <= 0) return "0%";
+      const pct = Math.max(2, Math.min(100, Math.round((val / max) * 100)));
+      return `${pct}%`;
+    },
+    getRankPrimaryNumber(row) {
+      if (!row) return null;
+      if (this.analysisRankMetric === "engagement") return row.engagementRatePct;
+      if (this.analysisRankMetric === "fans") return row.totalFansDelta;
+      return row.totalPlay;
+    },
+    calcRankBarWidth(row) {
+      const v = this.getRankPrimaryNumber(row);
+      if (typeof v !== "number" || !Number.isFinite(v)) return "0%";
+      return this.calcPercentWidth(Math.abs(v), this.analysisRankMaxVal);
+    },
+    formatRankPrimaryValue(row) {
+      const v = this.getRankPrimaryNumber(row);
+      if (v == null) return "-";
+      if (this.analysisRankMetric === "engagement") return `${v}%`;
+      return this.showNum(v);
+    },
+    trajectoryTagType(category) {
+      if (category === "长尾型") return "success";
+      if (category === "爆发后平稳") return "info";
+      if (category === "数据不足") return "warning";
+      return "primary";
+    },
+    toggleCollectionAnomalyRow(row) {
+      const tbl = this.$refs && this.$refs.collectionAnomalyTable;
+      if (tbl && typeof tbl.toggleRowExpansion === "function") {
+        tbl.toggleRowExpansion(row);
+      }
+    },
+    toggleRecommendSpikeRow(row) {
+      const tbl = this.$refs && this.$refs.recommendSpikeTable;
+      if (tbl && typeof tbl.toggleRowExpansion === "function") {
+        tbl.toggleRowExpansion(row);
       }
     },
     async loadContentSummary() {
@@ -1347,6 +2307,10 @@ export default {
 .num {
   font-variant-numeric: tabular-nums;
 
+  &.up {
+    color: #67c23a;
+  }
+
   &.down {
     color: #f56c6c;
   }
@@ -1428,5 +2392,142 @@ export default {
 
 .reassign-search {
   margin-bottom: 10px;
+}
+
+.analysis-toolbar-card {
+  margin-top: 4px;
+}
+
+.analysis-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.analysis-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.analysis-date-picker {
+  width: 160px;
+}
+
+.analysis-summary-card {
+  border-left: 3px solid #409eff;
+}
+
+.analysis-summary-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 13px;
+  line-height: 1.75;
+  color: #303133;
+
+  li.is-warning {
+    color: #e6a23c;
+    font-weight: 500;
+  }
+}
+
+.analysis-table {
+  width: 100%;
+}
+
+.sub-block-title {
+  margin: 12px 0 6px;
+  font-size: 13px;
+  font-weight: 500;
+  color: #606266;
+}
+
+.conclusion-box {
+  margin-bottom: 10px;
+  padding: 8px 12px;
+  background: #f5f7fa;
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: #303133;
+}
+
+.analysis-sub-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.bar-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.css-bar-track {
+  flex: 1;
+  height: 8px;
+  background: #ebeef5;
+  border-radius: 4px;
+  overflow: hidden;
+  min-width: 60px;
+}
+
+.css-bar-fill {
+  height: 100%;
+  border-radius: 4px;
+  transition: width 0.2s ease;
+
+  &.primary {
+    background: #409eff;
+  }
+
+  &.success {
+    background: #67c23a;
+  }
+}
+
+.bar-val {
+  min-width: 64px;
+  text-align: right;
+  font-size: 12px;
+}
+
+.inline-tag {
+  margin-left: 6px;
+}
+
+.category-tags {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.anomaly-collapse {
+  border-top: none;
+  border-bottom: none;
+}
+
+.anomaly-panel-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: #303133;
+}
+
+.anomaly-detail-box {
+  padding: 6px 12px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: #606266;
+}
+
+.clickable-rows {
+  cursor: pointer;
 }
 </style>

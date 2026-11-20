@@ -8,6 +8,7 @@
  * - stats:get-data             读取单账号本地数据（daily + works + meta）
  * - stats:get-overview         全账号按日聚合（所有账号总览页）
  * - stats:get-content-summary  跨平台作品汇总（作品汇总 tab）
+ * - stats:get-analysis         规则数据分析（数据分析 tab，与 Excel「分析」sheet 共用计算函数）
  * - stats:get-link-overrides   读取作品关联手工矫正配置
  * - stats:set-link-override    设置单条作品手工关联（assign / detach）
  * - stats:merge-works          合并多条未关联作品为同一 manual 内容
@@ -38,6 +39,7 @@ const {
   buildDefaultExportFileName,
   resolveLinkValidationContext,
   buildContentSummaryData,
+  buildStatsAnalysisData,
   buildStatsWorkbookData,
   writeStatsXlsx,
 } = require("./statsExport");
@@ -674,6 +676,28 @@ function registerDataStatsIpc(options = {}) {
         rows: [],
         date: "",
         error: (err && err.message) || "读取作品汇总失败",
+      };
+    }
+  });
+
+  ipcMain.handle("stats:get-analysis", async (event, args) => {
+    try {
+      if (!isLocalFrameEvent(event)) {
+        return { ok: false, error: "不允许外部页面读取数据分析" };
+      }
+      if (args != null && (typeof args !== "object" || Array.isArray(args))) {
+        return { ok: false, error: "查询参数无效" };
+      }
+      await overrideWriteChain;
+      const payload = args || {};
+      const period = payload.period !== undefined ? payload.period : 30;
+      const to = payload.to !== undefined ? payload.to : undefined;
+      const data = buildStatsAnalysisData({ period, to }, exportDeps);
+      return { ok: true, ...data };
+    } catch (err) {
+      return {
+        ok: false,
+        error: (err && err.message) || "读取数据分析失败",
       };
     }
   });

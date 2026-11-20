@@ -24,6 +24,10 @@ const {
   makeWorkIdentityKey,
   getLinkResultMeta,
 } = require("./contentLink");
+const {
+  DEFAULT_ANALYSIS_PERIOD,
+  buildStatsAnalysis,
+} = require("./statsAnalysis");
 
 const UTC8_MS = 8 * 3600e3;
 const DAY_MS = 86400000;
@@ -37,6 +41,7 @@ const SHEET_NAMES = [
   "作品跨平台汇总",
   "平台日汇总",
   "账号日快照",
+  "分析",
   "字段说明",
   "导出信息",
 ];
@@ -994,7 +999,7 @@ function resolveLinkValidationContext(options = {}, depsArg) {
   };
 }
 
-/** Sheet 1: 作品日明细 */
+/** Sheet 1: 作品日明细（单次构建截至 to 全历史供分析复用，按 from 过滤输出本表） */
 function buildWorkDailySheet(accountsData, link, from, to) {
   const allRows = [];
   for (const acc of accountsData) {
@@ -1003,7 +1008,6 @@ function buildWorkDailySheet(accountsData, link, from, to) {
       platform: acc.platform,
       works: acc.works,
       worksDaily: acc.worksDaily,
-      from,
       to,
       link,
     });
@@ -1024,8 +1028,10 @@ function buildWorkDailySheet(accountsData, link, from, to) {
     return compareText(a.workId, b.workId);
   });
 
+  const rows = from ? allRows.filter((r) => r.date >= from) : allRows;
+
   const aoa = [WORK_DAILY_HEADERS.map(sanitizeTextCell)];
-  for (const r of allRows) {
+  for (const r of rows) {
     const matchedByExport =
       r.contentKey != null && VALID_EXPORT_MATCH_METHODS.has(r.matchedBy)
         ? sanitizeTextCell(r.matchedBy)
@@ -1061,7 +1067,7 @@ function buildWorkDailySheet(accountsData, link, from, to) {
     ]);
   }
 
-  return { aoa, rows: allRows };
+  return { aoa, rows, allRows };
 }
 
 /** Sheet 2: 作品跨平台汇总 */
@@ -1239,9 +1245,9 @@ function buildPlatformDailySheet(workDailyRows) {
   return { aoa, rows };
 }
 
-/** Sheet 4: 账号日快照（daily.json，日增=与上一有记录日之差） */
+/** Sheet 4: 账号日快照（daily.json，日增=与上一有记录日之差；保留截至 to 全历史供分析复用） */
 function buildAccountDailySheet(accountsData, from, to) {
-  const rows = [];
+  const allRows = [];
 
   for (const acc of accountsData) {
     const dates = Object.keys(acc.daily)
@@ -1266,10 +1272,9 @@ function buildAccountDailySheet(accountsData, from, to) {
       if (vals.fans !== null) prevFans = vals.fans;
       if (vals.plays !== null) prevPlays = vals.plays;
 
-      if (from && date < from) continue;
       if (to && date > to) continue;
 
-      rows.push({
+      allRows.push({
         date,
         platform: acc.platform,
         group: acc.group,
@@ -1285,12 +1290,14 @@ function buildAccountDailySheet(accountsData, from, to) {
     }
   }
 
-  rows.sort((a, b) => {
+  allRows.sort((a, b) => {
     if (a.date !== b.date) return compareText(a.date, b.date);
     const pc = comparePlatform(a.platform, b.platform);
     if (pc !== 0) return pc;
     return compareText(a.group, b.group);
   });
+
+  const rows = from ? allRows.filter((r) => r.date >= from) : allRows;
 
   const aoa = [ACCOUNT_DAILY_HEADERS.map(sanitizeTextCell)];
   for (const r of rows) {
@@ -1309,7 +1316,306 @@ function buildAccountDailySheet(accountsData, from, to) {
     ]);
   }
 
-  return { aoa, rows };
+  return { aoa, rows, allRows };
+}
+
+/** Sheet 5: 分析（首块为文字小结，其后按 1–6 节输出长表，节间空一行，数值保持 number） */
+function buildAnalysisSheet(analysis) {
+  const aoa = [];
+  const a = isPlainObject(analysis) ? analysis : {};
+  const curRange = isPlainObject(a.currentRange) ? a.currentRange : { from: "", to: "" };
+  const prevRange = isPlainObject(a.previousRange) ? a.previousRange : { from: "", to: "" };
+  const period = typeof a.period === "number" ? a.period : DEFAULT_ANALYSIS_PERIOD;
+
+  // 首块：文字小结（每行一句）
+  aoa.push([sanitizeTextCell("文字小结")]);
+  const summaryLines =
+    isPlainObject(a.summary) && Array.isArray(a.summary.lines) ? a.summary.lines : [];
+  for (const line of summaryLines) {
+    aoa.push([sanitizeTextCell(line)]);
+  }
+  aoa.push([]);
+
+  // 第 1 节：总览（本周期 vs 上一周期）
+  aoa.push([
+    sanitizeTextCell(
+      `一、总览（本周期 ${curRange.from} ~ ${curRange.to} vs 上周期 ${prevRange.from} ~ ${prevRange.to}，周期 ${period} 天）`
+    ),
+  ]);
+  aoa.push(["指标", "本周期日增", "上周期日增", "环比(%)"].map(sanitizeTextCell));
+  const metrics = isPlainObject(a.overview) && isPlainObject(a.overview.metrics)
+    ? a.overview.metrics
+    : {};
+  for (const k of WORK_STAT_KEYS) {
+    const m = metrics[k];
+    if (!m) continue;
+    aoa.push([
+      sanitizeTextCell(m.label || k),
+      sanitizeNumberCell(m.current),
+      sanitizeNumberCell(m.previous),
+      sanitizeNumberCell(m.momPct),
+    ]);
+  }
+  aoa.push([]);
+
+  // 第 1 节（续）：各平台贡献占比（按播放日增）
+  aoa.push([sanitizeTextCell("一（续）、各平台贡献占比（按播放日增）")]);
+  aoa.push(
+    [
+      "平台",
+      "播放日增",
+      "播放占比(%)",
+      "点赞日增",
+      "评论日增",
+      "分享日增",
+      "收藏日增",
+      "涨粉日增",
+    ].map(sanitizeTextCell)
+  );
+  const contrib =
+    isPlainObject(a.overview) && Array.isArray(a.overview.platformContribution)
+      ? a.overview.platformContribution
+      : [];
+  for (const r of contrib) {
+    aoa.push([
+      sanitizeTextCell(r.platform),
+      sanitizeNumberCell(r.play),
+      sanitizeNumberCell(r.sharePct),
+      sanitizeNumberCell(r.like),
+      sanitizeNumberCell(r.comment),
+      sanitizeNumberCell(r.share),
+      sanitizeNumberCell(r.favorite),
+      sanitizeNumberCell(r.fansDelta),
+    ]);
+  }
+  aoa.push([]);
+
+  // 第 2 节：平台对比（仅覆盖 >=2 平台内容）
+  aoa.push([sanitizeTextCell("二、平台对比（仅覆盖 ≥2 平台内容）")]);
+  aoa.push(
+    ["平台", "样本数", "平均播放", "互动率(%)", "平均涨粉", "备注"].map(sanitizeTextCell)
+  );
+  const pc = isPlainObject(a.platformComparison) ? a.platformComparison : {};
+  for (const p of Array.isArray(pc.platforms) ? pc.platforms : []) {
+    aoa.push([
+      sanitizeTextCell(p.platform),
+      sanitizeNumberCell(p.sampleCount),
+      sanitizeNumberCell(p.avgPlay),
+      sanitizeNumberCell(p.engagementRatePct),
+      sanitizeNumberCell(p.avgFansDelta),
+      sanitizeTextCell(p.note || null),
+    ]);
+  }
+  for (const c of Array.isArray(pc.conclusions) ? pc.conclusions : []) {
+    aoa.push([sanitizeTextCell("结论"), sanitizeTextCell(c)]);
+  }
+  aoa.push([]);
+
+  // 第 3 节：作品排行（总播放 / 互动率[总播放>=100] / 总涨粉 各 Top10 & Bottom10）
+  aoa.push([
+    sanitizeTextCell("三、作品排行（总播放 / 互动率[总播放≥100] / 总涨粉 Top10 & Bottom10）"),
+  ]);
+  aoa.push(
+    [
+      "榜单",
+      "排名",
+      "内容ID",
+      "标题",
+      "首发日期",
+      "覆盖平台数",
+      "总播放",
+      "互动率(%)",
+      "总涨粉",
+    ].map(sanitizeTextCell)
+  );
+  const rk = isPlainObject(a.rankings) ? a.rankings : {};
+  const rankGroups = [
+    ["总播放 Top10", rk.byPlay && rk.byPlay.top],
+    ["总播放 Bottom10", rk.byPlay && rk.byPlay.bottom],
+    ["互动率 Top10", rk.byEngagement && rk.byEngagement.top],
+    ["互动率 Bottom10", rk.byEngagement && rk.byEngagement.bottom],
+    ["总涨粉 Top10", rk.byFans && rk.byFans.top],
+    ["总涨粉 Bottom10", rk.byFans && rk.byFans.bottom],
+  ];
+  for (const [label, list] of rankGroups) {
+    for (let i = 0; i < (Array.isArray(list) ? list.length : 0); i++) {
+      const item = list[i];
+      aoa.push([
+        sanitizeTextCell(label),
+        sanitizeNumberCell(i + 1),
+        sanitizeTextCell(item.contentKey),
+        sanitizeTextCell(item.title),
+        sanitizeTextCell(item.firstPublishDate || null),
+        sanitizeNumberCell(item.platformCount),
+        sanitizeNumberCell(item.totalPlay),
+        sanitizeNumberCell(item.engagementRatePct),
+        sanitizeNumberCell(item.totalFansDelta),
+      ]);
+    }
+  }
+  aoa.push([]);
+
+  // 第 3 节（续）：平台偏科
+  aoa.push([sanitizeTextCell("三（续）、平台偏科（单平台播放 ≥ 其它平台均值 3 倍且 ≥ 500）")]);
+  aoa.push(
+    ["内容ID", "标题", "突出平台", "该平台播放", "其它平台均播", "倍数"].map(
+      sanitizeTextCell
+    )
+  );
+  for (const s of Array.isArray(rk.platformSkew) ? rk.platformSkew : []) {
+    aoa.push([
+      sanitizeTextCell(s.contentKey),
+      sanitizeTextCell(s.title),
+      sanitizeTextCell(s.platform),
+      sanitizeNumberCell(s.platformPlay),
+      sanitizeNumberCell(s.otherAvgPlay),
+      sanitizeNumberCell(s.ratio),
+    ]);
+  }
+  aoa.push([]);
+
+  // 第 4 节：新作品走势（发布后第 1/3/7 天各平台累计播放）
+  aoa.push([sanitizeTextCell("四、新作品走势（本周期发布，发布后 D1/D3/D7 累计播放）")]);
+  aoa.push(
+    [
+      "内容ID",
+      "标题",
+      "平台",
+      "发布日期",
+      "D1播放",
+      "D3播放",
+      "D7播放",
+      "D3/D1",
+      "D7/D3",
+      "走势分类",
+    ].map(sanitizeTextCell)
+  );
+  const nw = isPlainObject(a.newWorks) && Array.isArray(a.newWorks.items) ? a.newWorks.items : [];
+  for (const item of nw) {
+    const plist = Array.isArray(item.platforms) ? item.platforms : [];
+    if (plist.length === 0) {
+      aoa.push([
+        sanitizeTextCell(item.contentKey),
+        sanitizeTextCell(item.title),
+        null,
+        sanitizeTextCell(item.publishDate || null),
+        sanitizeNumberCell(item.d1Play),
+        sanitizeNumberCell(item.d3Play),
+        sanitizeNumberCell(item.d7Play),
+        sanitizeNumberCell(item.d3ToD1),
+        sanitizeNumberCell(item.d7ToD3),
+        sanitizeTextCell(item.category),
+      ]);
+      continue;
+    }
+    for (const p of plist) {
+      aoa.push([
+        sanitizeTextCell(item.contentKey),
+        sanitizeTextCell(item.title),
+        sanitizeTextCell(p.platform),
+        sanitizeTextCell(p.publishDate || null),
+        sanitizeNumberCell(p.d1Play),
+        sanitizeNumberCell(p.d3Play),
+        sanitizeNumberCell(p.d7Play),
+        sanitizeNumberCell(p.d3ToD1),
+        sanitizeNumberCell(p.d7ToD3),
+        sanitizeTextCell(p.category),
+      ]);
+    }
+    if (plist.length > 1) {
+      aoa.push([
+        sanitizeTextCell(item.contentKey),
+        sanitizeTextCell(item.title),
+        sanitizeTextCell("全平台合计"),
+        sanitizeTextCell(item.publishDate || null),
+        sanitizeNumberCell(item.d1Play),
+        sanitizeNumberCell(item.d3Play),
+        sanitizeNumberCell(item.d7Play),
+        sanitizeNumberCell(item.d3ToD1),
+        sanitizeNumberCell(item.d7ToD3),
+        sanitizeTextCell(item.category),
+      ]);
+    }
+  }
+  aoa.push([]);
+
+  // 第 5 节：发布时间分析
+  aoa.push([sanitizeTextCell("五、发布时间分析（UTC+8 星期几 × 时段）")]);
+  aoa.push(
+    ["星期", "时段(UTC+8)", "样本数", "平均D7播放", "不足7天样本数", "备注"].map(
+      sanitizeTextCell
+    )
+  );
+  const pt =
+    isPlainObject(a.publishTime) && Array.isArray(a.publishTime.groups)
+      ? a.publishTime.groups
+      : [];
+  for (const g of pt) {
+    aoa.push([
+      sanitizeTextCell(g.weekdayLabel),
+      sanitizeTextCell(g.slot),
+      sanitizeNumberCell(g.sampleCount),
+      sanitizeNumberCell(g.avgD7Play),
+      sanitizeNumberCell(g.fallbackCount),
+      sanitizeTextCell(g.note || null),
+    ]);
+  }
+  aoa.push([]);
+
+  // 第 6 节：异常提醒（疑似采集异常 + 疑似上推荐）
+  aoa.push([sanitizeTextCell("六、异常提醒（疑似采集异常：掉0或缺失后回升，已在1–5节剔除）")]);
+  aoa.push(
+    [
+      "日期",
+      "平台",
+      "作品ID",
+      "标题",
+      "指标",
+      "异常值",
+      "前有记录日",
+      "前值",
+      "后有记录日",
+      "后值",
+    ].map(sanitizeTextCell)
+  );
+  const an = isPlainObject(a.anomalies) ? a.anomalies : {};
+  for (const col of Array.isArray(an.collectionAnomalies) ? an.collectionAnomalies : []) {
+    aoa.push([
+      sanitizeTextCell(col.date),
+      sanitizeTextCell(col.platform),
+      sanitizeTextCell(col.workId),
+      sanitizeTextCell(col.title),
+      sanitizeTextCell(col.metricLabel || col.metric),
+      sanitizeNumberCell(col.value),
+      sanitizeTextCell(col.prevDate),
+      sanitizeNumberCell(col.prevValue),
+      sanitizeTextCell(col.nextDate),
+      sanitizeNumberCell(col.nextValue),
+    ]);
+  }
+  aoa.push([]);
+
+  aoa.push([
+    sanitizeTextCell("六（续）、异常提醒（疑似上推荐：单日播放日增 ≥ 前7天日均×5 且 ≥ 1000）"),
+  ]);
+  aoa.push(
+    ["日期", "平台", "作品ID", "标题", "单日播放日增", "前7天日均", "倍数"].map(
+      sanitizeTextCell
+    )
+  );
+  for (const rec of Array.isArray(an.recommendSpikes) ? an.recommendSpikes : []) {
+    aoa.push([
+      sanitizeTextCell(rec.date),
+      sanitizeTextCell(rec.platform),
+      sanitizeTextCell(rec.workId),
+      sanitizeTextCell(rec.title),
+      sanitizeNumberCell(rec.dailyPlayDelta),
+      sanitizeNumberCell(rec.baselineAvg),
+      sanitizeNumberCell(rec.ratio),
+    ]);
+  }
+
+  return aoa;
 }
 
 /** Sheet 5: 字段说明（每个 sheet 每列一行，仅列出实际生成的列） */
@@ -1659,9 +1965,53 @@ function buildSchemaSheet(dynamicSchemaEntries) {
       "当日总播放 − 该账号上一有播放记录日的总播放（日增口径，跳过仅粉丝历史回填日；断档跨天时为多天合计变化）。",
     ],
 
-    // 5. 字段说明
+    // 5. 分析（纯规则分析，多节长表，与 GUI「数据分析」tab 共用计算函数）
+    [
+      "分析",
+      "文字小结",
+      "summary.lines",
+      "基于第 1–6 节纯规则生成的 5–8 行中文要点（总量与环比、表现最好的平台、Top 作品、长尾作品数、推荐发布时段、异常条数）；按实际有作品快照天数判断，少于 14 天时附「数据积累少于 14 天，走势与发布时间结论仅供参考」。",
+    ],
+    [
+      "分析",
+      "总览与环比",
+      "overview",
+      "本周期（to 往前 analysisPeriod 天，含起止日）与紧邻上一同长周期的播放/点赞/评论/分享/收藏/涨粉日增合计及各平台播放贡献占比(%)。环比(%) = (本周期 − 上周期) / |上周期| × 100，上期为 0 或无数据时为空（不写 Infinity）。",
+    ],
+    [
+      "分析",
+      "平台对比与互动率公式",
+      "platformComparison",
+      "仅取覆盖 ≥2 个去重平台的同款内容，按平台统计平均播放、互动率(%)、平均涨粉与样本数。互动率公式 = (点赞 + 评论 + 分享) / 播放（单条播放为 0 或空时不计入，输出为百分数）；样本数 <3 时标注「样本少，仅供参考」。",
+    ],
+    [
+      "分析",
+      "作品排行与平台偏科",
+      "rankings",
+      "按跨平台合并后的内容截至 to 的总播放 / 互动率（总播放 ≥100 才参与）/ 总涨粉各取 Top10、Bottom10。平台偏科：同一内容某平台播放 ≥ 其它平台平均播放 × 3 且该平台播放 ≥ 500 时列出。",
+    ],
+    [
+      "分析",
+      "新作品走势（D1/D3/D7与分类阈值）",
+      "newWorks",
+      "周期内发布的内容按发布日（UTC+8 日历日）起算发布后第 1/3/7 天（D1/D3/D7，即发布日 +1/+3/+7 天）各平台累计播放；无该天快照取 ≤ 该天最近一次有效快照，仍无为空；未到第 N 天为空。分类阈值：长尾型（D7/D3 ≥ 1.5）、爆发后平稳（D3/D1 < 1.3 且 D7/D3 < 1.1）、数据不足、其它。",
+    ],
+    [
+      "分析",
+      "发布时间",
+      "publishTime",
+      "按内容最早发布时间（UTC+8）的星期几 × 时段（0-6 / 6-12 / 12-18 / 18-24）分组，计算各组平均 D7 播放（不足 7 天用截至 to 的最新累计并标注）与样本数；样本 <3 的组标「样本少」。",
+    ],
+    [
+      "分析",
+      "异常提醒与剔除说明",
+      "anomalies",
+      "异常规则：①疑似采集异常：某作品某指标某日为 0 或缺失，而前后有记录日都 >0（掉 0 又涨回）；剔除说明：此类异常点在第 1–5 节全部计算中剔除，并按剔除后的有效快照序列重算日增与 D1/D3/D7。②疑似上推荐：某作品单日播放日增 ≥ 前 7 天日均 × 5 且 ≥ 1000。",
+    ],
+
+    // 6. 字段说明
     ["字段说明", "sheet", "sheet", "字段所属工作表名称。"],
-    ["字段说明", "列名", "column", "对应工作表首行的中文列名。"],
+    ["字段说明", "列名", "column", "对应工作表首行的中文列名（多节「分析」sheet 对应各节口径主题）。"],
     ["字段说明", "英文键", "key", "对应内部数据结构字段名，便于脚本或 AI 对齐。"],
     [
       "字段说明",
@@ -1670,13 +2020,13 @@ function buildSchemaSheet(dynamicSchemaEntries) {
       "字段含义、累计值与日增口径、平台缺项规则及已知问题说明。",
     ],
 
-    // 6. 导出信息
+    // 7. 导出信息
     ["导出信息", "项目", "item", "本次导出元信息条目名称。"],
     [
       "导出信息",
       "值",
       "value",
-      "本次导出的元信息取值（导出时间、日期范围、应用版本及账号/作品/内容/未关联计数；作品数与未关联作品数沿用作品跨平台汇总的去重与关联口径）。",
+      "本次导出的元信息取值（导出时间、日期范围、应用版本、账号/作品/内容/未关联计数及分析周期 analysisPeriod；作品数与未关联作品数沿用作品跨平台汇总的去重与关联口径）。",
     ]
   );
 
@@ -1687,8 +2037,8 @@ function buildSchemaSheet(dynamicSchemaEntries) {
   return aoa;
 }
 
-/** Sheet 6: 导出信息 */
-function buildMetaSheet({ exportedAt, from, to, appVersion, counts }) {
+/** Sheet 7: 导出信息 */
+function buildMetaSheet({ exportedAt, from, to, appVersion, counts, analysisPeriod }) {
   const aoa = [META_HEADERS.map(sanitizeTextCell)];
   aoa.push(
     [sanitizeTextCell("导出时间"), sanitizeTextCell(exportedAt)],
@@ -1697,9 +2047,97 @@ function buildMetaSheet({ exportedAt, from, to, appVersion, counts }) {
     [sanitizeTextCell("账号数"), sanitizeNumberCell(counts.accounts)],
     [sanitizeTextCell("作品数"), sanitizeNumberCell(counts.works)],
     [sanitizeTextCell("内容数"), sanitizeNumberCell(counts.contents)],
-    [sanitizeTextCell("未关联作品数"), sanitizeNumberCell(counts.unlinkedWorks)]
+    [sanitizeTextCell("未关联作品数"), sanitizeNumberCell(counts.unlinkedWorks)],
+    [sanitizeTextCell("analysisPeriod"), sanitizeNumberCell(analysisPeriod)]
   );
   return aoa;
+}
+
+function resolveAnalysisPeriodFromRange(from, to) {
+  const fromMs = Date.parse(`${from}T00:00:00Z`);
+  const toMs = Date.parse(`${to}T00:00:00Z`);
+  if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || toMs < fromMs) {
+    return DEFAULT_ANALYSIS_PERIOD;
+  }
+  const rangeDays = Math.round((toMs - fromMs) / DAY_MS) + 1;
+  return rangeDays < DEFAULT_ANALYSIS_PERIOD
+    ? Math.max(1, rangeDays)
+    : DEFAULT_ANALYSIS_PERIOD;
+}
+
+/**
+ * 构建数据分析结果（供 GUI「数据分析」tab / IPC stats:get-analysis 复用）。
+ * 与 Excel 导出共用同一个默认截止日（resolveDefaultCutoffDate）、S6 关联逻辑与 buildStatsAnalysis。
+ */
+function buildStatsAnalysisData(options = {}, depsArg) {
+  const opts = isPlainObject(options) ? options : {};
+  const explicitTo = validateOptionalDate(opts.to, "to");
+  const period =
+    opts.period === undefined || opts.period === null || opts.period === ""
+      ? DEFAULT_ANALYSIS_PERIOD
+      : opts.period;
+  if (typeof period !== "number" || !Number.isInteger(period) || period < 1 || period > 365) {
+    throw new Error(`分析周期 period 需为 1–365 的正整数：${opts.period}`);
+  }
+
+  const dataset = loadRawDataset(opts, depsArg);
+  const nowVal = dataset.io.now !== undefined ? dataset.io.now : Date.now();
+  const fallbackToday = formatUtc8Date(nowVal);
+  const resolvedTo = explicitTo || dataset.latestDataDate || fallbackToday;
+
+  const allContents = buildContentIndex(dataset.allPushRecords);
+  const link = linkWorks({
+    contents: allContents,
+    accounts: dataset.allAccountsData,
+    worksDaily: dataset.allWorksDailyByGp,
+    date: resolvedTo,
+    overrides: dataset.linkOverrides,
+  });
+  let summaryRows = buildContentSummaryRows({
+    contents: allContents,
+    accounts: dataset.allAccountsData,
+    link,
+    worksDaily: dataset.allWorksDailyByGp,
+    date: resolvedTo,
+    overrides: dataset.linkOverrides,
+    groups: dataset.groupSet,
+  });
+  if (dataset.groupSet) {
+    summaryRows = filterSummaryRowsByGroupScope(
+      summaryRows,
+      allContents,
+      link,
+      dataset.outputAccountsData,
+      dataset.groupSet,
+      resolvedTo
+    );
+  }
+
+  const workDaily = buildWorkDailySheet(
+    dataset.outputAccountsData,
+    link,
+    "",
+    resolvedTo
+  );
+  const accountDaily = buildAccountDailySheet(
+    dataset.outputAccountsData,
+    "",
+    resolvedTo
+  );
+
+  const analysis = buildStatsAnalysis({
+    dailyRows: workDaily.allRows,
+    summaryRows,
+    accountRows: accountDaily.allRows,
+    to: resolvedTo,
+    period,
+    now: nowVal,
+  });
+
+  return {
+    ...analysis,
+    defaultCutoffDate: dataset.latestDataDate || "",
+  };
 }
 
 /**
@@ -1796,6 +2234,16 @@ function buildStatsWorkbookData(options = {}, deps) {
     resolvedFrom,
     resolvedTo
   );
+  const analysisPeriod = resolveAnalysisPeriodFromRange(resolvedFrom, resolvedTo);
+  const analysis = buildStatsAnalysis({
+    dailyRows: workDaily.allRows,
+    summaryRows,
+    accountRows: accountDaily.allRows,
+    to: resolvedTo,
+    period: analysisPeriod,
+    now: nowVal,
+  });
+  const analysisAoa = buildAnalysisSheet(analysis);
   const schemaAoa = buildSchemaSheet(contentSummary.dynamicSchemaEntries);
 
   const workCounts = computeWorkCountsFromSummaryRows(summaryRows);
@@ -1817,6 +2265,7 @@ function buildStatsWorkbookData(options = {}, deps) {
     to: resolvedTo,
     appVersion,
     counts,
+    analysisPeriod,
   });
 
   const sheets = {
@@ -1824,6 +2273,7 @@ function buildStatsWorkbookData(options = {}, deps) {
     作品跨平台汇总: contentSummary.aoa,
     平台日汇总: platformDaily.aoa,
     账号日快照: accountDaily.aoa,
+    分析: analysisAoa,
     字段说明: schemaAoa,
     导出信息: metaAoa,
   };
@@ -1839,11 +2289,13 @@ function buildStatsWorkbookData(options = {}, deps) {
   return {
     from: resolvedFrom,
     to: resolvedTo,
+    analysisPeriod,
     exportedAt,
     appVersion,
     sheetOrder: [...SHEET_NAMES],
     sheets,
     counts,
+    analysis,
   };
 }
 
@@ -1864,13 +2316,20 @@ function estimateDisplayWidth(value) {
 
 function computeColWidths(aoa, maxWidth = 48) {
   if (!Array.isArray(aoa) || !aoa.length) return [];
-  const colCount = aoa[0].length;
-  const widths = new Array(colCount).fill(10);
   const sampleLimit = Math.min(aoa.length, 500);
+  let colCount = 0;
+  for (let r = 0; r < sampleLimit; r++) {
+    const row = aoa[r];
+    if (Array.isArray(row) && row.length > colCount) {
+      colCount = row.length;
+    }
+  }
+  if (colCount === 0) return [];
+  const widths = new Array(colCount).fill(10);
   for (let r = 0; r < sampleLimit; r++) {
     const row = aoa[r];
     if (!Array.isArray(row)) continue;
-    for (let c = 0; c < colCount; c++) {
+    for (let c = 0; c < row.length; c++) {
       const w = estimateDisplayWidth(row[c]) + 2;
       if (w > widths[c]) widths[c] = w;
     }
@@ -1910,7 +2369,7 @@ function writeStatsXlsx(data, filePath, options = {}) {
   for (const name of order) {
     const aoa = Array.isArray(data.sheets[name]) ? data.sheets[name] : [];
     const ws = xlsx.utils.aoa_to_sheet(aoa);
-    const maxW = name === "字段说明" ? 64 : 44;
+    const maxW = name === "字段说明" || name === "分析" ? 64 : 44;
     ws["!cols"] = computeColWidths(aoa, maxW);
     xlsx.utils.book_append_sheet(wb, ws, name);
   }
@@ -1941,6 +2400,8 @@ module.exports = {
   countWorkDailyRows,
   computeWorkCountsFromSummaryRows,
   buildContentSummaryData,
+  buildAnalysisSheet,
+  buildStatsAnalysisData,
   buildStatsWorkbookData,
   writeStatsXlsx,
 };

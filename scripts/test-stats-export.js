@@ -122,18 +122,21 @@ async function main() {
         "作品跨平台汇总",
         "平台日汇总",
         "账号日快照",
+        "分析",
         "字段说明",
         "导出信息",
       ]);
       assert.strictEqual(emptyData.to, "2026-11-19");
       assert.strictEqual(emptyData.from, "2026-10-21", "默认 from 应为 to 往前 29 天");
+      assert.strictEqual(emptyData.analysisPeriod, 30, "默认导出分析周期应为 30 天");
       assert.strictEqual(emptyData.sheets["作品日明细"].length, 1);
       assert.strictEqual(emptyData.sheets["作品跨平台汇总"].length, 1);
       assert.strictEqual(emptyData.sheets["平台日汇总"].length, 1);
       assert.strictEqual(emptyData.sheets["账号日快照"].length, 1);
-      assert.ok(emptyData.sheets["字段说明"].length > 40);
-      assert.strictEqual(emptyData.sheets["导出信息"].length, 8);
-      // P3：无动态列时，字段说明不得包含不存在的动态列占位符，且与实际各 sheet 表头 1:1 严格一致
+      assert.ok(emptyData.sheets["分析"].length > 10, "分析 sheet 应含小结与各节结构");
+      assert.ok(emptyData.sheets["字段说明"].length > 45);
+      assert.strictEqual(emptyData.sheets["导出信息"].length, 9);
+      // P3：无动态列时，字段说明不得包含不存在的动态列占位符，且与单表 sheet 实际表头 1:1 严格一致
       const emptySchemaRows = emptyData.sheets["字段说明"].slice(1);
       assert.strictEqual(
         emptySchemaRows.some((r) => String(r[1]).includes("<平台>")),
@@ -141,6 +144,11 @@ async function main() {
         "无动态列时字段说明不应包含占位列"
       );
       for (const sheetName of SHEET_NAMES) {
+        if (sheetName === "分析") {
+          const analysisDocs = emptySchemaRows.filter((r) => r[0] === "分析");
+          assert.ok(analysisDocs.length >= 6, "字段说明应覆盖分析 sheet 各节口径");
+          continue;
+        }
         const expectedCols = emptyData.sheets[sheetName][0];
         const documentedCols = emptySchemaRows
           .filter((r) => r[0] === sheetName)
@@ -808,6 +816,13 @@ async function main() {
       "匹配方式",
       "UTC+8 日历日相差 ≤2 天",
       "模糊匹配可能合错，已手工确认的标 manual",
+      "互动率公式",
+      "环比",
+      "D1/D3/D7",
+      "分类阈值",
+      "异常规则",
+      "剔除说明",
+      "analysisPeriod",
     ]) {
       assert.ok(s5Text.includes(kw), `字段说明缺少关键口径：${kw}`);
     }
@@ -821,8 +836,13 @@ async function main() {
       false,
       "头条适配器实际输出 repinCount，字段说明不得误写头条无收藏"
     );
-    // 校验所有 6 个 sheet 的表头与字段说明 1:1 严格一致
+    // 校验所有单表 sheet 的表头与字段说明 1:1 严格一致，分析 sheet 具备完整口径条目
     for (const sheetName of SHEET_NAMES) {
+      if (sheetName === "分析") {
+        const analysisDocs = s5.slice(1).filter((r) => r[0] === "分析");
+        assert.ok(analysisDocs.length >= 6, "字段说明必须记录分析 sheet 各节口径");
+        continue;
+      }
       const headers = wbData.sheets[sheetName][0];
       const documented = s5
         .slice(1)
@@ -835,7 +855,20 @@ async function main() {
       );
     }
 
-    // 验证 Sheet 6：导出信息
+    // 验证 Sheet 5：分析（在字段说明前，首块为文字小结，其后长表数值为 number）
+    assert.strictEqual(
+      wbData.sheetOrder.indexOf("分析"),
+      wbData.sheetOrder.indexOf("字段说明") - 1,
+      "分析 sheet 必须紧挨在字段说明之前"
+    );
+    const sAnalysis = wbData.sheets["分析"];
+    assert.strictEqual(sAnalysis[0][0], "文字小结", "分析 sheet 首块应为文字小结");
+    const overviewPlayRow = sAnalysis.find((r) => r[0] === "播放");
+    assert.ok(overviewPlayRow, "分析 sheet 应含总览播放行");
+    assert.strictEqual(typeof overviewPlayRow[1], "number", "分析 sheet 本周期播放日增应为 number");
+    assert.strictEqual(overviewPlayRow[1], 160 + 240 + 40 + 60 + 110 + 120 + 280);
+
+    // 验证 Sheet 7：导出信息（含 analysisPeriod）
     const s6 = wbData.sheets["导出信息"];
     assert.deepStrictEqual(s6[0], META_HEADERS);
     const s6Map = new Map(s6.slice(1).map((r) => [r[0], r[1]]));
@@ -845,6 +878,7 @@ async function main() {
     assert.strictEqual(s6Map.get("作品数"), 5);
     assert.strictEqual(s6Map.get("内容数"), 4);
     assert.strictEqual(s6Map.get("未关联作品数"), 2);
+    assert.strictEqual(s6Map.get("analysisPeriod"), 30);
 
     // 2.4 写出 .xlsx 并用 SheetJS 读回逐项校验
     const outXlsx = path.join(tmpRoot, "nested", "full-export.xlsx");
@@ -903,20 +937,59 @@ async function main() {
     }
     assert.ok(checkedDy1D2 && checkedKs2D2, "读回校验应命中目标行");
 
-    // 读回检查 Sheet 6 数值类型
+    // 读回检查 Sheet「分析」存在、顺序在字段说明前、数值单元格为 number 类型
+    assert.strictEqual(
+      readWb.SheetNames.indexOf("分析"),
+      readWb.SheetNames.indexOf("字段说明") - 1,
+      "读回 xlsx 中「分析」sheet 必须在「字段说明」之前"
+    );
+    const wsAnalysis = readWb.Sheets["分析"];
+    assert.ok(wsAnalysis && wsAnalysis["!ref"], "读回 xlsx 必须包含「分析」sheet");
+    const wsAnalysisRange = xlsx.utils.decode_range(wsAnalysis["!ref"]);
+    let analysisNumberCellCount = 0;
+    let foundPlayOverviewNum = false;
+    for (let r = 0; r <= wsAnalysisRange.e.r; r++) {
+      const c0 = wsAnalysis[xlsx.utils.encode_cell({ r, c: 0 })];
+      const c1 = wsAnalysis[xlsx.utils.encode_cell({ r, c: 1 })];
+      if (c0 && c0.v === "播放" && c1) {
+        assert.strictEqual(c1.t, "n", "「分析」sheet 总览播放日增必须为数字类型");
+        assert.strictEqual(c1.v, 1010);
+        foundPlayOverviewNum = true;
+      }
+      for (let c = 0; c <= wsAnalysisRange.e.c; c++) {
+        const cell = wsAnalysis[xlsx.utils.encode_cell({ r, c })];
+        if (cell && cell.t === "n") analysisNumberCellCount += 1;
+      }
+    }
+    assert.ok(foundPlayOverviewNum, "应读回「分析」sheet 总览播放日增数值");
+    assert.ok(analysisNumberCellCount >= 10, "「分析」sheet 应包含多个 number 类型数值单元格");
+
+    // 读回检查 Sheet 7 导出信息数值类型（含 analysisPeriod）
     const ws6 = readWb.Sheets["导出信息"];
     assert.strictEqual(ws6.B5.t, "n", "导出信息账号数必须为数字类型");
     assert.strictEqual(ws6.B5.v, 4);
     assert.strictEqual(ws6.B6.t, "n");
     assert.strictEqual(ws6.B6.v, 5);
+    assert.strictEqual(ws6.A9.v, "analysisPeriod");
+    assert.strictEqual(ws6.B9.t, "n", "导出信息 analysisPeriod 必须为数字类型");
+    assert.strictEqual(ws6.B9.v, 30);
 
-    // 2.5 from/to 过滤 + groups 过滤
+    // 2.5 from/to 过滤 + groups 过滤（含导出区间 <30 天时 analysisPeriod 自动缩为区间天数）
     const filtered = buildStatsWorkbookData({
       from: "2026-11-11",
       to: "2026-11-11",
     });
     assert.strictEqual(filtered.from, "2026-11-11");
     assert.strictEqual(filtered.to, "2026-11-11");
+    assert.strictEqual(filtered.analysisPeriod, 1, "单日导出区间 analysisPeriod 应为 1");
+    const filteredMetaMap = new Map(filtered.sheets["导出信息"].slice(1).map((r) => [r[0], r[1]]));
+    assert.strictEqual(filteredMetaMap.get("analysisPeriod"), 1);
+
+    const filtered5d = buildStatsWorkbookData({
+      from: "2026-11-10",
+      to: "2026-11-14",
+    });
+    assert.strictEqual(filtered5d.analysisPeriod, 5, "5 天导出区间 analysisPeriod 应为 5");
     const fS1Rows = filtered.sheets["作品日明细"].slice(1);
     assert.ok(fS1Rows.length > 0);
     assert.ok(fS1Rows.every((r) => r[0] === "2026-11-11"), "Sheet 1 应仅保留 11-11 行");

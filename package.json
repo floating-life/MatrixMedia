@@ -90,6 +90,7 @@
     "test:link-overrides": "node scripts/test-link-overrides.js",
     "test:stats-scheduler": "node scripts/test-stats-scheduler.js",
     "test:stats-export": "node scripts/test-stats-export.js",
+    "test:stats-analysis": "node scripts/test-stats-analysis.js",
     "test:ai-content": "node scripts/test-ai-content.js",
     "test:ai-key-store": "node scripts/test-ai-key-store.js",
     "test:ai-content-ipc": "node scripts/test-ai-content-ipc.js",
