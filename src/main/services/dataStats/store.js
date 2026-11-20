@@ -1356,7 +1356,7 @@ function updateAutoRunTimestamps({ lastAutoRunAt, partitionAutoRunAt } = {}) {
   const state = readAutoRunState();
   const nextLast =
     typeof lastAutoRunAt === "number" && Number.isFinite(lastAutoRunAt) && lastAutoRunAt > 0
-      ? lastAutoRunAt
+      ? Math.max(lastAutoRunAt, Number(state.lastAutoRunAt) || 0) // 只前进不后退：时钟回拨不覆盖较新限流记录
       : state.lastAutoRunAt;
   const partMap = state.partitionAutoRunAt;
   if (isPlainObject(partitionAutoRunAt)) {
@@ -1364,7 +1364,7 @@ function updateAutoRunTimestamps({ lastAutoRunAt, partitionAutoRunAt } = {}) {
       const nk = typeof k === "string" ? k.trim() : "";
       const ts = partitionAutoRunAt[k];
       if (nk && typeof ts === "number" && Number.isFinite(ts) && ts > 0) {
-        partMap[nk] = ts;
+        partMap[nk] = Math.max(ts, Number(partMap[nk]) || 0);
       }
     }
   }

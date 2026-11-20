@@ -2199,6 +2199,15 @@ async function main() {
                   seenDuringCollect.partitionAutoRunAt && seenDuringCollect.partitionAutoRunAt["persist:demo抖音"],
                   cnTime(2026, 11, 20, 16, 0, 0)
                 );
+
+                // 8) 时钟回拨：较早时间不得覆盖较新限流记录
+                storeR3.updateAutoRunTimestamps({
+                  lastAutoRunAt: cnTime(2026, 11, 20, 13, 55, 0),
+                  partitionAutoRunAt: { "persist:demo抖音": cnTime(2026, 11, 20, 13, 55, 0) },
+                });
+                const ledgerRb = JSON.parse(fs.readFileSync(storeR3.autoRunFile(), "utf8"));
+                assert.strictEqual(ledgerRb.lastAutoRunAt, cnTime(2026, 11, 20, 16, 0, 0), "时钟回拨不得回退全局限流时间");
+                assert.strictEqual(ledgerRb.partitionAutoRunAt["persist:demo抖音"], cnTime(2026, 11, 20, 16, 0, 0), "时钟回拨不得回退分区限流时间");
               });
             });
           } finally {
