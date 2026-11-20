@@ -1982,6 +1982,39 @@ async function main() {
     assert.ok(grpTueAft && grpTueAft.sampleCount === 1 && grpTueAft.avgD7Play === 300, "P3(300) 缺实采与确认时间，应兜底 createTime 归周二 12-18");
     assert.ok(grpFriAft && grpFriAft.sampleCount === 1 && grpFriAft.avgD7Play === 400, "P4(400) 应按 10/30 首发确认时间 14:00 归周五 12-18");
     console.log("✓ S7-r3#2(testS7r3PublishTimePriorityPerWorkAndRepublishRule) 通过");
+
+    // r4（评审 S7-review3）：同账号补发——首发记录无直链，补发记录直链匹配到作品，首发时间不得被补发吞掉
+    {
+      const firstOk = Date.parse("2026-11-17T18:30:00+08:00"); // 周二 18-24
+      const repub = Date.parse("2026-11-19T18:30:00+08:00"); // 周四 18-24
+      const deps = {
+        now: Date.parse("2026-11-20T12:00:00+08:00"),
+        listAccounts: () => [{ group: "创作组", platform: "抖音" }],
+        readWorks: () => [
+          { workId: "RP1", title: "同账号补发回归", url: "https://www.douyin.com/video/rp1", publishTime: repub },
+        ],
+        readWorksDaily: () => ({ RP1: { "2026-11-19": { play: 100 }, "2026-11-20": { play: 250 } } }),
+        readDaily: () => ({}),
+        readPushRecords: () => [
+          {
+            id: "rp-a", date: "2026-11-17", pt: "抖音", group: "创作组", publishStatus: "success",
+            title: "同账号补发回归", filePath: "/videos/rp.mp4",
+            createTime: Date.parse("2026-11-17T16:00:00+08:00"), lastPublishAt: firstOk,
+          },
+          {
+            id: "rp-b", date: "2026-11-19", pt: "抖音", group: "创作组", publishStatus: "success",
+            title: "同账号补发回归", filePath: "/videos/rp.mp4",
+            videoLink: "https://www.douyin.com/video/rp1", lastPublishAt: repub,
+          },
+        ],
+      };
+      const r = buildStatsAnalysisData({ period: 30, to: "2026-11-20" }, deps);
+      const tueEve = r.publishTime.groups.find((g) => g.weekdayLabel === "周二" && g.slot === "18-24");
+      const thuEve = r.publishTime.groups.find((g) => g.weekdayLabel === "周四" && g.slot === "18-24");
+      assert.ok(tueEve && tueEve.sampleCount === 1, "同账号补发：内容首发应按 11/17 18:30 归周二 18-24");
+      assert.ok(!thuEve, "同账号补发：不得按补发时间归周四 18-24");
+      console.log("✓ S7-r4(testS7r4SameAccountRepublishKeepsFirstPublish) 通过");
+    }
   }
 
   // testS7r3MergeWorksUpdatesExistingPublishTimeOnRecollect（评审 S7-review2 #5：UTC 主机旧存量重采后自动修正 publishTime）

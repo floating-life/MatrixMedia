@@ -1616,6 +1616,8 @@ function resolveAnalysisPublishTimes(
     const works = worksByContent.get(ck) || [];
     const recs = recsByContent.get(ck) || [];
     const matchedWorkPwKeys = new Set();
+    // 已被发布记录直链精确匹配的作品：日期兜底不再把其他（如同账号更早首发）记录吸到它身上
+    const linkMatchedPwKeys = new Set();
     const unmatchedRecs = [];
     const remainingRecs = [];
 
@@ -1627,6 +1629,7 @@ function resolveAnalysisPublishTimes(
         );
         if (urlMatch) {
           matchedWorkPwKeys.add(urlMatch.pwKey);
+          linkMatchedPwKeys.add(urlMatch.pwKey);
           if (
             urlMatch.pubMs === null &&
             (!urlMatch.fallbackRec || compareFallbackRecordTime(rec, urlMatch.fallbackRec) < 0)
@@ -1645,6 +1648,7 @@ function resolveAnalysisPublishTimes(
       let bestUnmatched = false;
       let bestDayDiff = Infinity;
       for (const w of works) {
+        if (linkMatchedPwKeys.has(w.pwKey)) continue;
         if (rec.platform && w.platform !== rec.platform) continue;
         if (rec.group && w.groups.size > 0 && !w.groups.has(rec.group)) continue;
         if (rec.normUrl && w.normUrl && rec.normUrl !== w.normUrl) continue;
