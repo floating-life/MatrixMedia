@@ -1188,12 +1188,27 @@ function registerDataStatsIpc(options = {}) {
           minAutoIntervalMs,
           persistedPartitionAutoRunAt: autoRunState.partitionAutoRunAt,
           onAutoCollectInitiated: (ts, normPart, isSuccessUpdate) => {
-            if (!isSuccessUpdate && !initiatedAutoAt) {
+            const isFirst = !isSuccessUpdate && !initiatedAutoAt;
+            if (isFirst) {
               initiatedAutoAt = ts;
               lastGlobalAutoRunAt = ts;
             }
             if (normPart) {
               initiatedAutoPartitions[normPart] = ts;
+            }
+            // 每个分区真正发起采集请求前立即落盘限流时间：采集中途退出/重启也不会绕过限流下限
+            if (!isSuccessUpdate && typeof store.updateAutoRunTimestamps === "function") {
+              try {
+                store.updateAutoRunTimestamps({
+                  lastAutoRunAt: isFirst ? ts : undefined,
+                  partitionAutoRunAt: normPart ? { [normPart]: ts } : undefined,
+                });
+              } catch (tsErr) {
+                console.warn(
+                  "[dataStats] 预写 auto-run.json 限流时间戳失败:",
+                  (tsErr && tsErr.message) || tsErr
+                );
+              }
             }
           },
         });

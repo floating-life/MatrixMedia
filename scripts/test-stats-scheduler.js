@@ -2169,6 +2169,36 @@ async function main() {
                 });
                 assert.strictEqual(afterFailRl.status, "skipped");
                 assert.strictEqual(afterFailRl.reason, "rate-limited");
+
+                // 7) S9-r4：采集请求发出时限流时间必须已落盘（模拟采集中途退出：请求进行中读盘即可看到）
+                const origImplR4 = collectorImpl;
+                mockNow = cnTime(2026, 11, 20, 16, 0, 0);
+                let seenDuringCollect = null;
+                collectorImpl = async (...a) => {
+                  seenDuringCollect = JSON.parse(fs.readFileSync(storeR3.autoRunFile(), "utf8"));
+                  return origImplR4(...a);
+                };
+                try {
+                  const r16 = await aHandler(fakeEvent, {
+                    accounts: [acc],
+                    slot: "2026-11-20 16:00",
+                    slotEndMs: cnTime(2026, 11, 20, 18, 0, 0),
+                    intervalHours: 2,
+                  });
+                  assert.strictEqual(r16.status, "done");
+                } finally {
+                  collectorImpl = origImplR4;
+                }
+                assert.ok(seenDuringCollect, "采集器应被调用");
+                assert.strictEqual(
+                  seenDuringCollect.lastAutoRunAt,
+                  cnTime(2026, 11, 20, 16, 0, 0),
+                  "采集进行中 auto-run.json 必须已含本次 lastAutoRunAt（中途退出重启不绕过限流）"
+                );
+                assert.strictEqual(
+                  seenDuringCollect.partitionAutoRunAt && seenDuringCollect.partitionAutoRunAt["persist:demo抖音"],
+                  cnTime(2026, 11, 20, 16, 0, 0)
+                );
               });
             });
           } finally {
