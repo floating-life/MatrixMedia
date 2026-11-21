@@ -351,7 +351,8 @@ function bjhTitleOk(cur, want, fileStem) {
   if (cur === want) return true;
   const stem = normBjhTitle(fileStem);
   if (stem && cur.includes(stem) && !want.includes(stem)) return false;
-  if (stem && want.startsWith(stem) && cur.length <= stem.length) return false;
+  if (stem && want.length > stem.length && want.startsWith(stem) && cur === stem)
+    return false;
   return cur.length >= 5 && want.startsWith(cur);
 }
 
