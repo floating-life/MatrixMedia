@@ -62,6 +62,9 @@ const PLATFORM_ALIAS_MAP = {
   fanqie: "番茄视频",
   fq: "番茄视频",
   番茄视频: "番茄视频",
+  juejin: "掘金",
+  jj: "掘金",
+  掘金: "掘金",
 };
 
 function resolveCanonicalPlatform(raw) {

@@ -338,14 +338,17 @@ export function checkPublishEntryDuplicate(data, records, options = {}) {
     typeof options.now === "number" && Number.isFinite(options.now)
       ? options.now
       : Date.now();
+  const excludeRecordId =
+    options.excludeRecordId != null ? options.excludeRecordId : data.recordId;
   const list =
     records !== undefined && records !== null
       ? flattenPushDataRecords(records)
       : readPushDataRecordsSafe();
   const filtered = list.filter((rec) => {
     if (!rec || typeof rec !== "object") return false;
-    // 排除 scheduledPublish.js 刚切为 publishing 的当前定时任务自身记录
+    // 兼容未传 recordId 的旧定时任务调用；已传 recordId 时严格按记录 id 排除
     if (
+      excludeRecordId == null &&
       rec.scheduledTask === true &&
       String(rec.publishStatus || "").toLowerCase() === "publishing" &&
       rec.lastPublishMessage === "定时任务开始发布" &&
@@ -358,7 +361,7 @@ export function checkPublishEntryDuplicate(data, records, options = {}) {
   });
   return findRecentDuplicatePublish(filtered, data, {
     now,
-    excludeRecordId: data.recordId,
+    excludeRecordId,
   });
 }
 

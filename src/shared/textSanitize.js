@@ -15,7 +15,8 @@
 const EXCEL_CR_ESCAPE_RE = /_x000d_/gi;
 const ZERO_WIDTH_RE = /[\uFEFF\u200B\u200C\u200D]/g;
 const NBSP_RE = /\u00A0/g;
-const TAG_SPLIT_RE = /[\s,，、;；|]+/;
+// 标签只按逗号/中文逗号/顿号/换行与 `#` 分隔，不按空格拆，以保留含空格标签（如 "Final Cut Pro"）
+const TAG_SPLIT_RE = /[\n,，、]+/;
 
 function isShipinhaoPlatform(raw) {
   const s = String(raw || "").trim().toLowerCase();
@@ -69,7 +70,7 @@ function sanitizeDescription(raw) {
  * 标签统一清洗与拆分（GUI 单发/批量、CLI publish/xlsx、HTTP /publish、videoMetadata、平台上传共用）：
  * - 支持字符串或字符串数组
  * - 删除 `_x000d_`、`\r`、零宽字符、NBSP
- * - 按空白（含换行）、中英文逗号/顿号/分号/竖线与 `#` 边界拆分
+ * - 只按逗号/中文逗号/顿号/换行与 `#` 边界拆分，不按空格拆（含空格的标签如 "Final Cut Pro" 保持完整）
  * - 去除前导 `#`，过滤空项并保序去重
  * @param {unknown} raw
  * @returns {string[]}
@@ -82,13 +83,14 @@ function splitAndSanitizeTags(raw) {
     if (entry == null) continue;
     const cleaned = stripExcelEscapesAndCR(entry)
       .replace(ZERO_WIDTH_RE, "")
-      .replace(NBSP_RE, " ");
+      .replace(NBSP_RE, " ")
+      .replace(/\t+/g, " ");
     const parts = cleaned.split(TAG_SPLIT_RE);
     for (const part of parts) {
       if (!part) continue;
       const hashParts = part.split(/(?=#)/);
       for (const hp of hashParts) {
-        const tag = hp.replace(/^#+/, "").trim();
+        const tag = hp.replace(/^#+/, "").replace(/ {2,}/g, " ").trim();
         if (!tag || seen.has(tag)) continue;
         seen.add(tag);
         out.push(tag);
@@ -100,6 +102,7 @@ function splitAndSanitizeTags(raw) {
 
 /**
  * 标签类字段清洗（tags / bq）：支持字符串或字符串数组，统一走 splitAndSanitizeTags。
+ * 字符串形态以 `,` 拼回，保持无损可逆（含空格标签如 "Final Cut Pro" 再次拆分仍完整）。
  * @param {unknown} raw
  * @returns {string|string[]}
  */
@@ -108,7 +111,7 @@ function sanitizeTags(raw) {
   if (Array.isArray(raw)) {
     return list;
   }
-  return list.join(" ");
+  return list.join(",");
 }
 
 /**

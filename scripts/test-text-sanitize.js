@@ -66,8 +66,8 @@ function main() {
     );
     assert.strictEqual(
       sanitizeTags("  标签1_x000d_\n标签2_X000D_\r标签3  "),
-      "标签1 标签2 标签3",
-      "tags 字符串应清理 _x000d_ 并折叠换行"
+      "标签1,标签2,标签3",
+      "tags 字符串应清理 _x000d_ 并按换行拆分为无损逗号串"
     );
     assert.deepStrictEqual(
       sanitizeTags(["  #美食_x000d_\r\n", "_X000D_", "旅行\r日记"]),
@@ -402,6 +402,135 @@ function main() {
           `${label} B 站标签应拆分为 ["美食", "旅行"]，实际=${JSON.stringify(got)}`
         );
       }
+    }
+
+    // 5. S10-fix2 #3：标签拆分只按逗号/中文逗号/顿号/换行/#分隔，不按空格拆（"Final Cut Pro,剪辑" 保持完整，三条链路一致）
+    {
+      const spacedTagCell = "Final Cut Pro,剪辑";
+      const spacedXlsxPath = path.join(tmpDir, "blbl-spaced-tags.xlsx");
+      const wbSpaced = xlsx.utils.book_new();
+      xlsx.utils.book_append_sheet(
+        wbSpaced,
+        xlsx.utils.json_to_sheet([
+          {
+            "文件名": "demo.mp4",
+            "标题": "B站含空格标签测试",
+            "简介": "简介",
+            "标签": spacedTagCell,
+          },
+        ]),
+        "Sheet1"
+      );
+      xlsx.writeFile(wbSpaced, spacedXlsxPath);
+
+      const spacedRows = normalizeBatchXlsxRows(
+        xlsx.utils.sheet_to_json(xlsx.readFile(spacedXlsxPath).Sheets.Sheet1, { defval: "" })
+      );
+      // GUI 批量 Excel（LocalVideoPublish.vue:2462 同路径）
+      const guiBatchTags = videoMetadata.normalizeVideoTags(
+        videoMetadata.normalizeVideoMetadata(
+          { title: spacedRows[0].title, description: spacedRows[0].description, tags: splitAndSanitizeTags(spacedRows[0].tags) },
+          "哔哩哔哩"
+        ).tags
+      );
+      // GUI 单视频发布
+      const guiSingleTags = videoMetadata.normalizeVideoTags(
+        videoMetadata.normalizeVideoMetadata(
+          { title: "B站含空格标签测试", tags: splitAndSanitizeTags(["Final Cut Pro", "剪辑"]) },
+          "哔哩哔哩"
+        ).tags
+      );
+      // CLI 批量 Excel
+      const cliBatchTags = videoMetadata.normalizeVideoTags(
+        videoMetadata.normalizeVideoMetadata(
+          { title: spacedRows[0].title, description: spacedRows[0].description, tags: splitAndSanitizeTags(spacedRows[0].tags) },
+          "哔哩哔哩"
+        ).tags
+      );
+      // CLI 单文件 --tags
+      const cliSingleParsedSpaced = parsePublish.parsePublishArgs(
+        sanitizePublishCliArgs([
+          "-p",
+          "blbl",
+          "--phone",
+          "A组",
+          "-f",
+          cliVideoFile,
+          "-t",
+          "B站含空格标签测试",
+          "--tags",
+          spacedTagCell,
+        ])
+      );
+      assert.strictEqual(cliSingleParsedSpaced.ok, true, cliSingleParsedSpaced.error);
+      const cliSingleTagsFromTags = videoMetadata.normalizeVideoTags(cliSingleParsedSpaced.value.tags);
+      const cliSingleTagsFromBq = videoMetadata.normalizeVideoTags(cliSingleParsedSpaced.value.bq);
+      // HTTP /publish（字符串与数组形态）
+      const httpStrParsed = parsePublish.parseMultiPublishRequest(
+        sanitizePublishPayloadObject({
+          platform: "blbl",
+          phone: "A组",
+          file: cliVideoFile,
+          title: "B站含空格标签测试",
+          tags: spacedTagCell,
+        })
+      );
+      assert.strictEqual(httpStrParsed.ok, true, httpStrParsed.error);
+      const httpStrTags = videoMetadata.normalizeVideoTags(httpStrParsed.value.bq);
+      const httpArrParsed = parsePublish.parseMultiPublishRequest(
+        sanitizePublishPayloadObject({
+          platform: "blbl",
+          phone: "A组",
+          file: cliVideoFile,
+          title: "B站含空格标签测试",
+          tags: ["Final Cut Pro", "剪辑"],
+        })
+      );
+      assert.strictEqual(httpArrParsed.ok, true, httpArrParsed.error);
+      const httpArrTags = videoMetadata.normalizeVideoTags(httpArrParsed.value.bq);
+
+      for (const [label, got] of [
+        ["GUI 批量 Excel", guiBatchTags],
+        ["GUI 单发", guiSingleTags],
+        ["CLI 批量 Excel", cliBatchTags],
+        ["CLI 单发(tags)", cliSingleTagsFromTags],
+        ["CLI 单发(bq)", cliSingleTagsFromBq],
+        ["HTTP /publish(string)", httpStrTags],
+        ["HTTP /publish(array)", httpArrTags],
+      ]) {
+        assert.deepStrictEqual(
+          got,
+          ["Final Cut Pro", "剪辑"],
+          `S10-fix2 #3 ${label} 应保留含空格标签 ["Final Cut Pro", "剪辑"]，实际=${JSON.stringify(got)}`
+        );
+      }
+
+      // 校验支持全部 5 种分隔符（逗号/中文逗号/顿号/换行/#）且不按空格拆
+      assert.deepStrictEqual(
+        splitAndSanitizeTags("Final Cut Pro，剪辑、后期制作\n#DaVinci Resolve #调色"),
+        ["Final Cut Pro", "剪辑", "后期制作", "DaVinci Resolve", "调色"]
+      );
+      // 抖音等话题平台在加 # 后再拆分仍保持完整
+      const dyParsedSpaced = parsePublish.parsePublishArgs(
+        sanitizePublishCliArgs([
+          "-p",
+          "dy",
+          "--phone",
+          "A组",
+          "-f",
+          cliVideoFile,
+          "-t",
+          "抖音含空格标签测试",
+          "--tags",
+          spacedTagCell,
+        ])
+      );
+      assert.strictEqual(dyParsedSpaced.ok, true, dyParsedSpaced.error);
+      assert.strictEqual(dyParsedSpaced.value.bq, "#Final Cut Pro #剪辑");
+      assert.deepStrictEqual(
+        videoMetadata.normalizeVideoTags(dyParsedSpaced.value.bq),
+        ["Final Cut Pro", "剪辑"]
+      );
     }
 
     // 确认 ipcMain.js / cli/index.js / LocalVideoPublish.vue / routes/index.js 统一接入共享清洗与标签拆分

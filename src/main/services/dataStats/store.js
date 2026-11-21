@@ -159,6 +159,8 @@ function computeEffectiveCurrWorksPlaySum(group, platform, prevWorks, incomingWo
           ? incomingPlay
           : lp !== null && lp > 0
           ? lp
+          : incomingPlay === 0
+          ? 0
           : null;
       if (v !== null) {
         sum += v;
@@ -1336,18 +1338,64 @@ function readMeta(group, platform) {
   return readJson(path.join(accountDir(group, platform), "meta.json"), {});
 }
 
-function writeMeta(group, platform, patch) {
+function writeMeta(group, platform, patch, accountMeta = null) {
   const file = path.join(accountDir(group, platform), "meta.json");
   const meta = readJson(file, {});
   const next = { ...meta, ...patch };
-  if (typeof patch.workCount === "number" && Number.isFinite(patch.workCount) && patch.workCount > 0) {
-    next.lastPositiveWorkCount = patch.workCount;
+  if (typeof patch.workCount === "number" && Number.isFinite(patch.workCount) && patch.workCount >= 0) {
+    if (patch.workCount > 0) {
+      next.lastPositiveWorkCount = patch.workCount;
+    }
+    const accId = resolveCollectAlertAccountKey(group, platform, accountMeta);
+    if (accId) {
+      const byAcc = isPlainObject(meta.workCountsByAccount)
+        ? { ...meta.workCountsByAccount }
+        : {};
+      const prevRec = isPlainObject(byAcc[accId]) ? byAcc[accId] : null;
+      const prevPos =
+        prevRec &&
+        typeof prevRec.lastPositiveWorkCount === "number" &&
+        Number.isFinite(prevRec.lastPositiveWorkCount) &&
+        prevRec.lastPositiveWorkCount > 0
+          ? prevRec.lastPositiveWorkCount
+          : 0;
+      byAcc[accId] = {
+        workCount: patch.workCount,
+        lastPositiveWorkCount: patch.workCount > 0 ? patch.workCount : prevPos,
+        updatedAt:
+          typeof patch.lastCollectAt === "number" && Number.isFinite(patch.lastCollectAt)
+            ? patch.lastCollectAt
+            : Date.now(),
+      };
+      next.workCountsByAccount = byAcc;
+    }
   }
   writeJson(file, next);
 }
 
-function getPreviousWorkCount(group, platform) {
+function getPreviousWorkCount(group, platform, accountMeta = null) {
   const meta = readMeta(group, platform);
+  const byAcc = isPlainObject(meta.workCountsByAccount) ? meta.workCountsByAccount : null;
+  const accId = resolveCollectAlertAccountKey(group, platform, accountMeta);
+  if (byAcc && accId && Object.prototype.hasOwnProperty.call(byAcc, accId)) {
+    const rec = byAcc[accId];
+    if (isPlainObject(rec)) {
+      const pos =
+        typeof rec.lastPositiveWorkCount === "number" && Number.isFinite(rec.lastPositiveWorkCount)
+          ? rec.lastPositiveWorkCount
+          : 0;
+      const cur =
+        typeof rec.workCount === "number" && Number.isFinite(rec.workCount) ? rec.workCount : 0;
+      return Math.max(pos, cur);
+    }
+  }
+  // 显式指定账号时只和同一账号自己的历史比较：已有其他账号记录或账号键与分组名不同时，绝不借用同组其他账号的作品数
+  if (hasExplicitAccountMeta(accountMeta)) {
+    const groupStr = String(group || "").trim();
+    if ((byAcc && Object.keys(byAcc).length > 0) || accId !== groupStr) {
+      return 0;
+    }
+  }
   const works = readWorks(group, platform).works || [];
   const metaPos =
     typeof meta.lastPositiveWorkCount === "number" && Number.isFinite(meta.lastPositiveWorkCount)
@@ -1428,19 +1476,138 @@ function emptyCollectAlertsDoc() {
   };
 }
 
-function normalizeCollectAlertEntry(raw) {
+function isLegacyGroupAlertEntry(raw) {
+  if (!isPlainObject(raw)) return false;
+  if (raw.legacyGroupScoped === true) return true;
+  return !hasExplicitAccountMeta(raw);
+}
+
+function sanitizeAccountKeyLocal(name) {
+  return String(name || "")
+    .replace(/[\s\-－—–]+/g, "")
+    .trim();
+}
+
+function listGroupPlatformAccountsFromDisk(group, platform) {
+  const g = String(group || "").trim();
+  const pt = String(platform || "").trim();
+  if (!g || !pt) return [];
+  const candidateDirs = [];
+  try {
+    if (app && typeof app.getPath === "function") {
+      const docs = app.getPath("documents");
+      if (docs) candidateDirs.push(path.join(docs, "MatrixMedia", "data", "account"));
+      const ud = app.getPath("userData");
+      if (ud) candidateDirs.push(path.join(ud, "data", "account"));
+    }
+  } catch (_) {
+    /* ignore */
+  }
+  const accountFolder = candidateDirs.find((dir) => {
+    try {
+      return (
+        fs.existsSync(dir) &&
+        fs.statSync(dir).isDirectory() &&
+        fs.readdirSync(dir).some((f) => /^\d{4}-\d{2}-\d{2}\.json$/.test(f))
+      );
+    } catch (_) {
+      return false;
+    }
+  });
+  if (!accountFolder) return [];
+  let files = [];
+  try {
+    files = fs
+      .readdirSync(accountFolder)
+      .filter((f) => /^\d{4}-\d{2}-\d{2}\.json$/.test(f))
+      .sort()
+      .reverse();
+  } catch (_) {
+    return [];
+  }
+  const seenPhonePt = new Map();
+  for (const file of files) {
+    const rows = readJson(path.join(accountFolder, file), []);
+    if (!Array.isArray(rows)) continue;
+    for (const row of rows) {
+      if (!isPlainObject(row) || !row.phone || !row.pt) continue;
+      const k = `${row.phone}__${row.pt}`;
+      const prev = seenPhonePt.get(k);
+      if (!prev || (row.createTime || 0) > (prev.createTime || 0)) {
+        seenPhonePt.set(k, row);
+      }
+    }
+  }
+  const byAccountKey = new Map();
+  for (const row of seenPhonePt.values()) {
+    if (String(row.pt || "").trim() !== pt) continue;
+    const phoneStr = String(row.phone || "").trim();
+    const phonePrefix = phoneStr.split("-")[0].trim();
+    const rowGroup = String(row.group || "").trim() || phonePrefix;
+    if (rowGroup !== g) continue;
+    const accKey = sanitizeAccountKeyLocal(row.accountKey) || phonePrefix;
+    if (!accKey || byAccountKey.has(accKey)) continue;
+    const dashIdx = phoneStr.indexOf("-");
+    const phoneSuffix = dashIdx > 0 ? phoneStr.slice(dashIdx + 1).trim() : "";
+    const accName = String(row.accountName || "").trim() || phoneSuffix || rowGroup;
+    byAccountKey.set(accKey, {
+      accountKey: accKey,
+      accountName: accName,
+      partition: `persist:${accKey}${pt}`,
+      phone: phoneStr,
+    });
+  }
+  return [...byAccountKey.values()];
+}
+
+function normalizeCollectAlertEntry(raw, options = null) {
   if (!isPlainObject(raw)) return null;
+  const opts = isPlainObject(options) ? options : null;
   const group = typeof raw.group === "string" ? raw.group.trim() : "";
   const platform = typeof raw.platform === "string" ? raw.platform.trim() : "";
   if (!platform) return null;
-  const partition = typeof raw.partition === "string" ? raw.partition.trim() : "";
-  const accountName = typeof raw.accountName === "string" ? raw.accountName.trim() : "";
-  const accountKey = resolveCollectAlertAccountKey(group, platform, {
+  const rawLegacy = isLegacyGroupAlertEntry(raw);
+  let partition = typeof raw.partition === "string" ? raw.partition.trim() : "";
+  let accountName = typeof raw.accountName === "string" ? raw.accountName.trim() : "";
+  let accountKey = resolveCollectAlertAccountKey(group, platform, {
     accountKey: raw.accountKey,
     partition,
     accountName,
     phone: raw.phone,
   });
+  let legacyGroupScoped = rawLegacy;
+  let migratedFromLegacy = false;
+
+  // 读入旧版按分组归键的告警条目时尝试迁移到账号键：
+  // 组内单账号直接映射到该账号键；多账号（或无法唯一映射）保留 legacyGroupScoped 标记，由任一账号成功时清除
+  if (rawLegacy && group && !(opts && opts.skipLegacyMigration)) {
+    const resolver =
+      opts && typeof opts.resolveGroupAccounts === "function"
+        ? opts.resolveGroupAccounts
+        : listGroupPlatformAccountsFromDisk;
+    let groupAccounts = [];
+    try {
+      const list = resolver(group, platform);
+      if (Array.isArray(list)) groupAccounts = list;
+    } catch (_) {
+      groupAccounts = [];
+    }
+    if (groupAccounts.length === 1 && groupAccounts[0]) {
+      const target = groupAccounts[0];
+      const resolvedKey = resolveCollectAlertAccountKey(group, platform, target);
+      if (resolvedKey) {
+        accountKey = resolvedKey;
+        accountName =
+          (typeof target.accountName === "string" && target.accountName.trim()) || resolvedKey;
+        partition =
+          (typeof target.partition === "string" && target.partition.trim()) ||
+          `persist:${resolvedKey}${platform}`;
+        legacyGroupScoped = false;
+        migratedFromLegacy = true;
+      }
+    }
+  }
+
   if (!group && !accountKey) return null;
   const consecutiveFailures =
     typeof raw.consecutiveFailures === "number" &&
@@ -1481,7 +1648,7 @@ function normalizeCollectAlertEntry(raw) {
       ? raw.notifiedAt
       : null;
   const key = collectAlertKey(group, platform, { accountKey, partition, accountName });
-  return {
+  const entry = {
     key,
     group: group || accountKey,
     platform,
@@ -1499,10 +1666,47 @@ function normalizeCollectAlertEntry(raw) {
     alerted,
     notified,
     notifiedAt,
+    ...(legacyGroupScoped ? { legacyGroupScoped: true } : {}),
+  };
+  if (migratedFromLegacy && opts && typeof opts.onMigrated === "function") {
+    opts.onMigrated(entry);
+  }
+  return entry;
+}
+
+function mergeCollectAlertEntries(existing, incoming) {
+  if (!existing) return incoming;
+  if (!incoming) return existing;
+  // 优先保留已按新账号键记录的条目，仅补充更早的首次失败时间/更高连败次数/已通知标记
+  const preferIncoming =
+    Boolean(existing.legacyGroupScoped) && !incoming.legacyGroupScoped
+      ? true
+      : !existing.legacyGroupScoped && Boolean(incoming.legacyGroupScoped)
+      ? false
+      : (incoming.lastFailedAt || 0) >= (existing.lastFailedAt || 0);
+  const primary = preferIncoming ? incoming : existing;
+  const secondary = preferIncoming ? existing : incoming;
+  const consecutiveFailures = Math.max(
+    primary.consecutiveFailures || 1,
+    secondary.consecutiveFailures || 1
+  );
+  const firstFailedAt =
+    primary.firstFailedAt > 0 && secondary.firstFailedAt > 0
+      ? Math.min(primary.firstFailedAt, secondary.firstFailedAt)
+      : primary.firstFailedAt || secondary.firstFailedAt || 0;
+  const notified = Boolean(primary.notified || secondary.notified);
+  const notifiedAt = primary.notifiedAt || secondary.notifiedAt || null;
+  return {
+    ...primary,
+    firstFailedAt,
+    consecutiveFailures,
+    alerted: consecutiveFailures >= COLLECT_ALERT_THRESHOLD,
+    notified,
+    notifiedAt,
   };
 }
 
-function readCollectAlerts() {
+function readCollectAlerts(options = null) {
   const file = collectAlertsFile();
   let raw;
   try {
@@ -1517,15 +1721,22 @@ function readCollectAlerts() {
     if (!isPlainObject(parsed) || !isPlainObject(parsed.accounts)) {
       return emptyCollectAlertsDoc();
     }
+    const opts = isPlainObject(options) ? options : null;
     const accounts = Object.create(null);
+    let migrated = false;
     for (const k of Object.keys(parsed.accounts)) {
       const desc = Object.getOwnPropertyDescriptor(parsed.accounts, k);
-      const norm = normalizeCollectAlertEntry(desc ? desc.value : null);
+      const norm = normalizeCollectAlertEntry(desc ? desc.value : null, {
+        resolveGroupAccounts: opts && opts.resolveGroupAccounts,
+        onMigrated: () => {
+          migrated = true;
+        },
+      });
       if (norm) {
-        accounts[norm.key] = norm;
+        accounts[norm.key] = mergeCollectAlertEntries(accounts[norm.key], norm);
       }
     }
-    return {
+    const doc = {
       version: COLLECT_ALERTS_VERSION,
       updatedAt:
         typeof parsed.updatedAt === "number" && Number.isFinite(parsed.updatedAt)
@@ -1533,6 +1744,14 @@ function readCollectAlerts() {
           : 0,
       accounts,
     };
+    if (migrated && !(opts && opts.noPersist)) {
+      try {
+        writeCollectAlerts(doc, doc.updatedAt || Date.now());
+      } catch (_) {
+        /* 只读环境下忽略写回失败，内存结果已完成迁移 */
+      }
+    }
+    return doc;
   } catch (err) {
     console.warn(`[dataStats] collect-alerts.json JSON 损坏 (${file}):`, (err && err.message) || err);
     return emptyCollectAlertsDoc();
@@ -1544,7 +1763,7 @@ function writeCollectAlerts(doc, now = Date.now()) {
   const plainAccounts = {};
   const src = doc && isPlainObject(doc.accounts) ? doc.accounts : {};
   for (const k of Object.keys(src)) {
-    const norm = normalizeCollectAlertEntry(src[k]);
+    const norm = normalizeCollectAlertEntry(src[k], { skipLegacyMigration: true });
     if (norm) {
       plainAccounts[norm.key] = norm;
     }
@@ -1636,8 +1855,27 @@ function markCollectAlertNotified(group, platform, now = Date.now(), meta = null
 function clearCollectFailure(group, platform, now = Date.now(), meta = null) {
   const doc = readCollectAlerts();
   const key = collectAlertKey(group, platform, meta);
-  if (!doc.accounts[key]) return false;
-  delete doc.accounts[key];
+  const g = String(group || "").trim();
+  const pt = String(platform || "").trim();
+  let removed = false;
+  if (doc.accounts[key]) {
+    delete doc.accounts[key];
+    removed = true;
+  }
+  // 旧版按分组归键且未唯一映射的告警条目（如多账号分组）：组内任一账号采集成功即清除
+  for (const existingKey of Object.keys(doc.accounts)) {
+    const entry = doc.accounts[existingKey];
+    if (
+      entry &&
+      entry.legacyGroupScoped === true &&
+      entry.group === g &&
+      entry.platform === pt
+    ) {
+      delete doc.accounts[existingKey];
+      removed = true;
+    }
+  }
+  if (!removed) return false;
   writeCollectAlerts(doc, now);
   return true;
 }

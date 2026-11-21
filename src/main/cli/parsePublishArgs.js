@@ -282,19 +282,10 @@ export function parsePublishArgs(subArgv) {
     }
   }
 
-  // 逗号等分隔符不再只告警：直接统一转空格，走共享 splitAndSanitizeTags。
-  // 日志里 21 次告警说明调用方一直在传逗号，而哔哩哔哩/小红书按空格切分，
-  // 逗号会被当成标签内的字符，等于把标签写坏。
-  if (out.bq && /[,，、;；|]/.test(out.bq)) {
-    const before = String(out.bq);
-    out.bq = splitAndSanitizeTags(before).join(" ");
-    console.log(
-      `MatrixMedia: --tags 中的 ,，、;；| 已统一转为空格（原值: ${before}）`
-    );
-  }
-
+  // 标签统一走共享 splitAndSanitizeTags（只按逗号/中文逗号/顿号/换行/# 分隔，保留含空格标签）
   if (out.bq) {
     const tags = splitAndSanitizeTags(out.bq);
+    out.tags = tags;
     if (tags.length > 4) {
       console.warn(
         `MatrixMedia: --tags 共 ${tags.length} 个，建议最多 4 个话题；多余标签会降低每个话题的权重，生成层请按相关性裁到 4 个以内。`
@@ -308,8 +299,13 @@ export function parsePublishArgs(subArgv) {
         )
         .join(" ");
     } else {
-      out.bq = tags.join(" ");
+      out.bq = tags.join(",");
     }
+  }
+
+  // allowDuplicate 放行透传进 publishOptions，确保经由 publishVideo.js 创建的定时任务记录也能持久保存
+  if (out.allowDuplicate) {
+    out.publishOptions = { ...(out.publishOptions || {}), allowDuplicate: true };
   }
 
   return { ok: true, value: out };
@@ -326,7 +322,7 @@ function pickBodyValue(body, keys) {
 }
 
 function normalizeBodyTags(value) {
-  return splitAndSanitizeTags(value).join(" ");
+  return splitAndSanitizeTags(value).join(",");
 }
 
 /**
@@ -353,8 +349,22 @@ export function publishBodyToArgv(body) {
   pushPair(["shortTitle", "short-title"], "--short-title");
   pushPair(["bookName", "name", "book-name"], "--name");
   pushPair(["bt2"], "--bt2");
-  const tags = pickBodyValue(body, ["tags", "bq"]);
-  if (tags != null) argv.push("--tags", normalizeBodyTags(tags));
+  const rawTags =
+    body.tags != null &&
+    (Array.isArray(body.tags)
+      ? body.tags.length > 0
+      : String(body.tags).trim() !== "")
+      ? body.tags
+      : body.bq != null &&
+        (Array.isArray(body.bq)
+          ? body.bq.length > 0
+          : String(body.bq).trim() !== "")
+      ? body.bq
+      : null;
+  if (rawTags != null) {
+    const normalizedTags = normalizeBodyTags(rawTags);
+    if (normalizedTags) argv.push("--tags", normalizedTags);
+  }
   pushPair(["publishAt", "publish-at"], "--publish-at");
   pushPair(
     ["creativeStatement", "creative-statement", "cs"],

@@ -711,7 +711,7 @@ async function collectAccounts(accounts, sender, options = {}) {
         : `${String(acc.platform || "")}|${String(acc.accountKey || acc.partition || acc.group || "")}`;
     const prevWorkCount =
       typeof store.getPreviousWorkCount === "function"
-        ? store.getPreviousWorkCount(acc.group, acc.platform)
+        ? store.getPreviousWorkCount(acc.group, acc.platform, alertMeta)
         : 0;
     try {
       const data = await collectAccount({
@@ -792,11 +792,16 @@ async function collectAccounts(accounts, sender, options = {}) {
       store.mergeWorks(acc.group, acc.platform, data.works, collectNow, {
         slot: slot || undefined,
       });
-      store.writeMeta(acc.group, acc.platform, {
-        lastCollectAt: collectNow,
-        lastError: "",
-        workCount: data.works.length,
-      });
+      store.writeMeta(
+        acc.group,
+        acc.platform,
+        {
+          lastCollectAt: collectNow,
+          lastError: "",
+          workCount: data.works.length,
+        },
+        alertMeta
+      );
       markPartitionCollected(acc.partition, collectNow, isAutoTrigger);
       if (isAutoTrigger) {
         const normPart = normalizePartition(acc.partition);
@@ -1943,9 +1948,10 @@ function registerDataStatsIpc(options = {}) {
       const entries = [...groupsMap.values()];
       for (let i = 0; i < entries.length; i++) {
         const { partition, platform, group, tasks: groupTasks } = entries[i];
+        const matchAlertMeta = { partition };
         const prevWorkCount =
           typeof store.getPreviousWorkCount === "function"
-            ? store.getPreviousWorkCount(group, platform)
+            ? store.getPreviousWorkCount(group, platform, matchAlertMeta)
             : 0;
         try {
           const data = await collectAccount({ partition, platform });
@@ -1983,11 +1989,16 @@ function registerDataStatsIpc(options = {}) {
             { works: data.works }
           );
           store.mergeWorks(group, platform, data.works, collectNow);
-          store.writeMeta(group, platform, {
-            lastCollectAt: collectNow,
-            lastError: "",
-            workCount: data.works.length,
-          });
+          store.writeMeta(
+            group,
+            platform,
+            {
+              lastCollectAt: collectNow,
+              lastError: "",
+              workCount: data.works.length,
+            },
+            matchAlertMeta
+          );
           markPartitionCollected(partition, collectNow, false);
           const byTitle = buildTitleIndex(data.works, normalizeStatusTitle);
           for (const t of groupTasks) {

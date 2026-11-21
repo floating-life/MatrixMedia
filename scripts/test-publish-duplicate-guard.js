@@ -967,6 +967,530 @@ process.exit(0);
   }
 }
 
+async function testS10Fix2_1_ArticleFirstPublishExcludesOwnRecord() {
+  // S10-fix2 #1：空发布历史执行 cli publish-article -p juejin --phone A组 -t 首篇文章 --content 正文内容
+  // 发布入口查重必须按记录 id 排除本次自己刚写入的 publishing 记录，进入上传并退出 0（修前匹配自身记录退出 3、历史记 failed）
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-s10-fix2-article-"));
+  const origLoad = Module._load;
+  const cliBundle = path.join(tmpDir, "cliArticle.cjs");
+  const pupBundle = path.join(tmpDir, "pupEntry.cjs");
+  const realUtilsPath = path.resolve(root, "src/main/server/utils.js");
+  delete require.cache[realUtilsPath];
+
+  await esbuild.build({
+    entryPoints: [path.join(root, "src/main/services/puppeteerFile.js")],
+    outfile: pupBundle,
+    bundle: true,
+    platform: "node",
+    format: "cjs",
+    external: [
+      "electron",
+      "puppeteer-core",
+      "puppeteer-extra",
+      "puppeteer-extra-plugin-stealth",
+      "puppeteer-in-electron",
+    ],
+  });
+
+  // 用真实 server/utils.js + 真实 checkPublishEntryDuplicate（拦截 doUpload 的上传器执行以验证查重闸门）
+  const pupRunnerStub = path.join(tmpDir, "pupRunnerStub.js");
+  fs.writeFileSync(
+    pupRunnerStub,
+    `const pupReal = require(${JSON.stringify(pupBundle)});
+     export const checkPublishEntryDuplicate = pupReal.checkPublishEntryDuplicate;
+     export const registerPublishDedupeBypass = pupReal.registerPublishDedupeBypass;
+     export function runPuppeteerTask(data, transport, onFinish) {
+       const dup = pupReal.checkPublishEntryDuplicate(data);
+       if (dup) {
+         transport.reply("puppeteerFile-done", {
+           ...data,
+           status: false,
+           duplicate: true,
+           publishStatus: "duplicate",
+           exitCode: 6,
+           message: dup.message,
+         });
+         if (onFinish) onFinish();
+         return;
+       }
+       transport.reply("puppeteerFile-done", {
+         ...data,
+         status: true,
+         message: "掘金文章上传成功",
+       });
+       if (onFinish) onFinish();
+     }`
+  );
+
+  await esbuild.build({
+    entryPoints: [path.join(root, "src/main/cli/index.js")],
+    outfile: cliBundle,
+    bundle: true,
+    platform: "node",
+    format: "cjs",
+    external: [
+      "electron",
+      "puppeteer-core",
+      "puppeteer-extra",
+      "puppeteer-extra-plugin-stealth",
+      "puppeteer-in-electron",
+      "xlsx",
+    ],
+    plugins: [
+      {
+        name: "wire-real-check-stub-upload",
+        setup(build) {
+          build.onResolve({ filter: /services\/puppeteerFile$/ }, () => ({
+            path: pupRunnerStub,
+          }));
+        },
+      },
+    ],
+  });
+
+  const xlsxModArt = require("xlsx");
+  Module._load = function (request, parent, isMain) {
+    if (request === "xlsx") return xlsxModArt;
+    if (request === "electron") {
+      return {
+        ipcMain: { on: () => {}, handle: () => {} },
+        app: {
+          getPath: () => tmpDir,
+          getVersion: () => "0.14.9-test",
+          on: () => {},
+          once: () => {},
+          commandLine: { getSwitchValue: () => "" },
+        },
+        BrowserWindow: function () {},
+        dialog: {},
+      };
+    }
+    if (request === "puppeteer-extra") {
+      return { addExtra: () => ({ use: () => {}, connect: () => {} }) };
+    }
+    if (request === "puppeteer-extra-plugin-stealth") {
+      return () => ({});
+    }
+    if (request.startsWith("puppeteer")) {
+      return { use: () => {}, connect: () => {} };
+    }
+    return origLoad.apply(this, arguments);
+  };
+
+  try {
+    const cliMod = require(cliBundle);
+    const { changeData } = require(realUtilsPath);
+    const out = [];
+    const err = [];
+    const origLog = console.log;
+    const origErr = console.error;
+    console.log = (...a) => out.push(a.join(" "));
+    console.error = (...a) => err.push(a.join(" "));
+    let code;
+    try {
+      code = await cliMod.runCliMain([
+        "node",
+        ".",
+        "cli",
+        "publish-article",
+        "-p",
+        "juejin",
+        "--phone",
+        "A组",
+        "-t",
+        "首篇文章",
+        "--content",
+        "正文内容",
+      ]);
+    } finally {
+      console.log = origLog;
+      console.error = origErr;
+    }
+    assert.strictEqual(
+      code,
+      0,
+      `S10-fix2 #1 空历史首发掘金文章应进入上传并退出 0，实际=${code}，err=${err.join(" | ")}`
+    );
+    const records = readPushDataRecords(changeData);
+    assert.strictEqual(records.length, 1);
+    assert.strictEqual(records[0].pt, "掘金");
+    assert.strictEqual(records[0].bt, "首篇文章");
+    assert.strictEqual(
+      records[0].publishStatus,
+      "success",
+      `S10-fix2 #1 历史记录状态应为 success，实际=${records[0].publishStatus}`
+    );
+
+    // 反向校验：若 pushData 中确实存在另一条（不同 id 的）7 天内同标题文章记录，仍应被查重拦截
+    const pupMod = require(pupBundle);
+    const dupHit = pupMod.checkPublishEntryDuplicate(
+      {
+        pt: "掘金",
+        phone: "A组",
+        partition: "persist:A组掘金",
+        textType: "article",
+        recordId: "new-article-id",
+        data: { title: "首篇文章" },
+      },
+      records
+    );
+    assert.ok(dupHit && dupHit.status === "duplicate", "已有另一条不同 id 的 7 天内文章记录时仍应拦截");
+
+    // LocalArticlePublish.vue 同样透传 recordId 且模板编译通过
+    const articleVueSrc = fs.readFileSync(
+      path.join(root, "src/renderer/components/LocalArticlePublish.vue"),
+      "utf8"
+    );
+    const sfc = compiler.parseComponent(articleVueSrc);
+    const compiled = compiler.compile(sfc.template.content);
+    assert.strictEqual(compiled.errors.length, 0);
+    assert.ok(articleVueSrc.includes("recordId: pendingRecordId"));
+
+    console.log("✓ 8. S10-fix2 #1 掘金文章首发按 recordId 排除自身记录并正常上传退出 0 验证通过");
+  } finally {
+    Module._load = origLoad;
+    delete require.cache[cliBundle];
+    delete require.cache[pupBundle];
+    delete require.cache[realUtilsPath];
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+async function testS10Fix2_2_ScheduledAllowDuplicatePersistedAcrossAllThreeChains() {
+  // S10-fix2 #2：同账号 1 小时前发过同标题，排期到 5 分钟后。
+  // CLI --allow-duplicate、HTTP allowDuplicate:true、GUI 点「仍然发布」三条链路均把 allowDuplicate:true 持久化到定时任务记录，
+  // 到点执行时（临时内存票据早已过期/不存在）均通过入口查重进入上传，不变成 failed。
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-s10-fix2-sched-"));
+  const origLoad = Module._load;
+  const videoFile = path.join(tmpDir, "sched.mp4");
+  fs.writeFileSync(videoFile, "video");
+  const cliBundle = path.join(tmpDir, "cliSched.cjs");
+  const schedBundle = path.join(tmpDir, "schedPub.cjs");
+  const pupBundle = path.join(tmpDir, "pupSched.cjs");
+  const realUtilsPath = path.resolve(root, "src/main/server/utils.js");
+  const realRoutePath = path.resolve(root, "src/main/server/routes/index.js");
+  delete require.cache[realUtilsPath];
+  delete require.cache[realRoutePath];
+
+  await esbuild.build({
+    entryPoints: [path.join(root, "src/main/services/puppeteerFile.js")],
+    outfile: pupBundle,
+    bundle: true,
+    platform: "node",
+    format: "cjs",
+    external: [
+      "electron",
+      "puppeteer-core",
+      "puppeteer-extra",
+      "puppeteer-extra-plugin-stealth",
+      "puppeteer-in-electron",
+    ],
+  });
+  await esbuild.build({
+    entryPoints: [path.join(root, "src/main/services/scheduledPublish.js")],
+    outfile: schedBundle,
+    bundle: true,
+    platform: "node",
+    format: "cjs",
+    external: [
+      "electron",
+      "puppeteer-core",
+      "puppeteer-extra",
+      "puppeteer-extra-plugin-stealth",
+      "puppeteer-in-electron",
+    ],
+  });
+  await esbuild.build({
+    entryPoints: [path.join(root, "src/main/cli/index.js")],
+    outfile: cliBundle,
+    bundle: true,
+    platform: "node",
+    format: "cjs",
+    external: [
+      "electron",
+      "puppeteer-core",
+      "puppeteer-extra",
+      "puppeteer-extra-plugin-stealth",
+      "puppeteer-in-electron",
+      "xlsx",
+    ],
+  });
+
+  const routesBundle = path.join(tmpDir, "routesSched.cjs");
+  const guardStub = path.join(tmpDir, "guardSchedStub.js");
+  fs.writeFileSync(guardStub, `module.exports = { isTrustedLocalRequest: () => true };`);
+  await esbuild.build({
+    entryPoints: [path.join(root, "src/main/server/routes/index.js")],
+    outfile: routesBundle,
+    bundle: true,
+    platform: "node",
+    format: "cjs",
+    external: [
+      "electron",
+      "express",
+      "puppeteer-core",
+      "puppeteer-extra",
+      "puppeteer-extra-plugin-stealth",
+      "puppeteer-in-electron",
+      "xlsx",
+    ],
+    plugins: [
+      {
+        name: "stub-http-sched-guard",
+        setup(build) {
+          build.onResolve({ filter: /^\.\.\/requestGuard$/ }, () => ({ path: guardStub }));
+        },
+      },
+    ],
+  });
+
+  const expressMod = require("express");
+  const xlsxMod2 = require("xlsx");
+  Module._load = function (request, parent, isMain) {
+    if (request === "express") return expressMod;
+    if (request === "xlsx") return xlsxMod2;
+    if (request === "electron") {
+      return {
+        ipcMain: { on: () => {}, handle: () => {} },
+        app: {
+          getPath: () => tmpDir,
+          getVersion: () => "0.14.9-test",
+          on: () => {},
+          once: () => {},
+          commandLine: { getSwitchValue: () => "" },
+        },
+        BrowserWindow: function () {},
+        dialog: {},
+      };
+    }
+    if (request === "puppeteer-extra") {
+      return { addExtra: () => ({ use: () => {}, connect: () => {} }) };
+    }
+    if (request === "puppeteer-extra-plugin-stealth") {
+      return () => ({});
+    }
+    if (request.startsWith("puppeteer")) {
+      return { use: () => {}, connect: () => {} };
+    }
+    return origLoad.apply(this, arguments);
+  };
+
+  function formatLocalYmdHms(ms) {
+    const d = new Date(ms);
+    const p = (n) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  }
+
+  try {
+    const { changeData } = require(realUtilsPath);
+    const cliMod = require(cliBundle);
+    const schedMod = require(schedBundle);
+    const pupMod = require(pupBundle);
+    const now = Date.now();
+    const todayKey = new Date(now + 8 * 3600000).toISOString().slice(0, 10);
+
+    // 预置同账号 1 小时前已成功发布的同标题记录
+    changeData({
+      fileName: "pushData",
+      type: "add",
+      item: {
+        pt: "抖音",
+        phone: "A组",
+        partition: "persist:A组抖音",
+        textType: "local",
+        textOtherName: "sched",
+        selectedFile: "sched.mp4",
+        bt: "定时重复标题",
+        title: "定时重复标题",
+        publishStatus: "success",
+        publishSuccessCount: 1,
+        lastPublishAt: now - 3600 * 1000,
+        date: todayKey,
+      },
+    });
+
+    const fireAt1 = now + 5 * 60 * 1000;
+    const fireAt2 = now + 6 * 60 * 1000;
+    const fireAt3 = now + 7 * 60 * 1000;
+
+    // 链路 1：CLI --allow-duplicate + --publish-at
+    const cliLogs = [];
+    const origLog = console.log;
+    console.log = (...a) => cliLogs.push(a.join(" "));
+    let cliCode;
+    try {
+      cliCode = await cliMod.runCliMain([
+        "node",
+        ".",
+        "cli",
+        "publish",
+        "-p",
+        "dy",
+        "--phone",
+        "A组",
+        "-f",
+        videoFile,
+        "-t",
+        "定时重复标题",
+        "--publish-at",
+        formatLocalYmdHms(fireAt1),
+        "--allow-duplicate",
+      ]);
+    } finally {
+      console.log = origLog;
+    }
+    assert.strictEqual(cliCode, 0, `CLI --allow-duplicate 定时排期应成功退出 0，实际=${cliCode}`);
+    const cliOut = JSON.parse(cliLogs[cliLogs.length - 1]);
+    assert.strictEqual(cliOut.scheduled, true);
+
+    // 链路 2：HTTP POST /publish 传 allowDuplicate: true + publishAt（真实路由 + 真实 publishVideo + 真实 createScheduledRecord）
+    const router = require(routesBundle);
+    const publishLayer = router.stack.find((l) => l.route && l.route.path === "/publish");
+    assert.ok(publishLayer && publishLayer.route.stack.length > 0);
+    const httpHandler = publishLayer.route.stack[0].handle;
+    const httpRes = await new Promise((resolve, reject) => {
+      const req = {
+        method: "POST",
+        headers: { origin: "http://localhost:8080" },
+        body: {
+          platform: "dy",
+          phone: "A组",
+          file: videoFile,
+          title: "定时重复标题",
+          publishAt: formatLocalYmdHms(fireAt2),
+          allowDuplicate: true,
+        },
+      };
+      const res = {
+        statusCode: 200,
+        status(code) {
+          this.statusCode = code;
+          return this;
+        },
+        json(payload) {
+          resolve({ statusCode: this.statusCode, body: payload });
+        },
+      };
+      Promise.resolve(httpHandler(req, res)).catch(reject);
+    });
+    assert.strictEqual(httpRes.statusCode, 200);
+    assert.strictEqual(httpRes.body.success, true, `HTTP allowDuplicate 定时创建应成功: ${JSON.stringify(httpRes.body)}`);
+    assert.strictEqual(httpRes.body.scheduled, true);
+
+    // 链路 3：GUI 确认「仍然发布」后写入定时任务记录
+    const vueSrc = fs.readFileSync(
+      path.join(root, "src/renderer/components/LocalVideoPublish.vue"),
+      "utf8"
+    );
+    assert.ok(
+      vueSrc.includes("dupDecision.allowDuplicate ? { allowDuplicate: true }") &&
+        vueSrc.includes("dirDupDecision.allowDuplicate ? { allowDuplicate: true }"),
+      "GUI 单视频与目录批量定时任务在用户点击「仍然发布」后必须持久化 allowDuplicate: true"
+    );
+    changeData({
+      fileName: "pushData",
+      type: "add",
+      item: {
+        pt: "抖音",
+        phone: "A组",
+        partition: "persist:A组抖音",
+        textType: "local",
+        textOtherName: "sched",
+        selectedFile: "sched.mp4",
+        bt: "定时重复标题",
+        title: "定时重复标题",
+        filePath: videoFile,
+        date: todayKey,
+        scheduledTask: true,
+        allowDuplicate: true,
+        scheduledPublishAt: fireAt3,
+        scheduledPublishAtText: formatLocalYmdHms(fireAt3),
+        publishStatus: "scheduled",
+        lastPublishMessage: "等待定时发布",
+        lastPublishAt: now,
+      },
+    });
+
+    // 验证落盘的三条定时任务记录均带有 allowDuplicate: true
+    const allRecords = readPushDataRecords(changeData);
+    const schedRecords = allRecords.filter((r) => r.scheduledTask === true);
+    assert.strictEqual(schedRecords.length, 3, `应落盘 3 条定时记录，实际=${schedRecords.length}`);
+    for (const rec of schedRecords) {
+      assert.strictEqual(
+        rec.allowDuplicate,
+        true,
+        `定时记录 id=${rec.id} 必须持久化 allowDuplicate: true`
+      );
+    }
+
+    // 模拟 5 分钟后到点执行（且跳过任何内存票据 skipBypass: true）：三条均应通过入口查重
+    for (const rec of schedRecords) {
+      const payload = schedMod.buildTaskPayloadFromRecord(rec);
+      assert.strictEqual(payload.allowDuplicate, true, "buildTaskPayloadFromRecord 必须读取 allowDuplicate: true");
+      assert.strictEqual(payload.recordId, rec.id, "buildTaskPayloadFromRecord 必须带上 recordId");
+      // 模拟 scheduledPublish 将自身状态改为 publishing 后调用入口查重
+      const snapshotAtFire = allRecords.map((r) =>
+        r.id === rec.id
+          ? { ...r, publishStatus: "publishing", lastPublishMessage: "定时任务开始发布", lastPublishAt: fireAt1 }
+          : r
+      );
+      const dupHit = pupMod.checkPublishEntryDuplicate(payload, snapshotAtFire, {
+        now: fireAt1 + 20000,
+        skipBypass: true,
+      });
+      assert.strictEqual(
+        dupHit,
+        null,
+        `S10-fix2 #2 放行的定时任务 id=${rec.id} 到点执行不得被拦截，实际=${JSON.stringify(dupHit)}`
+      );
+    }
+
+    // 反向校验：未放行（无 allowDuplicate）的定时任务排除自身 recordId，但若存在其它 7 天内记录仍被拦截
+    const normalSchedRec = schedMod.createScheduledRecord(
+      {
+        id: "sched-no-bypass",
+        pt: "抖音",
+        phone: "A组",
+        partition: "persist:A组抖音",
+        textType: "local",
+        textOtherName: "fresh",
+        selectedFile: "fresh.mp4",
+        bt: "全新定时标题",
+        title: "全新定时标题",
+        filePath: videoFile,
+        date: todayKey,
+      },
+      formatLocalYmdHms(fireAt1),
+      now
+    );
+    assert.strictEqual(normalSchedRec.allowDuplicate, undefined);
+    const normalPayload = schedMod.buildTaskPayloadFromRecord(normalSchedRec);
+    assert.strictEqual(normalPayload.recordId, "sched-no-bypass");
+    const ownPublishingOnly = [
+      { ...normalSchedRec, publishStatus: "publishing", lastPublishAt: fireAt1 },
+    ];
+    assert.strictEqual(
+      pupMod.checkPublishEntryDuplicate(normalPayload, ownPublishingOnly, {
+        now: fireAt1 + 20000,
+        skipBypass: true,
+      }),
+      null,
+      "未放行定时任务应按 recordId 排除自身 publishing 记录（即使超过 10 秒）"
+    );
+
+    console.log("✓ 9. S10-fix2 #2 CLI/HTTP/GUI 三条链路定时发布持久化 allowDuplicate 到点放行验证通过");
+  } finally {
+    Module._load = origLoad;
+    delete require.cache[cliBundle];
+    delete require.cache[schedBundle];
+    delete require.cache[pupBundle];
+    delete require.cache[routesBundle];
+    delete require.cache[realUtilsPath];
+    delete require.cache[realRoutePath];
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
 async function main() {
   testPureDedupeRules();
   await testHttpPublishRouteDedupe();
@@ -974,6 +1498,8 @@ async function main() {
   testGuiLocalVideoPublishCheck();
   testRealDiskPushDataAndGuiCheck();
   await testMcpPublishVideoDuplicateHandling();
+  await testS10Fix2_1_ArticleFirstPublishExcludesOwnRecord();
+  await testS10Fix2_2_ScheduledAllowDuplicatePersistedAcrossAllThreeChains();
   console.log("\ntest-publish-duplicate-guard: 全部断言通过");
 }
 

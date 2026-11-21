@@ -183,7 +183,7 @@ async function runStatsSyncWithAlerts(opts, deps = {}) {
   const alertMeta = { partition: resolvedPartition, phone: opts.phone };
   const prevWorkCount =
     typeof storeApi.getPreviousWorkCount === "function"
-      ? storeApi.getPreviousWorkCount(opts.phone, opts.platform)
+      ? storeApi.getPreviousWorkCount(opts.phone, opts.platform, alertMeta)
       : 0;
   try {
     const data = await collectorFn({
@@ -238,11 +238,16 @@ async function runStatsSyncWithAlerts(opts, deps = {}) {
       works: data.works,
     });
     storeApi.mergeWorks(opts.phone, opts.platform, data.works, collectNow);
-    storeApi.writeMeta(opts.phone, opts.platform, {
-      lastCollectAt: collectNow,
-      lastError: "",
-      workCount: data.works.length,
-    });
+    storeApi.writeMeta(
+      opts.phone,
+      opts.platform,
+      {
+        lastCollectAt: collectNow,
+        lastError: "",
+        workCount: data.works.length,
+      },
+      alertMeta
+    );
     storeApi.appendCollectLog({
       startedAt,
       finishedAt: Date.now(),
@@ -510,7 +515,7 @@ async function runBatchDirPublish(v, cfg) {
       if (hashtagPlatforms.has(v.platform)) {
         bq = tagList.map((t) => (t.startsWith("#") ? t : "#" + t)).join(" ");
       } else {
-        bq = tagList.join(" ");
+        bq = tagList.join(",");
       }
     }
 
@@ -657,6 +662,9 @@ async function runBatchDirPublish(v, cfg) {
         "MatrixMedia: 写入 pushData 初始记录失败 [" + row.fileName + "]:",
         e && e.message
       );
+    }
+    if (recordId != null) {
+      taskPayload.recordId = recordId;
     }
 
     const updateRecord = (status, message) => {
@@ -925,12 +933,19 @@ export async function runCliMain(argv = process.argv) {
         return DUPLICATE_EXIT_CODE;
       }
     }
-    registerPublishDedupeBypass({
-      pt: v.platform,
-      phone: v.phone || derivePhoneForRecord({ ...v, partition: resolvedPartition }),
-      partition: resolvedPartition,
-      title: candTitle,
-    });
+    if (allowDuplicate) {
+      v.allowDuplicate = true;
+      v.publishOptions = { ...(v.publishOptions || {}), allowDuplicate: true };
+    }
+    // 仅即时发布使用短期票据防止 publishVideo 自撞；定时发布依赖持久化的 allowDuplicate/recordId
+    if (!v.publishAt) {
+      registerPublishDedupeBypass({
+        pt: v.platform,
+        phone: v.phone || derivePhoneForRecord({ ...v, partition: resolvedPartition }),
+        partition: resolvedPartition,
+        title: candTitle,
+      });
+    }
 
     const result = await runSingleFilePublish(v);
     if (result.scheduled) {
@@ -1154,6 +1169,9 @@ export async function runCliMain(argv = process.argv) {
         "MatrixMedia: 写入文章 pushData 初始记录失败:",
         e && e.message
       );
+    }
+    if (recordId != null) {
+      taskPayload.recordId = recordId;
     }
 
     const updateRecord = (status, message) => {

@@ -699,10 +699,17 @@ export default {
           continue;
         }
 
+        const republishRecord = this.findRepublishRecord(p.pt, p);
+        const pendingRecordId =
+          republishRecord && republishRecord.id
+            ? republishRecord.id
+            : `${Date.now()}${Math.floor(Math.random() * 1000)}`;
+
         // JSON 兜底序列化，避免 Vue 响应式代理 / 不可克隆对象触发 IPC 错误
         ipcRenderer.send("puppeteerFile", JSON.parse(JSON.stringify({
           ...p,
           taskId,
+          recordId: pendingRecordId,
           ...article,
           publishMode: "publish",
           url: this.ptConfig[p.pt].upload,
@@ -713,7 +720,6 @@ export default {
           date: currentDate,
         })));
 
-        const republishRecord = this.findRepublishRecord(p.pt, p);
         if (republishRecord && republishRecord.id && republishRecord.date) {
           const oldAttempt = Number(republishRecord.publishAttemptCount) || 1;
           let oldRepublish = Number(republishRecord.republishCount);
@@ -750,7 +756,9 @@ export default {
           dataRequest({
             type: "add",
             fileName: "pushData",
-            item: this.buildPushRecord(article, p, partition, currentDate),
+            item: this.buildPushRecord(article, p, partition, currentDate, {
+              id: pendingRecordId,
+            }),
           });
         }
       }

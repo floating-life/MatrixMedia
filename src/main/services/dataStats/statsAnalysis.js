@@ -726,12 +726,19 @@ function buildWorkDailyPlaySumMap(seriesByWork) {
       if (rawP !== null && rawP > 0) {
         effectiveP = rawP;
         lastPosPlay = rawP;
-      } else if (rawP === null && lastPosPlay !== null && lastPosPlay > 0) {
-        // 作品级当日播放因假 0 / 采集异常被置空时，沿用其上一次有效正播放，
+      } else if (
+        (rawP === null || rawP === 0) &&
+        lastPosPlay !== null &&
+        lastPosPlay > 0
+      ) {
+        // 作品级当日播放因假 0 / 采集异常被置空或回退为 0 时，沿用其上一次有效正播放，
         // 避免误判为「作品级同步下降」而放过账号总播放骤降异常。
         effectiveP = lastPosPlay;
+      } else if (rawP === 0) {
+        // 历史从未有正播放、持续为 0 的作品属于有效 0 观测，必须计入当日作品总和（使当日和为 0 而非缺失）
+        effectiveP = 0;
       }
-      if (effectiveP === null || effectiveP <= 0) continue;
+      if (effectiveP === null) continue;
       const dn = series.dayNums[i];
       const grp = series.groups[i] || series.group || "";
       const pgKey = `${series.platform}|${grp}\0${dn}`;

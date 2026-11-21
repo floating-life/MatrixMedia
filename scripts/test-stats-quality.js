@@ -1253,6 +1253,401 @@ async function testS10Fix5_AlertIsolationAdapterErrorsLoginSignalAndNotifyRetry(
   console.log("✓ S10-fix #5 多账号隔离、一轮计一次、适配器报错/502 分类与通知失败重试验证通过");
 }
 
+/* ---------- S10-fix2 #4：同组新空号只与自己历史比较，从未有作品返回空列表不算失败 ---------- */
+async function testS10Fix2_4_EmptyNewAccountInSameGroupNoFalseAlert() {
+  const tmpUserData = createTempUserData("mm-s10-fix2-4-");
+  let roundPlan = null;
+  const env = loadWithMockElectron(tmpUserData, {
+    collectAccountImpl: async ({ partition, platform }) => {
+      const fn = roundPlan && roundPlan[partition];
+      if (!fn) throw new Error(`unexpected partition: ${partition}`);
+      return fn(platform);
+    },
+  });
+  try {
+    const { store, notifications, ipcHandlers } = env;
+    const { registerDataStatsIpc } = require("../src/main/services/dataStats/index.js");
+    registerDataStatsIpc();
+    const collectHandler = ipcHandlers.get("stats:collect");
+
+    const accA = { group: "同组", platform: "抖音", accountKey: "accA", partition: "persist:accA抖音" };
+    const accB = { group: "同组", platform: "抖音", accountKey: "accB", partition: "persist:accB抖音" };
+
+    roundPlan = {
+      "persist:accA抖音": async () => ({
+        overview: { fans: 100, plays: 500 },
+        fansHistory: [],
+        works: [{ workId: "WA1", title: "账号A视频", publishTime: Date.now() - 86400000, play: 500 }],
+      }),
+      "persist:accB抖音": async () => ({
+        overview: { fans: 0, plays: 0 },
+        fansHistory: [],
+        works: [],
+      }),
+    };
+
+    // 连续两轮：A 每轮正常返回 1 条作品，B 从未发过作品每轮正常返回空列表
+    for (let round = 1; round <= 2; round++) {
+      const res = await collectHandler({}, { accounts: [accA, accB] });
+      assert.strictEqual(res.results.length, 2);
+      assert.strictEqual(res.results[0].success, true, `第 ${round} 轮 A 应成功`);
+      assert.strictEqual(res.results[1].success, true, `S10-fix2 #4 第 ${round} 轮新空号 B 返回空列表不得算失败`);
+      assert.strictEqual(
+        store.getAccountCollectFailureState("同组", "抖音", accB),
+        null,
+        `S10-fix2 #4 第 ${round} 轮不得给 B 持久化失败记录`
+      );
+      assert.strictEqual(notifications.length, 0, "S10-fix2 #4 新空号 B 不得触发系统通知");
+    }
+
+    // 第 3 轮：已有作品的 A 突然返回空列表 -> 仅 A 判空作品异常，B 仍成功
+    roundPlan["persist:accA抖音"] = async () => ({
+      overview: { fans: 100, plays: 0 },
+      fansHistory: [],
+      works: [],
+    });
+    const res3 = await collectHandler({}, { accounts: [accA, accB] });
+    assert.strictEqual(res3.results[0].success, false, "已有作品的 A 返回空列表仍应判异常");
+    assert.strictEqual(res3.results[0].zeroWorksAnomaly, true);
+    assert.strictEqual(res3.results[1].success, true, "从未有作品的 B 返回空列表仍应成功");
+    assert.strictEqual(store.getAccountCollectFailureState("同组", "抖音", accB), null);
+    assert.strictEqual(store.getAccountCollectFailureState("同组", "抖音", accA).consecutiveFailures, 1);
+
+    console.log("✓ S10-fix2 #4 同组新空号只与自身历史比较且不误触发告警验证通过");
+  } finally {
+    env.restore();
+    fs.rmSync(tmpUserData, { recursive: true, force: true });
+  }
+}
+
+/* ---------- S10-fix2 #5：旧版按分组归键告警读入迁移（单账号直接映射；多账号任一成功即清除） ---------- */
+async function testS10Fix2_5_LegacyGroupAlertMigrationAndClear() {
+  const tmpUserData = createTempUserData("mm-s10-fix2-5-");
+  const env = loadWithMockElectron(tmpUserData);
+  try {
+    const { store, collectAlert } = env;
+    const { handleAccountCollectOutcome } = collectAlert;
+    const t0 = Date.parse("2026-11-20T10:00:00+08:00");
+
+    // 写入磁盘账号记录：
+    // 1) 「旧分组」下仅有一个抖音账号「账号甲」
+    // 2) 「旧多号组」下有两个抖音账号「账号甲」「账号乙」
+    const accountDir = path.join(tmpUserData, "MatrixMedia", "data", "account");
+    fs.mkdirSync(accountDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(accountDir, "2026-11-20.json"),
+      JSON.stringify([
+        {
+          id: "a1",
+          phone: "旧分组-账号甲",
+          pt: "抖音",
+          group: "旧分组",
+          accountName: "账号甲",
+          accountKey: "账号甲",
+          createTime: t0,
+        },
+        {
+          id: "a2",
+          phone: "旧多号组-账号甲",
+          pt: "抖音",
+          group: "旧多号组",
+          accountName: "账号甲",
+          accountKey: "账号甲",
+          createTime: t0,
+        },
+        {
+          id: "a3",
+          phone: "旧多号组-账号乙",
+          pt: "抖音",
+          group: "旧多号组",
+          accountName: "账号乙",
+          accountKey: "账号乙",
+          createTime: t0,
+        },
+      ])
+    );
+
+    // 按父提交 ab0aa69 格式写入 collect-alerts.json（无 accountKey / partition / accountName / key）
+    fs.mkdirSync(path.dirname(store.collectAlertsFile()), { recursive: true });
+    fs.writeFileSync(
+      store.collectAlertsFile(),
+      JSON.stringify({
+        version: 1,
+        updatedAt: t0 + 60000,
+        accounts: {
+          "旧分组|抖音": {
+            group: "旧分组",
+            platform: "抖音",
+            account: "旧分组·抖音",
+            reason: "登录态已失效，请重新扫码",
+            isLoginError: true,
+            firstFailedAt: t0,
+            lastFailedAt: t0 + 60000,
+            consecutiveFailures: 2,
+            alerted: true,
+            notified: true,
+            notifiedAt: t0 + 60000,
+          },
+          "旧多号组|抖音": {
+            group: "旧多号组",
+            platform: "抖音",
+            account: "旧多号组·抖音",
+            reason: "采集接口超时",
+            isLoginError: false,
+            firstFailedAt: t0,
+            lastFailedAt: t0 + 60000,
+            consecutiveFailures: 2,
+            alerted: true,
+            notified: true,
+            notifiedAt: t0 + 60000,
+          },
+        },
+      })
+    );
+
+    // 5a: 读入时单账号旧分组直接映射到账号键「抖音|账号甲」
+    const migratedDoc = store.readCollectAlerts();
+    assert.ok(
+      migratedDoc.accounts["抖音|账号甲"],
+      "S10-fix2 #5a 组内单账号旧告警应直接迁移到账号键 抖音|账号甲"
+    );
+    assert.strictEqual(migratedDoc.accounts["抖音|账号甲"].accountKey, "账号甲");
+    assert.strictEqual(migratedDoc.accounts["抖音|账号甲"].partition, "persist:账号甲抖音");
+    assert.strictEqual(migratedDoc.accounts["抖音|旧分组"], undefined);
+
+    // 账号甲采集成功后清除告警，红标消失
+    const okSingle = handleAccountCollectOutcome({
+      group: "旧分组",
+      platform: "抖音",
+      accountKey: "账号甲",
+      partition: "persist:账号甲抖音",
+      success: true,
+      works: [{ workId: "W_OLD1", title: "恢复视频", play: 100 }],
+      now: t0 + 120000,
+    });
+    assert.strictEqual(okSingle.ok, true);
+    assert.strictEqual(
+      store.readAccount("旧分组", "抖音").collectAlert,
+      null,
+      "S10-fix2 #5a 账号甲恢复成功后旧告警红标必须清除"
+    );
+    assert.strictEqual(
+      store.readOverview().collectAlerts.filter((a) => a.group === "旧分组").length,
+      0
+    );
+
+    // 5b: 多账号旧分组条目保留 legacyGroupScoped，任一账号成功即清除
+    const multiEntry = store.readCollectAlerts().accounts["抖音|旧多号组"];
+    assert.ok(multiEntry && multiEntry.legacyGroupScoped === true && multiEntry.alerted === true);
+
+    const okMulti = handleAccountCollectOutcome({
+      group: "旧多号组",
+      platform: "抖音",
+      accountKey: "账号甲",
+      partition: "persist:账号甲抖音",
+      success: true,
+      works: [{ workId: "W_MULTI1", title: "多号恢复", play: 200 }],
+      now: t0 + 180000,
+    });
+    assert.strictEqual(okMulti.ok, true);
+    assert.strictEqual(
+      store.readAccount("旧多号组", "抖音").collectAlert,
+      null,
+      "S10-fix2 #5b 多账号旧告警在任一账号成功后必须清除"
+    );
+    assert.strictEqual(store.listActiveCollectAlerts().length, 0);
+
+    console.log("✓ S10-fix2 #5 旧版分组告警迁移（单账号映射 + 多账号任一成功清除）验证通过");
+  } finally {
+    env.restore();
+    fs.rmSync(tmpUserData, { recursive: true, force: true });
+  }
+}
+
+/* ---------- S10-fix2 #6：真实归零（爆款下架 + 其余作品为有效 0）不判异常，Excel 正常导出 0 / -50000 ---------- */
+function testS10Fix2_6_RealDropToZeroNotMarkedAnomaly() {
+  const tmpUserData = createTempUserData("mm-s10-fix2-6-");
+  const env = loadWithMockElectron(tmpUserData);
+  try {
+    const { store } = env;
+    const tDay1 = Date.parse("2026-11-19T10:00:00+08:00");
+    const tDay2 = Date.parse("2026-11-20T10:00:00+08:00");
+
+    // 评审输入：快手一条 50,000 播放的作品下架，仍在架的另一条作品一直是 0 播放，账号总播放由 50000 变为 0
+    store.mergeDaily("快手组", "快手", { fans: 100, plays: 50000 }, [], tDay1, {
+      works: [
+        { workId: "KS_BIG", title: "爆款视频", publishTime: tDay1 - 86400000, play: 50000 },
+        { workId: "KS_ZERO", title: "零播视频", publishTime: tDay1 - 86400000, play: 0 },
+      ],
+    });
+    store.mergeWorks(
+      "快手组",
+      "快手",
+      [
+        { workId: "KS_BIG", title: "爆款视频", publishTime: tDay1 - 86400000, play: 50000 },
+        { workId: "KS_ZERO", title: "零播视频", publishTime: tDay1 - 86400000, play: 0 },
+      ],
+      tDay1
+    );
+
+    // 次日 KS_BIG 下架，只剩 KS_ZERO（一直是 0 播放），账号总播放 0
+    store.mergeDaily("快手组", "快手", { fans: 100, plays: 0 }, [], tDay2, {
+      works: [{ workId: "KS_ZERO", title: "零播视频", publishTime: tDay1 - 86400000, play: 0 }],
+    });
+    store.mergeWorks(
+      "快手组",
+      "快手",
+      [{ workId: "KS_ZERO", title: "零播视频", publishTime: tDay1 - 86400000, play: 0 }],
+      tDay2
+    );
+
+    const ksDaily = store.readDaily("快手组", "快手");
+    assert.strictEqual(ksDaily["2026-11-20"].plays, 0, "采集落盘应正确保存真实归零 plays=0");
+    assert.ok(!ksDaily["2026-11-20"].playsAnomaly, "采集落盘不应标 playsAnomaly");
+
+    const wb = withStubElectron(({ buildStatsWorkbookData }) =>
+      buildStatsWorkbookData(
+        { from: "2026-11-19", to: "2026-11-20", now: tDay2 },
+        {
+          listAccounts: () => [{ group: "快手组", platform: "快手", meta: {} }],
+          readDaily: (g, p) => store.readDaily(g, p),
+          readWorks: (g, p) => store.readWorks(g, p),
+          readWorksDaily: (g, p) => store.readWorksDaily(g, p),
+          readWorksIntraday: (g, p, r) => store.readWorksIntraday(g, p, r),
+          readPushRecords: () => [],
+          readLinkOverrides: () => ({ version: 1, updatedAt: 0, contents: {}, excludedAuto: {}, overrides: {} }),
+        }
+      )
+    );
+    assert.strictEqual(
+      wb.analysis.anomalies.collectionAnomalies.filter((a) => a.scope === "account").length,
+      0,
+      "S10-fix2 #6 作品下架导致真实归零不得判为账号总播放异常"
+    );
+    const snapRows = wb.sheets["账号日快照"].slice(1);
+    const day2Row = snapRows.find((r) => r[0] === "2026-11-20" && r[1] === "快手");
+    assert.strictEqual(day2Row[4], 0, `S10-fix2 #6 账号日快照总播放应导出 0，实际=${day2Row[4]}`);
+    assert.strictEqual(day2Row[10], -50000, `S10-fix2 #6 账号日快照播放日增应导出 -50000，实际=${day2Row[10]}`);
+    assert.strictEqual(day2Row[11], null, `S10-fix2 #6 真实归零异常标注应为空，实际=${day2Row[11]}`);
+
+    console.log("✓ S10-fix2 #6 作品下架+有效0作品真实归零不判异常且导出 0 / -50000 验证通过");
+  } finally {
+    env.restore();
+    fs.rmSync(tmpUserData, { recursive: true, force: true });
+  }
+}
+
+/* ---------- S10-fix2 #7：整时段所有成员作品播放缺失时该点留空（null），不伪造为零增长 ---------- */
+function testS10Fix2_7_AllWorksMissingIntradaySlotIsNull() {
+  const tYest = Date.parse("2026-11-19T10:00:00+08:00");
+  const t10 = Date.parse("2026-11-20T10:00:00+08:00");
+  const t14 = Date.parse("2026-11-20T14:00:00+08:00");
+  const t16 = Date.parse("2026-11-20T16:00:00+08:00");
+
+  // 评审输入：同一内容下两条作品 10:00 分别为 10000、100，14:00 均遇到假 0（存储为 null）
+  const seriesAllNull = withStubElectron(({ buildContentIntradayData }) =>
+    buildContentIntradayData(
+      { contentKey: "manual:intraday_all_null", date: "2026-11-20", days: 3, now: t16 },
+      {
+        listAccounts: () => [{ group: "主组", platform: "抖音", meta: {} }],
+        readDaily: () => ({ "2026-11-20": { fans: 100, plays: 10100 } }),
+        readWorks: () => ({
+          works: [
+            { workId: "AM1", title: "作品1", publishTime: tYest },
+            { workId: "AM2", title: "作品2", publishTime: tYest },
+          ],
+        }),
+        readWorksDaily: () => ({
+          AM1: { "2026-11-20": { play: 10000, like: 10 } },
+          AM2: { "2026-11-20": { play: 100, like: 2 } },
+        }),
+        readWorksIntraday: () => ({
+          AM1: [
+            { date: "2026-11-20", slot: "10:00", collectedAt: t10, play: 10000 },
+            { date: "2026-11-20", slot: "14:00", collectedAt: t14, play: null },
+          ],
+          AM2: [
+            { date: "2026-11-20", slot: "10:00", collectedAt: t10, play: 100 },
+            { date: "2026-11-20", slot: "14:00", collectedAt: t14, play: null },
+          ],
+        }),
+        readPushRecords: () => [],
+        readLinkOverrides: () => ({
+          version: 1,
+          updatedAt: tYest,
+          contents: { "manual:intraday_all_null": { title: "整时段缺失测试", createdAt: tYest } },
+          excludedAuto: {},
+          overrides: {
+            "抖音|AM1": { action: "assign", contentKey: "manual:intraday_all_null" },
+            "抖音|AM2": { action: "assign", contentKey: "manual:intraday_all_null" },
+          },
+        }),
+      }
+    )
+  );
+  assert.strictEqual(seriesAllNull.found, true);
+  const dy = seriesAllNull.platforms.find((p) => p.platform === "抖音");
+  assert.deepStrictEqual(
+    dy.play,
+    [10100, null],
+    `S10-fix2 #7 14:00 全员缺失应留空 null，实际=${JSON.stringify(dy.play)}`
+  );
+  assert.deepStrictEqual(
+    dy.playDelta,
+    [null, null],
+    `S10-fix2 #7 14:00 全员缺失增量应为 null（不为 0），实际=${JSON.stringify(dy.playDelta)}`
+  );
+  assert.deepStrictEqual(seriesAllNull.totalPlay, [10100, null]);
+  assert.deepStrictEqual(seriesAllNull.totalPlayDelta, [null, null]);
+
+  // 同时覆盖 14:00 两条均为未置空的假 0（0 after positive）同样留空
+  const seriesAllFalseZero = withStubElectron(({ buildContentIntradayData }) =>
+    buildContentIntradayData(
+      { contentKey: "manual:intraday_all_fz", date: "2026-11-20", days: 3, now: t16 },
+      {
+        listAccounts: () => [{ group: "主组", platform: "抖音", meta: {} }],
+        readDaily: () => ({ "2026-11-20": { fans: 100, plays: 10100 } }),
+        readWorks: () => ({
+          works: [
+            { workId: "FZ1", title: "作品1", publishTime: tYest },
+            { workId: "FZ2", title: "作品2", publishTime: tYest },
+          ],
+        }),
+        readWorksDaily: () => ({
+          FZ1: { "2026-11-20": { play: 10000, like: 10 } },
+          FZ2: { "2026-11-20": { play: 100, like: 2 } },
+        }),
+        readWorksIntraday: () => ({
+          FZ1: [
+            { date: "2026-11-20", slot: "10:00", collectedAt: t10, play: 10000 },
+            { date: "2026-11-20", slot: "14:00", collectedAt: t14, play: 0 },
+          ],
+          FZ2: [
+            { date: "2026-11-20", slot: "10:00", collectedAt: t10, play: 100 },
+            { date: "2026-11-20", slot: "14:00", collectedAt: t14, play: 0 },
+          ],
+        }),
+        readPushRecords: () => [],
+        readLinkOverrides: () => ({
+          version: 1,
+          updatedAt: tYest,
+          contents: { "manual:intraday_all_fz": { title: "整时段假0测试", createdAt: tYest } },
+          excludedAuto: {},
+          overrides: {
+            "抖音|FZ1": { action: "assign", contentKey: "manual:intraday_all_fz" },
+            "抖音|FZ2": { action: "assign", contentKey: "manual:intraday_all_fz" },
+          },
+        }),
+      }
+    )
+  );
+  const dyFz = seriesAllFalseZero.platforms.find((p) => p.platform === "抖音");
+  assert.deepStrictEqual(dyFz.play, [10100, null]);
+  assert.deepStrictEqual(dyFz.playDelta, [null, null]);
+
+  console.log("✓ S10-fix2 #7 整时段全员缺失留空 null、部分缺失沿用有效值验证通过");
+}
+
 async function main() {
   testS10Item2_WeightedEngagementAndFavorite();
   testS10Fix2_WeightedDenominatorAndZeroPlayExclusion();
@@ -1261,6 +1656,10 @@ async function main() {
   testS10Fix4_AccountAnomalyLinkageSameDayIntradayAndLegacyExport();
   await testS10Item5_CollectFailureAlerts();
   await testS10Fix5_AlertIsolationAdapterErrorsLoginSignalAndNotifyRetry();
+  await testS10Fix2_4_EmptyNewAccountInSameGroupNoFalseAlert();
+  await testS10Fix2_5_LegacyGroupAlertMigrationAndClear();
+  testS10Fix2_6_RealDropToZeroNotMarkedAnomaly();
+  testS10Fix2_7_AllWorksMissingIntradaySlotIsNull();
   console.log("\ntest-stats-quality: 全部断言通过");
 }
 

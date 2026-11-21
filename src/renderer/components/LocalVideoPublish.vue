@@ -1130,7 +1130,7 @@ export default {
         !ipcRenderer ||
         typeof ipcRenderer.invoke !== "function"
       ) {
-        return { proceed: true, allowDuplicate: true };
+        return { proceed: true, allowDuplicate: false };
       }
       let duplicates = [];
       try {
@@ -1139,10 +1139,10 @@ export default {
         });
         duplicates = res && Array.isArray(res.duplicates) ? res.duplicates : [];
       } catch (_) {
-        return { proceed: true, allowDuplicate: true };
+        return { proceed: true, allowDuplicate: false };
       }
       if (!duplicates.length) {
-        return { proceed: true, allowDuplicate: true };
+        return { proceed: true, allowDuplicate: false };
       }
       const lines = duplicates
         .slice(0, 6)
@@ -2047,6 +2047,7 @@ export default {
                 uploadUrl: this.ptConfig[p.pt].upload,
                 date: currentDate,
                 scheduledTask: true,
+                ...(dupDecision.allowDuplicate ? { allowDuplicate: true } : {}),
                 scheduledPublishAt: scheduledAtMs,
                 scheduledPublishAtText: scheduledAtText,
                 useRealBrowser: Boolean(p.useRealBrowser),
@@ -2501,7 +2502,7 @@ export default {
               .map((t) => (t.startsWith("#") ? t : "#" + t))
               .join(" ");
           } else {
-            bq = tagList.map((t) => t.replace(/^#/, "")).join(" ");
+            bq = tagList.map((t) => t.replace(/^#/, "")).join(",");
           }
           const metadata = normalizeVideoMetadata(
             {
@@ -2551,6 +2552,7 @@ export default {
                   uploadUrl: this.ptConfig[p.pt].upload,
                   date: currentDate,
                   scheduledTask: true,
+                  ...(dirDupDecision.allowDuplicate ? { allowDuplicate: true } : {}),
                   scheduledPublishAt: scheduledAtMs,
                   scheduledPublishAtText: scheduledAtText,
                   useRealBrowser: Boolean(p.useRealBrowser),

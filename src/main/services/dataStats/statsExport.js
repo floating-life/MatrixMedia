@@ -4275,17 +4275,22 @@ function buildContentIntradayData(options = {}, depsArg) {
 
     for (let i = 0; i < events.length; i++) {
       const ev = events[i];
+      let hasValidAtEvent = false;
       for (let w = 0; w < workCount; w++) {
         const pts = worksList[w];
         let p = ptrs[w];
         while (p < pts.length && comparePointEvent(pts[p], ev) <= 0) {
           const nextPlay = pts[p].play;
-          // 缺失播放（null）或已有正播放后出现假 0：沿用该作品上一次有效值，不产生负增量
-          if (
+          const isValidPlay =
             nextPlay !== null &&
-            !(nextPlay === 0 && curPlays[w] !== null && curPlays[w] > 0)
-          ) {
+            !(nextPlay === 0 && curPlays[w] !== null && curPlays[w] > 0);
+          // 缺失播放（null）或已有正播放后出现假 0：仅在同槽仍有其他有效成员时沿用上次有效值，
+          // 若该时段所有成员作品播放均缺失则该点留空（null），不伪造为零增长
+          if (isValidPlay) {
             curPlays[w] = nextPlay;
+            if (comparePointEvent(pts[p], ev) === 0) {
+              hasValidAtEvent = true;
+            }
           }
           p += 1;
         }
@@ -4293,12 +4298,14 @@ function buildContentIntradayData(options = {}, depsArg) {
       }
 
       let sumPlay = null;
-      for (let w = 0; w < workCount; w++) {
-        if (curPlays[w] !== null) {
-          sumPlay = sumPlay === null ? curPlays[w] : sumPlay + curPlays[w];
+      if (hasValidAtEvent) {
+        for (let w = 0; w < workCount; w++) {
+          if (curPlays[w] !== null) {
+            sumPlay = sumPlay === null ? curPlays[w] : sumPlay + curPlays[w];
+          }
         }
+        if (sumPlay === 0) sumPlay = 0;
       }
-      if (sumPlay === 0) sumPlay = 0;
 
       const rawDelta =
         hasPrev && sumPlay !== null && prevPlay !== null ? sumPlay - prevPlay : null;

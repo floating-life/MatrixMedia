@@ -132,7 +132,12 @@ router.post("/publish", async function (req, res) {
         pt: target.platform,
       });
       const candTitle = target.title || fileStemForDedupe(target.file);
-      if (!(rootAllowDuplicate || target.allowDuplicate === true)) {
+      const targetAllowDup = Boolean(rootAllowDuplicate || target.allowDuplicate === true);
+      if (targetAllowDup) {
+        target.allowDuplicate = true;
+        target.publishOptions = { ...(target.publishOptions || {}), allowDuplicate: true };
+      }
+      if (!targetAllowDup) {
         const hit = findRecentDuplicatePublish(records, {
           pt: target.platform,
           phone: target.phone,
@@ -154,12 +159,14 @@ router.post("/publish", async function (req, res) {
           });
         }
       }
-      registerPublishDedupeBypass({
-        pt: target.platform,
-        phone: target.phone,
-        partition: resolvedPartition,
-        title: candTitle,
-      });
+      if (!target.publishAt) {
+        registerPublishDedupeBypass({
+          pt: target.platform,
+          phone: target.phone,
+          partition: resolvedPartition,
+          title: candTitle,
+        });
+      }
       result = await publishService.runSingleFilePublish(target);
     } else {
       // platforms 数组（1 个或多个平台）：逐平台查重，仅拦截重复的那几个平台，其余平台照常执行
@@ -177,6 +184,10 @@ router.post("/publish", async function (req, res) {
         });
         const candTitle = t.title || fileStemForDedupe(t.file);
         const allowDup = Boolean(t.allowDuplicate);
+        if (allowDup) {
+          t.allowDuplicate = true;
+          t.publishOptions = { ...(t.publishOptions || {}), allowDuplicate: true };
+        }
         if (!allowDup) {
           const hit = findRecentDuplicatePublish(records, {
             pt: t.platform,
@@ -200,12 +211,14 @@ router.post("/publish", async function (req, res) {
             continue;
           }
         }
-        registerPublishDedupeBypass({
-          pt: t.platform,
-          phone: t.phone,
-          partition: resolvedPartition,
-          title: candTitle,
-        });
+        if (!t.publishAt) {
+          registerPublishDedupeBypass({
+            pt: t.platform,
+            phone: t.phone,
+            partition: resolvedPartition,
+            title: candTitle,
+          });
+        }
         allowedTargets.push(t);
         allowedIndices.push(i);
       }
@@ -358,11 +371,8 @@ router.post("/stats/sync", async function (req, res) {
   }
   const startedAt = Date.now();
   const store = require("../../services/dataStats/store.js");
-  const prevWorkCount =
-    typeof store.getPreviousWorkCount === "function"
-      ? store.getPreviousWorkCount(phone, pt)
-      : 0;
   let syncPartition = "";
+  let prevWorkCount = 0;
   try {
     const { collectAccount } = require("../../services/dataStats/collector.js");
     // 与登录窗口同一套 partition 规则：优先按账号记录的 accountKey（新分组模型），
@@ -372,6 +382,10 @@ router.post("/stats/sync", async function (req, res) {
     );
     syncPartition = resolveTaskPartition({ phone, pt });
     const alertMeta = { partition: syncPartition, phone };
+    prevWorkCount =
+      typeof store.getPreviousWorkCount === "function"
+        ? store.getPreviousWorkCount(phone, pt, alertMeta)
+        : 0;
     const data = await collectAccount({
       partition: syncPartition,
       platform: pt,
@@ -410,11 +424,16 @@ router.post("/stats/sync", async function (req, res) {
       works: data.works,
     });
     store.mergeWorks(phone, pt, data.works, collectNow);
-    store.writeMeta(phone, pt, {
-      lastCollectAt: collectNow,
-      lastError: "",
-      workCount: data.works.length,
-    });
+    store.writeMeta(
+      phone,
+      pt,
+      {
+        lastCollectAt: collectNow,
+        lastError: "",
+        workCount: data.works.length,
+      },
+      alertMeta
+    );
     store.appendCollectLog({
       startedAt,
       finishedAt: Date.now(),

@@ -66,8 +66,12 @@ export function createScheduledRecord(
   if (!parsed.ok) {
     throw new Error(parsed.error);
   }
+  const allowDuplicate =
+    recordItem.allowDuplicate === true ||
+    Boolean(recordItem.publishOptions && recordItem.publishOptions.allowDuplicate === true);
   return {
     ...recordItem,
+    ...(allowDuplicate ? { allowDuplicate: true } : {}),
     date: recordItem.date || todayYmd(nowMs),
     scheduledTask: true,
     scheduledPublishAt: parsed.value,
@@ -93,9 +97,16 @@ export function isExpiredScheduledRecord(record, nowMs = Date.now()) {
 
 export function buildTaskPayloadFromRecord(record) {
   const cfg = ptConfig[record.pt] || {};
+  const allowDuplicate =
+    record.allowDuplicate === true ||
+    Boolean(record.publishOptions && record.publishOptions.allowDuplicate === true);
+  const recordIdPatch = record.id != null ? { recordId: record.id } : {};
+  const allowDuplicatePatch = allowDuplicate ? { allowDuplicate: true } : {};
   if (record.textType === "article") {
     return {
       taskId: Date.now() + Math.random(),
+      ...recordIdPatch,
+      ...allowDuplicatePatch,
       bookName: record.bookName || record.textOtherName || "",
       textType: "article",
       data: {
@@ -126,6 +137,8 @@ export function buildTaskPayloadFromRecord(record) {
   const metadata = normalizeVideoRecordMetadata(record);
   return {
     taskId: Date.now() + Math.random(),
+    ...recordIdPatch,
+    ...allowDuplicatePatch,
     bookName: record.bookName || record.textOtherName || "",
     textType: record.textType || "local",
     data: {

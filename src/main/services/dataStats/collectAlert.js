@@ -106,7 +106,7 @@ function handleAccountCollectOutcome({
     typeof prevWorkCount === "number" && Number.isFinite(prevWorkCount)
       ? prevWorkCount
       : typeof store.getPreviousWorkCount === "function"
-      ? store.getPreviousWorkCount(group, platform)
+      ? store.getPreviousWorkCount(group, platform, alertMeta)
       : 0;
 
   const workLen = Array.isArray(works) ? works.length : 0;
