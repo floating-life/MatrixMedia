@@ -13,7 +13,13 @@ import { winURL } from "../config/StaticPath";
 import downloadFile from "./downloadFile";
 import { createPublishHistoryExportHandler } from "./publishHistoryExport.js";
 import { registerPuppeteerIpc } from "./puppeteerFile";
-import { registerScheduledPublishIpc } from "./scheduledPublish";
+import {
+  registerScheduledPublishIpc,
+  createScheduledRecord,
+  notifyScheduledPublishChanged,
+} from "./scheduledPublish";
+import { findExistingScheduled } from "./scheduledDedupe.js";
+import { registerPublishThrottleIpc } from "./publishThrottle.js";
 import { registerSphWindowProductsIpc } from "./sphWindowProducts";
 import { registerSphEntityOptionsIpc } from "./sphEntityOptions";
 import { createLaunchInstallerHandler } from "./launchInstaller";
@@ -110,6 +116,12 @@ export default {
     // puppeteerFile 上传文件发布，获取登录状态
     registerPuppeteerIpc();
     registerScheduledPublishIpc();
+    registerPublishThrottleIpc(ipcMain, {
+      changeData,
+      createScheduledRecord,
+      notifyScheduledPublishChanged,
+      findExistingScheduled,
+    });
     registerSphWindowProductsIpc(ipcMain);
     registerSphEntityOptionsIpc(ipcMain);
     // 数据统计：采集（页面上下文 fetch）+ 本地快照读取

@@ -670,6 +670,83 @@
         >
       </div>
     </el-dialog>
+
+    <!-- 发布节流排期预览表（点击「发布」前确认或改为不节流） -->
+    <el-dialog
+      title="发布排期预览（发布节流 / 平台错峰）"
+      :visible.sync="throttlePreviewVisible"
+      width="840px"
+      append-to-body
+      :close-on-click-modal="false"
+      @close="onThrottlePreviewDialogClose"
+    >
+      <p class="bt2-tip" style="margin-top: 0; margin-bottom: 12px">
+        以下为根据当前节流规则（同账号最小间隔、允许发布时段、每日上限与平台错峰延迟）计算的计划发布时间；确认后将自动提交立即任务并创建定时任务，或可点击「改为不节流」绕过本次节流。
+      </p>
+      <el-table
+        :data="throttlePreviewRows"
+        border
+        size="small"
+        max-height="360"
+        style="width: 100%"
+      >
+        <el-table-column prop="pt" label="平台" width="100" />
+        <el-table-column
+          prop="phone"
+          label="账号"
+          min-width="130"
+          show-overflow-tooltip
+        />
+        <el-table-column
+          prop="title"
+          label="标题"
+          min-width="160"
+          show-overflow-tooltip
+        />
+        <el-table-column label="计划时间" width="185">
+          <template slot-scope="{ row }">
+            <el-tag
+              size="mini"
+              :type="
+                row.isDraft
+                  ? 'info'
+                  : row.scheduled
+                  ? 'warning'
+                  : 'success'
+              "
+            >
+              {{ row.plannedTimeText }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column
+          prop="reasonText"
+          label="原因"
+          min-width="210"
+          show-overflow-tooltip
+        />
+      </el-table>
+      <div slot="footer" class="dialog-footer">
+        <el-button @click="resolveThrottlePreview('cancel')">取消</el-button>
+        <el-button
+          type="warning"
+          plain
+          @click="resolveThrottlePreview('no_throttle')"
+        >
+          {{
+            throttlePreviewHasExplicitTime
+              ? "改为不节流（按原定时间）"
+              : "改为不节流（全部立即发布）"
+          }}
+        </el-button>
+        <el-button
+          type="primary"
+          @click="resolveThrottlePreview('confirm')"
+        >
+          确认按排期发布
+        </el-button>
+      </div>
+    </el-dialog>
   </div>
 </template>
 
@@ -686,12 +763,14 @@ import {
 } from "@/utils/accountLoginFlag";
 import {
   CREATIVE_STATEMENT_DEFAULT,
+  DEFAULT_PUBLISH_CREATIVE_STATEMENT,
   CREATIVE_STATEMENT_OPTIONS,
   getCreativeStatementOptionsForPlatform,
   getCreativeStatementPlatformKey,
   getCreativeStatementShortLabel,
   normalizeCreativeStatement,
   platformSupportsCreativeStatement,
+  resolveCreativeStatementForPlatform,
 } from "../../shared/creativeStatement.js";
 import {
   getAccountProxyDisplay,
@@ -794,7 +873,12 @@ export default {
       checkedPlatformIds: [],
       checkAllPlatforms: false,
       checkAllIndeterminate: false,
-      batchCreativeStatement: CREATIVE_STATEMENT_DEFAULT,
+      defaultCreativeStatement: DEFAULT_PUBLISH_CREATIVE_STATEMENT,
+      batchCreativeStatement: DEFAULT_PUBLISH_CREATIVE_STATEMENT,
+      throttlePreviewVisible: false,
+      throttlePreviewRows: [],
+      throttlePreviewHasExplicitTime: false,
+      _throttlePreviewResolver: null,
       form: {
         title: "",
         bt1: "",
@@ -889,6 +973,7 @@ export default {
       }
     };
     ipcRenderer.on("getCookie-done", this._onGetCookieDone);
+    this.loadPublishThrottleDefaults();
   },
   beforeDestroy() {
     if (this._onGetCookieDone) {
@@ -1038,6 +1123,7 @@ export default {
       const defaultTitle = fileStem(filePath);
       this.bqTags = [];
       this.bqComposing = false;
+      this.loadPublishThrottleDefaults();
       this.resetPlatformStatementState();
       this.resetPlatformVideoLinks();
       this.form = {
@@ -1094,6 +1180,7 @@ export default {
         noDownload: form.noDownload === true,
       };
       this.bqTags = parseBqToTags(form.tags || form.bq);
+      this.loadPublishThrottleDefaults();
       this.resetPlatformStatementState();
       this.resetPlatformVideoLinks();
       this.thisShow = false;
@@ -1259,6 +1346,148 @@ export default {
         return { proceed: false, allowDuplicate: false };
       }
     },
+    async loadPublishThrottleDefaults() {
+      if (!ipcRenderer || typeof ipcRenderer.invoke !== "function") {
+        return this.defaultCreativeStatement || DEFAULT_PUBLISH_CREATIVE_STATEMENT;
+      }
+      try {
+        const res = await ipcRenderer.invoke("publish-throttle:get-settings");
+        const configured =
+          res && res.settings && res.settings.defaultCreativeStatement;
+        if (configured) {
+          this.defaultCreativeStatement = normalizeCreativeStatement(configured);
+        }
+      } catch (_) {
+        /* 保持当前默认声明 */
+      }
+      return this.defaultCreativeStatement || DEFAULT_PUBLISH_CREATIVE_STATEMENT;
+    },
+    resolveThrottlePreview(action) {
+      const resolver = this._throttlePreviewResolver;
+      this._throttlePreviewResolver = null;
+      this.throttlePreviewVisible = false;
+      if (typeof resolver === "function") {
+        resolver(action);
+      }
+    },
+    onThrottlePreviewDialogClose() {
+      if (typeof this._throttlePreviewResolver === "function") {
+        const resolver = this._throttlePreviewResolver;
+        this._throttlePreviewResolver = null;
+        resolver("cancel");
+      }
+    },
+    /**
+     * 批量发布（单视频多平台 / 目录批量）点击「发布」前弹出节流排期预览表，
+     * 展示 平台 / 账号 / 计划时间 / 原因，供用户确认或改为不节流。
+     */
+    async confirmThrottlePublishPlan(planEntries, options = {}) {
+      if (
+        !Array.isArray(planEntries) ||
+        planEntries.length === 0 ||
+        !ipcRenderer ||
+        typeof ipcRenderer.invoke !== "function"
+      ) {
+        return { proceed: true, noThrottle: true, itemsByKey: new Map() };
+      }
+
+      const activeEntries = planEntries.filter((e) => !e.isDraft);
+      if (activeEntries.length === 0) {
+        return { proceed: true, noThrottle: true, itemsByKey: new Map() };
+      }
+
+      let res;
+      try {
+        res = await ipcRenderer.invoke("publish-throttle:plan", {
+          targets: activeEntries.map((e) => ({
+            platform: e.pt,
+            phone: e.phone,
+            accountKey: e.accountKey,
+            partition: e.partition,
+          })),
+          publishAt: options.publishAt || null,
+          publishAtMs: options.publishAtMs || null,
+        });
+      } catch (_) {
+        return { proceed: true, noThrottle: true, itemsByKey: new Map() };
+      }
+
+      if (!res || res.ok !== true || res.enabled === false) {
+        return { proceed: true, noThrottle: true, itemsByKey: new Map() };
+      }
+
+      const planItems = Array.isArray(res.items) ? res.items : [];
+      const itemsByKey = new Map();
+      let activeIdx = 0;
+      const previewRows = planEntries.map((entry) => {
+        if (entry.isDraft) {
+          return {
+            pt: entry.pt,
+            phone: entry.phone,
+            title: entry.title,
+            isDraft: true,
+            scheduled: false,
+            plannedTimeText: "保存草稿",
+            reasonText: "账号默认保存草稿（不节流）",
+          };
+        }
+        const planItem = planItems[activeIdx++];
+        if (planItem) {
+          itemsByKey.set(entry.key, planItem);
+        }
+        const scheduled = Boolean(planItem && planItem.scheduled);
+        const plannedTimeText = scheduled
+          ? planItem.publishAt || options.publishAt || "定时发布"
+          : "立即发布";
+        const reasonText =
+          (planItem && planItem.reason) ||
+          (scheduled
+            ? "按指定定时时间发布"
+            : "满足节流规则，立即发布");
+        return {
+          pt: entry.pt,
+          phone: entry.phone,
+          title: entry.title,
+          isDraft: false,
+          scheduled,
+          plannedTimeText,
+          reasonText,
+        };
+      });
+
+      this.throttlePreviewRows = previewRows;
+      this.throttlePreviewHasExplicitTime = Boolean(options.publishAt);
+      this.throttlePreviewVisible = true;
+
+      const action = await new Promise((resolve) => {
+        this._throttlePreviewResolver = resolve;
+      });
+      if (action === "cancel") {
+        return { proceed: false, noThrottle: false, itemsByKey };
+      }
+      if (action === "no_throttle") {
+        return { proceed: true, noThrottle: true, itemsByKey: new Map() };
+      }
+      return { proceed: true, noThrottle: false, itemsByKey };
+    },
+    async writeScheduledPublishRecord(item) {
+      if (ipcRenderer && typeof ipcRenderer.invoke === "function") {
+        try {
+          const res = await ipcRenderer.invoke(
+            "publish-throttle:create-scheduled",
+            { item }
+          );
+          if (res && res.ok) return res;
+        } catch (_) {
+          /* 回退 dataRequest */
+        }
+      }
+      return dataRequest({
+        type: "add",
+        fileName: "pushData",
+        item,
+      });
+    },
     buildPlatformVideoPayload(platformNode, baseVideo) {
       const link = buildVideoLinkOption(
         platformNode.pt,
@@ -1283,7 +1512,9 @@ export default {
       this.checkedPlatformIds = [];
       this.checkAllPlatforms = false;
       this.checkAllIndeterminate = false;
-      this.batchCreativeStatement = CREATIVE_STATEMENT_DEFAULT;
+      this.batchCreativeStatement = normalizeCreativeStatement(
+        this.defaultCreativeStatement || DEFAULT_PUBLISH_CREATIVE_STATEMENT
+      );
     },
     resetPlatformVideoLinks() {
       this.platformVideoLinks = {};
@@ -1602,23 +1833,39 @@ export default {
       return leaves;
     },
     initPlatformStatementsForLeaves(leaves, defaultValue) {
+      const baseDefault =
+        defaultValue !== undefined
+          ? defaultValue
+          : this.defaultCreativeStatement || DEFAULT_PUBLISH_CREATIVE_STATEMENT;
       const next = { ...this.platformStatements };
       leaves.forEach((node) => {
         if (!next[node.id]) {
-          next[node.id] = normalizeCreativeStatement(defaultValue);
+          next[node.id] = resolveCreativeStatementForPlatform(
+            baseDefault,
+            node.pt
+          );
         }
       });
       this.platformStatements = next;
     },
     applyRepublishPlatformStatements(fallbackValue) {
-      const fallback = normalizeCreativeStatement(fallbackValue);
+      const fallbackBase =
+        fallbackValue != null && String(fallbackValue).trim() !== ""
+          ? fallbackValue
+          : this.defaultCreativeStatement || DEFAULT_PUBLISH_CREATIVE_STATEMENT;
       const next = { ...this.platformStatements };
       this.getAllPlatformLeafNodes().forEach((node) => {
         const rec = this.findRepublishRecord(node.pt, node);
         if (rec && rec.creativeStatement) {
-          next[node.id] = normalizeCreativeStatement(rec.creativeStatement);
+          next[node.id] = resolveCreativeStatementForPlatform(
+            rec.creativeStatement,
+            node.pt
+          );
         } else if (!next[node.id]) {
-          next[node.id] = fallback;
+          next[node.id] = resolveCreativeStatementForPlatform(
+            fallbackBase,
+            node.pt
+          );
         }
       });
       this.platformStatements = next;
@@ -1659,10 +1906,20 @@ export default {
     isPlatformNodeChecked(id) {
       return this.checkedPlatformIds.includes(id);
     },
-    getPlatformStatement(id) {
-      return normalizeCreativeStatement(
-        this.platformStatements[id] || CREATIVE_STATEMENT_DEFAULT
-      );
+    getPlatformStatement(id, pt) {
+      if (this.platformStatements[id]) {
+        return normalizeCreativeStatement(this.platformStatements[id]);
+      }
+      const fallback =
+        this.defaultCreativeStatement || DEFAULT_PUBLISH_CREATIVE_STATEMENT;
+      if (pt) {
+        return resolveCreativeStatementForPlatform(fallback, pt);
+      }
+      const leaf = this.getAllPlatformLeafNodes().find((n) => n.id === id);
+      if (leaf && leaf.pt) {
+        return resolveCreativeStatementForPlatform(fallback, leaf.pt);
+      }
+      return normalizeCreativeStatement(fallback);
     },
     setPlatformStatement(id, value) {
       this.$set(this.platformStatements, id, normalizeCreativeStatement(value));
@@ -1775,7 +2032,7 @@ export default {
       this.warnBt2SpecialPunctuation();
     },
 
-    onMetaNext() {
+    async onMetaNext() {
       if (!this.localFilePath) {
         this.$message.warning("请先点击选择或拖入视频文件");
         return;
@@ -1795,6 +2052,7 @@ export default {
         this.$message.warning(publishAtError);
         return;
       }
+      await this.loadPublishThrottleDefaults();
       this.loadAccounts();
       this.metaVisible = false;
       this.platformVisible = true;
@@ -2100,8 +2358,36 @@ export default {
         return;
       }
 
+      let throttleDecision = {
+        proceed: true,
+        noThrottle: true,
+        itemsByKey: new Map(),
+      };
+      if (!isDraftMode) {
+        const planEntries = platforms.map((p, idx) => {
+          const effectiveMode = resolveEffectivePublishMode(isDraftMode, p);
+          return {
+            key: `single:${idx}:${p.id}`,
+            pt: p.pt,
+            phone: p.phone,
+            accountKey: p.accountKey,
+            partition: buildAccountPartitionOf(p, p.pt),
+            title: baseVideo.data.title || baseVideo.bookName,
+            isDraft: effectiveMode.publishToDraft,
+          };
+        });
+        throttleDecision = await this.confirmThrottlePublishPlan(planEntries, {
+          publishAt: this.scheduledPublish ? scheduledAtText : null,
+          publishAtMs: scheduledAtMs,
+        });
+        if (!throttleDecision.proceed) {
+          return;
+        }
+      }
+
       const scheduledWriteTasks = [];
-      for (let p of platforms) {
+      for (let idx = 0; idx < platforms.length; idx++) {
+        const p = platforms[idx];
         const partition = buildAccountPartitionOf(p, p.pt);
         const taskId = Date.now() + Math.random();
         const shouldShow = this.thisShow;
@@ -2110,58 +2396,72 @@ export default {
           : true;
         const video = this.buildPlatformVideoPayload(p, baseVideo);
         const effectiveMode = resolveEffectivePublishMode(isDraftMode, p);
-        if (this.scheduledPublish && !effectiveMode.publishToDraft) {
+        const planItem = !throttleDecision.noThrottle
+          ? throttleDecision.itemsByKey.get(`single:${idx}:${p.id}`)
+          : null;
+        const shouldSchedule =
+          !effectiveMode.publishToDraft &&
+          (planItem ? planItem.scheduled : this.scheduledPublish);
+        if (shouldSchedule) {
+          const itemScheduledAtMs =
+            planItem && planItem.scheduled
+              ? planItem.plannedAtMs
+              : scheduledAtMs;
+          const itemScheduledAtText =
+            planItem && planItem.scheduled
+              ? planItem.publishAt
+              : scheduledAtText;
+          const itemThrottleReason =
+            (planItem && planItem.reason) || "";
           scheduledWriteTasks.push(
-            dataRequest({
-              type: "add",
-              fileName: "pushData",
-              item: {
-                bookName: video.bookName,
-                textOtherName: video.data.textOtherName,
-                textType: video.textType,
-                pt: p.pt,
-                selectedFile,
-                bt: video.data.bt1,
-                title: video.data.title,
-                description: video.data.description,
-                shortTitle: video.data.shortTitle,
-                tags: video.data.tags,
-                bt2: video.data.bt2,
-                bt2Filled: video.data.bt2Filled,
-                bdText: video.data.bdText,
-                bq: video.data.bq,
-                creativeStatement: video.data.creativeStatement,
-                noDownload: video.data.noDownload === true,
-                publishOptions: video.publishOptions,
-                coverPath: video.data.coverPath || "",
-                filePath: this.localFilePath,
-                useragent: this.ptConfig[p.pt].useragent,
-                phone: p.phone,
+            this.writeScheduledPublishRecord({
+              bookName: video.bookName,
+              textOtherName: video.data.textOtherName,
+              textType: video.textType,
+              pt: p.pt,
+              selectedFile,
+              bt: video.data.bt1,
+              title: video.data.title,
+              description: video.data.description,
+              shortTitle: video.data.shortTitle,
+              tags: video.data.tags,
+              bt2: video.data.bt2,
+              bt2Filled: video.data.bt2Filled,
+              bdText: video.data.bdText,
+              bq: video.data.bq,
+              creativeStatement: video.data.creativeStatement,
+              noDownload: video.data.noDownload === true,
+              publishOptions: video.publishOptions,
+              coverPath: video.data.coverPath || "",
+              filePath: this.localFilePath,
+              useragent: this.ptConfig[p.pt].useragent,
+              phone: p.phone,
               group: p.group,
               accountName: p.accountName,
               accountKey: p.accountKey,
-                group: p.group,
-                accountName: p.accountName,
-                accountKey: p.accountKey,
-                partition,
-                url: this.ptConfig[p.pt].listIndex,
-                uploadUrl: this.ptConfig[p.pt].upload,
-                date: currentDate,
-                scheduledTask: true,
-                ...(dupDecision.allowDuplicate ? { allowDuplicate: true } : {}),
-                scheduledPublishAt: scheduledAtMs,
-                scheduledPublishAtText: scheduledAtText,
-                useRealBrowser: Boolean(p.useRealBrowser),
-                publishAttemptCount: 1,
-                republishCount: 0,
-                publishSuccessCount: 0,
-                publishFailCount: 0,
-                publishMode: effectiveMode.publishMode,
-                publishToDraft: effectiveMode.publishToDraft,
-                publishStatus: "scheduled",
-                lastPublishMessage: "等待定时发布",
-                lastPublishAt: Date.now(),
-              },
+              partition,
+              url: this.ptConfig[p.pt].listIndex,
+              uploadUrl: this.ptConfig[p.pt].upload,
+              date: currentDate,
+              scheduledTask: true,
+              ...(dupDecision.allowDuplicate ? { allowDuplicate: true } : {}),
+              ...(itemThrottleReason
+                ? { throttleReason: itemThrottleReason }
+                : {}),
+              scheduledPublishAt: itemScheduledAtMs,
+              scheduledPublishAtText: itemScheduledAtText,
+              useRealBrowser: Boolean(p.useRealBrowser),
+              publishAttemptCount: 1,
+              republishCount: 0,
+              publishSuccessCount: 0,
+              publishFailCount: 0,
+              publishMode: effectiveMode.publishMode,
+              publishToDraft: effectiveMode.publishToDraft,
+              publishStatus: "scheduled",
+              lastPublishMessage: itemThrottleReason
+                ? `等待定时发布（${itemThrottleReason}）`
+                : "等待定时发布",
+              lastPublishAt: Date.now(),
             })
           );
           submitted++;
@@ -2294,7 +2594,7 @@ export default {
         if (effectiveMode.publishToDraft) draftSubmitted++;
       }
 
-      if (this.scheduledPublish && !isDraftMode) {
+      if (scheduledWriteTasks.length > 0) {
         await Promise.all(scheduledWriteTasks);
         ipcRenderer.send("scheduledPublish:refresh");
       }
@@ -2307,6 +2607,9 @@ export default {
         successMessage = `已提交 ${submitted} 个平台保存草稿`;
       } else if (scheduledSubmitted === submitted) {
         successMessage = `已创建 ${submitted} 个平台定时发布任务`;
+      } else if (scheduledSubmitted > 0) {
+        const immediateCount = submitted - scheduledSubmitted;
+        successMessage = `已提交 ${immediateCount} 个平台立即发布，${scheduledSubmitted} 个平台已按节流排期定时发布`;
       }
       this.$message.success(successMessage);
       this.attrsVisible = false;
@@ -2467,6 +2770,7 @@ export default {
         };
       });
 
+      await this.loadPublishThrottleDefaults();
       this.dirPublishVisible = false;
       this.loadAccounts();
       this.platformVisible = true;
@@ -2532,6 +2836,12 @@ export default {
       let scheduledSubmitted = 0;
       const scheduledWriteTasks = [];
 
+      platforms.sort((a, b) => {
+        if (a.pt.includes("视频号")) return -1;
+        if (b.pt.includes("视频号")) return 1;
+        return 0;
+      });
+
       const dirDupTargets = [];
       for (const fileRow of this.dirBatchFiles) {
         const stem = fileRow.fileName.replace(/\.[^/.]+$/, "");
@@ -2551,7 +2861,45 @@ export default {
         return;
       }
 
-      for (const fileRow of this.dirBatchFiles) {
+      let dirThrottleDecision = {
+        proceed: true,
+        noThrottle: true,
+        itemsByKey: new Map(),
+      };
+      if (!isDraftMode) {
+        const dirPlanEntries = [];
+        for (let rIdx = 0; rIdx < this.dirBatchFiles.length; rIdx++) {
+          const fileRow = this.dirBatchFiles[rIdx];
+          const stem = fileRow.fileName.replace(/\.[^/.]+$/, "");
+          const rowTitle = sanitizeTitle(fileRow.title) || stem;
+          for (let pIdx = 0; pIdx < platforms.length; pIdx++) {
+            const p = platforms[pIdx];
+            const effectiveMode = resolveEffectivePublishMode(isDraftMode, p);
+            dirPlanEntries.push({
+              key: `dir:${rIdx}:${pIdx}:${p.id}`,
+              pt: p.pt,
+              phone: p.phone,
+              accountKey: p.accountKey,
+              partition: buildAccountPartitionOf(p, p.pt),
+              title: rowTitle,
+              isDraft: effectiveMode.publishToDraft,
+            });
+          }
+        }
+        dirThrottleDecision = await this.confirmThrottlePublishPlan(
+          dirPlanEntries,
+          {
+            publishAt: this.scheduledPublish ? scheduledAtText : null,
+            publishAtMs: scheduledAtMs,
+          }
+        );
+        if (!dirThrottleDecision.proceed) {
+          return;
+        }
+      }
+
+      for (let rIdx = 0; rIdx < this.dirBatchFiles.length; rIdx++) {
+        const fileRow = this.dirBatchFiles[rIdx];
         // 优先使用 onDirPublishNext 里 IPC 解析好的真实路径（已做存在性 + 后缀补全）。
         // 兜底：老入口或刷新后 resolvedPath 丢失时，回退到 dirPath + fileName 拼接。
         const filePath =
@@ -2579,20 +2927,15 @@ export default {
           return shortTitle;
         })();
 
-        platforms.sort((a, b) => {
-          if (a.pt.includes("视频号")) return -1;
-          if (b.pt.includes("视频号")) return 1;
-          return 0;
-        });
-
-        for (const p of platforms) {
+        for (let pIdx = 0; pIdx < platforms.length; pIdx++) {
+          const p = platforms[pIdx];
           const partition = buildAccountPartitionOf(p, p.pt);
           const taskId = Date.now() + Math.random();
           const shouldShow = this.thisShow;
           const shouldCloseWindowAfterPublish = shouldShow
             ? this.closeWindow
             : true;
-          const creativeStatement = this.getPlatformStatement(p.id);
+          const creativeStatement = this.getPlatformStatement(p.id, p.pt);
           const effectiveMode = resolveEffectivePublishMode(isDraftMode, p);
 
           // Format bq for this platform
@@ -2615,58 +2958,70 @@ export default {
             p.pt
           );
 
-          if (this.scheduledPublish && !effectiveMode.publishToDraft) {
+          const dirPlanItem = !dirThrottleDecision.noThrottle
+            ? dirThrottleDecision.itemsByKey.get(`dir:${rIdx}:${pIdx}:${p.id}`)
+            : null;
+          const shouldScheduleDir =
+            !effectiveMode.publishToDraft &&
+            (dirPlanItem ? dirPlanItem.scheduled : this.scheduledPublish);
+
+          if (shouldScheduleDir) {
+            const itemScheduledAtMs =
+              dirPlanItem && dirPlanItem.scheduled
+                ? dirPlanItem.plannedAtMs
+                : scheduledAtMs;
+            const itemScheduledAtText =
+              dirPlanItem && dirPlanItem.scheduled
+                ? dirPlanItem.publishAt
+                : scheduledAtText;
+            const itemThrottleReason =
+              (dirPlanItem && dirPlanItem.reason) || "";
             scheduledWriteTasks.push(
-              dataRequest({
-                type: "add",
-                fileName: "pushData",
-                item: {
-                  bookName,
-                  textOtherName,
-                  textType: "local",
-                  pt: p.pt,
-                  selectedFile,
-                  bt: metadata.title,
-                  title: metadata.title,
-                  description: metadata.description,
-                  shortTitle: metadata.shortTitle,
-                  tags: metadata.tags,
-                  ...metadata.legacy,
-                  bq,
-                  creativeStatement,
-                  coverPath: fileRow.coverResolved || "",
-                  noDownload: this.form.noDownload === true,
-                  filePath,
-                  useragent: this.ptConfig[p.pt].useragent,
-                  phone: p.phone,
-                  group: p.group,
-                  accountName: p.accountName,
-                  accountKey: p.accountKey,
-              group: p.group,
-              accountName: p.accountName,
-              accountKey: p.accountKey,
+              this.writeScheduledPublishRecord({
+                bookName,
+                textOtherName,
+                textType: "local",
+                pt: p.pt,
+                selectedFile,
+                bt: metadata.title,
+                title: metadata.title,
+                description: metadata.description,
+                shortTitle: metadata.shortTitle,
+                tags: metadata.tags,
+                ...metadata.legacy,
+                bq,
+                creativeStatement,
+                coverPath: fileRow.coverResolved || "",
+                noDownload: this.form.noDownload === true,
+                filePath,
+                useragent: this.ptConfig[p.pt].useragent,
+                phone: p.phone,
                 group: p.group,
                 accountName: p.accountName,
                 accountKey: p.accountKey,
-                  partition,
-                  url: this.ptConfig[p.pt].listIndex,
-                  uploadUrl: this.ptConfig[p.pt].upload,
-                  date: currentDate,
-                  scheduledTask: true,
-                  ...(dirDupDecision.allowDuplicate ? { allowDuplicate: true } : {}),
-                  scheduledPublishAt: scheduledAtMs,
-                  scheduledPublishAtText: scheduledAtText,
-                  useRealBrowser: Boolean(p.useRealBrowser),
-                  publishMode: effectiveMode.publishMode,
-                  publishToDraft: effectiveMode.publishToDraft,
-                  publishAttemptCount: 1,
-                  republishCount: 0,
-                  publishSuccessCount: 0,
-                  publishFailCount: 0,
-                  publishStatus: "scheduled",
-                  lastPublishMessage: "等待定时发布",
-                  lastPublishAt: Date.now(),
-                },
+                partition,
+                url: this.ptConfig[p.pt].listIndex,
+                uploadUrl: this.ptConfig[p.pt].upload,
+                date: currentDate,
+                scheduledTask: true,
+                ...(dirDupDecision.allowDuplicate ? { allowDuplicate: true } : {}),
+                ...(itemThrottleReason
+                  ? { throttleReason: itemThrottleReason }
+                  : {}),
+                scheduledPublishAt: itemScheduledAtMs,
+                scheduledPublishAtText: itemScheduledAtText,
+                useRealBrowser: Boolean(p.useRealBrowser),
+                publishMode: effectiveMode.publishMode,
+                publishToDraft: effectiveMode.publishToDraft,
+                publishAttemptCount: 1,
+                republishCount: 0,
+                publishSuccessCount: 0,
+                publishFailCount: 0,
+                publishStatus: "scheduled",
+                lastPublishMessage: itemThrottleReason
+                  ? `等待定时发布（${itemThrottleReason}）`
+                  : "等待定时发布",
+                lastPublishAt: Date.now(),
               })
             );
             submitted++;
@@ -2767,7 +3122,7 @@ export default {
         }
       }
 
-      if (this.scheduledPublish && !isDraftMode) {
+      if (scheduledWriteTasks.length > 0) {
         await Promise.all(scheduledWriteTasks);
         ipcRenderer.send("scheduledPublish:refresh");
       }
@@ -2781,6 +3136,9 @@ export default {
         successMessage = `已提交 ${submitted} 个目录批量保存草稿任务`;
       } else if (scheduledSubmitted === submitted) {
         successMessage = `已创建 ${submitted} 个目录批量定时发布任务`;
+      } else if (scheduledSubmitted > 0) {
+        const immediateCount = submitted - scheduledSubmitted;
+        successMessage = `已提交 ${immediateCount} 个目录批量立即发布，${scheduledSubmitted} 个已按节流排期定时发布`;
       }
       this.$message.success(successMessage);
       this.attrsVisible = false;

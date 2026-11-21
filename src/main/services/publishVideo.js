@@ -2,12 +2,19 @@
 
 import fs from "fs";
 import path from "path";
-import { normalizeCreativeStatement } from "../../shared/creativeStatement.js";
+import {
+  normalizeCreativeStatement,
+  resolveCreativeStatementForPlatform,
+} from "../../shared/creativeStatement.js";
 import ptConfig from "../config/ptConfig";
 import { runPuppeteerTask } from "./puppeteerFile";
 import { changeData } from "../server/utils";
-import { createScheduledRecord } from "./scheduledPublish";
+import {
+  createScheduledRecord,
+  notifyScheduledPublishChanged,
+} from "./scheduledPublish";
 import { findExistingScheduled } from "./scheduledDedupe.js";
+import { getDefaultCreativeStatement } from "./publishThrottle.js";
 import { CLI_PUBLISH_TIMEOUT_MS } from "./upLoad/uploadTimeouts.js";
 import {
   isRemotePublishFile,
@@ -178,6 +185,19 @@ async function runSingleFilePublishInner(
     requestDraftMode: Boolean(v.draft),
   });
 
+  // 创作声明：显式传入优先，未传时套用发布设置里的默认声明（默认 ai_generated），
+  // 平台不支持该声明时按现有规则自动回退为 none。
+  const rawCreativeStatement =
+    v.creativeStatement != null && String(v.creativeStatement).trim() !== ""
+      ? v.creativeStatement
+      : getDefaultCreativeStatement();
+  const finalCreativeStatement = resolveCreativeStatementForPlatform(
+    rawCreativeStatement,
+    v.platform
+  );
+  const throttleReason = String(v.throttleReason || "").trim();
+  const isThrottled = Boolean(v.throttled);
+
   const taskPayload = {
     taskId: Date.now() + Math.random(),
     bookName,
@@ -189,7 +209,7 @@ async function runSingleFilePublishInner(
       shortTitle: metadata.shortTitle,
       tags: metadata.tags,
       ...metadata.legacy,
-      creativeStatement: normalizeCreativeStatement(v.creativeStatement || ""),
+      creativeStatement: normalizeCreativeStatement(finalCreativeStatement),
       coverPath,
       noDownload: v.noDownload === true,
     },
@@ -225,7 +245,8 @@ async function runSingleFilePublishInner(
     shortTitle: metadata.shortTitle,
     tags: metadata.tags,
     ...metadata.legacy,
-    creativeStatement: normalizeCreativeStatement(v.creativeStatement || ""),
+    creativeStatement: normalizeCreativeStatement(finalCreativeStatement),
+    ...(throttleReason ? { throttleReason } : {}),
     coverPath,
     noDownload: v.noDownload === true,
     filePath:
@@ -258,11 +279,20 @@ async function runSingleFilePublishInner(
   if (v.publishAt) {
     let scheduledRecord;
     try {
-      scheduledRecord = createScheduledRecord(recordItem, v.publishAt);
+      scheduledRecord = createScheduledRecord(
+        recordItem,
+        v.publishAt,
+        Date.now(),
+        {
+          scheduledPublishAtMs: v.scheduledPublishAtMs,
+          throttleReason,
+        }
+      );
     } catch (e) {
       return {
         exitCode: 2,
         status: "failed",
+        creativeStatement: finalCreativeStatement,
         message: e && e.message ? e.message : String(e),
       };
     }
@@ -281,6 +311,11 @@ async function runSingleFilePublishInner(
           duplicate: true,
           id: existing.id || null,
           publishAt: scheduledRecord.scheduledPublishAtText,
+          plannedAtMs: scheduledRecord.scheduledPublishAt,
+          creativeStatement: finalCreativeStatement,
+          throttled: isThrottled,
+          throttleReason,
+          reason: throttleReason,
           message: "同一视频在该时间点的定时任务已存在，未重复创建",
         };
       }
@@ -304,18 +339,29 @@ async function runSingleFilePublishInner(
           );
         if (found) recordId = found.id;
       }
+      notifyScheduledPublishChanged();
+      const scheduledMessage =
+        isThrottled && throttleReason
+          ? `已按发布节流排期至 ${scheduledRecord.scheduledPublishAtText}（${throttleReason}）`
+          : "定时发布任务已创建，已写入发布历史";
       return {
         exitCode: 0,
         status: "scheduled",
         scheduled: true,
         id: recordId,
         publishAt: scheduledRecord.scheduledPublishAtText,
-        message: "定时发布任务已创建，已写入发布历史",
+        plannedAtMs: scheduledRecord.scheduledPublishAt,
+        creativeStatement: finalCreativeStatement,
+        throttled: isThrottled,
+        throttleReason,
+        reason: throttleReason,
+        message: scheduledMessage,
       };
     } catch (e) {
       return {
         exitCode: 1,
         status: "failed",
+        creativeStatement: finalCreativeStatement,
         message: `写入定时发布记录失败: ${e && e.message ? e.message : e}`,
       };
     }
@@ -420,6 +466,7 @@ async function runSingleFilePublishInner(
             status: completion.status,
             message: completion.message,
             id: recordId,
+            creativeStatement: finalCreativeStatement,
             publishMode: completion.savedAsDraft ? "draft" : "publish",
             outcome: payload && payload.outcome,
             needsAttention: completion.fallbackDraft,
@@ -441,6 +488,7 @@ async function runSingleFilePublishInner(
             status: "login_required",
             message,
             id: recordId,
+            creativeStatement: finalCreativeStatement,
             loginRequired: true,
           });
         }
@@ -454,6 +502,7 @@ async function runSingleFilePublishInner(
         status: "submitted",
         message: "已提交发布任务",
         id: recordId,
+        creativeStatement: finalCreativeStatement,
       });
     }
   });
@@ -461,8 +510,10 @@ async function runSingleFilePublishInner(
 
 function sortPublishPlatforms(list) {
   return [...list].sort((a, b) => {
-    if (a.platform.includes("视频号")) return -1;
-    if (b.platform.includes("视频号")) return 1;
+    const ptA = a.platform || (a.item && a.item.platform) || "";
+    const ptB = b.platform || (b.item && b.item.platform) || "";
+    if (ptA.includes("视频号")) return -1;
+    if (ptB.includes("视频号")) return 1;
     return 0;
   });
 }
@@ -487,6 +538,9 @@ export async function runMultiPlatformPublish(parsedList) {
 
   if (parsedList.length === 1) {
     const result = await runSingleFilePublish(parsedList[0]);
+    const finalCs =
+      result.creativeStatement || parsedList[0].creativeStatement || "none";
+    const throttleReason = result.throttleReason || result.reason || "";
     return {
       success: result.exitCode === 0,
       exitCode: result.exitCode,
@@ -494,7 +548,12 @@ export async function runMultiPlatformPublish(parsedList) {
       message: result.message || "",
       id: result.id ?? null,
       publishAt: result.publishAt ?? null,
+      plannedAtMs: result.plannedAtMs ?? null,
       scheduled: result.scheduled === true,
+      throttled: result.throttled === true,
+      throttleReason,
+      reason: throttleReason,
+      creativeStatement: finalCs,
       total: 1,
       succeeded: result.exitCode === 0 ? 1 : 0,
       failed: result.exitCode === 0 ? 0 : 1,
@@ -502,14 +561,18 @@ export async function runMultiPlatformPublish(parsedList) {
         {
           platform: parsedList[0].platform,
           phone: parsedList[0].phone || "",
-          creativeStatement: parsedList[0].creativeStatement || "none",
+          creativeStatement: finalCs,
           success: result.exitCode === 0,
           exitCode: result.exitCode,
           status: result.status,
           message: result.message || "",
           id: result.id ?? null,
           publishAt: result.publishAt ?? null,
+          plannedAtMs: result.plannedAtMs ?? null,
           scheduled: result.scheduled === true,
+          throttled: result.throttled === true,
+          throttleReason,
+          reason: throttleReason,
         },
       ],
     };
@@ -544,7 +607,8 @@ export async function runMultiPlatformPublish(parsedList) {
     }
   }
 
-  const results = [];
+  const results = new Array(parsedList.length);
+  let executedCount = 0;
   let pendingCleanupCount = parsedList.length;
   const releaseSharedDownload = () => {
     pendingCleanupCount -= 1;
@@ -554,40 +618,85 @@ export async function runMultiPlatformPublish(parsedList) {
     }
   };
 
+  const indexed = parsedList.map((item, origIdx) => ({ item, origIdx }));
   try {
-    for (const item of sortPublishPlatforms(parsedList)) {
+    for (const { item, origIdx } of sortPublishPlatforms(indexed)) {
       const result = await runSingleFilePublish(item, fileContext, {
         waitForResult: false,
         onDone: releaseSharedDownload,
       });
-      results.push({
+      // 定时任务或提前失败不会触发异步 onDone 回调，立即释放共享下载计数避免临时文件泄漏
+      if (result.scheduled || result.status !== "submitted") {
+        releaseSharedDownload();
+      }
+      const throttleReason = result.throttleReason || result.reason || "";
+      results[origIdx] = {
         platform: item.platform,
         phone: item.phone || "",
-        creativeStatement: item.creativeStatement || "none",
+        creativeStatement:
+          result.creativeStatement || item.creativeStatement || "none",
         success: result.exitCode === 0,
         exitCode: result.exitCode,
         status: result.status,
         message: result.message || "",
         id: result.id ?? null,
         publishAt: result.publishAt ?? null,
+        plannedAtMs: result.plannedAtMs ?? null,
         scheduled: result.scheduled === true,
-      });
-      if (item.platform.includes("视频号")) {
+        throttled: result.throttled === true,
+        throttleReason,
+        reason: throttleReason,
+      };
+      executedCount += 1;
+      if (
+        !result.scheduled &&
+        result.status === "submitted" &&
+        item.platform.includes("视频号")
+      ) {
         await new Promise((resolve) => setTimeout(resolve, 4000));
       }
     }
   } finally {
-    if (results.length === 0 && cleanupDownload) cleanupDownload();
+    if (executedCount < parsedList.length) {
+      pendingCleanupCount -= parsedList.length - executedCount;
+      if (pendingCleanupCount <= 0 && cleanupDownload) {
+        cleanupDownload();
+        cleanupDownload = null;
+      }
+    }
+  }
+
+  const compactResults = results.filter(Boolean);
+  const scheduledCount = compactResults.filter((r) => r.scheduled).length;
+  const submittedCount = compactResults.filter(
+    (r) => !r.scheduled && r.success
+  ).length;
+  const failedCount = compactResults.filter((r) => !r.success).length;
+  const allScheduledResult =
+    scheduledCount === compactResults.length && failedCount === 0;
+  const topStatus = allScheduledResult
+    ? "scheduled"
+    : failedCount === compactResults.length
+    ? "failed"
+    : "submitted";
+  let topMessage = `已提交 ${compactResults.length} 个平台发布`;
+  if (allScheduledResult) {
+    topMessage = `已创建 ${scheduledCount} 个平台定时发布任务`;
+  } else if (scheduledCount > 0 && submittedCount > 0) {
+    topMessage = `已提交 ${submittedCount} 个平台立即发布，${scheduledCount} 个平台已按节流排期定时发布`;
   }
 
   return {
-    success: true,
-    exitCode: 0,
-    status: "submitted",
-    message: `已提交 ${results.length} 个平台发布`,
-    total: results.length,
-    succeeded: 0,
-    failed: 0,
-    results,
+    success: failedCount === 0,
+    exitCode: failedCount === 0 ? 0 : 1,
+    status: topStatus,
+    scheduled: allScheduledResult,
+    scheduledCount,
+    submittedCount,
+    message: topMessage,
+    total: compactResults.length,
+    succeeded: scheduledCount,
+    failed: failedCount,
+    results: compactResults,
   };
 }

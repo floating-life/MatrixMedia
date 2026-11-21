@@ -7,6 +7,7 @@ import {
   isVideoPublishPlatform,
 } from "../../shared/publishPlatforms.js";
 import {
+  DEFAULT_PUBLISH_CREATIVE_STATEMENT,
   resolveCreativeStatementForPlatform,
   getCreativeStatementPlatformKey,
 } from "../../shared/creativeStatement.js";
@@ -52,6 +53,7 @@ export function parsePublishArgs(subArgv) {
     creativeStatement: null,
     draft: false,
     allowDuplicate: false,
+    noThrottle: false,
     noDownload: false,
     sphLinkType: null,
     sphLinkValue: null,
@@ -98,6 +100,8 @@ export function parsePublishArgs(subArgv) {
       out.draft = true;
     } else if (a === "--allow-duplicate") {
       out.allowDuplicate = true;
+    } else if (a === "--no-throttle") {
+      out.noThrottle = true;
     } else if (a === "--no-download") {
       out.noDownload = true;
     } else if (a === "--sph-link-type") {
@@ -411,6 +415,8 @@ export function publishBodyToArgv(body) {
   if (body.draft === true) argv.push("--draft");
   if (body.allowDuplicate === true || body["allow-duplicate"] === true)
     argv.push("--allow-duplicate");
+  if (body.noThrottle === true || body["no-throttle"] === true)
+    argv.push("--no-throttle");
   if (body.noDownload === true || body["no-download"] === true)
     argv.push("--no-download");
 
@@ -455,6 +461,8 @@ const SHARED_PUBLISH_BODY_KEYS = [
   "draft",
   "allowDuplicate",
   "allow-duplicate",
+  "noThrottle",
+  "no-throttle",
   "noDownload",
   "no-download",
   "platformOptions",
@@ -554,9 +562,15 @@ function pickTargetCreativeStatement(target) {
 }
 
 /**
- * HTTP 创作声明解析（对齐 LocalVideoPublish 批量设置 + 单账号覆盖）
+ * HTTP 创作声明解析（对齐 LocalVideoPublish 批量设置 + 单账号覆盖 + 设置默认声明）
+ * 优先级：target.creativeStatement > creativeStatements[平台] > body.creativeStatement > options.defaultCreativeStatement（默认 ai_generated）
  */
-export function resolveHttpPublishCreativeStatement(body, platformPt, target) {
+export function resolveHttpPublishCreativeStatement(
+  body,
+  platformPt,
+  target,
+  options = {}
+) {
   let raw = pickTargetCreativeStatement(target);
   if (raw == null) {
     raw = pickCreativeStatementFromMap(body.creativeStatements, platformPt);
@@ -568,25 +582,39 @@ export function resolveHttpPublishCreativeStatement(body, platformPt, target) {
       "cs",
     ]);
   }
+  if (raw == null) {
+    raw =
+      options && options.defaultCreativeStatement !== undefined
+        ? options.defaultCreativeStatement
+        : DEFAULT_PUBLISH_CREATIVE_STATEMENT;
+  }
   return resolveCreativeStatementForPlatform(raw, platformPt);
 }
 
-function applyHttpCreativeStatements(body, parsedValue, target = {}) {
+function applyHttpCreativeStatements(
+  body,
+  parsedValue,
+  target = {},
+  options = {}
+) {
   return {
     ...parsedValue,
     creativeStatement: resolveHttpPublishCreativeStatement(
       body,
       parsedValue.platform,
-      target
+      target,
+      options
     ),
   };
 }
 
 /**
  * 解析 HTTP 发布请求；支持单平台 platform 或多平台 platforms
+ * @param {object} body
+ * @param {{ defaultCreativeStatement?: string }} [options]
  * @returns {{ ok: true, multi: boolean, value: object|object[] } | { ok: false, error: string }}
  */
-export function parseMultiPublishRequest(body) {
+export function parseMultiPublishRequest(body, options = {}) {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     return { ok: false, error: "请求体必须是 JSON 对象" };
   }
@@ -598,7 +626,7 @@ export function parseMultiPublishRequest(body) {
     return {
       ok: true,
       multi: false,
-      value: applyHttpCreativeStatements(body, single.value, body),
+      value: applyHttpCreativeStatements(body, single.value, body, options),
     };
   }
 
@@ -636,7 +664,9 @@ export function parseMultiPublishRequest(body) {
         error: "HTTP API 暂不支持批量目录发布，请使用 cli publish --dir",
       };
     }
-    parsed.push(applyHttpCreativeStatements(body, item.value, targets[i]));
+    parsed.push(
+      applyHttpCreativeStatements(body, item.value, targets[i], options)
+    );
   }
 
   if (parsed.length === 0) {
@@ -682,7 +712,7 @@ export function publishHelpText() {
       --config <path>       [batch] xlsx 声明文件（列：文件名/标题/简介/标签/视频号短标题/创作声明）
       --cs, --creative-statement <val>  creative statement value for single-file mode.
                             Valid values: none | ai_generated | fiction | marketing | personal_opinion | repost | self_made_no_repost
-                            (self_made_no_repost is blbl-only). Default: none.
+                            (self_made_no_repost is blbl-only). Default: configured setting (default ai_generated; unsupported platforms fall back to none).
       --cover <path>    自定义封面图片路径（抖音/快手/视频号生效；竖封面 3:4 比例最佳，
                             抖音横封面基于竖封面自动生成；视频号仅收 jpg/png）。
                             单文件模式传绝对路径；--dir 批量模式下全局覆盖 xlsx「封面」列，
@@ -707,6 +737,7 @@ export function publishHelpText() {
       --draft           显式发布到草稿箱（小红书点「暂存离开」）。若账号在 GUI「媒体平台管理」
                             里开启了「默认发布到草稿」，即使不加该参数也会自动走草稿。
       --allow-duplicate 放行 7 天内同平台+同账号+同标题的重复发布拦截（默认拒绝并退出码 6）
+      --no-throttle     绕过发布节流与错峰排期（不自动顺延为定时任务；即使传了 --publish-at 也不顺延）
       --no-download     快手专用：取消勾选「允许下载此作品」并校验终态（其它平台忽略；
                             取消未确认会中止发布，宁可不发不可漏禁下载红线）
       --sph-product-id <id>   视频号商品上架（快捷参数，等价于 product + 商品编号）

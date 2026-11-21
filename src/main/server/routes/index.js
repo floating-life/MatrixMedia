@@ -9,6 +9,12 @@ const {
   readPushDataRecords,
 } = require("../../../shared/publishDedupe.js");
 const { handleAccountCollectOutcome } = require("../../services/dataStats/collectAlert.js");
+const {
+  readPublishThrottleSettings,
+  getDefaultCreativeStatement,
+  planPublishTimes,
+  parseLocalPublishAt,
+} = require("../../services/publishThrottle.js");
 
 var router = express.Router();
 
@@ -47,9 +53,10 @@ router.get("/creative-statements", async function (req, res) {
     const { getCreativeStatementApiSpec } = await import(
       "../../../shared/creativeStatement.js"
     );
+    const defaultStatement = getDefaultCreativeStatement();
     res.json({
       success: true,
-      ...getCreativeStatementApiSpec(),
+      ...getCreativeStatementApiSpec(defaultStatement),
     });
   } catch (error) {
     console.error("[HTTP /creative-statements]", error);
@@ -108,8 +115,11 @@ router.post("/publish", async function (req, res) {
       "../../services/puppeteerFile.js"
     );
 
+    const throttleSettings = readPublishThrottleSettings();
     const sanitizedBody = sanitizePublishPayloadObject(req.body || {});
-    const parsed = parseMultiPublishRequest(sanitizedBody);
+    const parsed = parseMultiPublishRequest(sanitizedBody, {
+      defaultCreativeStatement: throttleSettings.defaultCreativeStatement,
+    });
     if (!parsed.ok) {
       return res.status(400).json({
         success: false,
@@ -122,6 +132,7 @@ router.post("/publish", async function (req, res) {
       sanitizedBody && sanitizedBody.allowDuplicate === true
     );
     const records = readPushDataRecordsForHttp();
+    const nowMs = Date.now();
 
     let result;
     if (!Array.isArray(parsed.value)) {
@@ -153,13 +164,54 @@ router.post("/publish", async function (req, res) {
             platform: hit.platform,
             phone: hit.phone,
             title: hit.title,
+            creativeStatement: target.creativeStatement || "none",
             lastPublishAt: hit.lastPublishAt,
             lastPublishAtText: hit.lastPublishAtText,
             message: hit.message,
           });
         }
       }
-      if (!target.publishAt) {
+
+      // 显式 publishAt 先校验，再过节流排期（只顺延不提前，除非 noThrottle）
+      let explicitPublishAtMs = null;
+      if (target.publishAt) {
+        const parsedAt = parseLocalPublishAt(target.publishAt, nowMs);
+        if (!parsedAt.ok) {
+          return res.status(400).json({
+            success: false,
+            status: "failed",
+            message: parsedAt.error,
+          });
+        }
+        explicitPublishAtMs = parsedAt.value;
+      }
+
+      const planItem = planPublishTimes({
+        targets: [
+          {
+            platform: target.platform,
+            phone: target.phone,
+            partition: resolvedPartition,
+            publishAt: target.publishAt || null,
+            publishAtMs: explicitPublishAtMs,
+            noThrottle: Boolean(target.noThrottle),
+          },
+        ],
+        now: nowMs,
+        records,
+        settings: throttleSettings,
+      }).items[0];
+
+      if (planItem && planItem.scheduled) {
+        target.publishAt = planItem.publishAt;
+        target.scheduledPublishAtMs = planItem.plannedAtMs;
+        target.throttled = planItem.throttled;
+        target.throttleReason = planItem.reason;
+      } else {
+        target.publishAt = null;
+        target.scheduledPublishAtMs = null;
+        target.throttled = false;
+        target.throttleReason = "";
         registerPublishDedupeBypass({
           pt: target.platform,
           phone: target.phone,
@@ -168,10 +220,15 @@ router.post("/publish", async function (req, res) {
         });
       }
       result = await publishService.runSingleFilePublish(target);
+      if (result && result.creativeStatement == null) {
+        result.creativeStatement = target.creativeStatement || "none";
+      }
     } else {
-      // platforms 数组（1 个或多个平台）：逐平台查重，仅拦截重复的那几个平台，其余平台照常执行
+      // platforms 数组（1 个或多个平台）：先逐平台查重，仅拦截重复的那几个平台；
+      // 未被拦截的平台再进入节流排期并执行
       const targets = parsed.value;
       const allowedTargets = [];
+      const allowedMeta = [];
       const allowedIndices = [];
       const blockedByIndex = new Map();
 
@@ -199,6 +256,7 @@ router.post("/publish", async function (req, res) {
             blockedByIndex.set(i, {
               platform: t.platform,
               phone: t.phone || "",
+              creativeStatement: t.creativeStatement || "none",
               success: false,
               status: "duplicate",
               exitCode: DUPLICATE_EXIT_CODE,
@@ -211,15 +269,20 @@ router.post("/publish", async function (req, res) {
             continue;
           }
         }
-        if (!t.publishAt) {
-          registerPublishDedupeBypass({
-            pt: t.platform,
-            phone: t.phone,
-            partition: resolvedPartition,
-            title: candTitle,
-          });
+        let explicitPublishAtMs = null;
+        if (t.publishAt) {
+          const parsedAt = parseLocalPublishAt(t.publishAt, nowMs);
+          if (!parsedAt.ok) {
+            return res.status(400).json({
+              success: false,
+              status: "failed",
+              message: parsedAt.error,
+            });
+          }
+          explicitPublishAtMs = parsedAt.value;
         }
         allowedTargets.push(t);
+        allowedMeta.push({ resolvedPartition, candTitle, explicitPublishAtMs });
         allowedIndices.push(i);
       }
 
@@ -236,46 +299,106 @@ router.post("/publish", async function (req, res) {
           message: blockedList.map((r) => r.message).join("；"),
           results: blockedList,
         };
-      } else if (blockedByIndex.size === 0) {
-        result = parsed.multi
-          ? await publishService.runMultiPlatformPublish(allowedTargets)
-          : await publishService.runSingleFilePublish(allowedTargets[0]);
       } else {
-        const runRes = await publishService.runMultiPlatformPublish(allowedTargets);
-        const runResults = Array.isArray(runRes && runRes.results) ? runRes.results : [];
-        const mergedResults = new Array(targets.length);
-        for (const [idx, blocked] of blockedByIndex.entries()) {
-          mergedResults[idx] = blocked;
+        // 仅对未命中重复拦截的平台进行节流排期
+        const plan = planPublishTimes({
+          targets: allowedTargets.map((t, k) => ({
+            platform: t.platform,
+            phone: t.phone,
+            partition: allowedMeta[k].resolvedPartition,
+            publishAt: t.publishAt || null,
+            publishAtMs: allowedMeta[k].explicitPublishAtMs,
+            noThrottle: Boolean(t.noThrottle),
+          })),
+          now: nowMs,
+          records,
+          settings: throttleSettings,
+        });
+
+        for (let k = 0; k < allowedTargets.length; k++) {
+          const t = allowedTargets[k];
+          const meta = allowedMeta[k];
+          const planItem = plan.items[k];
+          if (planItem && planItem.scheduled) {
+            t.publishAt = planItem.publishAt;
+            t.scheduledPublishAtMs = planItem.plannedAtMs;
+            t.throttled = planItem.throttled;
+            t.throttleReason = planItem.reason;
+          } else {
+            t.publishAt = null;
+            t.scheduledPublishAtMs = null;
+            t.throttled = false;
+            t.throttleReason = "";
+            registerPublishDedupeBypass({
+              pt: t.platform,
+              phone: t.phone,
+              partition: meta.resolvedPartition,
+              title: meta.candTitle,
+            });
+          }
         }
-        for (let k = 0; k < allowedIndices.length; k++) {
-          mergedResults[allowedIndices[k]] = runResults[k] || {
-            platform: allowedTargets[k].platform,
-            success: false,
-            status: "failed",
-            exitCode: 1,
-            message: "发布未返回结果",
+
+        if (blockedByIndex.size === 0) {
+          result = parsed.multi
+            ? await publishService.runMultiPlatformPublish(allowedTargets)
+            : await publishService.runSingleFilePublish(allowedTargets[0]);
+          if (!parsed.multi && result && result.creativeStatement == null) {
+            result.creativeStatement = allowedTargets[0].creativeStatement || "none";
+          }
+        } else {
+          const runRes = await publishService.runMultiPlatformPublish(allowedTargets);
+          const runResults = Array.isArray(runRes && runRes.results) ? runRes.results : [];
+          const mergedResults = new Array(targets.length);
+          for (const [idx, blocked] of blockedByIndex.entries()) {
+            mergedResults[idx] = blocked;
+          }
+          for (let k = 0; k < allowedIndices.length; k++) {
+            const rr = runResults[k];
+            mergedResults[allowedIndices[k]] = rr
+              ? {
+                  ...rr,
+                  creativeStatement:
+                    rr.creativeStatement ||
+                    allowedTargets[k].creativeStatement ||
+                    "none",
+                }
+              : {
+                  platform: allowedTargets[k].platform,
+                  phone: allowedTargets[k].phone || "",
+                  creativeStatement: allowedTargets[k].creativeStatement || "none",
+                  success: false,
+                  status: "failed",
+                  exitCode: 1,
+                  message: "发布未返回结果",
+                };
+          }
+          const total = mergedResults.length;
+          const succeeded = mergedResults.filter(
+            (r) => r && (r.success === true || r.exitCode === 0)
+          ).length;
+          const scheduledCount = mergedResults.filter(
+            (r) => r && r.scheduled === true
+          ).length;
+          const failed = total - succeeded;
+          result = {
+            ...(runRes || {}),
+            success: failed === 0,
+            status: succeeded > 0 ? "partial_duplicate" : "duplicate",
+            exitCode: failed === 0 ? 0 : DUPLICATE_EXIT_CODE,
+            total,
+            succeeded,
+            scheduledCount,
+            failed,
+            results: mergedResults,
+            message: `共 ${total} 个平台：成功 ${succeeded} 个${
+              scheduledCount > 0 ? `（含节流排期 ${scheduledCount} 个）` : ""
+            }，拦截重复 ${blockedByIndex.size} 个${
+              failed - blockedByIndex.size > 0
+                ? `，失败 ${failed - blockedByIndex.size} 个`
+                : ""
+            }`,
           };
         }
-        const total = mergedResults.length;
-        const succeeded = mergedResults.filter(
-          (r) => r && (r.success === true || r.exitCode === 0)
-        ).length;
-        const failed = total - succeeded;
-        result = {
-          ...(runRes || {}),
-          success: failed === 0,
-          status: succeeded > 0 ? "partial_duplicate" : "duplicate",
-          exitCode: failed === 0 ? 0 : DUPLICATE_EXIT_CODE,
-          total,
-          succeeded,
-          failed,
-          results: mergedResults,
-          message: `共 ${total} 个平台：成功 ${succeeded} 个，拦截重复 ${blockedByIndex.size} 个${
-            failed - blockedByIndex.size > 0
-              ? `，失败 ${failed - blockedByIndex.size} 个`
-              : ""
-          }`,
-        };
       }
     }
 

@@ -24,6 +24,9 @@
           <el-button type="success" @click="openArticlePublish"
             >发布文章</el-button
           >
+          <el-button plain @click="publishSettingsVisible = true"
+            >发布节流设置</el-button
+          >
         </div>
         <div class="toolbar-right">
           <el-button plain :loading="exportingHistory" @click="exportHistory"
@@ -103,7 +106,14 @@
                     <el-tag
                       size="mini"
                       :type="publishStatusType(sub.publishStatus)"
+                      :title="sub.throttleReason || sub.lastPublishMessage || ''"
                       >{{ publishStatusText(sub.publishStatus) }}</el-tag
+                    >
+                    <span
+                      v-if="sub.publishStatus === 'scheduled' && sub.scheduledPublishAtText"
+                      class="progress-count"
+                      :title="sub.throttleReason || sub.lastPublishMessage || ''"
+                      >计划 {{ sub.scheduledPublishAtText }}</span
                     >
                   </div>
                 </div>
@@ -149,6 +159,20 @@
         </el-card>
       </template>
     </div>
+
+    <!-- 发布节流与默认创作声明设置弹窗 -->
+    <el-dialog
+      title="发布节流设置"
+      :visible.sync="publishSettingsVisible"
+      width="860px"
+      append-to-body
+      :close-on-click-modal="false"
+    >
+      <PublishThrottleSettingsCard
+        v-if="publishSettingsVisible"
+        @saved="publishSettingsVisible = false"
+      />
+    </el-dialog>
 
     <!-- 发布失败截图：点记录里的「失败 / 异常」次数打开 -->
     <el-dialog
@@ -204,6 +228,7 @@ import ptConfig from "@/utils/configUrl";
 import openLoginWindow from "@/utils/openLoginWindow";
 import LocalVideoPublish from "@/components/LocalVideoPublish.vue";
 import LocalArticlePublish from "@/components/LocalArticlePublish.vue";
+import PublishThrottleSettingsCard from "@/components/PublishThrottleSettingsCard.vue";
 import { normalizeVideoRecordMetadata } from "../../../shared/videoMetadata.js";
 import {
   buildAccountPartitionOf,
@@ -217,6 +242,7 @@ export default {
   components: {
     LocalVideoPublish,
     LocalArticlePublish,
+    PublishThrottleSettingsCard,
   },
   data() {
     return {
@@ -225,6 +251,7 @@ export default {
       ptConfig,
       dataList: {},
       exportingHistory: false,
+      publishSettingsVisible: false,
       taskHandlers: new Map(),
       statusLoadingMap: {},
       loginData: {},

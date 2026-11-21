@@ -120,6 +120,8 @@ matrixmedia.exe cli publish -p dy --phone 13800138000 -f C:\video.mp4 -t "标题
 | `--sph-link-type`          | 视频号链接类型，支持 `none` / `product` / `mini_drama` / `sph_series`（也接受 `短剧` / `drama` / `剧集` / `series` 等别名）；其他平台忽略                  |
 | `--sph-link-value`         | 视频号链接值：商品编号，或短剧 / 剧集**名称**；只传该参数时默认按商品上架                                 |
 | `--allow-duplicate`        | 允许重复发布；默认同平台+同账号+清洗归一后同标题在 7 天内已有成功/进行中记录时拒绝并返回退出码 `6`（`status: "duplicate"`，message 含上次时间），显式传本参数才放行 |
+| `--no-throttle`            | 绕过发布节流与错峰排期；默认与 GUI / HTTP 共用主进程持久化节流配置（同账号最小间隔 抖音 6h/其余 4h、每日上限 3 条、允许时段 06:00–23:30 UTC+8、平台相对首发延迟默认 0 / 百家号可设 10h），超限时自动转为定时任务并返回 `status: "scheduled"`、`publishAt` 与原因（显式 `--publish-at` 同样只顺延不提前），传 `--no-throttle` 可跳过 |
+| `--cs` / `--creative-statement` | 创作声明（`none` / `ai_generated` / `fiction` / `marketing` / `personal_opinion` / `repost` / `self_shot` / `self_made_no_repost`）；省略时套用发布设置里的默认声明（出厂默认 `ai_generated`，平台不支持时回退 `none`），JSON 输出会返回最终生效的 `creativeStatement` |
 
 完整说明请执行：
 
@@ -184,7 +186,15 @@ electron . cli publish -p sph --phone 13800138000 -f /path/to/video.mp4 \
 3. **进程生命周期**：CLI 仍会启动一个 Electron 主进程，只是不显示 GUI。命令完成、参数失败或业务失败后会主动退出；执行发布期间进程存在属于正常现象。
 4. **启动诊断**：终端会依次输出 Puppeteer 初始化、Electron ready、CLI 参数识别和最终退出码。初始化超过 15 秒会以退出码 `1` 结束并打印明确错误，不会无限静默等待。
 5. **登录失效**：视频号发布页若跳转到 `channels.weixin.qq.com/login.html`，CLI 会立即提示重新登录并以退出码 `5` 结束（`cli history` 里该条记录状态为 `login_required`，GUI 视频管理显示「需重新登录」），不再按普通 URL 不匹配重复重试；重新扫码后重跑即可。
-6. **定时发布**：`--publish-at "YYYY-MM-DD HH:mm:ss"` 只支持一次性明确时间点，不支持每日/每周/每月。定时任务会写入发布历史，状态为“等待定时发布”；如果应用关闭导致错过执行时间，下次启动会标记为“任务过期”，可在视频管理中重新发布。
+6. **定时发布与发布节流**：`--publish-at "YYYY-MM-DD HH:mm:ss"` 只支持一次性明确时间点，不支持每日/每周/每月。开启发布节流（默认开，与 GUI「发布节流设置」及 HTTP API 共用 `<userData>/publish-throttle-settings.json`）后，若距上次同平台同账号发布/待发任务不足最小间隔、落在允许时段外、超出当日上限或配置了平台错峰延迟，CLI 会自动顺延并写入定时任务（退出码 `0`，stdout JSON 返回 `status: "scheduled"`、`scheduled: true`、`publishAt`、`throttled: true`、`throttleReason`、`creativeStatement`）；传 `--publish-at` 时也会过节流且只顺延不提前；传 `--no-throttle` 可绕过。先查 7 天重复拦截，再进入节流排期。定时任务写入发布历史，重启应用后由主进程定时调度器自动恢复；如果应用关闭导致错过执行时间，下次启动会标记为“任务过期”，可在视频管理中重新发布。
+
+```bash
+# 按节流发布（未传 --cs 时套用默认创作声明 ai_generated；间隔不足自动建定时任务）
+electron . cli publish -p dy --phone 13800138000 -f /path/to/video.mp4 -t "新视频标题"
+
+# 绕过节流并显式关闭创作声明
+electron . cli publish -p dy --phone 13800138000 -f /path/to/video.mp4 -t "紧急视频" --no-throttle --cs none
+```
 7. **Linux 打包**：使用 `yarn build:linux` 生成 AppImage（需在本机构建环境安装相应依赖）。
 
 ## 发布掘金文章

@@ -23,6 +23,21 @@
 | S8 | feat/stats-charts | ECharts 5.5.1 按需封装 `StatsChart.vue` +「数据分析」6 节可视化图表 + 导出单图/全部图表 PNG +「作品汇总」单内容播放走势弹窗 |
 | S9 | feat/stats-intraday | 固定时段内每 N 小时（默认 2）自动采集 + 分时段作品快照 `works-intraday/YYYY-MM-DD.json`（含保留期清理）+ 作品趋势「按天/按时段」+「最近采集」列 +「新作品前 24 小时」图 + Excel「作品时段明细」sheet |
 | S10 | feat/stats-quality | 标题/文案共享清洗（`_x000d_`/`\r`）+ 分析页加权互动率与三项互动率 + 总览实际覆盖天数与账号快照涨粉主口径 + 作品/账号防假 0 覆写 + 连续采集失败告警与系统通知 + 7 天同平台重复发布拦截（GUI/CLI/HTTP） |
+| S11 | feat/stats-throttle | 发布节流（同账号最小间隔/每日上限/允许时段 UTC+8）+ 平台错峰延迟（百家号可设 +10h）+ 自动转定时任务与重启恢复 + GUI 排期预览表与设置入口 + 默认 AI 创作声明（`ai_generated`，三端共用） |
+
+## S11：发布节流 / 平台错峰 / 默认 AI 创作声明（`feat/stats-throttle`）
+- **主进程持久化设置（`src/shared/publishThrottle.js` + `src/main/services/publishThrottle.js` + `ipcMain.js`）**：配置保存在 `<userData>/publish-throttle-settings.json`（原子写），GUI / CLI / HTTP 共用；IPC 通道 `publish-throttle:get-settings` / `save-settings` / `reset-settings` / `plan` / `create-scheduled`。出厂默认值：
+  - 总开关 `enabled: true`（默认开）
+  - 允许发布时段 `allowedWindow: { start: "06:00", end: "23:30" }`（UTC+8 本地时间）
+  - 每平台规则：同账号最小间隔小时 `minIntervalHours`（抖音默认 `6`，其余平台默认 `4`）、同账号每日上限 `dailyLimit`（默认 `3`，`0` 表示不限）、相对首发延迟小时 `delayFromFirstHours`（默认 `0`，百家号可按建议设 `10`–`12`）
+  - 默认创作声明 `defaultCreativeStatement: "ai_generated"`（可改 `none` 等）
+- **纯函数排期引擎（`planPublishTimes`）**：输入本次请求的平台/账号列表、请求时刻（或显式 `publishAt`）、该账号历史有效发布记录（`success`/`published`/`publishing`）与未过期 `scheduled` 待发任务、设置；按 `(canonicalPlatform, canonicalPartition)` 分桶，顺序累积计算 `max(基准时刻 + 平台延迟, 最新发布或待发任务 + 最小间隔)`，并迭代对齐 UTC+8 允许发布时段（时段外顺延至下个时段开始）与 UTC+8 日历日上限（超限顺延至次日首个可用时刻）。显式 `publishAt` 同样过节流且只顺延不提前；同一请求内同平台多账号互不影响，同账号多条请求按顺序累积；未显式定时且计划时刻 `≤ now + 1 分钟` 则立即发，否则转为定时任务并输出中文原因列表。
+- **三端应用与 S10 重复拦截兼容（`publishVideo.js` + `scheduledPublish.js` + `cli/index.js` + `parsePublishArgs.js` + `server/routes/index.js` + `LocalVideoPublish.vue`）**：
+  - 统一顺序：先执行 S10 7 天重复发布拦截，再进入 S11 节流排期；命中 `duplicate` 的平台不进入排期。
+  - 定时任务复用 `scheduledPublish.createScheduledRecord`（支持显式 epoch ms 透传，避免跨时区偏差）与 `scheduledDedupe.findExistingScheduled` 去重，落盘至 `pushData` 并调用 `notifyScheduledPublishChanged()` 立即刷新调度器，应用重启后由 `startScheduledPublishScheduler` 自动恢复。
+  - CLI 支持 `--no-throttle`、HTTP 支持 `noThrottle: true`（顶层及 `platforms[]` 单平台覆盖）；多平台混合立即与定时时 `runMultiPlatformPublish` 保持结果顺序、及时释放远程下载临时文件、按条返回 `status`（`submitted` / `scheduled` / `duplicate`）、`publishAt`、`throttled`、`throttleReason` 与最终 `creativeStatement`。
+  - GUI：`videoManager/index.vue` 工具栏提供「发布节流设置」弹窗入口，`projectDetail/index.vue` 新增「⏱ 发布设置」tab（共用 `PublishThrottleSettingsCard.vue`）；`LocalVideoPublish.vue`（单视频多平台与目录批量）点「发布」前弹出「发布排期预览」表（平台 / 账号 / 标题 / 计划时间 / 原因），支持「确认按排期发布」「改为不节流」或「取消」。
+- **默认创作声明（`creativeStatement.js` + `parsePublishArgs.js` + `publishVideo.js` + `cli/index.js` + `routes/index.js` + `LocalVideoPublish.vue`）**：出厂默认 `ai_generated`；HTTP/CLI 请求未传 `creativeStatement` / `creativeStatements` / `--cs` 时自动套用持久化默认声明，显式传值（含 `none`）覆盖默认；GUI 发布页初始选中该默认值；平台不支持时按 `resolveCreativeStatementForPlatform` 回退 `none`；CLI / HTTP 返回明细均写出最终 `creativeStatement`。
 
 ## S10：数据质量与发布防呆（`feat/stats-quality`）
 - **标题/文案共享清洗（`src/shared/textSanitize.js` + `videoMetadata.js` + `ipcMain.js` + `cli/index.js` + `server/routes/index.js` + `LocalVideoPublish.vue`）**：统一删除 Excel 转义字面量 `_x000d_`（大小写不敏感、可连续），将 `\r\n`/`\r` 转为 `\n`；标题类字段（`title`/`shortTitle`/`bt1`）将换行折成空格并 trim，简介类字段（`description`/`bdText`）保留 `\n` 并 trim。GUI 批量导入、CLI `publish`/xlsx、HTTP `POST /publish` 共用同一清洗链路，结果完全一致。

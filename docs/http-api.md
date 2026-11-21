@@ -79,19 +79,20 @@
 
 **响应字段**：
 
-| 字段           | 说明                                               |
-| -------------- | -------------------------------------------------- |
-| `default`      | 默认值，一般为 `none`                              |
-| `batchOptions` | 全局批量下拉全部选项（value + label）              |
-| `platforms`    | 按平台 code 列出 `supports` 与该平台可用 `options` |
-| `input`        | HTTP `POST /publish` 入参说明                      |
+| 字段           | 说明                                                               |
+| -------------- | ------------------------------------------------------------------ |
+| `default`      | 当前发布设置里的默认创作声明，出厂默认 `ai_generated`（可改 `none` 等） |
+| `fallback`     | 平台不支持所选声明时的回退值，固定为 `none`                        |
+| `batchOptions` | 全局批量下拉全部选项（value + label）                              |
+| `platforms`    | 按平台 code 列出 `supports` 与该平台可用 `options`                 |
+| `input`        | HTTP `POST /publish` 入参说明                                      |
 
 **声明 value 一览**（也可用中文 label 或各平台页面原文案）：
 
 | value                 | 说明       | 备注              |
 | --------------------- | ---------- | ----------------- |
-| `none`                | 无标注     | 默认              |
-| `ai_generated`        | AI 生成    |                   |
+| `none`                | 无标注     | 平台不支持时回退  |
+| `ai_generated`        | AI 生成    | 出厂默认          |
 | `fiction`             | 虚构演绎   |                   |
 | `marketing`           | 营销推广   | 快手/头条不支持   |
 | `personal_opinion`    | 个人观点   | 小红书/头条不支持 |
@@ -138,28 +139,33 @@
 | `sphSeriesId` | 否 | 视频号剧集挂载快捷字段（**剧集名称**，视频号原生剧集）；仅视频号生效，等价于 `platformOptions.sph.link.type=sph_series`                                         |
 | `sphLink`            | 否     | 视频号链接对象，如 `{ "type": "product", "value": "商品编号" }`、`{ "type": "mini_drama", "value": "短剧名称" }` 或 `{ "type": "sph_series", "value": "剧集名称" }`；与三个快捷字段同时传时优先快捷字段                           |
 | `platformOptions`    | 否     | 平台专属参数容器；视频号商品也可用 `platformOptions.sph.link`，不会应用到其他平台                                                        |
-| `creativeStatement`  | 否     | 全局创作声明，等同 GUI「批量设置创作声明」；支持 value、中文 label 或平台页面原文案（如 `内容由AI生成`）                                 |
+| `creativeStatement`  | 否     | 全局创作声明，等同 GUI「批量设置创作声明」；未传时套用发布设置里的默认声明（出厂默认 `ai_generated`，可在 GUI「发布节流设置」修改为 `none` 等）；支持 value、中文 label 或平台页面原文案（如 `内容由AI生成`） |
 | `creativeStatements` | 否     | 按平台覆盖声明，key 用 code 或中文名，如 `{ "dy": "ai_generated", "blbl": "fiction" }`；某平台不支持所选值时回退 `none`                  |
 | `allowDuplicate`     | 否     | 默认 `false`；7 天内同平台+同账号+清洗后同标题已有成功/进行中记录时默认拦截，传 `true` 才放行（亦可在多平台 `platforms[]` 子对象内按平台单独指定） |
+| `noThrottle`         | 否     | 默认 `false`；开启发布节流时同账号间隔不足、超出允许发布时段（默认 06:00–23:30 UTC+8）、达当日上限或配置了平台错峰延迟会自动顺延为定时任务（显式 `publishAt` 同样只顺延不提前），传 `true` 可绕过（支持顶层或 `platforms[]` 单平台覆盖） |
 
-**创作声明优先级**（与 GUI 一致）：`platforms[].creativeStatement` > `creativeStatements[平台]` > `creativeStatement`。
+**创作声明优先级**（与 GUI 一致）：`platforms[].creativeStatement` > `creativeStatements[平台]` > `creativeStatement` > 主进程发布设置 `defaultCreativeStatement`（出厂默认 `ai_generated`）。
 
-视频号已支持「视频标注」创作声明。某平台不支持所选值时回退为 `none`。可用 `GET /creative-statements` 查询各平台可用选项。
+视频号已支持「视频标注」创作声明。某平台不支持所选值（如番茄视频）时按现有规则自动回退为 `none`。响应体及多平台 `results[]` 明细中均会写出最终生效的 `creativeStatement`。可用 `GET /creative-statements` 查询当前默认值与各平台可用选项。
+
+**发布节流与重复拦截执行顺序**：先执行 7 天同平台重复发布拦截，再进入节流排期；被判定为 `duplicate` 的平台不会进入排期。对于通过重复校验的平台：若计划时刻 `≤ 现在 + 1 分钟` 则立即提交发布；否则自动创建定时发布任务（复用 `scheduledPublish` 与去重，应用重启不丢失），该平台返回 `status: "scheduled"`、`scheduled: true`、`publishAt`、`throttled: true` 及 `throttleReason`（如「距上次抖音发布不足 6 小时」「百家号相对首发延迟 10 小时」）。多平台请求中可同时出现部分平台立即提交（`status: "submitted"`）、部分平台节流定时（`status: "scheduled"`）与部分平台重复拦截（`status: "duplicate"`）。
 
 **响应体（JSON）**：
 
 | 字段                             | 说明                                                 |
 | -------------------------------- | ---------------------------------------------------- |
-| `success`                        | 请求是否被接受；多平台表示已成功提交到发布队列       |
-| `status`                         | 单平台为最终状态（重复拦截为 `duplicate`）；多平台提交成功为 `submitted`，部分平台被拦截重复为 `partial_duplicate`，全拦截为 `duplicate` |
-| `exitCode`                       | 单平台同 CLI（重复拦截为 `6`）；多平台提交成功为 `0` |
+| `success`                        | 请求是否被接受；多平台表示已成功提交到发布队列或已创建定时任务 |
+| `status`                         | 单平台为最终状态（重复拦截为 `duplicate`，节流或显式定时为 `scheduled`）；多平台全立即或混合为 `submitted`，全定时为 `scheduled`，部分重复拦截为 `partial_duplicate`，全拦截为 `duplicate` |
+| `exitCode`                       | 单平台同 CLI（重复拦截为 `6`）；多平台提交/排期成功为 `0` |
 | `duplicate`                      | 触发 7 天内重复发布拦截时为 `true`                   |
 | `lastPublishAt` / `lastPublishAtText` | 触发重复发布拦截时返回上次匹配记录的时间戳（ms）与 UTC+8 时间文本 |
-| `message`                        | 结果说明（重复拦截时含上次发布时间）                 |
+| `creativeStatement`              | 单平台响应写出最终生效的创作声明（多平台写在每个 `results[]` 条目中） |
+| `throttled` / `throttleReason` / `reason` | 触发节流顺延为定时任务时返回 `throttled: true` 与顺延原因文案 |
+| `message`                        | 结果说明（重复拦截时含上次发布时间；节流排期时含计划时间与原因） |
 | `total` / `succeeded` / `failed` | 多平台提交汇总；最终成功失败以 `pushData` 记录为准   |
-| `results`                        | 多平台时各平台提交明细数组（含 `creativeStatement`；重复平台单独标 `status: "duplicate"`、`exitCode: 6`，其余平台照常执行） |
+| `results`                        | 多平台时各平台提交明细数组（含最终 `creativeStatement`、`status`、`scheduled`、`publishAt`、`throttled`、`throttleReason`；重复平台单独标 `status: "duplicate"`、`exitCode: 6`，其余平台照常执行/排期） |
 | `id`                             | 单平台时写入 `pushData` 的记录 id                    |
-| `scheduled` / `publishAt`        | 定时发布时返回                                       |
+| `scheduled` / `publishAt`        | 定时发布或被节流顺延为定时任务时返回                 |
 
 **HTTP 状态码**：
 
@@ -325,10 +331,96 @@ curl -X POST http://127.0.0.1:30088/publish \
     },
     {
       "platform": "快手",
+      "phone": "13900139000",
+      "creativeStatement": "ai_generated",
       "success": true,
       "exitCode": 0,
       "status": "submitted",
+      "scheduled": false,
+      "throttled": false,
       "message": "已提交发布任务"
+    }
+  ]
+}
+```
+
+多平台节流排期与绕过示例（假设抖音 1 小时前刚发过、百家号配置了相对首发延迟 10 小时，快手无记录）：
+
+```bash
+# 按节流自动错峰（抖音与百家号自动建定时任务，快手立即提交；未传声明时套用默认 ai_generated）
+curl -X POST http://127.0.0.1:30088/publish \
+  -H "Content-Type: application/json" \
+  -d '{
+    "phone": "13800138000",
+    "file": "/Users/me/video.mp4",
+    "title": "我的视频标题",
+    "platforms": ["dy", "ks", "bjh"]
+  }'
+
+# 显式绕过节流并覆盖创作声明为 none
+curl -X POST http://127.0.0.1:30088/publish \
+  -H "Content-Type: application/json" \
+  -d '{
+    "platform": "dy",
+    "phone": "13800138000",
+    "file": "/Users/me/video.mp4",
+    "title": "紧急视频",
+    "noThrottle": true,
+    "creativeStatement": "none"
+  }'
+```
+
+多平台部分立即、部分节流定时的响应示例：
+
+```json
+{
+  "success": true,
+  "exitCode": 0,
+  "status": "submitted",
+  "scheduled": false,
+  "scheduledCount": 2,
+  "submittedCount": 1,
+  "message": "已提交 1 个平台立即发布，2 个平台已按节流排期定时发布",
+  "total": 3,
+  "succeeded": 2,
+  "failed": 0,
+  "results": [
+    {
+      "platform": "抖音",
+      "phone": "13800138000",
+      "creativeStatement": "ai_generated",
+      "success": true,
+      "exitCode": 0,
+      "status": "scheduled",
+      "scheduled": true,
+      "publishAt": "2026-11-21 15:00:00",
+      "throttled": true,
+      "throttleReason": "距上次抖音发布不足 6 小时",
+      "message": "已按发布节流排期至 2026-11-21 15:00:00（距上次抖音发布不足 6 小时）"
+    },
+    {
+      "platform": "快手",
+      "phone": "13800138000",
+      "creativeStatement": "ai_generated",
+      "success": true,
+      "exitCode": 0,
+      "status": "submitted",
+      "scheduled": false,
+      "throttled": false,
+      "message": "已提交发布任务"
+    },
+    {
+      "platform": "百家号",
+      "phone": "13800138000",
+      "creativeStatement": "ai_generated",
+      "success": true,
+      "exitCode": 0,
+      "status": "scheduled",
+      "scheduled": true,
+      "publishAt": "2026-11-21 20:00:00",
+      "throttled": true,
+      "throttleReason": "百家号相对首发延迟 10 小时",
+      "message": "已按发布节流排期至 2026-11-21 20:00:00（百家号相对首发延迟 10 小时）"
     }
   ]
 }

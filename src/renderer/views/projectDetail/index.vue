@@ -24,11 +24,21 @@
         @click="activeTab = 'ai'"
         >🤖 AI 设置</el-button
       >
+      <el-button
+        :type="activeTab === 'publish' ? 'warning' : 'info'"
+        @click="activeTab = 'publish'"
+        >⏱ 发布设置</el-button
+      >
     </div>
 
     <!-- Tab: AI 设置（API Key 管理，供发布页 AI 生成标题/正文/标签使用） -->
     <div v-if="activeTab === 'ai'">
       <ai-settings-card />
+    </div>
+
+    <!-- Tab: 发布设置（节流/错峰排期/默认创作声明） -->
+    <div v-if="activeTab === 'publish'">
+      <publish-throttle-settings-card />
     </div>
 
     <!-- Tab: 项目文档 -->
@@ -350,10 +360,11 @@ import packageInfo from "../../../../package.json";
 import { ipcRenderer } from "electron";
 import { VIDEO_PUBLISH_PLATFORM_DOCS } from "../../../shared/publishPlatforms.js";
 import AiSettingsCard from "@/components/ai/AiSettingsCard.vue";
+import PublishThrottleSettingsCard from "@/components/PublishThrottleSettingsCard.vue";
 
 export default {
   name: "ProjectDetail",
-  components: { AiSettingsCard },
+  components: { AiSettingsCard, PublishThrottleSettingsCard },
   data() {
     const videoPlatforms = VIDEO_PUBLISH_PLATFORM_DOCS.map((item) => ({
       code: item.code,
@@ -364,7 +375,9 @@ export default {
     return {
       appVersion: packageInfo.version,
       httpPort: 30088,
-      activeTab: ["docs", "dev", "ai"].includes(this.$route && this.$route.query.tab)
+      activeTab: ["docs", "dev", "ai", "publish"].includes(
+        this.$route && this.$route.query.tab
+      )
         ? this.$route.query.tab
         : "docs",
       telemetryEnabled: false,
@@ -840,7 +853,7 @@ export default async function (page, data, window, event) {
   watch: {
     // 发布页「AI 生成 → 去配置」会带 ?tab=ai 跳过来；已在项目详情页时组件不会重建，需监听切换
     "$route.query.tab"(v) {
-      if (["docs", "dev", "ai"].includes(v)) this.activeTab = v;
+      if (["docs", "dev", "ai", "publish"].includes(v)) this.activeTab = v;
     },
   },
   mounted() {

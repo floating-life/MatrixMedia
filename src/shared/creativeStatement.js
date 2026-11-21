@@ -16,6 +16,10 @@ export const CREATIVE_STATEMENT_VALUES = {
 
 export const CREATIVE_STATEMENT_DEFAULT = CREATIVE_STATEMENT_VALUES.NONE;
 
+/** 发布设置里默认的创作声明值（请求未显式传声明且设置未修改时套用） */
+export const DEFAULT_PUBLISH_CREATIVE_STATEMENT =
+  CREATIVE_STATEMENT_VALUES.AI_GENERATED;
+
 /** 无标注在表单与历史记录中的展示文案 */
 export const CREATIVE_STATEMENT_NONE_LABEL = "无标注";
 
@@ -264,8 +268,12 @@ export function resolveCreativeStatementForPlatform(value, pt) {
 
 /**
  * 供 HTTP GET /creative-statements 与文档生成
+ * @param {string} [configuredDefault] 主进程持久化设置里的默认声明值
  */
-export function getCreativeStatementApiSpec() {
+export function getCreativeStatementApiSpec(
+  configuredDefault = DEFAULT_PUBLISH_CREATIVE_STATEMENT
+) {
+  const effectiveDefault = normalizeCreativeStatement(configuredDefault);
   const platforms = {};
   for (const item of VIDEO_PUBLISH_PLATFORM_DOCS) {
     const supports = platformSupportsCreativeStatement(item.name);
@@ -282,7 +290,8 @@ export function getCreativeStatementApiSpec() {
   }
 
   return {
-    default: CREATIVE_STATEMENT_DEFAULT,
+    default: effectiveDefault,
+    fallback: CREATIVE_STATEMENT_DEFAULT,
     batchOptions: CREATIVE_STATEMENT_OPTIONS.map((opt) => ({
       value: opt.value,
       label: opt.label,
@@ -291,7 +300,7 @@ export function getCreativeStatementApiSpec() {
     platforms,
     input: {
       creativeStatement:
-        "全局默认声明，等同 GUI「批量设置创作声明」；支持 value、中文 label 或各平台页面原文案",
+        "全局默认声明，等同 GUI「批量设置创作声明」；未传时套用发布设置里的默认创作声明（默认 ai_generated）；支持 value、中文 label 或各平台页面原文案",
       creativeStatements:
         '按平台覆盖，key 可用 code（dy/blbl）或中文名；如 { "dy": "ai_generated", "blbl": "fiction" }',
       perPlatform: "platforms 对象数组内可传 creativeStatement / cs 覆盖单平台",

@@ -60,18 +60,56 @@ export function parsePublishAt(value, nowMs = Date.now()) {
 export function createScheduledRecord(
   recordItem,
   publishAtText,
-  nowMs = Date.now()
+  nowMs = Date.now(),
+  options = {}
 ) {
-  const parsed = parsePublishAt(publishAtText, nowMs);
-  if (!parsed.ok) {
-    throw new Error(parsed.error);
+  let parsed;
+  if (
+    publishAtText &&
+    typeof publishAtText === "object" &&
+    Number.isFinite(publishAtText.value)
+  ) {
+    if (publishAtText.value <= nowMs) {
+      throw new Error("定时发布时间必须是未来时间");
+    }
+    const text =
+      String(publishAtText.text || "").trim() ||
+      new Date(publishAtText.value + 8 * 3600 * 1000)
+        .toISOString()
+        .slice(0, 19)
+        .replace("T", " ");
+    parsed = { ok: true, value: publishAtText.value, text };
+  } else if (
+    options &&
+    Number.isFinite(options.scheduledPublishAtMs) &&
+    options.scheduledPublishAtMs > 0
+  ) {
+    if (options.scheduledPublishAtMs <= nowMs) {
+      throw new Error("定时发布时间必须是未来时间");
+    }
+    const text =
+      String(publishAtText || "").trim() ||
+      new Date(options.scheduledPublishAtMs + 8 * 3600 * 1000)
+        .toISOString()
+        .slice(0, 19)
+        .replace("T", " ");
+    parsed = { ok: true, value: options.scheduledPublishAtMs, text };
+  } else {
+    parsed = parsePublishAt(publishAtText, nowMs);
+    if (!parsed.ok) {
+      throw new Error(parsed.error);
+    }
   }
   const allowDuplicate =
     recordItem.allowDuplicate === true ||
     Boolean(recordItem.publishOptions && recordItem.publishOptions.allowDuplicate === true);
+  const throttleReason = String(
+    (options && options.throttleReason) || recordItem.throttleReason || ""
+  ).trim();
   return {
     ...recordItem,
     ...(allowDuplicate ? { allowDuplicate: true } : {}),
+    ...(throttleReason ? { throttleReason } : {}),
     date: recordItem.date || todayYmd(nowMs),
     scheduledTask: true,
     scheduledPublishAt: parsed.value,
@@ -81,7 +119,9 @@ export function createScheduledRecord(
     republishCount: Number(recordItem.republishCount) || 0,
     publishSuccessCount: Number(recordItem.publishSuccessCount) || 0,
     publishFailCount: Number(recordItem.publishFailCount) || 0,
-    lastPublishMessage: "等待定时发布",
+    lastPublishMessage: throttleReason
+      ? `等待定时发布（${throttleReason}）`
+      : "等待定时发布",
     lastPublishAt: nowMs,
   };
 }
@@ -186,7 +226,7 @@ function updateRecord(record, patch) {
   });
 }
 
-function listScheduledRecords() {
+export function listScheduledRecords() {
   const result = changeData({
     fileName: "pushData",
     type: "get",
@@ -385,8 +425,7 @@ export function schedulePublishRecord(record, nowMs = Date.now()) {
   scheduledTimers.set(key, timer);
 }
 
-export function refreshScheduledPublishScheduler() {
-  const nowMs = Date.now();
+export function refreshScheduledPublishScheduler(nowMs = Date.now()) {
   // 同一轮触发里同一任务只处理一次：历史数据里可能存在同键重复记录
   // （isDuplicate 不覆盖 scheduledTask），这里做兜底防止双发。
   const inFlight = new Set();
@@ -399,6 +438,15 @@ export function refreshScheduledPublishScheduler() {
     if (key) inFlight.add(key);
     schedulePublishRecord(record, nowMs);
   });
+}
+
+export function notifyScheduledPublishChanged(nowMs = Date.now()) {
+  if (!schedulerStarted) return;
+  refreshScheduledPublishScheduler(nowMs);
+}
+
+export function getScheduledTimersSnapshot() {
+  return Array.from(scheduledTimers.keys());
 }
 
 export function startScheduledPublishScheduler() {

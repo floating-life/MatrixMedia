@@ -3,7 +3,10 @@
 import path from "path";
 import fs from "fs";
 import xlsx from "xlsx";
-import { normalizeCreativeStatement } from "../../shared/creativeStatement.js";
+import {
+  normalizeCreativeStatement,
+  resolveCreativeStatementForPlatform,
+} from "../../shared/creativeStatement.js";
 import { getCliSubArgv, isCliMode } from "./detectArgv";
 import { parsePublishArgs, publishHelpText } from "./parsePublishArgs";
 import {
@@ -32,7 +35,16 @@ import { runSphCliLogin } from "../services/cliLogin/sphCliLogin";
 import { runSphChromeLogin } from "../services/cliLogin/sphChromeLogin";
 import { runSingleFilePublish } from "../services/publishVideo";
 import { changeData } from "../server/utils";
-import { createScheduledRecord } from "../services/scheduledPublish";
+import {
+  createScheduledRecord,
+  notifyScheduledPublishChanged,
+} from "../services/scheduledPublish";
+import { findExistingScheduled } from "../services/scheduledDedupe.js";
+import {
+  readPublishThrottleSettings,
+  planPublishTimes,
+  parseLocalPublishAt,
+} from "../services/publishThrottle.js";
 import { CLI_PUBLISH_TIMEOUT_MS } from "../services/upLoad/uploadTimeouts.js";
 import { resolveAccountPublishMode } from "../services/accountPublishSettingsResolver.js";
 import { resolveTaskPartition } from "../services/accountLookup.js";
@@ -436,6 +448,16 @@ async function runBatchDirPublish(v, cfg) {
   }
 
   const recordDate = todayYmd();
+  const throttleSettings = readPublishThrottleSettings();
+  let batchExplicitPublishAtMs = null;
+  if (v.publishAt) {
+    const parsedAt = parseLocalPublishAt(v.publishAt, Date.now());
+    if (!parsedAt.ok) {
+      console.error(parsedAt.error);
+      return 2;
+    }
+    batchExplicitPublishAtMs = parsedAt.value;
+  }
   const results = [];
 
   for (let i = 0; i < rows.length; i++) {
@@ -519,7 +541,11 @@ async function runBatchDirPublish(v, cfg) {
       }
     }
 
-    const cs = normalizeCreativeStatement(row.creativeStatement || "");
+    const rawCs =
+      (row.creativeStatement && String(row.creativeStatement).trim()) ||
+      (v.creativeStatement && String(v.creativeStatement).trim()) ||
+      throttleSettings.defaultCreativeStatement;
+    const cs = resolveCreativeStatementForPlatform(rawCs, v.platform);
     const metadata = normalizeVideoMetadata(
       {
         title: bt1,
@@ -537,8 +563,9 @@ async function runBatchDirPublish(v, cfg) {
       phone: v.phone,
       pt: v.platform,
     });
+    const currentRecords = readPushDataRecordsForCli();
     if (!v.allowDuplicate) {
-      const dup = findRecentDuplicatePublish(readPushDataRecordsForCli(), {
+      const dup = findRecentDuplicatePublish(currentRecords, {
         pt: v.platform,
         phone: derivePhoneForRecord(v),
         partition: v.partition,
@@ -552,6 +579,7 @@ async function runBatchDirPublish(v, cfg) {
           title: metadata.title,
           platform: v.platform,
           phone: v.phone || "",
+          creativeStatement: cs,
           status: "duplicate",
           exitCode: DUPLICATE_EXIT_CODE,
           duplicate: true,
@@ -570,6 +598,122 @@ async function runBatchDirPublish(v, cfg) {
       partition: v.partition,
       requestDraftMode: Boolean(v.draft),
     });
+
+    const rowNowMs = Date.now();
+    const rowPlan = planPublishTimes({
+      targets: [
+        {
+          platform: v.platform,
+          phone: derivePhoneForRecord(v),
+          partition: v.partition,
+          publishAt: v.publishAt || null,
+          publishAtMs: batchExplicitPublishAtMs,
+          noThrottle: Boolean(v.noThrottle),
+        },
+      ],
+      now: rowNowMs,
+      records: currentRecords,
+      settings: throttleSettings,
+    }).items[0];
+
+    const selectedFile = path.basename(resolvedFile);
+    const recordItem = {
+      bookName,
+      textOtherName: stem,
+      textType: "local",
+      pt: v.platform,
+      selectedFile,
+      bt: metadata.title,
+      title: metadata.title,
+      description: metadata.description,
+      shortTitle: metadata.shortTitle,
+      tags: metadata.tags,
+      ...metadata.legacy,
+      creativeStatement: cs,
+      coverPath,
+      filePath: resolvedFile,
+      useragent: cfg.useragent,
+      phone: derivePhoneForRecord(v),
+      partition: v.partition,
+      url: cfg.listIndex,
+      uploadUrl: cfg.upload,
+      date: recordDate,
+      ...(v.allowDuplicate ? { allowDuplicate: true } : {}),
+      publishAttemptCount: 1,
+      republishCount: 0,
+      publishSuccessCount: 0,
+      publishFailCount: 0,
+      publishMode: effectivePublishMode.publishMode,
+      publishToDraft: effectivePublishMode.publishToDraft,
+      publishOptions: v.publishOptions || {},
+      publishStatus: effectivePublishMode.publishToDraft
+        ? "drafting"
+        : "publishing",
+      lastPublishMessage: effectivePublishMode.publishToDraft
+        ? "等待保存草稿结果"
+        : "等待发布结果",
+      lastPublishAt: rowNowMs,
+    };
+
+    if (rowPlan && rowPlan.scheduled) {
+      const scheduledRecord = createScheduledRecord(
+        recordItem,
+        rowPlan.publishAt,
+        rowNowMs,
+        {
+          scheduledPublishAtMs: rowPlan.plannedAtMs,
+          throttleReason: rowPlan.reason,
+        }
+      );
+      const existing = findExistingScheduled(currentRecords, scheduledRecord);
+      let recordId = existing ? existing.id || null : null;
+      if (!existing) {
+        const addRes = changeData({
+          fileName: "pushData",
+          type: "add",
+          item: scheduledRecord,
+        });
+        if (addRes && addRes.success && Array.isArray(addRes.data)) {
+          const found = [...addRes.data]
+            .reverse()
+            .find(
+              (it) =>
+                it.scheduledTask === true &&
+                it.scheduledPublishAt === scheduledRecord.scheduledPublishAt &&
+                it.textOtherName === scheduledRecord.textOtherName &&
+                it.pt === scheduledRecord.pt &&
+                it.selectedFile === scheduledRecord.selectedFile
+            );
+          if (found) recordId = found.id;
+        }
+        notifyScheduledPublishChanged();
+      }
+      const schedMsg = existing
+        ? "同一视频在该时间点的定时任务已存在，未重复创建"
+        : rowPlan.throttled && rowPlan.reason
+        ? `已按发布节流排期至 ${scheduledRecord.scheduledPublishAtText}（${rowPlan.reason}）`
+        : "定时发布任务已创建，已写入发布历史";
+      const r = {
+        index: i + 1,
+        total: rows.length,
+        fileName: row.fileName,
+        title: metadata.title,
+        platform: v.platform,
+        phone: v.phone || "",
+        creativeStatement: cs,
+        status: "scheduled",
+        scheduled: true,
+        id: recordId,
+        publishAt: scheduledRecord.scheduledPublishAtText,
+        throttled: rowPlan.throttled,
+        throttleReason: rowPlan.reason,
+        reason: rowPlan.reason,
+        message: schedMsg,
+      };
+      results.push(r);
+      console.log(JSON.stringify({ progress: true, done: true, ...r }));
+      continue;
+    }
 
     const taskId = Date.now() + Math.random();
     const taskPayload = {
@@ -599,43 +743,6 @@ async function runBatchDirPublish(v, cfg) {
       phone: derivePhoneForRecord(v),
       filePath: resolvedFile,
       pt: v.platform,
-    };
-
-    const selectedFile = path.basename(resolvedFile);
-    const recordItem = {
-      bookName,
-      textOtherName: stem,
-      textType: "local",
-      pt: v.platform,
-      selectedFile,
-      bt: metadata.title,
-      title: metadata.title,
-      description: metadata.description,
-      shortTitle: metadata.shortTitle,
-      tags: metadata.tags,
-      ...metadata.legacy,
-      coverPath,
-      filePath: resolvedFile,
-      useragent: cfg.useragent,
-      phone: derivePhoneForRecord(v),
-      partition: v.partition,
-      url: cfg.listIndex,
-      uploadUrl: cfg.upload,
-      date: recordDate,
-      publishAttemptCount: 1,
-      republishCount: 0,
-      publishSuccessCount: 0,
-      publishFailCount: 0,
-      publishMode: effectivePublishMode.publishMode,
-      publishToDraft: effectivePublishMode.publishToDraft,
-      publishOptions: v.publishOptions || {},
-      publishStatus: effectivePublishMode.publishToDraft
-        ? "drafting"
-        : "publishing",
-      lastPublishMessage: effectivePublishMode.publishToDraft
-        ? "等待保存草稿结果"
-        : "等待发布结果",
-      lastPublishAt: Date.now(),
     };
 
     let recordId = null;
@@ -766,6 +873,7 @@ async function runBatchDirPublish(v, cfg) {
       title: bt1,
       platform: v.platform,
       phone: v.phone || "",
+      creativeStatement: cs,
       status: taskResult.ok ? "success" : "failed",
       message: taskResult.message,
     };
@@ -774,7 +882,10 @@ async function runBatchDirPublish(v, cfg) {
   }
 
   // Summary
-  const succeeded = results.filter((r) => r.status === "success").length;
+  const scheduledCount = results.filter((r) => r.status === "scheduled").length;
+  const succeeded = results.filter(
+    (r) => r.status === "success" || r.status === "scheduled"
+  ).length;
   const duplicateCount = results.filter((r) => r.status === "duplicate").length;
   const failed = results.filter(
     (r) => r.status === "failed" || r.status === "skipped" || r.status === "duplicate"
@@ -784,11 +895,13 @@ async function runBatchDirPublish(v, cfg) {
       summary: true,
       total: rows.length,
       succeeded,
+      scheduled: scheduledCount,
       failed,
       duplicate: duplicateCount,
       message:
         "成功 " +
         succeeded +
+        (scheduledCount > 0 ? "（含定时排期 " + scheduledCount + "）" : "") +
         " / 失败 " +
         failed +
         (duplicateCount > 0 ? "（含重复拦截 " + duplicateCount + "）" : ""),
@@ -902,14 +1015,25 @@ export async function runCliMain(argv = process.argv) {
       return await runBatchDirPublish(v, cfg);
     }
 
+    const throttleSettings = readPublishThrottleSettings();
+    const rawCreativeStatement =
+      v.creativeStatement != null && String(v.creativeStatement).trim() !== ""
+        ? v.creativeStatement
+        : throttleSettings.defaultCreativeStatement;
+    v.creativeStatement = resolveCreativeStatementForPlatform(
+      rawCreativeStatement,
+      v.platform
+    );
+
     const resolvedPartition = resolveTaskPartition({
       partition: v.partition,
       phone: v.phone,
       pt: v.platform,
     });
     const candTitle = sanitizeTitle(v.title) || fileStem(v.file);
+    const pushRecords = readPushDataRecordsForCli();
     if (!allowDuplicate) {
-      const hit = findRecentDuplicatePublish(readPushDataRecordsForCli(), {
+      const hit = findRecentDuplicatePublish(pushRecords, {
         pt: v.platform,
         phone: v.phone || derivePhoneForRecord({ ...v, partition: resolvedPartition }),
         partition: resolvedPartition,
@@ -924,6 +1048,7 @@ export async function runCliMain(argv = process.argv) {
             platform: hit.platform,
             phone: hit.phone,
             title: hit.title,
+            creativeStatement: v.creativeStatement,
             lastPublishAt: hit.lastPublishAt,
             lastPublishAtText: hit.lastPublishAtText,
             message: hit.message,
@@ -937,8 +1062,46 @@ export async function runCliMain(argv = process.argv) {
       v.allowDuplicate = true;
       v.publishOptions = { ...(v.publishOptions || {}), allowDuplicate: true };
     }
-    // 仅即时发布使用短期票据防止 publishVideo 自撞；定时发布依赖持久化的 allowDuplicate/recordId
-    if (!v.publishAt) {
+
+    // 显式 --publish-at 先做格式与未来时间校验，再过节流排期（只顺延不提前）
+    const nowMs = Date.now();
+    let explicitPublishAtMs = null;
+    if (v.publishAt) {
+      const parsedAt = parseLocalPublishAt(v.publishAt, nowMs);
+      if (!parsedAt.ok) {
+        console.error(parsedAt.error);
+        return 2;
+      }
+      explicitPublishAtMs = parsedAt.value;
+    }
+
+    const planItem = planPublishTimes({
+      targets: [
+        {
+          platform: v.platform,
+          phone: v.phone || derivePhoneForRecord({ ...v, partition: resolvedPartition }),
+          partition: resolvedPartition,
+          publishAt: v.publishAt || null,
+          publishAtMs: explicitPublishAtMs,
+          noThrottle: Boolean(v.noThrottle),
+        },
+      ],
+      now: nowMs,
+      records: pushRecords,
+      settings: throttleSettings,
+    }).items[0];
+
+    if (planItem && planItem.scheduled) {
+      v.publishAt = planItem.publishAt;
+      v.scheduledPublishAtMs = planItem.plannedAtMs;
+      v.throttled = planItem.throttled;
+      v.throttleReason = planItem.reason;
+    } else {
+      v.publishAt = null;
+      v.scheduledPublishAtMs = null;
+      v.throttled = false;
+      v.throttleReason = "";
+      // 仅即时发布使用短期票据防止 publishVideo 自撞；定时发布依赖持久化的 allowDuplicate/recordId
       registerPublishDedupeBypass({
         pt: v.platform,
         phone: v.phone || derivePhoneForRecord({ ...v, partition: resolvedPartition }),
@@ -948,13 +1111,19 @@ export async function runCliMain(argv = process.argv) {
     }
 
     const result = await runSingleFilePublish(v);
+    const finalCs = result.creativeStatement || v.creativeStatement || "none";
     if (result.scheduled) {
+      const throttleReason = result.throttleReason || v.throttleReason || "";
       console.log(
         JSON.stringify({
-          status: true,
+          success: true,
+          status: "scheduled",
           scheduled: true,
           id: result.id,
           publishAt: result.publishAt,
+          creativeStatement: finalCs,
+          throttled: Boolean(result.throttled || v.throttled),
+          ...(throttleReason ? { throttleReason, reason: throttleReason } : {}),
           message: result.message,
         })
       );
@@ -965,6 +1134,7 @@ export async function runCliMain(argv = process.argv) {
           status: true,
           resultStatus: result.status,
           publishMode: result.publishMode,
+          creativeStatement: finalCs,
           // 草稿模式的保存结果校验字段（#42），老版本 App 无这两个字段
           ...(result.draftVerified !== undefined
             ? { draftVerified: result.draftVerified }
@@ -982,6 +1152,7 @@ export async function runCliMain(argv = process.argv) {
           status: false,
           resultStatus: result.status,
           publishMode: result.publishMode,
+          creativeStatement: finalCs,
           outcome: result.outcome,
           needsAttention: true,
           // 草稿未确认场景透传诊断字段，便于 e2e/脚本消费（#42）
