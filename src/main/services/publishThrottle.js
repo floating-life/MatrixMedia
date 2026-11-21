@@ -21,7 +21,8 @@ const {
 
 const SETTINGS_FILE_NAME = "publish-throttle-settings.json";
 const LEDGER_FILE_NAME = "publish-throttle-ledger.json";
-const RESERVED_STALE_TTL_MS = 5 * 60 * 1000;
+// 立即发布的预留在结果回写前一直有效（大文件下载/上传可能很久）；只为防进程崩溃永久占位设 3 小时兜底
+const RESERVED_STALE_TTL_MS = 3 * 60 * 60 * 1000;
 const LEDGER_LOCK_STALE_MS = 30 * 1000;
 const LEDGER_LOCK_TIMEOUT_MS = 10 * 1000;
 const LEDGER_LOCK_INITIAL_DELAY_MS = 15;
@@ -174,22 +175,15 @@ function tryPreemptStaleLock(lockPath, staleMs, state) {
   if (!isStale) return false;
 
   lockTokenSeq = (lockTokenSeq + 1) % 1000000;
-  const staleTmp = `${lockPath}.stale.${process.pid}.${nowMs}.${lockTokenSeq}`;
+  // 只在锁内容仍是我们判定陈旧的那份时才删除；不用 rename（会把别的进程刚拿到的新锁挪走）。
+  // 删除后由调用方用 openSync('wx') 独占创建，同时只有一个进程能成功。
   try {
-    fs.renameSync(lockPath, staleTmp);
-    try {
-      fs.unlinkSync(staleTmp);
-    } catch (_) {}
+    const cur = fs.readFileSync(lockPath, "utf8");
+    if (cur !== raw) return false;
+    fs.unlinkSync(lockPath);
     return true;
   } catch (err) {
     if (err && err.code === "ENOENT") return true;
-    try {
-      const cur = fs.readFileSync(lockPath, "utf8");
-      if (cur === raw) {
-        fs.unlinkSync(lockPath);
-        return true;
-      }
-    } catch (_) {}
   }
   return false;
 }
@@ -561,10 +555,25 @@ function readPublishThrottleLedgerRaw(options = {}) {
       },
     };
   } catch (err) {
-    console.warn(
-      "[publishThrottle] 读取节流账本失败，视为空账本:",
-      (err && err.message) || err
-    );
+    // 读失败（EIO/半写入等）不能当空账本，否则会重复上传或连发：重试一次，仍失败则报错（排期与派发均中止）
+    try {
+      const raw2 = JSON.parse(fs.readFileSync(ledgerPath, "utf8"));
+      return {
+        exists: true,
+        ledgerPath,
+        ledger: {
+          version: 1,
+          importedPushData: Boolean(raw2 && raw2.importedPushData),
+          updatedAt: Number(raw2 && raw2.updatedAt) || 0,
+          entries: Array.isArray(raw2 && raw2.entries) ? raw2.entries : [],
+          scheduledDispatches: normalizeScheduledDispatchesMap(raw2 && raw2.scheduledDispatches),
+        },
+      };
+    } catch (_) {}
+    const e = new Error(`节流账本读取失败，已停止本次发布以防重复：${(err && err.message) || err}`);
+    e.code = "LEDGER_READ_FAILED";
+    throw e;
+    // eslint-disable-next-line no-unreachable
     return {
       exists: false,
       ledgerPath,
@@ -787,7 +796,15 @@ function loadActiveLedger(options = {}, nowMs = Date.now(), pushDataRecordsOpt =
     (e) => e && String(e.status || "").trim().toLowerCase() === "scheduled"
   );
   if (hasScheduledEntries && options.skipPushDataReconcile !== true) {
-    const pushRes = ensurePushRecords();
+    let pushRes = ensurePushRecords();
+    // 历史读到 0 条却有待发预留：可能是偶发读取失败（读失败也返回空），重读一次确认后再对账
+    if (pushRes.ok && pushRes.records.length === 0 && !Array.isArray(pushDataRecordsOpt)) {
+      const again = readPushDataRecordsSafe(defaultChangeDataFn(options));
+      if (again.ok && again.records.length > 0) {
+        pushRes = again;
+        cachedPushRes = again;
+      }
+    }
     if (pushRes.ok) {
       const checked = reconcileScheduledLedgerEntries(
         ledger.entries,
@@ -802,7 +819,12 @@ function loadActiveLedger(options = {}, nowMs = Date.now(), pushDataRecordsOpt =
 }
 
 function readPublishThrottleLedger(options = {}, nowMs = Date.now()) {
-  return loadActiveLedger(options, nowMs).ledger;
+  try {
+    return loadActiveLedger(options, nowMs).ledger;
+  } catch (err) {
+    console.warn("[publishThrottle] 读取账本失败（仅展示用，返回空）:", (err && err.message) || err);
+    return { version: 1, importedPushData: true, updatedAt: 0, entries: [], scheduledDispatches: {} };
+  }
 }
 
 function derivePhoneFallback(target, canonicalPt) {

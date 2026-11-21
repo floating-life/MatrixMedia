@@ -494,6 +494,15 @@ function executeScheduledRecord(record, dispatchKey) {
 async function executeScheduledRecordAsync(record, dispatchKey) {
   if (!record || !record.id) return { historyWritten: true };
 
+  // 计时器到点时任务可能已被删除/改期：上传前重读历史确认它仍是待发（读不到就本轮不发，下轮刷新再判）
+  const stillPending = listScheduledRecords().some(
+    (r) => r && String(r.id) === String(record.id)
+  );
+  if (!stillPending) {
+    console.warn("[scheduledPublish] 任务已删除、已改状态或历史暂不可读，跳过本次派发:", record.id);
+    return { historyWritten: true, abortedBeforeUpload: true };
+  }
+
   // 派发前先把「已派发」标记持久化到账本（按任务 id）；若账本已显示已开始/已成功则不再上传，只补写历史
   const markRes = await markScheduledTaskDispatched(record, Date.now());
   if (!markRes || markRes.ok !== true) {
@@ -762,10 +771,51 @@ export function getScheduledTimersSnapshot() {
   return Array.from(scheduledTimers.keys());
 }
 
+/**
+ * 启动时处理上次运行中断、停在「发布中」的定时任务：
+ * - 账本显示已成功/已存草稿 → 补写历史为对应结果；
+ * - 否则（下载/上传中途退出）→ 标为失败并提示手动重发，绝不自动重传（宁可少发不重复发）。
+ */
+function recoverInterruptedScheduledTasks(nowMs = Date.now()) {
+  const result = changeData({ fileName: "pushData", type: "get", item: { page: 1, pageSize: 10000 } });
+  const data = (result && result.data) || {};
+  Object.keys(data).forEach((date) => {
+    (data[date] || []).forEach((item) => {
+      if (!item || item.scheduledTask !== true || item.publishStatus !== "publishing") return;
+      const record = { ...item, date: item.date || date };
+      let state = null;
+      try {
+        state = getScheduledTaskDispatchStateSync(record.id);
+      } catch (_) {
+        return; // 账本读不了就先不动，下次启动再处理
+      }
+      const st = state && state.status;
+      if (st === "success" || st === "draft") {
+        updateRecord(record, {
+          ...(state.resultPatch || {}),
+          publishStatus: st,
+          lastPublishMessage: st === "draft" ? "已存草稿（启动时补写）" : "发布成功（启动时补写）",
+        });
+        return;
+      }
+      updateRecord(record, {
+        publishStatus: "failed",
+        lastPublishMessage: "上次运行中断，任务未完成；为防重复发布未自动重试，请确认平台上是否已发出后手动重发",
+        lastPublishAt: nowMs,
+      });
+    });
+  });
+}
+
 export function startScheduledPublishScheduler(nowMs = Date.now()) {
   if (schedulerStarted) return;
   schedulerStarted = true;
   schedulerStartedAt = nowMs;
+  try {
+    recoverInterruptedScheduledTasks(nowMs);
+  } catch (err) {
+    console.warn("[scheduledPublish] 恢复中断任务失败:", (err && err.message) || err);
+  }
   refreshScheduledPublishScheduler(nowMs);
   refreshInterval = setInterval(() => {
     refreshScheduledPublishScheduler();
