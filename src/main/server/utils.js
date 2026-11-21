@@ -87,6 +87,14 @@ function articleTagsValue(item) {
   return recordValue(item.bq || item.tags);
 }
 
+function recordAccountIdentity(item) {
+  const part = recordValue(item && item.partition).trim();
+  if (part) return part;
+  const key = recordValue(item && item.accountKey).trim();
+  if (key) return `key:${key}`;
+  return recordValue(item && item.phone).trim();
+}
+
 function isSamePushDataRecord(existingItem, newItem) {
   if (
     existingItem.textOtherName !== newItem.textOtherName ||
@@ -108,7 +116,10 @@ function isSamePushDataRecord(existingItem, newItem) {
     );
   }
 
-  return existingItem.selectedFile === newItem.selectedFile;
+  return (
+    existingItem.selectedFile === newItem.selectedFile &&
+    recordAccountIdentity(existingItem) === recordAccountIdentity(newItem)
+  );
 }
 
 // 核心 CRUD
@@ -346,6 +357,18 @@ function changeDataUnsafe({ item, fileName, type } = {}) {
       }
       list[index] = { ...list[index], ...item };
       writeDayData(filePath, list);
+      if (folder.name === "pushData") {
+        try {
+          require("../services/publishThrottle.js").syncLedgerOnPushDataMutation({
+            type: "update",
+            id: list[index].id,
+            publishStatus: list[index].publishStatus,
+            publishMode: list[index].publishMode,
+            publishToDraft: list[index].publishToDraft,
+            lastPublishAt: list[index].lastPublishAt,
+          });
+        } catch (_) {}
+      }
       return { success: true, data: list };
     }
 
@@ -359,6 +382,14 @@ function changeDataUnsafe({ item, fileName, type } = {}) {
         return { success: false, message: `未找到 id=${item.id} 的记录` };
       }
       writeDayData(filePath, newList);
+      if (folder.name === "pushData") {
+        try {
+          require("../services/publishThrottle.js").syncLedgerOnPushDataMutation({
+            type: "delete",
+            id: item.id,
+          });
+        } catch (_) {}
+      }
       return { success: true, data: newList };
     }
 

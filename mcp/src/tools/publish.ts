@@ -73,6 +73,11 @@ export const publishVideoTool: Tool = {
         description:
           "If true, bypass the 7-day same-platform/same-account/same-title duplicate publish guard (forwards --allow-duplicate to CLI).",
       },
+      noThrottle: {
+        type: "boolean",
+        description:
+          "If true, bypass publish throttling / platform stagger scheduling (forwards --no-throttle to CLI; publishes immediately or keeps explicit publishAt without postponing).",
+      },
       noDownload: {
         type: "boolean",
         description:
@@ -144,6 +149,7 @@ export async function handlePublishVideo(
   const show = args.show;
   const draft = args.draft;
   const allowDuplicate = args.allowDuplicate === true;
+  const noThrottle = args.noThrottle === true;
   const noDownload = args.noDownload === true;
   const creativeStatement =
     args.creativeStatement == null ? "" : String(args.creativeStatement).trim();
@@ -230,6 +236,7 @@ export async function handlePublishVideo(
     ...(show ? ["--show"] : []),
     ...(draft ? ["--draft"] : []),
     ...(allowDuplicate ? ["--allow-duplicate"] : []),
+    ...(noThrottle ? ["--no-throttle"] : []),
     ...(noDownload ? ["--no-download"] : []),
     ...(creativeStatement ? ["--creative-statement", creativeStatement] : []),
     ...(cover ? ["--cover", cover] : []),
@@ -239,34 +246,100 @@ export async function handlePublishVideo(
   const result = await runCli(cliArgs, { onProgress });
 
   if (result.exitCode === 0) {
-    const lastJson = result.lastJson;
-    if (
-      lastJson !== null &&
-      typeof lastJson === "object" &&
-      (lastJson as { scheduled?: unknown }).scheduled === true
-    ) {
+    const lastJson =
+      result.lastJson !== null && typeof result.lastJson === "object"
+        ? (result.lastJson as Record<string, unknown>)
+        : null;
+    if (lastJson && lastJson.scheduled === true) {
+      const throttleReason =
+        typeof lastJson.throttleReason === "string"
+          ? lastJson.throttleReason
+          : typeof lastJson.reason === "string"
+          ? lastJson.reason
+          : "";
+      const reasons = Array.isArray(lastJson.reasons)
+        ? lastJson.reasons
+        : throttleReason
+        ? [throttleReason]
+        : [];
       return JSON.stringify({
         status: "scheduled",
-        id: (lastJson as any).id,
-        publishAt: (lastJson as any).publishAt,
-        message: (lastJson as any).message,
+        scheduled: true,
+        id: lastJson.id,
+        publishAt: lastJson.publishAt,
+        ...(lastJson.plannedAtMs !== undefined
+          ? { plannedAtMs: lastJson.plannedAtMs }
+          : {}),
+        ...(lastJson.creativeStatement !== undefined
+          ? { creativeStatement: lastJson.creativeStatement }
+          : {}),
+        ...(lastJson.throttled !== undefined
+          ? { throttled: Boolean(lastJson.throttled) }
+          : {}),
+        ...(throttleReason
+          ? { throttleReason, reason: throttleReason }
+          : {}),
+        ...(reasons.length > 0 ? { reasons } : {}),
+        ...(lastJson.duplicate !== undefined
+          ? { duplicate: Boolean(lastJson.duplicate) }
+          : {}),
+        message: lastJson.message,
       });
     }
     return JSON.stringify({
-      status: (result.lastJson as any)?.resultStatus ?? "success",
-      publishMode: (result.lastJson as any)?.publishMode,
-      message: (result.lastJson as any)?.message ?? "上传成功",
+      status: lastJson?.resultStatus ?? "success",
+      publishMode: lastJson?.publishMode,
+      ...(lastJson?.creativeStatement !== undefined
+        ? { creativeStatement: lastJson.creativeStatement }
+        : {}),
+      ...(lastJson?.draftVerified !== undefined
+        ? { draftVerified: lastJson.draftVerified }
+        : {}),
+      ...(lastJson?.draftUrlUnchanged !== undefined
+        ? { draftUrlUnchanged: lastJson.draftUrlUnchanged }
+        : {}),
+      message: lastJson?.message ?? "上传成功",
     });
   }
 
   if (result.exitCode === 4) {
+    const lastJson =
+      result.lastJson !== null && typeof result.lastJson === "object"
+        ? (result.lastJson as Record<string, unknown>)
+        : {};
+    if (lastJson.duplicate === true) {
+      return JSON.stringify({
+        status: (lastJson.status as string) ?? "needs_attention",
+        needsAttention: true,
+        duplicate: true,
+        ...(lastJson.id !== undefined ? { id: lastJson.id } : {}),
+        ...(lastJson.publishAt !== undefined
+          ? { publishAt: lastJson.publishAt }
+          : {}),
+        ...(lastJson.plannedAtMs !== undefined
+          ? { plannedAtMs: lastJson.plannedAtMs }
+          : {}),
+        ...(lastJson.creativeStatement !== undefined
+          ? { creativeStatement: lastJson.creativeStatement }
+          : {}),
+        ...(lastJson.requestedCreativeStatement !== undefined
+          ? { requestedCreativeStatement: lastJson.requestedCreativeStatement }
+          : {}),
+        message:
+          (lastJson.message as string) ??
+          "同一视频在该时间点的定时任务已存在，但创作声明不一致",
+      });
+    }
     return JSON.stringify({
       status: "needs_attention",
-      publishMode: "draft",
-      outcome: (result.lastJson as any)?.outcome ?? "draft_saved",
+      publishMode: (lastJson.publishMode as string) ?? "draft",
+      outcome: (lastJson.outcome as string) ?? "draft_saved",
+      ...(lastJson.creativeStatement !== undefined
+        ? { creativeStatement: lastJson.creativeStatement }
+        : {}),
       needsAttention: true,
       message:
-        (result.lastJson as any)?.message ?? "已转存草稿，请检查视频号链接",
+        (lastJson.message as string) ?? "已转存草稿，请检查视频号链接",
     });
   }
 

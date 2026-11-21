@@ -810,6 +810,7 @@ import {
   sanitizeDescription,
   splitAndSanitizeTags,
 } from "../../shared/textSanitize.js";
+import { parsePublishAtUtc8 } from "../../shared/publishThrottle.js";
 import AiGenerateButton from "@/components/ai/AiGenerateButton.vue";
 
 function fileBaseName(p) {
@@ -1380,6 +1381,9 @@ export default {
     /**
      * 批量发布（单视频多平台 / 目录批量）点击「发布」前弹出节流排期预览表，
      * 展示 平台 / 账号 / 计划时间 / 原因，供用户确认或改为不节流。
+     * 确认时由主进程加锁重算并写账本预留：
+     * - 显式 publishAt 已过期或排期已满 → 返回错误让用户重选，不得继续提交
+     * - 预览期间有其他入口占用名额导致排期变化 → 刷新预览表让用户重新确认，不得用旧预览提交
      */
     async confirmThrottlePublishPlan(planEntries, options = {}) {
       if (
@@ -1388,98 +1392,281 @@ export default {
         !ipcRenderer ||
         typeof ipcRenderer.invoke !== "function"
       ) {
-        return { proceed: true, noThrottle: true, itemsByKey: new Map() };
+        return {
+          proceed: true,
+          noThrottle: true,
+          itemsByKey: new Map(),
+          reservationIds: [],
+        };
       }
 
       const activeEntries = planEntries.filter((e) => !e.isDraft);
       if (activeEntries.length === 0) {
-        return { proceed: true, noThrottle: true, itemsByKey: new Map() };
+        return {
+          proceed: true,
+          noThrottle: true,
+          itemsByKey: new Map(),
+          reservationIds: [],
+        };
       }
 
-      let res;
-      try {
-        res = await ipcRenderer.invoke("publish-throttle:plan", {
-          targets: activeEntries.map((e) => ({
-            platform: e.pt,
-            phone: e.phone,
-            accountKey: e.accountKey,
-            partition: e.partition,
-          })),
-          publishAt: options.publishAt || null,
-          publishAtMs: options.publishAtMs || null,
-        });
-      } catch (_) {
-        return { proceed: true, noThrottle: true, itemsByKey: new Map() };
-      }
+      const targetsPayload = activeEntries.map((e) => ({
+        platform: e.pt,
+        phone: e.phone,
+        accountKey: e.accountKey,
+        partition: e.partition,
+        filePath: e.filePath || "",
+        textType: e.textType || "local",
+      }));
 
-      if (!res || res.ok !== true || res.enabled === false) {
-        return { proceed: true, noThrottle: true, itemsByKey: new Map() };
-      }
-
-      const planItems = Array.isArray(res.items) ? res.items : [];
-      const itemsByKey = new Map();
-      let activeIdx = 0;
-      const previewRows = planEntries.map((entry) => {
-        if (entry.isDraft) {
+      const buildPreviewState = (planItems) => {
+        const itemsByKey = new Map();
+        let activeIdx = 0;
+        const previewRows = planEntries.map((entry) => {
+          if (entry.isDraft) {
+            return {
+              pt: entry.pt,
+              phone: entry.phone,
+              title: entry.title,
+              isDraft: true,
+              scheduled: false,
+              plannedTimeText: "保存草稿",
+              reasonText: "账号默认保存草稿（不节流）",
+            };
+          }
+          const planItem = planItems[activeIdx++];
+          if (planItem) {
+            itemsByKey.set(entry.key, planItem);
+          }
+          const scheduled = Boolean(planItem && planItem.scheduled);
+          const plannedTimeText = scheduled
+            ? planItem.publishAt || options.publishAt || "定时发布"
+            : "立即发布";
+          const reasonText =
+            (planItem && planItem.reason) ||
+            (scheduled
+              ? "按指定定时时间发布"
+              : "满足节流规则，立即发布");
           return {
             pt: entry.pt,
             phone: entry.phone,
             title: entry.title,
-            isDraft: true,
-            scheduled: false,
-            plannedTimeText: "保存草稿",
-            reasonText: "账号默认保存草稿（不节流）",
+            isDraft: false,
+            scheduled,
+            plannedTimeText,
+            reasonText,
+          };
+        });
+        return { itemsByKey, previewRows };
+      };
+
+      const buildCommittedMap = (committedItems, fallbackItems) => {
+        const list =
+          Array.isArray(committedItems) && committedItems.length > 0
+            ? committedItems
+            : fallbackItems;
+        const map = new Map();
+        for (let i = 0; i < activeEntries.length; i++) {
+          if (list[i]) {
+            map.set(activeEntries[i].key, list[i]);
+          }
+        }
+        return map;
+      };
+
+      let res;
+      try {
+        res = await ipcRenderer.invoke("publish-throttle:plan", {
+          targets: targetsPayload,
+          publishAt: options.publishAt || null,
+          publishAtMs: options.publishAtMs || null,
+        });
+      } catch (e) {
+        if (this.$message) {
+          this.$message.error(
+            "计算发布排期失败：" + ((e && e.message) || String(e))
+          );
+        }
+        return {
+          proceed: false,
+          noThrottle: false,
+          itemsByKey: new Map(),
+          reservationIds: [],
+        };
+      }
+
+      if (!res || res.ok !== true) {
+        if (this.$message) {
+          this.$message.warning(
+            (res && (res.message || res.error)) || "发布排期校验失败，请重新选择"
+          );
+        }
+        return {
+          proceed: false,
+          noThrottle: false,
+          itemsByKey: new Map(),
+          reservationIds: [],
+        };
+      }
+
+      // 节流总开关关闭时不弹预览表，但仍走主进程加锁提交（校验显式时间未过期并写入账本）
+      if (res.enabled === false) {
+        let commitRes;
+        try {
+          commitRes = await ipcRenderer.invoke("publish-throttle:commit-plan", {
+            targets: targetsPayload,
+            publishAt: options.publishAt || null,
+            publishAtMs: options.publishAtMs || null,
+            noThrottle: true,
+          });
+        } catch (e) {
+          if (this.$message) {
+            this.$message.error(
+              "提交发布排期失败：" + ((e && e.message) || String(e))
+            );
+          }
+          return {
+            proceed: false,
+            noThrottle: false,
+            itemsByKey: new Map(),
+            reservationIds: [],
           };
         }
-        const planItem = planItems[activeIdx++];
-        if (planItem) {
-          itemsByKey.set(entry.key, planItem);
+        if (!commitRes || commitRes.ok !== true) {
+          if (this.$message) {
+            this.$message.warning(
+              (commitRes && (commitRes.message || commitRes.error)) ||
+                "发布时间已失效或排期失败，请重新选择"
+            );
+          }
+          return {
+            proceed: false,
+            noThrottle: false,
+            itemsByKey: new Map(),
+            reservationIds: [],
+          };
         }
-        const scheduled = Boolean(planItem && planItem.scheduled);
-        const plannedTimeText = scheduled
-          ? planItem.publishAt || options.publishAt || "定时发布"
-          : "立即发布";
-        const reasonText =
-          (planItem && planItem.reason) ||
-          (scheduled
-            ? "按指定定时时间发布"
-            : "满足节流规则，立即发布");
         return {
-          pt: entry.pt,
-          phone: entry.phone,
-          title: entry.title,
-          isDraft: false,
-          scheduled,
-          plannedTimeText,
-          reasonText,
+          proceed: true,
+          noThrottle: true,
+          itemsByKey: buildCommittedMap(commitRes.items, res.items || []),
+          reservationIds: Array.isArray(commitRes.reservationIds)
+            ? commitRes.reservationIds
+            : [],
         };
-      });
-
-      this.throttlePreviewRows = previewRows;
-      this.throttlePreviewHasExplicitTime = Boolean(options.publishAt);
-      this.throttlePreviewVisible = true;
-
-      const action = await new Promise((resolve) => {
-        this._throttlePreviewResolver = resolve;
-      });
-      if (action === "cancel") {
-        return { proceed: false, noThrottle: false, itemsByKey };
       }
-      if (action === "no_throttle") {
-        return { proceed: true, noThrottle: true, itemsByKey: new Map() };
+
+      let currentPlanItems = Array.isArray(res.items) ? res.items : [];
+      while (true) {
+        const { previewRows } = buildPreviewState(currentPlanItems);
+        this.throttlePreviewRows = previewRows;
+        this.throttlePreviewHasExplicitTime = Boolean(options.publishAt);
+        this.throttlePreviewVisible = true;
+
+        const action = await new Promise((resolve) => {
+          this._throttlePreviewResolver = resolve;
+        });
+        if (action === "cancel") {
+          return {
+            proceed: false,
+            noThrottle: false,
+            itemsByKey: new Map(),
+            reservationIds: [],
+          };
+        }
+
+        const wantNoThrottle = action === "no_throttle";
+        let commitRes;
+        try {
+          commitRes = await ipcRenderer.invoke("publish-throttle:commit-plan", {
+            targets: targetsPayload,
+            publishAt: options.publishAt || null,
+            publishAtMs: options.publishAtMs || null,
+            noThrottle: wantNoThrottle,
+            previewItems: wantNoThrottle
+              ? null
+              : currentPlanItems.map((it) => ({
+                  isDraft: Boolean(it && it.isDraft),
+                  scheduled: Boolean(it && it.scheduled),
+                  plannedAtMs: it ? it.plannedAtMs : null,
+                  publishAt: it ? it.publishAt : null,
+                })),
+          });
+        } catch (e) {
+          if (this.$message) {
+            this.$message.error(
+              "确认发布排期失败：" + ((e && e.message) || String(e))
+            );
+          }
+          return {
+            proceed: false,
+            noThrottle: false,
+            itemsByKey: new Map(),
+            reservationIds: [],
+          };
+        }
+
+        if (!commitRes || commitRes.ok !== true) {
+          if (this.$message) {
+            this.$message.warning(
+              (commitRes && (commitRes.message || commitRes.error)) ||
+                "发布时间已过或排期失败，请重新选择"
+            );
+          }
+          return {
+            proceed: false,
+            noThrottle: false,
+            itemsByKey: new Map(),
+            reservationIds: [],
+          };
+        }
+
+        // 主进程重算结果与预览不同：刷新预览表让用户重新确认，不得按旧预览提交
+        if (commitRes.changed === true) {
+          currentPlanItems = Array.isArray(commitRes.items)
+            ? commitRes.items
+            : [];
+          if (this.$message) {
+            this.$message.warning(
+              commitRes.message || "期间有新的发布任务，排期已更新，请重新确认"
+            );
+          }
+          continue;
+        }
+
+        return {
+          proceed: true,
+          noThrottle: wantNoThrottle,
+          itemsByKey: buildCommittedMap(
+            commitRes.items,
+            wantNoThrottle ? [] : currentPlanItems
+          ),
+          reservationIds: Array.isArray(commitRes.reservationIds)
+            ? commitRes.reservationIds
+            : [],
+        };
       }
-      return { proceed: true, noThrottle: false, itemsByKey };
     },
-    async writeScheduledPublishRecord(item) {
+    async writeScheduledPublishRecord(item, reservationId = null) {
       if (ipcRenderer && typeof ipcRenderer.invoke === "function") {
         try {
           const res = await ipcRenderer.invoke(
             "publish-throttle:create-scheduled",
-            { item }
+            { item, reservationId }
           );
-          if (res && res.ok) return res;
-        } catch (_) {
-          /* 回退 dataRequest */
+          if (res && res.ok === true) return res;
+          // 严禁在 IPC 拒绝（如时间已过期或写盘失败）时回退备用 dataRequest 写入路径
+          return {
+            ok: false,
+            ...(res && typeof res === "object" ? res : {}),
+            message:
+              (res && (res.message || res.error)) || "写入定时发布记录失败",
+          };
+        } catch (e) {
+          return {
+            ok: false,
+            message: (e && e.message) || "写入定时发布记录失败",
+          };
         }
       }
       return dataRequest({
@@ -1487,6 +1674,25 @@ export default {
         fileName: "pushData",
         item,
       });
+    },
+    async releaseThrottleReservations(reservationIds) {
+      if (
+        !ipcRenderer ||
+        typeof ipcRenderer.invoke !== "function" ||
+        !reservationIds ||
+        (Array.isArray(reservationIds) && reservationIds.length === 0)
+      ) {
+        return;
+      }
+      try {
+        await ipcRenderer.invoke("publish-throttle:release-reservation", {
+          reservationIds: Array.isArray(reservationIds)
+            ? reservationIds
+            : [reservationIds],
+        });
+      } catch (_) {
+        /* ignore */
+      }
     },
     buildPlatformVideoPayload(platformNode, baseVideo) {
       const link = buildVideoLinkOption(
@@ -1997,9 +2203,8 @@ export default {
       if (!this.scheduledPublish) return "";
       const value = String(this.publishAt || "").trim();
       if (!value) return "请选择定时发布时间";
-      const dt = moment(value, "YYYY-MM-DD HH:mm:ss", true);
-      if (!dt.isValid()) return "定时发布时间格式应为 YYYY-MM-DD HH:mm:ss";
-      if (!dt.isAfter(moment())) return "定时发布时间必须是未来时间";
+      const parsed = parsePublishAtUtc8(value, Date.now());
+      if (!parsed.ok) return parsed.error;
       return "";
     },
     validateVideohaoBt2(value) {
@@ -2333,12 +2538,17 @@ export default {
       const selectedFile = fileBaseName(this.localFilePath);
       const currentDate = moment().format("YYYY-MM-DD");
       const scheduledAtText = String(this.publishAt || "").trim();
-      const scheduledAtMs = this.scheduledPublish
-        ? moment(scheduledAtText, "YYYY-MM-DD HH:mm:ss", true).valueOf()
+      const parsedScheduledAt = this.scheduledPublish
+        ? parsePublishAtUtc8(scheduledAtText, Date.now())
         : null;
+      const scheduledAtMs =
+        parsedScheduledAt && parsedScheduledAt.ok
+          ? parsedScheduledAt.value
+          : null;
       let submitted = 0;
       let draftSubmitted = 0;
       let scheduledSubmitted = 0;
+      const writeErrors = [];
 
       platforms.sort((a, b) => {
         if (a.pt.includes("视频号")) return -1;
@@ -2362,6 +2572,7 @@ export default {
         proceed: true,
         noThrottle: true,
         itemsByKey: new Map(),
+        reservationIds: [],
       };
       if (!isDraftMode) {
         const planEntries = platforms.map((p, idx) => {
@@ -2372,6 +2583,8 @@ export default {
             phone: p.phone,
             accountKey: p.accountKey,
             partition: buildAccountPartitionOf(p, p.pt),
+            filePath: this.localFilePath,
+            textType: "local",
             title: baseVideo.data.title || baseVideo.bookName,
             isDraft: effectiveMode.publishToDraft,
           };
@@ -2396,12 +2609,14 @@ export default {
           : true;
         const video = this.buildPlatformVideoPayload(p, baseVideo);
         const effectiveMode = resolveEffectivePublishMode(isDraftMode, p);
-        const planItem = !throttleDecision.noThrottle
-          ? throttleDecision.itemsByKey.get(`single:${idx}:${p.id}`)
-          : null;
+        const planItem = throttleDecision.itemsByKey.get(`single:${idx}:${p.id}`);
+        const itemReservationId =
+          !effectiveMode.publishToDraft && planItem && planItem.reservationId
+            ? planItem.reservationId
+            : null;
         const shouldSchedule =
           !effectiveMode.publishToDraft &&
-          (planItem ? planItem.scheduled : this.scheduledPublish);
+          (planItem ? Boolean(planItem.scheduled) : this.scheduledPublish);
         if (shouldSchedule) {
           const itemScheduledAtMs =
             planItem && planItem.scheduled
@@ -2412,68 +2627,210 @@ export default {
               ? planItem.publishAt
               : scheduledAtText;
           const itemThrottleReason =
-            (planItem && planItem.reason) || "";
+            (!throttleDecision.noThrottle && planItem && planItem.reason) || "";
           scheduledWriteTasks.push(
-            this.writeScheduledPublishRecord({
-              bookName: video.bookName,
-              textOtherName: video.data.textOtherName,
-              textType: video.textType,
-              pt: p.pt,
-              selectedFile,
-              bt: video.data.bt1,
-              title: video.data.title,
-              description: video.data.description,
-              shortTitle: video.data.shortTitle,
-              tags: video.data.tags,
-              bt2: video.data.bt2,
-              bt2Filled: video.data.bt2Filled,
-              bdText: video.data.bdText,
-              bq: video.data.bq,
-              creativeStatement: video.data.creativeStatement,
-              noDownload: video.data.noDownload === true,
-              publishOptions: video.publishOptions,
-              coverPath: video.data.coverPath || "",
-              filePath: this.localFilePath,
-              useragent: this.ptConfig[p.pt].useragent,
-              phone: p.phone,
-              group: p.group,
-              accountName: p.accountName,
-              accountKey: p.accountKey,
-              partition,
-              url: this.ptConfig[p.pt].listIndex,
-              uploadUrl: this.ptConfig[p.pt].upload,
-              date: currentDate,
-              scheduledTask: true,
-              ...(dupDecision.allowDuplicate ? { allowDuplicate: true } : {}),
-              ...(itemThrottleReason
-                ? { throttleReason: itemThrottleReason }
-                : {}),
-              scheduledPublishAt: itemScheduledAtMs,
-              scheduledPublishAtText: itemScheduledAtText,
-              useRealBrowser: Boolean(p.useRealBrowser),
-              publishAttemptCount: 1,
-              republishCount: 0,
-              publishSuccessCount: 0,
-              publishFailCount: 0,
-              publishMode: effectiveMode.publishMode,
-              publishToDraft: effectiveMode.publishToDraft,
-              publishStatus: "scheduled",
-              lastPublishMessage: itemThrottleReason
-                ? `等待定时发布（${itemThrottleReason}）`
-                : "等待定时发布",
-              lastPublishAt: Date.now(),
-            })
+            this.writeScheduledPublishRecord(
+              {
+                bookName: video.bookName,
+                textOtherName: video.data.textOtherName,
+                textType: video.textType,
+                pt: p.pt,
+                selectedFile,
+                bt: video.data.bt1,
+                title: video.data.title,
+                description: video.data.description,
+                shortTitle: video.data.shortTitle,
+                tags: video.data.tags,
+                bt2: video.data.bt2,
+                bt2Filled: video.data.bt2Filled,
+                bdText: video.data.bdText,
+                bq: video.data.bq,
+                creativeStatement: video.data.creativeStatement,
+                noDownload: video.data.noDownload === true,
+                publishOptions: video.publishOptions,
+                coverPath: video.data.coverPath || "",
+                filePath: this.localFilePath,
+                useragent: this.ptConfig[p.pt].useragent,
+                phone: p.phone,
+                group: p.group,
+                accountName: p.accountName,
+                accountKey: p.accountKey,
+                partition,
+                url: this.ptConfig[p.pt].listIndex,
+                uploadUrl: this.ptConfig[p.pt].upload,
+                date: currentDate,
+                scheduledTask: true,
+                ...(dupDecision.allowDuplicate ? { allowDuplicate: true } : {}),
+                ...(itemThrottleReason
+                  ? { throttleReason: itemThrottleReason }
+                  : {}),
+                scheduledPublishAt: itemScheduledAtMs,
+                scheduledPublishAtText: itemScheduledAtText,
+                useRealBrowser: Boolean(p.useRealBrowser),
+                publishAttemptCount: 1,
+                republishCount: 0,
+                publishSuccessCount: 0,
+                publishFailCount: 0,
+                publishMode: effectiveMode.publishMode,
+                publishToDraft: effectiveMode.publishToDraft,
+                publishStatus: "scheduled",
+                lastPublishMessage: itemThrottleReason
+                  ? `等待定时发布（${itemThrottleReason}）`
+                  : "等待定时发布",
+                lastPublishAt: Date.now(),
+              },
+              itemReservationId
+            )
           );
-          submitted++;
-          scheduledSubmitted++;
           continue;
         }
+        // 先写 pushData，确认落盘成功再提交上传（写盘失败时释放预留并报错）
+        const republishRecord = this.findRepublishRecord(p.pt, p);
+        let pushRes;
+        let persistedRecordId = null;
+        try {
+          if (republishRecord && republishRecord.id && republishRecord.date) {
+            const oldAttempt = Number(republishRecord.publishAttemptCount) || 1;
+            let oldRepublish = Number(republishRecord.republishCount);
+            if (!Number.isFinite(oldRepublish) || oldRepublish < 0) {
+              oldRepublish = Math.max(0, oldAttempt - 1);
+            }
+            pushRes = await dataRequest({
+              type: "update",
+              fileName: "pushData",
+              item: {
+                id: republishRecord.id,
+                date: republishRecord.date,
+                bookName: video.bookName,
+                textOtherName: video.data.textOtherName,
+                selectedFile,
+                bt: video.data.bt1,
+                title: video.data.title,
+                description: video.data.description,
+                shortTitle: video.data.shortTitle,
+                tags: video.data.tags,
+                bt2: video.data.bt2,
+                bt2Filled: video.data.bt2Filled,
+                bdText: video.data.bdText,
+                bq: video.data.bq,
+                creativeStatement: video.data.creativeStatement,
+                noDownload: video.data.noDownload === true,
+                publishOptions: video.publishOptions,
+                coverPath: video.data.coverPath || "",
+                filePath: this.localFilePath,
+                publishAttemptCount: oldAttempt + 1,
+                republishCount: oldRepublish + 1,
+                publishMode: effectiveMode.publishMode,
+                publishToDraft: effectiveMode.publishToDraft,
+                publishStatus: effectiveMode.publishToDraft
+                  ? "drafting"
+                  : "publishing",
+                lastPublishMessage: effectiveMode.publishToDraft
+                  ? "等待保存草稿结果"
+                  : "等待发布结果",
+                lastPublishAt: Date.now(),
+              },
+            });
+            persistedRecordId = republishRecord.id;
+          } else {
+            pushRes = await dataRequest({
+              type: "add",
+              fileName: "pushData",
+              item: {
+                bookName: video.bookName,
+                textOtherName: video.data.textOtherName,
+                textType: video.textType,
+                pt: p.pt,
+                selectedFile,
+                bt: video.data.bt1,
+                title: video.data.title,
+                description: video.data.description,
+                shortTitle: video.data.shortTitle,
+                tags: video.data.tags,
+                bt2: video.data.bt2,
+                bt2Filled: video.data.bt2Filled,
+                bdText: video.data.bdText,
+                bq: video.data.bq,
+                creativeStatement: video.data.creativeStatement,
+                noDownload: video.data.noDownload === true,
+                publishOptions: video.publishOptions,
+                coverPath: video.data.coverPath || "",
+                filePath: this.localFilePath,
+                useragent: this.ptConfig[p.pt].useragent,
+                phone: p.phone,
+                group: p.group,
+                accountName: p.accountName,
+                accountKey: p.accountKey,
+                partition,
+                url: this.ptConfig[p.pt].listIndex,
+                date: currentDate,
+                useRealBrowser: Boolean(p.useRealBrowser),
+                publishMode: effectiveMode.publishMode,
+                publishToDraft: effectiveMode.publishToDraft,
+                publishAttemptCount: 1,
+                republishCount: 0,
+                publishSuccessCount: 0,
+                publishFailCount: 0,
+                publishStatus: effectiveMode.publishToDraft
+                  ? "drafting"
+                  : "publishing",
+                lastPublishMessage: effectiveMode.publishToDraft
+                  ? "等待保存草稿结果"
+                  : "等待发布结果",
+                lastPublishAt: Date.now(),
+              },
+            });
+            if (pushRes && pushRes.success && Array.isArray(pushRes.data)) {
+              const found = [...pushRes.data]
+                .reverse()
+                .find(
+                  (it) =>
+                    it.textOtherName === video.data.textOtherName &&
+                    it.pt === p.pt &&
+                    it.selectedFile === selectedFile &&
+                    String(it.partition || "") === String(partition || "")
+                );
+              if (found) persistedRecordId = found.id;
+            }
+          }
+        } catch (e) {
+          pushRes = { success: false, message: (e && e.message) || String(e) };
+        }
+        if (pushRes && pushRes.success === false) {
+          if (itemReservationId) {
+            await this.releaseThrottleReservations([itemReservationId]);
+          }
+          writeErrors.push(
+            `${p.pt} 写入发布记录失败：${pushRes.message || "未知错误"}`
+          );
+          continue;
+        }
+        if (
+          itemReservationId &&
+          ipcRenderer &&
+          typeof ipcRenderer.invoke === "function"
+        ) {
+          try {
+            await ipcRenderer.invoke("publish-throttle:confirm-reservation", {
+              reservationId: itemReservationId,
+              status: "publishing",
+              recordId: persistedRecordId,
+              ts: Date.now(),
+              isScheduled: false,
+            });
+          } catch (_) {}
+        }
+
         // 用 JSON 兜底序列化，去掉 Vue 响应式代理 / 不可克隆对象，
         // 避免 Electron IPC 抛 "object could not be cloned" 导致页面会话提前关闭。
         const publishPayload = applyXhsConservativePublishOptions({
           ...p,
           taskId,
           allowDuplicate: true,
+          ...(persistedRecordId != null ? { recordId: persistedRecordId } : {}),
+          ...(itemReservationId
+            ? { throttleReservationId: itemReservationId }
+            : {}),
           ...video,
           textOtherName: video.data.textOtherName,
           selectedFile,
@@ -2492,99 +2849,6 @@ export default {
           JSON.parse(JSON.stringify(publishPayload))
         );
 
-        const republishRecord = this.findRepublishRecord(p.pt, p);
-        if (republishRecord && republishRecord.id && republishRecord.date) {
-          const oldAttempt = Number(republishRecord.publishAttemptCount) || 1;
-          let oldRepublish = Number(republishRecord.republishCount);
-          if (!Number.isFinite(oldRepublish) || oldRepublish < 0) {
-            oldRepublish = Math.max(0, oldAttempt - 1);
-          }
-          dataRequest({
-            type: "update",
-            fileName: "pushData",
-            item: {
-              id: republishRecord.id,
-              date: republishRecord.date,
-              bookName: video.bookName,
-              textOtherName: video.data.textOtherName,
-              selectedFile,
-              bt: video.data.bt1,
-              title: video.data.title,
-              description: video.data.description,
-              shortTitle: video.data.shortTitle,
-              tags: video.data.tags,
-              bt2: video.data.bt2,
-              bt2Filled: video.data.bt2Filled,
-              bdText: video.data.bdText,
-              bq: video.data.bq,
-              creativeStatement: video.data.creativeStatement,
-              noDownload: video.data.noDownload === true,
-              publishOptions: video.publishOptions,
-              coverPath: video.data.coverPath || "",
-              filePath: this.localFilePath,
-              publishAttemptCount: oldAttempt + 1,
-              republishCount: oldRepublish + 1,
-              publishMode: effectiveMode.publishMode,
-              publishToDraft: effectiveMode.publishToDraft,
-              publishStatus: effectiveMode.publishToDraft
-                ? "drafting"
-                : "publishing",
-              lastPublishMessage: effectiveMode.publishToDraft
-                ? "等待保存草稿结果"
-                : "等待发布结果",
-              lastPublishAt: Date.now(),
-            },
-          });
-        } else {
-          dataRequest({
-            type: "add",
-            fileName: "pushData",
-            item: {
-              bookName: video.bookName,
-              textOtherName: video.data.textOtherName,
-              textType: video.textType,
-              pt: p.pt,
-              selectedFile,
-              bt: video.data.bt1,
-              title: video.data.title,
-              description: video.data.description,
-              shortTitle: video.data.shortTitle,
-              tags: video.data.tags,
-              bt2: video.data.bt2,
-              bt2Filled: video.data.bt2Filled,
-              bdText: video.data.bdText,
-              bq: video.data.bq,
-              creativeStatement: video.data.creativeStatement,
-              noDownload: video.data.noDownload === true,
-              publishOptions: video.publishOptions,
-              coverPath: video.data.coverPath || "",
-              filePath: this.localFilePath,
-              useragent: this.ptConfig[p.pt].useragent,
-              phone: p.phone,
-              group: p.group,
-              accountName: p.accountName,
-              accountKey: p.accountKey,
-              partition,
-              url: this.ptConfig[p.pt].listIndex,
-              date: currentDate,
-              useRealBrowser: Boolean(p.useRealBrowser),
-              publishMode: effectiveMode.publishMode,
-              publishToDraft: effectiveMode.publishToDraft,
-              publishAttemptCount: 1,
-              republishCount: 0,
-              publishSuccessCount: 0,
-              publishFailCount: 0,
-              publishStatus: effectiveMode.publishToDraft
-                ? "drafting"
-                : "publishing",
-              lastPublishMessage: effectiveMode.publishToDraft
-                ? "等待保存草稿结果"
-                : "等待发布结果",
-              lastPublishAt: Date.now(),
-            },
-          });
-        }
-
         if (isXhsPlatform(p.pt)) {
           await sleep(getXhsPlatformStaggerDelayMs());
         } else if (p.pt === "视频号") {
@@ -2595,11 +2859,28 @@ export default {
       }
 
       if (scheduledWriteTasks.length > 0) {
-        await Promise.all(scheduledWriteTasks);
-        ipcRenderer.send("scheduledPublish:refresh");
+        const writeResults = await Promise.all(scheduledWriteTasks);
+        for (const r of writeResults) {
+          if (r && (r.ok === true || r.success === true)) {
+            submitted++;
+            scheduledSubmitted++;
+          } else {
+            writeErrors.push(
+              (r && (r.message || r.error)) || "写入定时发布记录失败"
+            );
+          }
+        }
+        if (scheduledSubmitted > 0) {
+          ipcRenderer.send("scheduledPublish:refresh");
+        }
+      }
+      if (writeErrors.length > 0) {
+        this.$message.error(writeErrors.join("；"));
       }
       if (submitted === 0) {
-        this.$message.warning("没有提交新的发布任务");
+        if (writeErrors.length === 0) {
+          this.$message.warning("没有提交新的发布任务");
+        }
         return;
       }
       let successMessage = `已提交 ${submitted} 个平台发布`;
@@ -2826,15 +3107,20 @@ export default {
 
       const currentDate = moment().format("YYYY-MM-DD");
       const scheduledAtText = String(this.publishAt || "").trim();
-      const scheduledAtMs = this.scheduledPublish
-        ? moment(scheduledAtText, "YYYY-MM-DD HH:mm:ss", true).valueOf()
+      const parsedScheduledAt = this.scheduledPublish
+        ? parsePublishAtUtc8(scheduledAtText, Date.now())
         : null;
+      const scheduledAtMs =
+        parsedScheduledAt && parsedScheduledAt.ok
+          ? parsedScheduledAt.value
+          : null;
 
       const path = require("path");
       let submitted = 0;
       let draftSubmitted = 0;
       let scheduledSubmitted = 0;
       const scheduledWriteTasks = [];
+      const writeErrors = [];
 
       platforms.sort((a, b) => {
         if (a.pt.includes("视频号")) return -1;
@@ -2865,6 +3151,7 @@ export default {
         proceed: true,
         noThrottle: true,
         itemsByKey: new Map(),
+        reservationIds: [],
       };
       if (!isDraftMode) {
         const dirPlanEntries = [];
@@ -2872,6 +3159,8 @@ export default {
           const fileRow = this.dirBatchFiles[rIdx];
           const stem = fileRow.fileName.replace(/\.[^/.]+$/, "");
           const rowTitle = sanitizeTitle(fileRow.title) || stem;
+          const rowFilePath =
+            fileRow.resolvedPath || path.join(this.dirPath, fileRow.fileName);
           for (let pIdx = 0; pIdx < platforms.length; pIdx++) {
             const p = platforms[pIdx];
             const effectiveMode = resolveEffectivePublishMode(isDraftMode, p);
@@ -2881,6 +3170,8 @@ export default {
               phone: p.phone,
               accountKey: p.accountKey,
               partition: buildAccountPartitionOf(p, p.pt),
+              filePath: rowFilePath,
+              textType: "local",
               title: rowTitle,
               isDraft: effectiveMode.publishToDraft,
             });
@@ -2935,7 +3226,14 @@ export default {
           const shouldCloseWindowAfterPublish = shouldShow
             ? this.closeWindow
             : true;
-          const creativeStatement = this.getPlatformStatement(p.id, p.pt);
+          // Excel 显式声明（含 none / 无标注）永远优先于默认值与界面默认选项，与 CLI 保持一致（#11）
+          const rowExplicitCs =
+            fileRow && fileRow.creativeStatement != null
+              ? String(fileRow.creativeStatement).trim()
+              : "";
+          const creativeStatement = rowExplicitCs
+            ? resolveCreativeStatementForPlatform(rowExplicitCs, p.pt)
+            : this.getPlatformStatement(p.id, p.pt);
           const effectiveMode = resolveEffectivePublishMode(isDraftMode, p);
 
           // Format bq for this platform
@@ -2958,12 +3256,20 @@ export default {
             p.pt
           );
 
-          const dirPlanItem = !dirThrottleDecision.noThrottle
-            ? dirThrottleDecision.itemsByKey.get(`dir:${rIdx}:${pIdx}:${p.id}`)
-            : null;
+          const dirPlanItem = dirThrottleDecision.itemsByKey.get(
+            `dir:${rIdx}:${pIdx}:${p.id}`
+          );
+          const dirReservationId =
+            !effectiveMode.publishToDraft &&
+            dirPlanItem &&
+            dirPlanItem.reservationId
+              ? dirPlanItem.reservationId
+              : null;
           const shouldScheduleDir =
             !effectiveMode.publishToDraft &&
-            (dirPlanItem ? dirPlanItem.scheduled : this.scheduledPublish);
+            (dirPlanItem
+              ? Boolean(dirPlanItem.scheduled)
+              : this.scheduledPublish);
 
           if (shouldScheduleDir) {
             const itemScheduledAtMs =
@@ -2975,9 +3281,71 @@ export default {
                 ? dirPlanItem.publishAt
                 : scheduledAtText;
             const itemThrottleReason =
-              (dirPlanItem && dirPlanItem.reason) || "";
+              (!dirThrottleDecision.noThrottle &&
+                dirPlanItem &&
+                dirPlanItem.reason) ||
+              "";
             scheduledWriteTasks.push(
-              this.writeScheduledPublishRecord({
+              this.writeScheduledPublishRecord(
+                {
+                  bookName,
+                  textOtherName,
+                  textType: "local",
+                  pt: p.pt,
+                  selectedFile,
+                  bt: metadata.title,
+                  title: metadata.title,
+                  description: metadata.description,
+                  shortTitle: metadata.shortTitle,
+                  tags: metadata.tags,
+                  ...metadata.legacy,
+                  bq,
+                  creativeStatement,
+                  coverPath: fileRow.coverResolved || "",
+                  noDownload: this.form.noDownload === true,
+                  filePath,
+                  useragent: this.ptConfig[p.pt].useragent,
+                  phone: p.phone,
+                  group: p.group,
+                  accountName: p.accountName,
+                  accountKey: p.accountKey,
+                  partition,
+                  url: this.ptConfig[p.pt].listIndex,
+                  uploadUrl: this.ptConfig[p.pt].upload,
+                  date: currentDate,
+                  scheduledTask: true,
+                  ...(dirDupDecision.allowDuplicate ? { allowDuplicate: true } : {}),
+                  ...(itemThrottleReason
+                    ? { throttleReason: itemThrottleReason }
+                    : {}),
+                  scheduledPublishAt: itemScheduledAtMs,
+                  scheduledPublishAtText: itemScheduledAtText,
+                  useRealBrowser: Boolean(p.useRealBrowser),
+                  publishMode: effectiveMode.publishMode,
+                  publishToDraft: effectiveMode.publishToDraft,
+                  publishAttemptCount: 1,
+                  republishCount: 0,
+                  publishSuccessCount: 0,
+                  publishFailCount: 0,
+                  publishStatus: "scheduled",
+                  lastPublishMessage: itemThrottleReason
+                    ? `等待定时发布（${itemThrottleReason}）`
+                    : "等待定时发布",
+                  lastPublishAt: Date.now(),
+                },
+                dirReservationId
+              )
+            );
+            continue;
+          }
+
+          let pushRes;
+          let persistedRecordId = null;
+          try {
+            pushRes = await dataRequest({
+              type: "add",
+              fileName: "pushData",
+              item: {
                 bookName,
                 textOtherName,
                 textType: "local",
@@ -3003,36 +3371,76 @@ export default {
                 url: this.ptConfig[p.pt].listIndex,
                 uploadUrl: this.ptConfig[p.pt].upload,
                 date: currentDate,
-                scheduledTask: true,
-                ...(dirDupDecision.allowDuplicate ? { allowDuplicate: true } : {}),
-                ...(itemThrottleReason
-                  ? { throttleReason: itemThrottleReason }
-                  : {}),
-                scheduledPublishAt: itemScheduledAtMs,
-                scheduledPublishAtText: itemScheduledAtText,
                 useRealBrowser: Boolean(p.useRealBrowser),
                 publishMode: effectiveMode.publishMode,
                 publishToDraft: effectiveMode.publishToDraft,
+                // 重发开始即清掉上次失败截图，避免显示的是上一轮的旧画面
+                failScreenshot: "",
                 publishAttemptCount: 1,
                 republishCount: 0,
                 publishSuccessCount: 0,
                 publishFailCount: 0,
-                publishStatus: "scheduled",
-                lastPublishMessage: itemThrottleReason
-                  ? `等待定时发布（${itemThrottleReason}）`
-                  : "等待定时发布",
+                publishStatus: effectiveMode.publishToDraft
+                  ? "drafting"
+                  : "publishing",
+                lastPublishMessage: effectiveMode.publishToDraft
+                  ? "等待保存草稿结果"
+                  : "等待发布结果",
                 lastPublishAt: Date.now(),
-              })
+              },
+            });
+            if (pushRes && pushRes.success && Array.isArray(pushRes.data)) {
+              const found = [...pushRes.data]
+                .reverse()
+                .find(
+                  (it) =>
+                    it.textOtherName === textOtherName &&
+                    it.pt === p.pt &&
+                    it.selectedFile === selectedFile &&
+                    String(it.partition || "") === String(partition || "")
+                );
+              if (found) persistedRecordId = found.id;
+            }
+          } catch (e) {
+            pushRes = { success: false, message: (e && e.message) || String(e) };
+          }
+          if (pushRes && pushRes.success === false) {
+            if (dirReservationId) {
+              await this.releaseThrottleReservations([dirReservationId]);
+            }
+            writeErrors.push(
+              `${fileRow.fileName}（${p.pt}）写入发布记录失败：${
+                pushRes.message || "未知错误"
+              }`
             );
-            submitted++;
-            scheduledSubmitted++;
             continue;
+          }
+          if (
+            dirReservationId &&
+            ipcRenderer &&
+            typeof ipcRenderer.invoke === "function"
+          ) {
+            try {
+              await ipcRenderer.invoke("publish-throttle:confirm-reservation", {
+                reservationId: dirReservationId,
+                status: "publishing",
+                recordId: persistedRecordId,
+                ts: Date.now(),
+                isScheduled: false,
+              });
+            } catch (_) {}
           }
 
           const publishPayload = applyXhsConservativePublishOptions({
             ...p,
             taskId,
             allowDuplicate: true,
+            ...(persistedRecordId != null
+              ? { recordId: persistedRecordId }
+              : {}),
+            ...(dirReservationId
+              ? { throttleReservationId: dirReservationId }
+              : {}),
             bookName,
             textType: "local",
             data: {
@@ -3064,54 +3472,6 @@ export default {
             JSON.parse(JSON.stringify(publishPayload))
           );
 
-          dataRequest({
-            type: "add",
-            fileName: "pushData",
-            item: {
-              bookName,
-              textOtherName,
-              textType: "local",
-              pt: p.pt,
-              selectedFile,
-              bt: metadata.title,
-              title: metadata.title,
-              description: metadata.description,
-              shortTitle: metadata.shortTitle,
-              tags: metadata.tags,
-              ...metadata.legacy,
-              bq,
-              creativeStatement,
-              coverPath: fileRow.coverResolved || "",
-              noDownload: this.form.noDownload === true,
-              filePath,
-              useragent: this.ptConfig[p.pt].useragent,
-              phone: p.phone,
-              group: p.group,
-              accountName: p.accountName,
-              accountKey: p.accountKey,
-              partition,
-              url: this.ptConfig[p.pt].listIndex,
-              uploadUrl: this.ptConfig[p.pt].upload,
-              date: currentDate,
-              useRealBrowser: Boolean(p.useRealBrowser),
-              publishMode: effectiveMode.publishMode,
-              publishToDraft: effectiveMode.publishToDraft,
-              // 重发开始即清掉上次失败截图，避免显示的是上一轮的旧画面
-              failScreenshot: "",
-              publishAttemptCount: 1,
-              republishCount: 0,
-              publishSuccessCount: 0,
-              publishFailCount: 0,
-              publishStatus: effectiveMode.publishToDraft
-                ? "drafting"
-                : "publishing",
-              lastPublishMessage: effectiveMode.publishToDraft
-                ? "等待保存草稿结果"
-                : "等待发布结果",
-              lastPublishAt: Date.now(),
-            },
-          });
-
           submitted++;
           if (isXhsPlatform(p.pt)) {
             await sleep(getXhsPlatformStaggerDelayMs());
@@ -3123,12 +3483,29 @@ export default {
       }
 
       if (scheduledWriteTasks.length > 0) {
-        await Promise.all(scheduledWriteTasks);
-        ipcRenderer.send("scheduledPublish:refresh");
+        const writeResults = await Promise.all(scheduledWriteTasks);
+        for (const r of writeResults) {
+          if (r && (r.ok === true || r.success === true)) {
+            submitted++;
+            scheduledSubmitted++;
+          } else {
+            writeErrors.push(
+              (r && (r.message || r.error)) || "写入定时发布记录失败"
+            );
+          }
+        }
+        if (scheduledSubmitted > 0) {
+          ipcRenderer.send("scheduledPublish:refresh");
+        }
       }
 
+      if (writeErrors.length > 0) {
+        this.$message.error(writeErrors.join("；"));
+      }
       if (submitted === 0) {
-        this.$message.warning("没有提交新的发布任务");
+        if (writeErrors.length === 0) {
+          this.$message.warning("没有提交新的发布任务");
+        }
         return;
       }
       let successMessage = `已提交 ${submitted} 个目录批量发布任务`;

@@ -12,8 +12,9 @@ const { handleAccountCollectOutcome } = require("../../services/dataStats/collec
 const {
   readPublishThrottleSettings,
   getDefaultCreativeStatement,
-  planPublishTimes,
-  parseLocalPublishAt,
+  planAndReservePublishTimes,
+  releaseThrottleReservation,
+  parsePublishAtUtc8,
 } = require("../../services/publishThrottle.js");
 
 var router = express.Router();
@@ -92,6 +93,21 @@ function fileStemForDedupe(rawFile) {
   return dot > 0 ? base.slice(0, dot) : base;
 }
 
+function normalizeFilePathForScheduledKey(rawFile) {
+  const s = String(rawFile || "").trim();
+  if (!s) return "";
+  if (/^https?:\/\//i.test(s)) return s;
+  return path.resolve(s);
+}
+
+function derivePhoneForHttpTarget(target, resolvedPartition) {
+  if (target && target.phone) return String(target.phone);
+  if (!resolvedPartition) return "";
+  const stripped = String(resolvedPartition).replace(/^persist:/, "");
+  const idx = target && target.platform ? stripped.indexOf(target.platform) : -1;
+  return idx > 0 ? stripped.slice(0, idx) : stripped;
+}
+
 function readPushDataRecordsForHttp() {
   return readPushDataRecords(changeData);
 }
@@ -103,6 +119,7 @@ router.post("/publish", async function (req, res) {
   if (!isTrustedLocalRequest(req)) {
     return res.status(403).json({ success: false, message: "Forbidden" });
   }
+  const acquiredReservationIds = [];
   try {
     const { parseMultiPublishRequest } = await import(
       "../../cli/parsePublishArgs.js"
@@ -113,6 +130,9 @@ router.post("/publish", async function (req, res) {
     );
     const { registerPublishDedupeBypass } = await import(
       "../../services/puppeteerFile.js"
+    );
+    const { resolveAccountPublishMode } = await import(
+      "../../services/accountPublishSettingsResolver.js"
     );
 
     const throttleSettings = readPublishThrottleSettings();
@@ -142,19 +162,47 @@ router.post("/publish", async function (req, res) {
         phone: target.phone,
         pt: target.platform,
       });
+      const targetPhone = derivePhoneForHttpTarget(target, resolvedPartition);
+      const effectiveMode = resolveAccountPublishMode({
+        phone: targetPhone,
+        pt: target.platform,
+        partition: resolvedPartition,
+        requestDraftMode: Boolean(target.draft),
+      });
+      const isDraft = Boolean(effectiveMode.publishToDraft);
       const candTitle = target.title || fileStemForDedupe(target.file);
       const targetAllowDup = Boolean(rootAllowDuplicate || target.allowDuplicate === true);
       if (targetAllowDup) {
         target.allowDuplicate = true;
         target.publishOptions = { ...(target.publishOptions || {}), allowDuplicate: true };
       }
+
+      // 显式 publishAt 先统一按 UTC+8 校验
+      let explicitPublishAtMs = null;
+      if (target.publishAt) {
+        const parsedAt = parsePublishAtUtc8(target.publishAt, nowMs);
+        if (!parsedAt.ok) {
+          return res.status(400).json({
+            success: false,
+            status: "failed",
+            message: parsedAt.error,
+          });
+        }
+        explicitPublishAtMs = parsedAt.value;
+        target.publishAt = parsedAt.text;
+      }
+
       if (!targetAllowDup) {
-        const hit = findRecentDuplicatePublish(records, {
-          pt: target.platform,
-          phone: target.phone,
-          partition: resolvedPartition,
-          title: candTitle,
-        });
+        const hit = findRecentDuplicatePublish(
+          records,
+          {
+            pt: target.platform,
+            phone: targetPhone,
+            partition: resolvedPartition,
+            title: candTitle,
+          },
+          { now: nowMs, candidateScheduledAt: explicitPublishAtMs }
+        );
         if (hit) {
           return res.status(200).json({
             success: false,
@@ -172,65 +220,82 @@ router.post("/publish", async function (req, res) {
         }
       }
 
-      // 显式 publishAt 先校验，再过节流排期（只顺延不提前，除非 noThrottle）
-      let explicitPublishAtMs = null;
-      if (target.publishAt) {
-        const parsedAt = parseLocalPublishAt(target.publishAt, nowMs);
-        if (!parsedAt.ok) {
-          return res.status(400).json({
-            success: false,
-            status: "failed",
-            message: parsedAt.error,
-          });
-        }
-        explicitPublishAtMs = parsedAt.value;
-      }
-
-      const planItem = planPublishTimes({
+      // 主进程串行加锁排期 + 立即写账本预留（草稿不进账本、既有同文件同时刻任务直接复用）
+      const planRes = await planAndReservePublishTimes({
         targets: [
           {
             platform: target.platform,
-            phone: target.phone,
+            phone: targetPhone,
             partition: resolvedPartition,
             publishAt: target.publishAt || null,
             publishAtMs: explicitPublishAtMs,
             noThrottle: Boolean(target.noThrottle),
+            isDraft,
+            filePath: normalizeFilePathForScheduledKey(target.file),
+            textType: "local",
           },
         ],
         now: nowMs,
-        records,
-        settings: throttleSettings,
-      }).items[0];
+      });
+
+      if (!planRes.ok) {
+        const isParamErr =
+          planRes.code === "INVALID_PUBLISH_AT" ||
+          planRes.code === "EXPIRED_PUBLISH_AT";
+        const exitCode = isParamErr
+          ? 2
+          : planRes.code === "SCHEDULE_FULL"
+          ? 3
+          : 1;
+        return res.status(isParamErr ? 400 : 200).json({
+          success: false,
+          status: "failed",
+          exitCode,
+          code: planRes.code,
+          creativeStatement: target.creativeStatement || "none",
+          message: planRes.message || planRes.error || "发布排期失败",
+        });
+      }
+
+      const planItem = planRes.items[0];
+      if (planItem && planItem.reservationId) {
+        acquiredReservationIds.push(planItem.reservationId);
+        target.throttleReservationId = planItem.reservationId;
+      }
 
       if (planItem && planItem.scheduled) {
         target.publishAt = planItem.publishAt;
         target.scheduledPublishAtMs = planItem.plannedAtMs;
         target.throttled = planItem.throttled;
         target.throttleReason = planItem.reason;
+        target.throttleReasons = planItem.reasons || [];
       } else {
         target.publishAt = null;
         target.scheduledPublishAtMs = null;
         target.throttled = false;
         target.throttleReason = "";
+        target.throttleReasons = [];
         registerPublishDedupeBypass({
           pt: target.platform,
-          phone: target.phone,
+          phone: targetPhone,
           partition: resolvedPartition,
           title: candTitle,
         });
       }
       result = await publishService.runSingleFilePublish(target);
+      acquiredReservationIds.length = 0;
       if (result && result.creativeStatement == null) {
         result.creativeStatement = target.creativeStatement || "none";
       }
     } else {
-      // platforms 数组（1 个或多个平台）：先逐平台查重，仅拦截重复的那几个平台；
-      // 未被拦截的平台再进入节流排期并执行
+      // platforms 数组（1 个或多个平台）：先逐平台校验 publishAt 与查重，仅拦截重复的那几个平台；
+      // 未被拦截的平台再进入主进程串行排期与账本预留
       const targets = parsed.value;
       const allowedTargets = [];
       const allowedMeta = [];
       const allowedIndices = [];
       const blockedByIndex = new Map();
+      const planFailedByIndex = new Map();
 
       for (let i = 0; i < targets.length; i++) {
         const t = targets[i];
@@ -239,19 +304,44 @@ router.post("/publish", async function (req, res) {
           phone: t.phone,
           pt: t.platform,
         });
+        const targetPhone = derivePhoneForHttpTarget(t, resolvedPartition);
+        const effectiveMode = resolveAccountPublishMode({
+          phone: targetPhone,
+          pt: t.platform,
+          partition: resolvedPartition,
+          requestDraftMode: Boolean(t.draft),
+        });
+        const isDraft = Boolean(effectiveMode.publishToDraft);
         const candTitle = t.title || fileStemForDedupe(t.file);
         const allowDup = Boolean(t.allowDuplicate);
         if (allowDup) {
           t.allowDuplicate = true;
           t.publishOptions = { ...(t.publishOptions || {}), allowDuplicate: true };
         }
+        let explicitPublishAtMs = null;
+        if (t.publishAt) {
+          const parsedAt = parsePublishAtUtc8(t.publishAt, nowMs);
+          if (!parsedAt.ok) {
+            return res.status(400).json({
+              success: false,
+              status: "failed",
+              message: parsedAt.error,
+            });
+          }
+          explicitPublishAtMs = parsedAt.value;
+          t.publishAt = parsedAt.text;
+        }
         if (!allowDup) {
-          const hit = findRecentDuplicatePublish(records, {
-            pt: t.platform,
-            phone: t.phone,
-            partition: resolvedPartition,
-            title: candTitle,
-          });
+          const hit = findRecentDuplicatePublish(
+            records,
+            {
+              pt: t.platform,
+              phone: targetPhone,
+              partition: resolvedPartition,
+              title: candTitle,
+            },
+            { now: nowMs, candidateScheduledAt: explicitPublishAtMs }
+          );
           if (hit) {
             blockedByIndex.set(i, {
               platform: t.platform,
@@ -269,20 +359,14 @@ router.post("/publish", async function (req, res) {
             continue;
           }
         }
-        let explicitPublishAtMs = null;
-        if (t.publishAt) {
-          const parsedAt = parseLocalPublishAt(t.publishAt, nowMs);
-          if (!parsedAt.ok) {
-            return res.status(400).json({
-              success: false,
-              status: "failed",
-              message: parsedAt.error,
-            });
-          }
-          explicitPublishAtMs = parsedAt.value;
-        }
         allowedTargets.push(t);
-        allowedMeta.push({ resolvedPartition, candTitle, explicitPublishAtMs });
+        allowedMeta.push({
+          resolvedPartition,
+          targetPhone,
+          isDraft,
+          candTitle,
+          explicitPublishAtMs,
+        });
         allowedIndices.push(i);
       }
 
@@ -300,72 +384,124 @@ router.post("/publish", async function (req, res) {
           results: blockedList,
         };
       } else {
-        // 仅对未命中重复拦截的平台进行节流排期
-        const plan = planPublishTimes({
+        // 仅对未命中重复拦截的平台进行主进程串行节流排期与账本预留
+        const planRes = await planAndReservePublishTimes({
           targets: allowedTargets.map((t, k) => ({
             platform: t.platform,
-            phone: t.phone,
+            phone: allowedMeta[k].targetPhone,
             partition: allowedMeta[k].resolvedPartition,
             publishAt: t.publishAt || null,
             publishAtMs: allowedMeta[k].explicitPublishAtMs,
             noThrottle: Boolean(t.noThrottle),
+            isDraft: allowedMeta[k].isDraft,
+            filePath: normalizeFilePathForScheduledKey(t.file),
+            textType: "local",
           })),
           now: nowMs,
-          records,
-          settings: throttleSettings,
+          allowPartialError: true,
         });
 
+        if (!planRes.ok) {
+          const isParamErr =
+            planRes.code === "INVALID_PUBLISH_AT" ||
+            planRes.code === "EXPIRED_PUBLISH_AT";
+          return res.status(isParamErr ? 400 : 200).json({
+            success: false,
+            status: "failed",
+            exitCode: isParamErr ? 2 : 1,
+            code: planRes.code,
+            total: targets.length,
+            succeeded: 0,
+            failed: targets.length,
+            message: planRes.message || planRes.error || "发布排期失败",
+            results: [],
+          });
+        }
+
+        const execTargets = [];
+        const execIndices = [];
         for (let k = 0; k < allowedTargets.length; k++) {
           const t = allowedTargets[k];
           const meta = allowedMeta[k];
-          const planItem = plan.items[k];
+          const planItem = planRes.items[k];
+          if (planItem && planItem.ok === false) {
+            planFailedByIndex.set(allowedIndices[k], {
+              platform: t.platform,
+              phone: t.phone || "",
+              creativeStatement: t.creativeStatement || "none",
+              success: false,
+              status: "failed",
+              exitCode: 3,
+              message: planItem.error || "排期已满",
+            });
+            continue;
+          }
+          if (planItem && planItem.reservationId) {
+            acquiredReservationIds.push(planItem.reservationId);
+            t.throttleReservationId = planItem.reservationId;
+          }
           if (planItem && planItem.scheduled) {
             t.publishAt = planItem.publishAt;
             t.scheduledPublishAtMs = planItem.plannedAtMs;
             t.throttled = planItem.throttled;
             t.throttleReason = planItem.reason;
+            t.throttleReasons = planItem.reasons || [];
           } else {
             t.publishAt = null;
             t.scheduledPublishAtMs = null;
             t.throttled = false;
             t.throttleReason = "";
+            t.throttleReasons = [];
             registerPublishDedupeBypass({
               pt: t.platform,
-              phone: t.phone,
+              phone: meta.targetPhone,
               partition: meta.resolvedPartition,
               title: meta.candTitle,
             });
           }
+          execTargets.push(t);
+          execIndices.push(allowedIndices[k]);
         }
 
-        if (blockedByIndex.size === 0) {
+        if (
+          blockedByIndex.size === 0 &&
+          planFailedByIndex.size === 0
+        ) {
           result = parsed.multi
-            ? await publishService.runMultiPlatformPublish(allowedTargets)
-            : await publishService.runSingleFilePublish(allowedTargets[0]);
+            ? await publishService.runMultiPlatformPublish(execTargets)
+            : await publishService.runSingleFilePublish(execTargets[0]);
+          acquiredReservationIds.length = 0;
           if (!parsed.multi && result && result.creativeStatement == null) {
-            result.creativeStatement = allowedTargets[0].creativeStatement || "none";
+            result.creativeStatement = execTargets[0].creativeStatement || "none";
           }
         } else {
-          const runRes = await publishService.runMultiPlatformPublish(allowedTargets);
+          const runRes =
+            execTargets.length > 0
+              ? await publishService.runMultiPlatformPublish(execTargets)
+              : { results: [] };
+          acquiredReservationIds.length = 0;
           const runResults = Array.isArray(runRes && runRes.results) ? runRes.results : [];
           const mergedResults = new Array(targets.length);
           for (const [idx, blocked] of blockedByIndex.entries()) {
             mergedResults[idx] = blocked;
           }
-          for (let k = 0; k < allowedIndices.length; k++) {
+          for (const [idx, failedItem] of planFailedByIndex.entries()) {
+            mergedResults[idx] = failedItem;
+          }
+          for (let k = 0; k < execIndices.length; k++) {
             const rr = runResults[k];
-            mergedResults[allowedIndices[k]] = rr
+            mergedResults[execIndices[k]] = rr
               ? {
                   ...rr,
                   creativeStatement:
                     rr.creativeStatement ||
-                    allowedTargets[k].creativeStatement ||
+                    execTargets[k].creativeStatement ||
                     "none",
                 }
               : {
-                  platform: allowedTargets[k].platform,
-                  phone: allowedTargets[k].phone || "",
-                  creativeStatement: allowedTargets[k].creativeStatement || "none",
+                  platform: execTargets[k].platform,
+                  phone: execTargets[k].phone || "",
+                  creativeStatement: execTargets[k].creativeStatement || "none",
                   success: false,
                   status: "failed",
                   exitCode: 1,
@@ -380,23 +516,42 @@ router.post("/publish", async function (req, res) {
             (r) => r && r.scheduled === true
           ).length;
           const failed = total - succeeded;
+          const hasDup = blockedByIndex.size > 0;
           result = {
             ...(runRes || {}),
             success: failed === 0,
-            status: succeeded > 0 ? "partial_duplicate" : "duplicate",
-            exitCode: failed === 0 ? 0 : DUPLICATE_EXIT_CODE,
+            status: hasDup
+              ? succeeded > 0
+                ? "partial_duplicate"
+                : "duplicate"
+              : failed === total
+              ? "failed"
+              : "partial_failed",
+            exitCode:
+              failed === 0
+                ? 0
+                : hasDup && failed === blockedByIndex.size
+                ? DUPLICATE_EXIT_CODE
+                : planFailedByIndex.size === failed
+                ? 3
+                : 1,
             total,
             succeeded,
             scheduledCount,
             failed,
             results: mergedResults,
-            message: `共 ${total} 个平台：成功 ${succeeded} 个${
-              scheduledCount > 0 ? `（含节流排期 ${scheduledCount} 个）` : ""
-            }，拦截重复 ${blockedByIndex.size} 个${
-              failed - blockedByIndex.size > 0
-                ? `，失败 ${failed - blockedByIndex.size} 个`
-                : ""
-            }`,
+            message: hasDup
+              ? `共 ${total} 个平台：成功 ${succeeded} 个${
+                  scheduledCount > 0 ? `（含节流排期 ${scheduledCount} 个）` : ""
+                }，拦截重复 ${blockedByIndex.size} 个${
+                  failed - blockedByIndex.size > 0
+                    ? `，失败 ${failed - blockedByIndex.size} 个`
+                    : ""
+                }`
+              : mergedResults
+                  .filter((r) => r && !r.success && r.message)
+                  .map((r) => r.message)
+                  .join("；") || `共 ${total} 个平台：成功 ${succeeded} 个，失败 ${failed} 个`,
           };
         }
       }
@@ -414,6 +569,11 @@ router.post("/publish", async function (req, res) {
 
     return res.status(httpStatus).json(response);
   } catch (error) {
+    if (acquiredReservationIds.length > 0) {
+      try {
+        await releaseThrottleReservation(acquiredReservationIds);
+      } catch (_) {}
+    }
     console.error("[HTTP /publish]", error);
     return res.status(500).json({
       success: false,

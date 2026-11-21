@@ -10,12 +10,27 @@ import { normalizeCreativeStatement } from "../../shared/creativeStatement.js";
 import { isRemotePublishFile, resolvePublishFile } from "./resolvePublishFile";
 import { normalizeVideoRecordMetadata } from "../../shared/videoMetadata.js";
 import { scheduledKey } from "./scheduledDedupe.js";
+import { resolvePublishCompletion } from "../../shared/publishResult.js";
+import {
+  SCHEDULED_EXPIRE_GRACE_MS,
+  formatUtc8DateTime,
+  parsePublishAtUtc8,
+} from "../../shared/publishThrottle.js";
+import {
+  confirmThrottleReservation,
+  releaseThrottleReservation,
+  settleThrottleByRecordId,
+} from "./publishThrottle.js";
 
 const MAX_TIMER_DELAY_MS = 24 * 60 * 60 * 1000;
 const REFRESH_INTERVAL_MS = 60 * 1000;
 const scheduledTimers = new Map();
+const dispatchedKeys = new Set();
 let schedulerStarted = false;
+let schedulerStartedAt = null;
 let refreshInterval = null;
+
+export { SCHEDULED_EXPIRE_GRACE_MS };
 
 function pad(n) {
   return String(n).padStart(2, "0");
@@ -26,35 +41,8 @@ function todayYmd(nowMs = Date.now()) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
-function parseDateParts(value) {
-  const text = String(value || "").trim();
-  const m = text.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})$/);
-  if (!m) {
-    return { ok: false, error: "定时发布时间格式应为 YYYY-MM-DD HH:mm:ss" };
-  }
-  const nums = m.slice(1).map((v) => Number(v));
-  const [year, month, day, hour, minute, second] = nums;
-  const dt = new Date(year, month - 1, day, hour, minute, second, 0);
-  const valid =
-    dt.getFullYear() === year &&
-    dt.getMonth() === month - 1 &&
-    dt.getDate() === day &&
-    dt.getHours() === hour &&
-    dt.getMinutes() === minute &&
-    dt.getSeconds() === second;
-  if (!valid) {
-    return { ok: false, error: "定时发布时间不是有效日期" };
-  }
-  return { ok: true, text, value: dt.getTime() };
-}
-
 export function parsePublishAt(value, nowMs = Date.now()) {
-  const parsed = parseDateParts(value);
-  if (!parsed.ok) return parsed;
-  if (parsed.value <= nowMs) {
-    return { ok: false, error: "定时发布时间必须是未来时间" };
-  }
-  return { ok: true, value: parsed.value, text: parsed.text };
+  return parsePublishAtUtc8(value, nowMs);
 }
 
 export function createScheduledRecord(
@@ -72,12 +60,7 @@ export function createScheduledRecord(
     if (publishAtText.value <= nowMs) {
       throw new Error("定时发布时间必须是未来时间");
     }
-    const text =
-      String(publishAtText.text || "").trim() ||
-      new Date(publishAtText.value + 8 * 3600 * 1000)
-        .toISOString()
-        .slice(0, 19)
-        .replace("T", " ");
+    const text = formatUtc8DateTime(publishAtText.value);
     parsed = { ok: true, value: publishAtText.value, text };
   } else if (
     options &&
@@ -87,12 +70,7 @@ export function createScheduledRecord(
     if (options.scheduledPublishAtMs <= nowMs) {
       throw new Error("定时发布时间必须是未来时间");
     }
-    const text =
-      String(publishAtText || "").trim() ||
-      new Date(options.scheduledPublishAtMs + 8 * 3600 * 1000)
-        .toISOString()
-        .slice(0, 19)
-        .replace("T", " ");
+    const text = formatUtc8DateTime(options.scheduledPublishAtMs);
     parsed = { ok: true, value: options.scheduledPublishAtMs, text };
   } else {
     parsed = parsePublishAt(publishAtText, nowMs);
@@ -106,10 +84,15 @@ export function createScheduledRecord(
   const throttleReason = String(
     (options && options.throttleReason) || recordItem.throttleReason || ""
   ).trim();
+  const throttleReservationId =
+    (options && options.throttleReservationId) ||
+    recordItem.throttleReservationId ||
+    null;
   return {
     ...recordItem,
     ...(allowDuplicate ? { allowDuplicate: true } : {}),
     ...(throttleReason ? { throttleReason } : {}),
+    ...(throttleReservationId ? { throttleReservationId } : {}),
     date: recordItem.date || todayYmd(nowMs),
     scheduledTask: true,
     scheduledPublishAt: parsed.value,
@@ -135,6 +118,26 @@ export function isExpiredScheduledRecord(record, nowMs = Date.now()) {
   );
 }
 
+/**
+ * 仅当定时任务已超过宽限期（默认 10 分钟）且应用在其计划时刻未运行时，才判定为 expired。
+ * 应用持续运行期间刚到点的任务不得标 expired，一律进入执行队列（S11-fix #2）。
+ */
+function shouldExpireScheduledRecord(record, nowMs = Date.now()) {
+  if (!isExpiredScheduledRecord(record, nowMs)) return false;
+  const scheduledAt = Number(record.scheduledPublishAt);
+  if (nowMs - scheduledAt <= SCHEDULED_EXPIRE_GRACE_MS) {
+    return false;
+  }
+  if (
+    schedulerStarted &&
+    schedulerStartedAt !== null &&
+    scheduledAt >= schedulerStartedAt
+  ) {
+    return false;
+  }
+  return true;
+}
+
 export function buildTaskPayloadFromRecord(record) {
   const cfg = ptConfig[record.pt] || {};
   const allowDuplicate =
@@ -142,11 +145,20 @@ export function buildTaskPayloadFromRecord(record) {
     Boolean(record.publishOptions && record.publishOptions.allowDuplicate === true);
   const recordIdPatch = record.id != null ? { recordId: record.id } : {};
   const allowDuplicatePatch = allowDuplicate ? { allowDuplicate: true } : {};
+  const scheduledAtPatch =
+    Number.isFinite(Number(record.scheduledPublishAt)) &&
+    Number(record.scheduledPublishAt) > 0
+      ? { scheduledPublishAt: Number(record.scheduledPublishAt) }
+      : {};
+  const reservationPatch = record.throttleReservationId
+    ? { throttleReservationId: record.throttleReservationId }
+    : {};
   if (record.textType === "article") {
     return {
       taskId: Date.now() + Math.random(),
       ...recordIdPatch,
       ...allowDuplicatePatch,
+      ...scheduledAtPatch,
       bookName: record.bookName || record.textOtherName || "",
       textType: "article",
       data: {
@@ -179,6 +191,8 @@ export function buildTaskPayloadFromRecord(record) {
     taskId: Date.now() + Math.random(),
     ...recordIdPatch,
     ...allowDuplicatePatch,
+    ...scheduledAtPatch,
+    ...reservationPatch,
     bookName: record.bookName || record.textOtherName || "",
     textType: record.textType || "local",
     data: {
@@ -201,7 +215,8 @@ export function buildTaskPayloadFromRecord(record) {
     show: false,
     mmCliSuppressWindow: false,
     publishMode: record.publishMode || "publish",
-    publishToDraft: record.publishMode === "draft",
+    publishToDraft:
+      record.publishMode === "draft" || record.publishToDraft === true,
     publishOptions: record.publishOptions || {},
     closeWindowAfterPublish: true,
     useragent: record.useragent || cfg.useragent,
@@ -251,7 +266,39 @@ export function listScheduledRecords() {
   return rows;
 }
 
+function settleScheduledLedger(record, status, extra = {}) {
+  try {
+    const reservationId = record && record.throttleReservationId;
+    const isFormalSuccess =
+      status === "success" &&
+      extra.publishToDraft !== true &&
+      String(extra.publishMode || "").trim().toLowerCase() !== "draft";
+    if (reservationId) {
+      if (isFormalSuccess) {
+        confirmThrottleReservation(reservationId, {
+          status: "success",
+          ts:
+            typeof extra.ts === "number" && Number.isFinite(extra.ts)
+              ? extra.ts
+              : Date.now(),
+          isScheduled: false,
+          recordId: record && record.id,
+        }).catch(() => {});
+      } else {
+        releaseThrottleReservation(reservationId).catch(() => {});
+      }
+      return;
+    }
+    if (record && record.id != null) {
+      settleThrottleByRecordId(record.id, status, extra).catch(() => {});
+    }
+  } catch (_) {
+    /* ignore */
+  }
+}
+
 function finishScheduledRecord(record, payload) {
+  const nowMs = Date.now();
   if (payload && payload.skipped) {
     updateRecord(record, {
       publishStatus: "skipped",
@@ -259,38 +306,69 @@ function finishScheduledRecord(record, payload) {
       publishFailCount: 0,
       lastPublishMessage:
         (payload && payload.message) || "用户关闭窗口，已跳过发布",
-      lastPublishAt: Date.now(),
+      lastPublishAt: nowMs,
     });
+    settleScheduledLedger(record, "skipped", { ts: nowMs });
     return;
   }
-  const ok = payload && payload.status === true;
-  const abnormal = ok && payload.publishAbnormal === true;
+  const mergedPayload = {
+    ...(payload || {}),
+    publishMode:
+      (payload && payload.publishMode) || record.publishMode || "publish",
+    publishToDraft:
+      (payload && payload.publishToDraft === true) ||
+      (payload && payload.publishMode === "draft") ||
+      record.publishMode === "draft" ||
+      record.publishToDraft === true,
+  };
+  const completion = resolvePublishCompletion(mergedPayload);
   // 失败/异常时主进程已在发布页截了图，落库后视频管理里可点开回看
   const failScreenshot =
     (payload && payload.failScreenshot) || record.failScreenshot;
+  const isPositive =
+    completion.recordStatus === "success" ||
+    completion.recordStatus === "draft";
+  const isFailure =
+    completion.recordStatus === "failed" ||
+    completion.recordStatus === "login_required";
   updateRecord(record, {
-    publishStatus: abnormal ? "abnormal" : ok ? "success" : "failed",
-    publishSuccessCount: ok && !abnormal ? 1 : 0,
-    publishFailCount: ok ? 0 : 1,
-    publishAbnormalCount: abnormal ? 1 : 0,
-    ...(ok && !abnormal ? {} : { failScreenshot }),
-    lastPublishMessage:
-      (payload && payload.message) || (ok ? "发布成功" : "发布失败"),
-    lastPublishAt: Date.now(),
+    publishMode: completion.savedAsDraft ? "draft" : record.publishMode || "publish",
+    publishToDraft: completion.savedAsDraft,
+    publishStatus: completion.recordStatus,
+    publishSuccessCount: isPositive ? 1 : 0,
+    publishFailCount: isFailure ? 1 : 0,
+    publishAbnormalCount: completion.publishAbnormal ? 1 : 0,
+    ...(isPositive ? {} : { failScreenshot }),
+    lastPublishMessage: completion.message,
+    lastPublishAt: nowMs,
+  });
+  settleScheduledLedger(record, completion.recordStatus, {
+    publishMode: completion.savedAsDraft ? "draft" : "publish",
+    publishToDraft: completion.savedAsDraft,
+    ts: nowMs,
   });
 }
 
-function executeScheduledRecord(record) {
-  if (!record || !record.id) return;
-  executeScheduledRecordAsync(record).catch((e) => {
-    console.error("[scheduledPublish] 执行定时发布失败:", e && e.message);
-    updateRecord(record, {
-      publishStatus: "failed",
-      publishFailCount: 1,
-      lastPublishMessage: (e && e.message) || "定时发布执行失败",
-      lastPublishAt: Date.now(),
+function executeScheduledRecord(record, dispatchKey) {
+  if (!record || !record.id) {
+    if (dispatchKey) dispatchedKeys.delete(dispatchKey);
+    return;
+  }
+  executeScheduledRecordAsync(record)
+    .catch((e) => {
+      console.error("[scheduledPublish] 执行定时发布失败:", e && e.message);
+      const nowMs = Date.now();
+      updateRecord(record, {
+        publishStatus: "failed",
+        publishFailCount: 1,
+        lastPublishMessage: (e && e.message) || "定时发布执行失败",
+        lastPublishAt: nowMs,
+      });
+      settleScheduledLedger(record, "failed", { ts: nowMs });
+    })
+    .finally(() => {
+      if (dispatchKey) dispatchedKeys.delete(dispatchKey);
     });
-  });
 }
 
 async function executeScheduledRecordAsync(record) {
@@ -301,12 +379,14 @@ async function executeScheduledRecordAsync(record) {
 
   if (record.textType !== "article") {
     if (!publishFilePath) {
+      const nowMs = Date.now();
       updateRecord(record, {
         publishStatus: "failed",
         publishFailCount: 1,
         lastPublishMessage: "本地视频文件不存在",
-        lastPublishAt: Date.now(),
+        lastPublishAt: nowMs,
       });
+      settleScheduledLedger(record, "failed", { ts: nowMs });
       return;
     }
 
@@ -316,21 +396,25 @@ async function executeScheduledRecordAsync(record) {
         publishFilePath = resolved.localPath;
         cleanupDownload = resolved.cleanup;
       } catch (e) {
+        const nowMs = Date.now();
         updateRecord(record, {
           publishStatus: "failed",
           publishFailCount: 1,
           lastPublishMessage: `下载视频失败: ${e && e.message ? e.message : e}`,
-          lastPublishAt: Date.now(),
+          lastPublishAt: nowMs,
         });
+        settleScheduledLedger(record, "failed", { ts: nowMs });
         return;
       }
     } else if (!fs.existsSync(publishFilePath)) {
+      const nowMs = Date.now();
       updateRecord(record, {
         publishStatus: "failed",
         publishFailCount: 1,
         lastPublishMessage: "本地视频文件不存在",
-        lastPublishAt: Date.now(),
+        lastPublishAt: nowMs,
       });
+      settleScheduledLedger(record, "failed", { ts: nowMs });
       return;
     }
   }
@@ -340,12 +424,14 @@ async function executeScheduledRecordAsync(record) {
     !String(record.content || "").trim() &&
     (!record.articleFilePath || !fs.existsSync(record.articleFilePath))
   ) {
+    const nowMs = Date.now();
     updateRecord(record, {
       publishStatus: "failed",
       publishFailCount: 1,
       lastPublishMessage: "文章正文文件不存在",
-      lastPublishAt: Date.now(),
+      lastPublishAt: nowMs,
     });
+    settleScheduledLedger(record, "failed", { ts: nowMs });
     return;
   }
 
@@ -355,9 +441,13 @@ async function executeScheduledRecordAsync(record) {
       filePath: publishFilePath,
     });
     const taskId = taskPayload.taskId;
+    const isDraftTask =
+      record.publishMode === "draft" || record.publishToDraft === true;
     updateRecord(record, {
-      publishStatus: "publishing",
-      lastPublishMessage: "定时任务开始发布",
+      publishStatus: isDraftTask ? "drafting" : "publishing",
+      lastPublishMessage: isDraftTask
+        ? "定时任务开始保存草稿"
+        : "定时任务开始发布",
       lastPublishAt: Date.now(),
     });
 
@@ -377,13 +467,15 @@ async function executeScheduledRecordAsync(record) {
             finish();
           } else if (channel === "puppeteer-noLogin") {
             // 登录失效单独标状态：任务本身没错，补扫码后可重新排期
+            const nowMs = Date.now();
             updateRecord(record, {
               publishStatus: "login_required",
               publishFailCount: Number(record.publishFailCount || 0) + 1,
               lastPublishMessage:
                 "登录态失效，需重新扫码登录后重排（本次未发布）",
-              lastPublishAt: Date.now(),
+              lastPublishAt: nowMs,
             });
+            settleScheduledLedger(record, "login_required", { ts: nowMs });
             finish();
           }
         },
@@ -395,41 +487,81 @@ async function executeScheduledRecordAsync(record) {
   }
 }
 
+function dispatchScheduledRecord(record, key) {
+  if (dispatchedKeys.has(key)) return;
+  dispatchedKeys.add(key);
+  executeScheduledRecord(record, key);
+}
+
 export function schedulePublishRecord(record, nowMs = Date.now()) {
   if (!record || !record.id || record.publishStatus !== "scheduled") return;
   const key = `${record.date || ""}:${record.id}`;
-  if (scheduledTimers.has(key)) {
-    clearTimeout(scheduledTimers.get(key));
-    scheduledTimers.delete(key);
-  }
-  if (isExpiredScheduledRecord(record, nowMs)) {
-    updateRecord(record, {
-      publishStatus: "expired",
-      lastPublishMessage: "任务过期，未执行发布",
-      lastPublishAt: nowMs,
-    });
+  if (dispatchedKeys.has(key)) return;
+
+  const targetAt = Number(record.scheduledPublishAt);
+  const existingEntry = scheduledTimers.get(key);
+
+  if (targetAt <= nowMs) {
+    if (shouldExpireScheduledRecord(record, nowMs)) {
+      if (existingEntry) {
+        clearTimeout(existingEntry.timer);
+        scheduledTimers.delete(key);
+      }
+      updateRecord(record, {
+        publishStatus: "expired",
+        lastPublishMessage: "任务过期，未执行发布",
+        lastPublishAt: nowMs,
+      });
+      settleScheduledLedger(record, "expired", { ts: nowMs });
+      return;
+    }
+    // 已到点且在宽限期内或应用持续运行中：直接进入执行队列（避免刷新误取消或标 expired）
+    if (existingEntry) {
+      clearTimeout(existingEntry.timer);
+      scheduledTimers.delete(key);
+    }
+    dispatchScheduledRecord(record, key);
     return;
   }
-  const delay = Math.min(
-    Number(record.scheduledPublishAt) - nowMs,
-    MAX_TIMER_DELAY_MS
-  );
+
+  // 尚未到点且已有同一时刻的有效计时器：保留原计时器不重复清掉重建
+  if (existingEntry && existingEntry.scheduledPublishAt === targetAt) {
+    return;
+  }
+  if (existingEntry) {
+    clearTimeout(existingEntry.timer);
+    scheduledTimers.delete(key);
+  }
+  const delay = Math.min(targetAt - nowMs, MAX_TIMER_DELAY_MS);
   const timer = setTimeout(() => {
     scheduledTimers.delete(key);
     if (Number(record.scheduledPublishAt) > Date.now()) {
       schedulePublishRecord(record);
       return;
     }
-    executeScheduledRecord(record);
+    dispatchScheduledRecord(record, key);
   }, delay);
-  scheduledTimers.set(key, timer);
+  scheduledTimers.set(key, { timer, scheduledPublishAt: targetAt });
 }
 
 export function refreshScheduledPublishScheduler(nowMs = Date.now()) {
   // 同一轮触发里同一任务只处理一次：历史数据里可能存在同键重复记录
   // （isDuplicate 不覆盖 scheduledTask），这里做兜底防止双发。
+  const activeRecords = listScheduledRecords();
+  const activeKeySet = new Set(
+    activeRecords
+      .filter((r) => r && r.id)
+      .map((r) => `${r.date || ""}:${r.id}`)
+  );
+  // 清理已被删除或取消的旧计时器，但绝不清掉仍在待发列表或已到点的计时器
+  for (const [k, entry] of scheduledTimers.entries()) {
+    if (!activeKeySet.has(k) && !dispatchedKeys.has(k)) {
+      clearTimeout(entry.timer);
+      scheduledTimers.delete(k);
+    }
+  }
   const inFlight = new Set();
-  listScheduledRecords().forEach((record) => {
+  activeRecords.forEach((record) => {
     const key = scheduledKey(record);
     if (key && inFlight.has(key)) {
       console.warn(`[scheduled] 同键任务已在本轮处理，跳过重复记录: ${key}`);
@@ -449,10 +581,11 @@ export function getScheduledTimersSnapshot() {
   return Array.from(scheduledTimers.keys());
 }
 
-export function startScheduledPublishScheduler() {
+export function startScheduledPublishScheduler(nowMs = Date.now()) {
   if (schedulerStarted) return;
   schedulerStarted = true;
-  refreshScheduledPublishScheduler();
+  schedulerStartedAt = nowMs;
+  refreshScheduledPublishScheduler(nowMs);
   refreshInterval = setInterval(() => {
     refreshScheduledPublishScheduler();
   }, REFRESH_INTERVAL_MS);
@@ -469,7 +602,9 @@ export function stopScheduledPublishScheduler() {
     clearInterval(refreshInterval);
     refreshInterval = null;
   }
-  scheduledTimers.forEach((timer) => clearTimeout(timer));
+  scheduledTimers.forEach((entry) => clearTimeout(entry.timer));
   scheduledTimers.clear();
+  dispatchedKeys.clear();
   schedulerStarted = false;
+  schedulerStartedAt = null;
 }

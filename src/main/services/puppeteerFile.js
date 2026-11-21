@@ -35,6 +35,7 @@ import {
   readPushDataRecords,
   findRecentDuplicatePublish,
 } from "../../shared/publishDedupe.js";
+import { resolvePublishCompletion } from "../../shared/publishResult.js";
 import { changeData } from "../server/utils.js";
 
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
@@ -362,7 +363,43 @@ export function checkPublishEntryDuplicate(data, records, options = {}) {
   return findRecentDuplicatePublish(filtered, data, {
     now,
     excludeRecordId,
+    isExecutionCheck: true,
+    candidateScheduledAt:
+      data && data.scheduledPublishAt != null ? data.scheduledPublishAt : now,
   });
+}
+
+function settleTaskThrottleReservation(data, channel, payload) {
+  const reservationId = data && data.throttleReservationId;
+  if (!reservationId) return;
+  try {
+    const throttleSvc = require("./publishThrottle.js");
+    if (channel === "puppeteerFile-done" && payload && !payload.skipped) {
+      const completion = resolvePublishCompletion({
+        ...payload,
+        publishMode: payload.publishMode || data.publishMode,
+        publishToDraft:
+          payload.publishToDraft === true ||
+          payload.publishMode === "draft" ||
+          data.publishToDraft === true ||
+          data.publishMode === "draft",
+      });
+      if (completion.recordStatus === "success") {
+        throttleSvc
+          .confirmThrottleReservation(reservationId, {
+            status: "success",
+            ts: Date.now(),
+            isScheduled: false,
+            recordId: data.recordId,
+          })
+          .catch(() => {});
+        return;
+      }
+    }
+    throttleSvc.releaseThrottleReservation(reservationId).catch(() => {});
+  } catch (_) {
+    /* ignore */
+  }
 }
 
 async function doUpload(data, transport, queueDone, runtimeTask) {
@@ -379,6 +416,10 @@ async function doUpload(data, transport, queueDone, runtimeTask) {
   // 发布入口兜底查重（7 天内同平台+同账号+清洗后同标题成功/进行中记录默认拦截）
   const duplicateHit = checkPublishEntryDuplicate(data);
   if (duplicateHit) {
+    settleTaskThrottleReservation(data, "puppeteerFile-done", {
+      status: false,
+      duplicate: true,
+    });
     try {
       transport.reply("puppeteerFile-done", {
         ...data,
@@ -400,6 +441,7 @@ async function doUpload(data, transport, queueDone, runtimeTask) {
   const maxRetries = getPublishAttemptLimit(data, 5);
   let currentAttempt = 0;
   let finished = false;
+  let reservationSettled = false;
   let activeBrowser = null;
   let activeWin = null;
   let activePage = null;
@@ -407,7 +449,16 @@ async function doUpload(data, transport, queueDone, runtimeTask) {
   let actionCheckTimer = null;
   const retryDelay = 1000;
 
+  const settleReservationOnce = (channel, payload) => {
+    if (reservationSettled) return;
+    reservationSettled = true;
+    settleTaskThrottleReservation(data, channel, payload);
+  };
+
   const safeReply = (channel, payload) => {
+    if (channel === "puppeteerFile-done" || channel === "puppeteer-noLogin") {
+      settleReservationOnce(channel, payload);
+    }
     try {
       transport.reply(channel, payload);
       return true;
@@ -470,6 +521,9 @@ async function doUpload(data, transport, queueDone, runtimeTask) {
         payload &&
         payload.status === true &&
         !payload.skipped;
+      if (channel === "puppeteerFile-done" || channel === "puppeteer-noLogin") {
+        settleReservationOnce(channel, payload);
+      }
       const replied = transport.reply(channel, ...args);
       if (ok) finishOnce();
       return replied;

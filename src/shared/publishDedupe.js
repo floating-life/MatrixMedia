@@ -300,9 +300,14 @@ function readPushDataRecords(changeDataFn, options = {}) {
 /**
  * 在 pushData 发布记录中查找同平台 + 同账号 + 清洗归一后标题相同、且 7 天内有成功/进行中记录的最近一条。
  *
+ * 定时待发（scheduled）记录的先后规则（S11-fix #5）：
+ * - 待发记录只拦截「计划时刻更早或相同」（recPlannedMs <= refMs）的同标题请求；
+ * - 执行时查重（isExecutionCheck: true）排除计划时刻晚于本任务的待发记录（recPlannedMs > taskTimeMs）；
+ * - allowDuplicate 只影响带它的那条任务，不放行其它未带 allowDuplicate 的任务。
+ *
  * @param {Array<object>|Record<string, Array<object>>} records pushData 记录数组或按日期分组对象
- * @param {object} candidate { pt|platform, phone?, partition?, accountKey?, title?, bt1?, bookName?, data? }
- * @param {object} [options] { now?: number, windowMs?: number, excludeRecordId?: string|number }
+ * @param {object} candidate { pt|platform, phone?, partition?, accountKey?, title?, bt1?, bookName?, data?, scheduledPublishAt?, publishAt? }
+ * @param {object} [options] { now?: number, windowMs?: number, excludeRecordId?: string|number, candidateScheduledAt?: number|null, isExecutionCheck?: boolean }
  * @returns {object|null}
  */
 function findRecentDuplicatePublish(records, candidate, options = {}) {
@@ -318,6 +323,16 @@ function findRecentDuplicatePublish(records, candidate, options = {}) {
       : DUPLICATE_WINDOW_MS;
   const excludeRecordId =
     options.excludeRecordId != null ? String(options.excludeRecordId) : "";
+  const isExecutionCheck = options.isExecutionCheck === true;
+  const candidateScheduledAt = (() => {
+    const fromOpt = parseRecordTimeMs(options.candidateScheduledAt);
+    if (fromOpt !== null) return fromOpt;
+    const fromCandSched = parseRecordTimeMs(candidate.scheduledPublishAt);
+    if (fromCandSched !== null) return fromCandSched;
+    const fromCandPublishAt = parseRecordTimeMs(candidate.publishAt);
+    if (fromCandPublishAt !== null) return fromCandPublishAt;
+    return null;
+  })();
 
   const candPlatform = resolveCanonicalPlatform(
     candidate.pt || candidate.platform
@@ -364,6 +379,21 @@ function findRecentDuplicatePublish(records, candidate, options = {}) {
     const recStatus = String(rec2.publishStatus || "").trim().toLowerCase();
     const recTimeMs = extractRecordPublishTimeMs(rec2);
     if (recTimeMs === null) continue;
+
+    if (recStatus === "scheduled") {
+      const recPlannedMs =
+        parseRecordTimeMs(rec2.scheduledPublishAt) ||
+        parseRecordTimeMs(rec2.scheduledPublishAtText) ||
+        recTimeMs;
+      if (isExecutionCheck) {
+        // 执行时查重：排除计划时刻晚于本任务的待发记录（后排任务不得拦掉先排任务）
+        const taskRefMs = candidateScheduledAt !== null ? candidateScheduledAt : now;
+        if (recPlannedMs > taskRefMs) continue;
+      } else if (candidateScheduledAt !== null) {
+        // 提交时带计划时刻：待发记录只拦截计划时刻更早或相同的同标题请求
+        if (recPlannedMs > candidateScheduledAt) continue;
+      }
+    }
 
     const ageMs = now - recTimeMs;
     // 允许定时待发记录（创建在 7 天内或定时时间在未来），普通记录须在 7 天窗口内

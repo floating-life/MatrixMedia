@@ -20,7 +20,8 @@ const DAY_MS = 24 * 3600 * 1000;
 const HOUR_MS = 3600 * 1000;
 const MINUTE_MS = 60 * 1000;
 const IMMEDIATE_THRESHOLD_MS = 60 * 1000;
-const MAX_PLAN_LOOKAHEAD_DAYS = 366;
+const MAX_PLAN_LOOKAHEAD_DAYS = 60;
+const SCHEDULED_EXPIRE_GRACE_MS = 10 * 60 * 1000;
 
 const DEFAULT_CREATIVE_STATEMENT_VALUE = "ai_generated";
 
@@ -49,11 +50,26 @@ const CREATIVE_STATEMENT_LABEL_MAP = new Map([
   ["笔记含AI合成内容", "ai_generated"],
   ["虚构演绎", "fiction"],
   ["含虚构演绎内容", "fiction"],
+  ["虚构演绎，仅供娱乐", "fiction"],
+  ["演绎情节，仅供娱乐", "fiction"],
+  ["虚构演绎，故事经历", "fiction"],
+  ["内容为虚构剧情，仅供娱乐", "fiction"],
   ["营销推广", "marketing"],
+  ["内容含营销信息", "marketing"],
+  ["内容含营销推广信息", "marketing"],
+  ["内容包含营销广告", "marketing"],
   ["个人观点", "personal_opinion"],
+  ["个人观点，仅供参考", "personal_opinion"],
+  ["内容为个人观点或见解", "personal_opinion"],
   ["转载", "repost"],
+  ["内容为转载", "repost"],
+  ["内容为转载信息", "repost"],
+  ["取自站外", "repost"],
+  ["素材来源于网络", "repost"],
   ["自行拍摄", "self_shot"],
+  ["内容为自行拍摄", "self_shot"],
   ["自制禁转载", "self_made_no_repost"],
+  ["内容为自制：未经作者允许，禁止转载", "self_made_no_repost"],
 ]);
 
 /** 全部支持节流配置的视频平台（canonical 中文名） */
@@ -100,8 +116,9 @@ function createDefaultPublishThrottleSettings() {
 
 const DEFAULT_THROTTLE_SETTINGS = createDefaultPublishThrottleSettings();
 
-/** 计入节流间隔与日上限的发布状态（已成功 / 进行中 / 待执行定时任务） */
+/** 计入节流间隔与日上限的发布状态（已预留 / 已成功 / 进行中 / 待执行定时任务） */
 const COUNTING_PUBLISH_STATUSES = new Set([
+  "reserved",
   "success",
   "published",
   "publishing",
@@ -409,9 +426,22 @@ function getPlatformThrottleRule(settings, platform) {
   return defaultRuleForPlatform(canonical);
 }
 
+function isDraftPublishItem(record) {
+  if (!record || typeof record !== "object") return false;
+  if (record.isDraft === true || record.draft === true || record.publishToDraft === true) {
+    return true;
+  }
+  const mode = String(record.publishMode || "").trim().toLowerCase();
+  return mode === "draft";
+}
+
 function isCountingRecordForThrottle(record) {
   if (!record || typeof record !== "object") return false;
-  const rawStatus = String(record.publishStatus || "").trim().toLowerCase();
+  // 草稿（含定时草稿、账号默认草稿）一律不计入节流与日上限
+  if (isDraftPublishItem(record)) return false;
+  const rawStatus = String(record.publishStatus || record.status || "")
+    .trim()
+    .toLowerCase();
   if (rawStatus) {
     if (COUNTING_PUBLISH_STATUSES.has(rawStatus)) return true;
     if (NON_COUNTING_PUBLISH_STATUSES.has(rawStatus)) return false;
@@ -420,19 +450,37 @@ function isCountingRecordForThrottle(record) {
   return Number(record.publishSuccessCount) > 0 || Boolean(record.videoLink);
 }
 
-function extractThrottleRecordEvent(record, nowMs) {
+function extractThrottleRecordEvent(record, nowMs, options = {}) {
   if (!isCountingRecordForThrottle(record)) return null;
-  const status = String(record.publishStatus || "").trim().toLowerCase();
-  if (status === "scheduled" || (record.scheduledTask === true && !status)) {
+  const status = String(record.publishStatus || record.status || "")
+    .trim()
+    .toLowerCase();
+  const graceMs =
+    typeof options.scheduledExpireGraceMs === "number" &&
+    Number.isFinite(options.scheduledExpireGraceMs) &&
+    options.scheduledExpireGraceMs >= 0
+      ? options.scheduledExpireGraceMs
+      : 0;
+  const isSched =
+    record.isScheduled === true ||
+    status === "scheduled" ||
+    (record.scheduledTask === true && !status);
+  if (isSched) {
     const ts =
+      (typeof record.ts === "number" && Number.isFinite(record.ts) && record.ts > 0
+        ? record.ts
+        : null) ||
       parseUtc8DateTimeMs(record.scheduledPublishAt) ||
       parseUtc8DateTimeMs(record.scheduledPublishAtText);
     if (ts === null) return null;
     // 已过期的待发任务不会执行，不计入排期占位
-    if (ts < nowMs) return null;
+    if (ts < nowMs - graceMs) return null;
     return { ts, isScheduled: true };
   }
   const ts =
+    (typeof record.ts === "number" && Number.isFinite(record.ts) && record.ts > 0
+      ? record.ts
+      : null) ||
     parseUtc8DateTimeMs(record.lastPublishAt) ||
     parseUtc8DateTimeMs(record.createTime) ||
     parseUtc8DateTimeMs(record.date);
@@ -523,6 +571,8 @@ function planPublishTimes({
   settings = null,
   noThrottle = false,
   immediateThresholdMs = IMMEDIATE_THRESHOLD_MS,
+  maxLookaheadDays = MAX_PLAN_LOOKAHEAD_DAYS,
+  scheduledExpireGraceMs = 0,
 } = {}) {
   const nowMs =
     typeof now === "number" && Number.isFinite(now) ? now : Date.now();
@@ -530,15 +580,19 @@ function planPublishTimes({
   const startMin = parseTimeOfDayMinutes(normSettings.allowedWindow.start);
   const endMin = parseTimeOfDayMinutes(normSettings.allowedWindow.end);
   const windowLabel = `${normSettings.allowedWindow.start}–${normSettings.allowedWindow.end}`;
+  const lookaheadDays =
+    typeof maxLookaheadDays === "number" &&
+    Number.isFinite(maxLookaheadDays) &&
+    maxLookaheadDays >= 1
+      ? Math.floor(maxLookaheadDays)
+      : MAX_PLAN_LOOKAHEAD_DAYS;
 
   const globalExplicitMs =
     typeof publishAtMs === "number" && Number.isFinite(publishAtMs)
       ? publishAtMs
       : parseUtc8DateTimeMs(publishAt);
-  const globalExplicitText =
-    typeof publishAt === "string" && publishAt.trim() ? publishAt.trim() : null;
 
-  // 按 (平台, 账号) 分桶索引历史有效发布记录与待执行定时任务
+  // 按 (平台, 账号) 分桶索引历史有效发布记录 / 账本记录与待执行定时任务
   const flatRecords = Array.isArray(records)
     ? records
     : flattenPushDataRecords(records);
@@ -551,9 +605,14 @@ function planPublishTimes({
     if (String(rec.textType || "").trim().toLowerCase() === "article") continue;
     const recPt = resolveCanonicalPlatform(rec.pt || rec.platform);
     if (!recPt) continue;
-    const ev = extractThrottleRecordEvent(rec, nowMs);
+    const ev = extractThrottleRecordEvent(rec, nowMs, {
+      scheduledExpireGraceMs,
+    });
     if (!ev) continue;
-    const key = buildAccountBucketKey(rec, recPt);
+    const key =
+      typeof rec.bucketKey === "string" && rec.bucketKey.trim()
+        ? rec.bucketKey.trim()
+        : buildAccountBucketKey(rec, recPt);
     let list = buckets.get(key);
     if (!list) {
       list = [];
@@ -578,12 +637,68 @@ function planPublishTimes({
         : t.publishAt != null && String(t.publishAt).trim() !== ""
         ? parseUtc8DateTimeMs(t.publishAt)
         : globalExplicitMs;
-    const targetExplicitText =
-      typeof t.publishAt === "string" && t.publishAt.trim()
-        ? t.publishAt.trim()
-        : targetExplicitMs === globalExplicitMs
-        ? globalExplicitText
-        : null;
+
+    const hasExplicit = targetExplicitMs !== null;
+
+    // 0. 草稿（CLI --draft、HTTP draft、账号默认草稿、定时草稿）一律不节流、不进账本、不计入日上限
+    if (isDraftPublishItem(t)) {
+      const plannedAtMs = hasExplicit ? targetExplicitMs : nowMs;
+      const scheduled = hasExplicit;
+      const immediate = !scheduled;
+      const finalPublishAt = scheduled ? formatUtc8DateTime(plannedAtMs) : null;
+      items.push({
+        index,
+        ok: true,
+        overflow: false,
+        error: "",
+        platform: canonicalPt,
+        phone: String(t.phone || "").trim(),
+        partition: resolvedPartition,
+        accountKey: bucketKey,
+        isDraft: true,
+        reusedScheduled: false,
+        immediate,
+        scheduled,
+        throttled: false,
+        bypassed: true,
+        requestedAtMs: hasExplicit ? targetExplicitMs : nowMs,
+        plannedAtMs,
+        publishAt: finalPublishAt,
+        reasons: [],
+        reason: "",
+        rule,
+      });
+      continue;
+    }
+
+    // 1. 复用既有同文件同时刻定时任务：按原基线规则复用，不再节流顺延，也不重复占位
+    if (t.reusedScheduled === true && hasExplicit) {
+      const finalPublishAt = formatUtc8DateTime(targetExplicitMs);
+      items.push({
+        index,
+        ok: true,
+        overflow: false,
+        error: "",
+        platform: canonicalPt,
+        phone: String(t.phone || "").trim(),
+        partition: resolvedPartition,
+        accountKey: bucketKey,
+        isDraft: false,
+        reusedScheduled: true,
+        existingRecordId: t.existingRecordId || null,
+        immediate: false,
+        scheduled: true,
+        throttled: false,
+        bypassed: false,
+        requestedAtMs: targetExplicitMs,
+        plannedAtMs: targetExplicitMs,
+        publishAt: finalPublishAt,
+        reasons: [],
+        reason: "",
+        rule,
+      });
+      continue;
+    }
 
     const bypass = Boolean(noThrottle || t.noThrottle || !normSettings.enabled);
 
@@ -594,22 +709,24 @@ function planPublishTimes({
     }
 
     if (bypass) {
-      const hasExplicit = targetExplicitMs !== null;
       const plannedAtMs = hasExplicit ? targetExplicitMs : nowMs;
       const scheduled = hasExplicit;
       const immediate = !scheduled;
-      const finalPublishAt = scheduled
-        ? targetExplicitText || formatUtc8DateTime(plannedAtMs)
-        : null;
+      const finalPublishAt = scheduled ? formatUtc8DateTime(plannedAtMs) : null;
 
       list.push({ ts: Math.max(nowMs, plannedAtMs), isScheduled: scheduled });
 
       items.push({
         index,
+        ok: true,
+        overflow: false,
+        error: "",
         platform: canonicalPt,
         phone: String(t.phone || "").trim(),
         partition: resolvedPartition,
         accountKey: bucketKey,
+        isDraft: false,
+        reusedScheduled: false,
         immediate,
         scheduled,
         throttled: false,
@@ -624,8 +741,9 @@ function planPublishTimes({
       continue;
     }
 
-    const hasExplicit = targetExplicitMs !== null;
     const baseRequestMs = hasExplicit ? Math.max(nowMs, targetExplicitMs) : nowMs;
+    const horizonDayStartMs =
+      utc8DayStartMs(baseRequestMs) + lookaheadDays * DAY_MS;
     let candidateMs = baseRequestMs;
     const reasons = [];
 
@@ -638,7 +756,7 @@ function planPublishTimes({
       );
     }
 
-    // 2. 同账号最小发布间隔（取所有有效历史记录与待执行定时任务中最新一条）
+    // 2. 同账号最小发布间隔（取所有有效账本记录与待执行定时任务中最新一条）
     const minIntervalMs = Math.round(rule.minIntervalHours * HOUR_MS);
     if (minIntervalMs > 0 && list.length > 0) {
       let latestEv = list[0];
@@ -658,10 +776,18 @@ function planPublishTimes({
       }
     }
 
-    // 3. 迭代检查允许发布时段（UTC+8）与每日上限（UTC+8 日历日），确保全部约束同时满足
+    // 3. 迭代检查允许发布时段（UTC+8）与每日上限（UTC+8 日历日），超过搜索上限返回「排期已满」而非突破上限
     let addedWindowReason = false;
     let addedDailyLimitReason = false;
-    for (let step = 0; step < MAX_PLAN_LOOKAHEAD_DAYS; step++) {
+    let foundSlot = false;
+    let overflow = false;
+    const maxSteps = Math.max(10, (lookaheadDays + 2) * 3);
+
+    for (let step = 0; step < maxSteps; step++) {
+      if (utc8DayStartMs(candidateMs) > horizonDayStartMs) {
+        overflow = true;
+        break;
+      }
       let moved = false;
 
       if (startMin !== null && endMin !== null && startMin !== endMin) {
@@ -676,6 +802,11 @@ function planPublishTimes({
             );
           }
         }
+      }
+
+      if (utc8DayStartMs(candidateMs) > horizonDayStartMs) {
+        overflow = true;
+        break;
       }
 
       if (rule.dailyLimit > 0) {
@@ -703,7 +834,42 @@ function planPublishTimes({
         }
       }
 
-      if (!moved) break;
+      if (utc8DayStartMs(candidateMs) > horizonDayStartMs) {
+        overflow = true;
+        break;
+      }
+
+      if (!moved) {
+        foundSlot = true;
+        break;
+      }
+    }
+
+    if (!foundSlot || overflow) {
+      const errorMsg = `${canonicalPt}排期已满（未来 ${lookaheadDays} 天内无可用发布时段，请调整节流设置或改用不节流模式）`;
+      items.push({
+        index,
+        ok: false,
+        overflow: true,
+        error: errorMsg,
+        platform: canonicalPt,
+        phone: String(t.phone || "").trim(),
+        partition: resolvedPartition,
+        accountKey: bucketKey,
+        isDraft: false,
+        reusedScheduled: false,
+        immediate: false,
+        scheduled: false,
+        throttled: false,
+        bypassed: false,
+        requestedAtMs: hasExplicit ? targetExplicitMs : nowMs,
+        plannedAtMs: null,
+        publishAt: null,
+        reasons,
+        reason: errorMsg,
+        rule,
+      });
+      continue;
     }
 
     // 只顺延不提前
@@ -717,12 +883,8 @@ function planPublishTimes({
     const immediate = !scheduled;
     const throttled = scheduled && candidateMs > baseRequestMs;
     const finalPlannedAtMs = immediate ? nowMs : candidateMs;
-
-    const finalPublishAt = scheduled
-      ? throttled
-        ? formatUtc8DateTime(candidateMs)
-        : targetExplicitText || formatUtc8DateTime(candidateMs)
-      : null;
+    // 回执 publishAt 与解析统一按 UTC+8 格式化，与主机系统时区无关
+    const finalPublishAt = scheduled ? formatUtc8DateTime(candidateMs) : null;
 
     // 写回桶内，供同请求后续同平台同账号任务按顺序累积
     list.push({ ts: Math.max(nowMs, finalPlannedAtMs), isScheduled: scheduled });
@@ -730,10 +892,15 @@ function planPublishTimes({
     const finalReasons = throttled ? reasons : [];
     items.push({
       index,
+      ok: true,
+      overflow: false,
+      error: "",
       platform: canonicalPt,
       phone: String(t.phone || "").trim(),
       partition: resolvedPartition,
       accountKey: bucketKey,
+      isDraft: false,
+      reusedScheduled: false,
       immediate,
       scheduled,
       throttled,
@@ -747,7 +914,11 @@ function planPublishTimes({
     });
   }
 
+  const firstErrorItem = items.find((it) => it && it.ok === false);
   return {
+    ok: !firstErrorItem,
+    error: firstErrorItem ? firstErrorItem.error : "",
+    hasError: Boolean(firstErrorItem),
     enabled: normSettings.enabled,
     nowMs,
     settings: normSettings,
@@ -758,32 +929,105 @@ function planPublishTimes({
 }
 
 /**
- * 校验用户显式传入的 publishAt（与 scheduledPublish.parsePublishAt 同口径：
- * 格式 YYYY-MM-DD HH:mm:ss、合法日历日期且必须晚于 nowMs）。
+ * 校验并按 UTC+8 解析用户显式传入的 publishAt（与回执 formatUtc8DateTime 同口径，不受主机系统时区影响）：
+ * 格式 YYYY-MM-DD HH:mm:ss、合法日历日期且必须晚于 nowMs。
  */
-function parseLocalPublishAt(value, nowMs = Date.now()) {
+function parsePublishAtUtc8(value, nowMs = Date.now()) {
   const text = String(value || "").trim();
   const m = text.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})$/);
   if (!m) {
-    return { ok: false, error: "定时发布时间格式应为 YYYY-MM-DD HH:mm:ss" };
+    return {
+      ok: false,
+      code: "INVALID_PUBLISH_AT",
+      error: "定时发布时间格式应为 YYYY-MM-DD HH:mm:ss",
+    };
   }
   const nums = m.slice(1).map((v) => Number(v));
   const [year, month, day, hour, minute, second] = nums;
-  const dt = new Date(year, month - 1, day, hour, minute, second, 0);
+  const utcMs = Date.UTC(year, month - 1, day, hour, minute, second, 0);
+  const check = new Date(utcMs);
   const valid =
-    dt.getFullYear() === year &&
-    dt.getMonth() === month - 1 &&
-    dt.getDate() === day &&
-    dt.getHours() === hour &&
-    dt.getMinutes() === minute &&
-    dt.getSeconds() === second;
+    check.getUTCFullYear() === year &&
+    check.getUTCMonth() === month - 1 &&
+    check.getUTCDate() === day &&
+    check.getUTCHours() === hour &&
+    check.getUTCMinutes() === minute &&
+    check.getUTCSeconds() === second;
   if (!valid) {
-    return { ok: false, error: "定时发布时间不是有效日期" };
+    return {
+      ok: false,
+      code: "INVALID_PUBLISH_AT",
+      error: "定时发布时间不是有效日期",
+    };
   }
-  if (dt.getTime() <= nowMs) {
-    return { ok: false, error: "定时发布时间必须是未来时间" };
+  const ms = utcMs - UTC8_OFFSET_MS;
+  if (ms <= nowMs) {
+    return {
+      ok: false,
+      code: "EXPIRED_PUBLISH_AT",
+      error: "定时发布时间必须是未来时间",
+    };
   }
-  return { ok: true, value: dt.getTime(), text };
+  return { ok: true, value: ms, text: formatUtc8DateTime(ms) };
+}
+
+/** 兼容旧导出名，内部统一按 UTC+8 解析 */
+function parseLocalPublishAt(value, nowMs = Date.now()) {
+  return parsePublishAtUtc8(value, nowMs);
+}
+
+/**
+ * 校验复用既有定时任务时的创作声明冲突：
+ * - 回执必须反映既有任务的实际声明（与上传参数一致）
+ * - 若请求声明与既有任务不同，标记 conflict: true，交由调用方返回 needs_attention 不静默吞掉
+ */
+function checkExistingScheduledCreativeConflict(
+  existing,
+  requestedCreativeStatement
+) {
+  const actualCreativeStatement = normalizeDefaultCreativeStatement(
+    existing && existing.creativeStatement,
+    "none"
+  );
+  const requestedNorm = normalizeDefaultCreativeStatement(
+    requestedCreativeStatement,
+    "none"
+  );
+  const conflict = actualCreativeStatement !== requestedNorm;
+  return {
+    conflict,
+    actualCreativeStatement,
+    requestedCreativeStatement: requestedNorm,
+    message: conflict
+      ? `同一视频在该时间点的定时任务已存在（id=${
+          (existing && existing.id) || ""
+        }），但既有任务创作声明为「${actualCreativeStatement}」，与本次请求声明「${requestedNorm}」不一致，未覆盖原任务，请核对后处理`
+      : "同一视频在该时间点的定时任务已存在，未重复创建",
+  };
+}
+
+/**
+ * 比较 GUI 预览排期与主进程加锁重算后的排期是否发生偏移（例如预览期间有新任务占用了名额）。
+ */
+function comparePlanForGuiDrift(previewItems, freshItems) {
+  if (!Array.isArray(previewItems) || !Array.isArray(freshItems)) return false;
+  if (previewItems.length !== freshItems.length) return true;
+  for (let i = 0; i < freshItems.length; i++) {
+    const prev = previewItems[i] || {};
+    const fresh = freshItems[i] || {};
+    if (Boolean(prev.isDraft) !== Boolean(fresh.isDraft)) return true;
+    if (fresh.isDraft) continue;
+    if (Boolean(prev.scheduled) !== Boolean(fresh.scheduled)) return true;
+    if (Boolean(fresh.scheduled)) {
+      if (
+        String(prev.publishAt || "") !== String(fresh.publishAt || "") ||
+        Number(prev.plannedAtMs || 0) !== Number(fresh.plannedAtMs || 0)
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 module.exports = {
@@ -792,6 +1036,8 @@ module.exports = {
   HOUR_MS,
   MINUTE_MS,
   IMMEDIATE_THRESHOLD_MS,
+  MAX_PLAN_LOOKAHEAD_DAYS,
+  SCHEDULED_EXPIRE_GRACE_MS,
   DEFAULT_CREATIVE_STATEMENT_VALUE,
   THROTTLE_PLATFORMS,
   DEFAULT_ALLOWED_WINDOW,
@@ -807,11 +1053,17 @@ module.exports = {
   utc8DayStartMs,
   utc8TimeOfDayMs,
   parseUtc8DateTimeMs,
+  parsePublishAtUtc8,
   parseLocalPublishAt,
   normalizeDefaultCreativeStatement,
   normalizePublishThrottleSettings,
   validatePublishThrottleSettings,
   getPlatformThrottleRule,
+  isDraftPublishItem,
   isCountingRecordForThrottle,
+  extractThrottleRecordEvent,
+  buildAccountBucketKey,
   planPublishTimes,
+  checkExistingScheduledCreativeConflict,
+  comparePlanForGuiDrift,
 };

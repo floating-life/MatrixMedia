@@ -37,7 +37,14 @@
   - 定时任务复用 `scheduledPublish.createScheduledRecord`（支持显式 epoch ms 透传，避免跨时区偏差）与 `scheduledDedupe.findExistingScheduled` 去重，落盘至 `pushData` 并调用 `notifyScheduledPublishChanged()` 立即刷新调度器，应用重启后由 `startScheduledPublishScheduler` 自动恢复。
   - CLI 支持 `--no-throttle`、HTTP 支持 `noThrottle: true`（顶层及 `platforms[]` 单平台覆盖）；多平台混合立即与定时时 `runMultiPlatformPublish` 保持结果顺序、及时释放远程下载临时文件、按条返回 `status`（`submitted` / `scheduled` / `duplicate`）、`publishAt`、`throttled`、`throttleReason` 与最终 `creativeStatement`。
   - GUI：`videoManager/index.vue` 工具栏提供「发布节流设置」弹窗入口，`projectDetail/index.vue` 新增「⏱ 发布设置」tab（共用 `PublishThrottleSettingsCard.vue`）；`LocalVideoPublish.vue`（单视频多平台与目录批量）点「发布」前弹出「发布排期预览」表（平台 / 账号 / 标题 / 计划时间 / 原因），支持「确认按排期发布」「改为不节流」或「取消」。
-- **默认创作声明（`creativeStatement.js` + `parsePublishArgs.js` + `publishVideo.js` + `cli/index.js` + `routes/index.js` + `LocalVideoPublish.vue`）**：出厂默认 `ai_generated`；HTTP/CLI 请求未传 `creativeStatement` / `creativeStatements` / `--cs` 时自动套用持久化默认声明，显式传值（含 `none`）覆盖默认；GUI 发布页初始选中该默认值；平台不支持时按 `resolveCreativeStatementForPlatform` 回退 `none`；CLI / HTTP 返回明细均写出最终 `creativeStatement`。
+- **默认创作声明（`creativeStatement.js` + `parsePublishArgs.js` + `publishVideo.js` + `cli/index.js` + `routes/index.js` + `LocalVideoPublish.vue`）**：出厂默认 `ai_generated`；HTTP/CLI 请求未传 `creativeStatement` / `creativeStatements` / `--cs` 时自动套用持久化默认声明，显式传值（含 Excel 列的 `none`）永远优先覆盖默认；GUI 发布页初始选中该默认值；平台不支持时按 `resolveCreativeStatementForPlatform` 回退 `none`；CLI / HTTP / MCP 返回明细均写出最终 `creativeStatement`；复用既有定时任务时回执反映任务实际声明，声明冲突返回 `needs_attention`（退出码 4）不静默。
+- **S11-fix 评审返修加固**：
+  - 独立节流账本 `<userData>/publish-throttle-ledger.json`（按 `平台|规范化账号分区` 独立记录每次已预留/进行中/待发/成功正式发布，账本为空时一次性导入旧 `pushData`，失败/取消/过期/转草稿释放预留，不再依赖可合并多账号或同文件的 `pushData` 行；`utils.js` 同步补账号分区判等防不同账号覆盖历史）；
+  - 主进程全局 async 锁统一串行 `planPublishTimes` + 写账本预留（HTTP/CLI/GUI `commit-plan` 共用），GUI 确认时若与预览偏移则退回新计划重确认，过期显式时间直接拒绝且移除 `dataRequest` 备用写入路径；
+  - 草稿（CLI `--draft`、HTTP `draft`、账号默认草稿、定时草稿）一律不节流、不进账本、不计日上限，`scheduledPublish` 与 CLI 批量改走 `resolvePublishCompletion` 正确写回 `draft`；
+  - 所有 `publishAt` 解析与回执格式化统一 UTC+8（`parsePublishAtUtc8` / `formatUtc8DateTime`）；排期搜索上限 60 天，超限返回「排期已满」；
+  - 定时调度器刷新不取消未到期/已到点计时器，到点任务一律进入执行队列，仅超过 10 分钟宽限期且应用未运行时标 `expired`；`pushData`/账本写盘失败一律报错并回滚；
+  - S10 查重在待发记录比较中只拦截计划时刻更早或相同的请求、执行时排除计划时刻晚于本任务的待发记录；同文件同时刻改标题先匹配既有定时任务直接复用不顺延；混合远程发布立即平台下载失败不影响待排平台；MCP `publish_video` 透传 `noThrottle` 并回传 `creativeStatement` 与结构化节流原因。
 
 ## S10：数据质量与发布防呆（`feat/stats-quality`）
 - **标题/文案共享清洗（`src/shared/textSanitize.js` + `videoMetadata.js` + `ipcMain.js` + `cli/index.js` + `server/routes/index.js` + `LocalVideoPublish.vue`）**：统一删除 Excel 转义字面量 `_x000d_`（大小写不敏感、可连续），将 `\r\n`/`\r` 转为 `\n`；标题类字段（`title`/`shortTitle`/`bt1`）将换行折成空格并 trim，简介类字段（`description`/`bdText`）保留 `\n` 并 trim。GUI 批量导入、CLI `publish`/xlsx、HTTP `POST /publish` 共用同一清洗链路，结果完全一致。

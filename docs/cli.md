@@ -186,7 +186,7 @@ electron . cli publish -p sph --phone 13800138000 -f /path/to/video.mp4 \
 3. **进程生命周期**：CLI 仍会启动一个 Electron 主进程，只是不显示 GUI。命令完成、参数失败或业务失败后会主动退出；执行发布期间进程存在属于正常现象。
 4. **启动诊断**：终端会依次输出 Puppeteer 初始化、Electron ready、CLI 参数识别和最终退出码。初始化超过 15 秒会以退出码 `1` 结束并打印明确错误，不会无限静默等待。
 5. **登录失效**：视频号发布页若跳转到 `channels.weixin.qq.com/login.html`，CLI 会立即提示重新登录并以退出码 `5` 结束（`cli history` 里该条记录状态为 `login_required`，GUI 视频管理显示「需重新登录」），不再按普通 URL 不匹配重复重试；重新扫码后重跑即可。
-6. **定时发布与发布节流**：`--publish-at "YYYY-MM-DD HH:mm:ss"` 只支持一次性明确时间点，不支持每日/每周/每月。开启发布节流（默认开，与 GUI「发布节流设置」及 HTTP API 共用 `<userData>/publish-throttle-settings.json`）后，若距上次同平台同账号发布/待发任务不足最小间隔、落在允许时段外、超出当日上限或配置了平台错峰延迟，CLI 会自动顺延并写入定时任务（退出码 `0`，stdout JSON 返回 `status: "scheduled"`、`scheduled: true`、`publishAt`、`throttled: true`、`throttleReason`、`creativeStatement`）；传 `--publish-at` 时也会过节流且只顺延不提前；传 `--no-throttle` 可绕过。先查 7 天重复拦截，再进入节流排期。定时任务写入发布历史，重启应用后由主进程定时调度器自动恢复；如果应用关闭导致错过执行时间，下次启动会标记为“任务过期”，可在视频管理中重新发布。
+6. **定时发布与发布节流**：`--publish-at "YYYY-MM-DD HH:mm:ss"` 只支持一次性明确时间点（统一按 UTC+8 东八区解析与回执格式化，与主机时区无关），不支持每日/每周/每月。开启发布节流（默认开，与 GUI「发布节流设置」及 HTTP API 共用 `<userData>/publish-throttle-settings.json` 与节流账本 `<userData>/publish-throttle-ledger.json`）后，若距上次同平台同账号发布/待发任务不足最小间隔、落在允许时段外、超出当日上限或配置了平台错峰延迟，CLI 会自动顺延并写入定时任务（退出码 `0`，stdout JSON 返回 `status: "scheduled"`、`scheduled: true`、`publishAt`、`plannedAtMs`、`throttled: true`、`throttleReason`、`reasons`、`creativeStatement`）；搜索上限 60 天，超出返回「排期已满」（非 0 退出码）。传 `--publish-at` 时也会过节流且只顺延不提前（改标题复用同文件同时刻的既有定时任务直接复用，若请求创作声明与既有任务不同则返回 `status: "needs_attention"` 与退出码 `4`）；传 `--no-throttle` 可绕过；草稿模式（`--draft` 或账号默认草稿）一律不节流、不进账本、不计入日上限。先查 7 天重复拦截，再进入节流排期。定时任务写入发布历史，重启应用后由主进程定时调度器自动恢复；仅在超过 10 分钟宽限期且应用未运行时标为 `expired`，应用持续运行期间到点任务一律进入执行队列。
 
 ```bash
 # 按节流发布（未传 --cs 时套用默认创作声明 ai_generated；间隔不足自动建定时任务）

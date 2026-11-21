@@ -1276,9 +1276,10 @@ async function testS10Fix2_2_ScheduledAllowDuplicatePersistedAcrossAllThreeChain
   };
 
   function formatLocalYmdHms(ms) {
-    const d = new Date(ms);
-    const p = (n) => String(n).padStart(2, "0");
-    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+    return new Date(ms + 8 * 3600 * 1000)
+      .toISOString()
+      .slice(0, 19)
+      .replace("T", " ");
   }
 
   try {

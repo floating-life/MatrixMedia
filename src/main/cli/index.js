@@ -42,9 +42,14 @@ import {
 import { findExistingScheduled } from "../services/scheduledDedupe.js";
 import {
   readPublishThrottleSettings,
-  planPublishTimes,
-  parseLocalPublishAt,
+  planAndReservePublishTimes,
+  confirmThrottleReservation,
+  releaseThrottleReservation,
+  parsePublishAtUtc8,
+  checkExistingScheduledCreativeConflict,
+  formatUtc8DateTime,
 } from "../services/publishThrottle.js";
+import { resolvePublishCompletion } from "../../shared/publishResult.js";
 import { CLI_PUBLISH_TIMEOUT_MS } from "../services/upLoad/uploadTimeouts.js";
 import { resolveAccountPublishMode } from "../services/accountPublishSettingsResolver.js";
 import { resolveTaskPartition } from "../services/accountLookup.js";
@@ -451,12 +456,13 @@ async function runBatchDirPublish(v, cfg) {
   const throttleSettings = readPublishThrottleSettings();
   let batchExplicitPublishAtMs = null;
   if (v.publishAt) {
-    const parsedAt = parseLocalPublishAt(v.publishAt, Date.now());
+    const parsedAt = parsePublishAtUtc8(v.publishAt, Date.now());
     if (!parsedAt.ok) {
       console.error(parsedAt.error);
       return 2;
     }
     batchExplicitPublishAtMs = parsedAt.value;
+    v.publishAt = parsedAt.text;
   }
   const results = [];
 
@@ -565,12 +571,16 @@ async function runBatchDirPublish(v, cfg) {
     });
     const currentRecords = readPushDataRecordsForCli();
     if (!v.allowDuplicate) {
-      const dup = findRecentDuplicatePublish(currentRecords, {
-        pt: v.platform,
-        phone: derivePhoneForRecord(v),
-        partition: v.partition,
-        title: metadata.title,
-      });
+      const dup = findRecentDuplicatePublish(
+        currentRecords,
+        {
+          pt: v.platform,
+          phone: derivePhoneForRecord(v),
+          partition: v.partition,
+          title: metadata.title,
+        },
+        { now: Date.now(), candidateScheduledAt: batchExplicitPublishAtMs }
+      );
       if (dup) {
         const r = {
           index: i + 1,
@@ -598,9 +608,10 @@ async function runBatchDirPublish(v, cfg) {
       partition: v.partition,
       requestDraftMode: Boolean(v.draft),
     });
+    const isDraftRow = effectivePublishMode.publishToDraft === true;
 
     const rowNowMs = Date.now();
-    const rowPlan = planPublishTimes({
+    const rowPlanRes = await planAndReservePublishTimes({
       targets: [
         {
           platform: v.platform,
@@ -609,12 +620,32 @@ async function runBatchDirPublish(v, cfg) {
           publishAt: v.publishAt || null,
           publishAtMs: batchExplicitPublishAtMs,
           noThrottle: Boolean(v.noThrottle),
+          isDraft: isDraftRow,
+          filePath: resolvedFile,
+          textType: "local",
         },
       ],
       now: rowNowMs,
-      records: currentRecords,
-      settings: throttleSettings,
-    }).items[0];
+    });
+    if (!rowPlanRes.ok) {
+      const r = {
+        index: i + 1,
+        total: rows.length,
+        fileName: row.fileName,
+        title: metadata.title,
+        platform: v.platform,
+        phone: v.phone || "",
+        creativeStatement: cs,
+        status: "failed",
+        scheduled: false,
+        message: rowPlanRes.message || rowPlanRes.error || "发布排期失败",
+      };
+      results.push(r);
+      console.log(JSON.stringify({ progress: true, done: true, ...r }));
+      continue;
+    }
+    const rowPlan = rowPlanRes.items[0];
+    let rowReservationId = (rowPlan && rowPlan.reservationId) || null;
 
     const selectedFile = path.basename(resolvedFile);
     const recordItem = {
@@ -630,6 +661,7 @@ async function runBatchDirPublish(v, cfg) {
       tags: metadata.tags,
       ...metadata.legacy,
       creativeStatement: cs,
+      ...(rowReservationId ? { throttleReservationId: rowReservationId } : {}),
       coverPath,
       filePath: resolvedFile,
       useragent: cfg.useragent,
@@ -656,43 +688,173 @@ async function runBatchDirPublish(v, cfg) {
     };
 
     if (rowPlan && rowPlan.scheduled) {
-      const scheduledRecord = createScheduledRecord(
-        recordItem,
-        rowPlan.publishAt,
-        rowNowMs,
-        {
-          scheduledPublishAtMs: rowPlan.plannedAtMs,
-          throttleReason: rowPlan.reason,
+      let scheduledRecord;
+      try {
+        scheduledRecord = createScheduledRecord(
+          recordItem,
+          rowPlan.publishAt,
+          rowNowMs,
+          {
+            scheduledPublishAtMs: rowPlan.plannedAtMs,
+            throttleReason: rowPlan.reason,
+            throttleReservationId: rowReservationId,
+          }
+        );
+      } catch (e) {
+        if (rowReservationId) {
+          await releaseThrottleReservation(rowReservationId);
         }
-      );
-      const existing = findExistingScheduled(currentRecords, scheduledRecord);
-      let recordId = existing ? existing.id || null : null;
-      if (!existing) {
-        const addRes = changeData({
-          fileName: "pushData",
-          type: "add",
-          item: scheduledRecord,
-        });
-        if (addRes && addRes.success && Array.isArray(addRes.data)) {
-          const found = [...addRes.data]
-            .reverse()
-            .find(
-              (it) =>
-                it.scheduledTask === true &&
-                it.scheduledPublishAt === scheduledRecord.scheduledPublishAt &&
-                it.textOtherName === scheduledRecord.textOtherName &&
-                it.pt === scheduledRecord.pt &&
-                it.selectedFile === scheduledRecord.selectedFile
-            );
-          if (found) recordId = found.id;
-        }
-        notifyScheduledPublishChanged();
+        const r = {
+          index: i + 1,
+          total: rows.length,
+          fileName: row.fileName,
+          title: metadata.title,
+          platform: v.platform,
+          phone: v.phone || "",
+          creativeStatement: cs,
+          status: "failed",
+          scheduled: false,
+          message: (e && e.message) || String(e),
+        };
+        results.push(r);
+        console.log(JSON.stringify({ progress: true, done: true, ...r }));
+        continue;
       }
-      const schedMsg = existing
-        ? "同一视频在该时间点的定时任务已存在，未重复创建"
-        : rowPlan.throttled && rowPlan.reason
-        ? `已按发布节流排期至 ${scheduledRecord.scheduledPublishAtText}（${rowPlan.reason}）`
-        : "定时发布任务已创建，已写入发布历史";
+      const existing = findExistingScheduled(currentRecords, scheduledRecord);
+      if (existing) {
+        if (rowReservationId) {
+          await releaseThrottleReservation(rowReservationId);
+        }
+        const conflictInfo = checkExistingScheduledCreativeConflict(existing, cs);
+        const existingPublishAt =
+          existing.scheduledPublishAtText ||
+          formatUtc8DateTime(existing.scheduledPublishAt) ||
+          scheduledRecord.scheduledPublishAtText;
+        const r = conflictInfo.conflict
+          ? {
+              index: i + 1,
+              total: rows.length,
+              fileName: row.fileName,
+              title: metadata.title,
+              platform: v.platform,
+              phone: v.phone || "",
+              creativeStatement: conflictInfo.actualCreativeStatement,
+              requestedCreativeStatement:
+                conflictInfo.requestedCreativeStatement,
+              status: "needs_attention",
+              needsAttention: true,
+              duplicate: true,
+              scheduled: false,
+              id: existing.id || null,
+              publishAt: existingPublishAt,
+              plannedAtMs: existing.scheduledPublishAt,
+              message: conflictInfo.message,
+            }
+          : {
+              index: i + 1,
+              total: rows.length,
+              fileName: row.fileName,
+              title: metadata.title,
+              platform: v.platform,
+              phone: v.phone || "",
+              creativeStatement: conflictInfo.actualCreativeStatement,
+              status: "scheduled",
+              scheduled: true,
+              duplicate: true,
+              id: existing.id || null,
+              publishAt: existingPublishAt,
+              plannedAtMs: existing.scheduledPublishAt,
+              throttled: false,
+              throttleReason: "",
+              reason: "",
+              reasons: [],
+              message: conflictInfo.message,
+            };
+        results.push(r);
+        console.log(JSON.stringify({ progress: true, done: true, ...r }));
+        continue;
+      }
+
+      const addRes = changeData({
+        fileName: "pushData",
+        type: "add",
+        item: scheduledRecord,
+      });
+      if (!addRes || addRes.success !== true) {
+        if (rowReservationId) {
+          await releaseThrottleReservation(rowReservationId);
+        }
+        const r = {
+          index: i + 1,
+          total: rows.length,
+          fileName: row.fileName,
+          title: metadata.title,
+          platform: v.platform,
+          phone: v.phone || "",
+          creativeStatement: cs,
+          status: "failed",
+          scheduled: false,
+          id: null,
+          message: (addRes && addRes.message) || "写入定时发布记录失败",
+        };
+        results.push(r);
+        console.log(JSON.stringify({ progress: true, done: true, ...r }));
+        continue;
+      }
+      let recordId = null;
+      if (Array.isArray(addRes.data)) {
+        const found = [...addRes.data]
+          .reverse()
+          .find(
+            (it) =>
+              it.scheduledTask === true &&
+              it.scheduledPublishAt === scheduledRecord.scheduledPublishAt &&
+              it.textOtherName === scheduledRecord.textOtherName &&
+              it.pt === scheduledRecord.pt &&
+              it.selectedFile === scheduledRecord.selectedFile
+          );
+        if (found) recordId = found.id;
+      }
+      if (!isDraftRow && rowReservationId) {
+        const ledgerRes = await confirmThrottleReservation(rowReservationId, {
+          status: "scheduled",
+          ts: scheduledRecord.scheduledPublishAt,
+          isScheduled: true,
+          recordId,
+        });
+        if (!ledgerRes || ledgerRes.ok !== true) {
+          if (recordId != null && scheduledRecord.date) {
+            try {
+              changeData({
+                fileName: "pushData",
+                type: "delete",
+                item: { id: recordId, date: scheduledRecord.date },
+              });
+            } catch (_) {}
+          }
+          const r = {
+            index: i + 1,
+            total: rows.length,
+            fileName: row.fileName,
+            title: metadata.title,
+            platform: v.platform,
+            phone: v.phone || "",
+            creativeStatement: cs,
+            status: "failed",
+            scheduled: false,
+            id: null,
+            message: (ledgerRes && ledgerRes.error) || "写入节流账本失败",
+          };
+          results.push(r);
+          console.log(JSON.stringify({ progress: true, done: true, ...r }));
+          continue;
+        }
+      }
+      notifyScheduledPublishChanged();
+      const schedMsg =
+        rowPlan.throttled && rowPlan.reason
+          ? `已按发布节流排期至 ${scheduledRecord.scheduledPublishAtText}（${rowPlan.reason}）`
+          : "定时发布任务已创建，已写入发布历史";
       const r = {
         index: i + 1,
         total: rows.length,
@@ -705,9 +867,11 @@ async function runBatchDirPublish(v, cfg) {
         scheduled: true,
         id: recordId,
         publishAt: scheduledRecord.scheduledPublishAtText,
+        plannedAtMs: scheduledRecord.scheduledPublishAt,
         throttled: rowPlan.throttled,
         throttleReason: rowPlan.reason,
         reason: rowPlan.reason,
+        reasons: rowPlan.reasons || [],
         message: schedMsg,
       };
       results.push(r);
@@ -719,6 +883,7 @@ async function runBatchDirPublish(v, cfg) {
     const taskPayload = {
       taskId,
       allowDuplicate: true,
+      ...(rowReservationId ? { throttleReservationId: rowReservationId } : {}),
       bookName,
       textType: "local",
       data: {
@@ -746,13 +911,17 @@ async function runBatchDirPublish(v, cfg) {
     };
 
     let recordId = null;
+    let pushWriteError = "";
     try {
       const addRes = changeData({
         fileName: "pushData",
         type: "add",
         item: recordItem,
       });
-      if (addRes && addRes.success && Array.isArray(addRes.data)) {
+      if (!addRes || addRes.success !== true) {
+        pushWriteError =
+          (addRes && addRes.message) || "写入发布历史记录失败";
+      } else if (Array.isArray(addRes.data)) {
         const found = [...addRes.data]
           .reverse()
           .find(
@@ -760,19 +929,79 @@ async function runBatchDirPublish(v, cfg) {
               it.textOtherName === recordItem.textOtherName &&
               it.pt === recordItem.pt &&
               it.selectedFile === recordItem.selectedFile &&
-              it.textType === recordItem.textType
+              it.textType === recordItem.textType &&
+              String(it.partition || "") === String(recordItem.partition || "")
           );
         if (found) recordId = found.id;
       }
     } catch (e) {
-      console.error(
-        "MatrixMedia: 写入 pushData 初始记录失败 [" + row.fileName + "]:",
-        e && e.message
-      );
+      pushWriteError =
+        "写入发布历史记录失败: " + (e && e.message ? e.message : String(e));
+    }
+    if (pushWriteError) {
+      if (rowReservationId) {
+        await releaseThrottleReservation(rowReservationId);
+      }
+      const r = {
+        index: i + 1,
+        total: rows.length,
+        fileName: row.fileName,
+        title: metadata.title,
+        platform: v.platform,
+        phone: v.phone || "",
+        creativeStatement: cs,
+        status: "failed",
+        message: pushWriteError,
+      };
+      results.push(r);
+      console.log(JSON.stringify({ progress: true, done: true, ...r }));
+      continue;
     }
     if (recordId != null) {
       taskPayload.recordId = recordId;
     }
+    if (!isDraftRow && rowReservationId) {
+      const ledgerRes = await confirmThrottleReservation(rowReservationId, {
+        status: "publishing",
+        ts: recordItem.lastPublishAt,
+        isScheduled: false,
+        recordId,
+      });
+      if (!ledgerRes || ledgerRes.ok !== true) {
+        const r = {
+          index: i + 1,
+          total: rows.length,
+          fileName: row.fileName,
+          title: metadata.title,
+          platform: v.platform,
+          phone: v.phone || "",
+          creativeStatement: cs,
+          status: "failed",
+          message: (ledgerRes && ledgerRes.error) || "写入节流账本失败",
+        };
+        results.push(r);
+        console.log(JSON.stringify({ progress: true, done: true, ...r }));
+        continue;
+      }
+    }
+
+    let rowLedgerSettled = false;
+    const settleRowLedger = (status, extra = {}) => {
+      if (rowLedgerSettled || !rowReservationId) return;
+      rowLedgerSettled = true;
+      const isFormalSuccess =
+        status === "success" && !isDraftRow && extra.savedAsDraft !== true;
+      if (isFormalSuccess) {
+        confirmThrottleReservation(rowReservationId, {
+          status: "success",
+          ts: Date.now(),
+          isScheduled: false,
+          recordId,
+        }).catch(() => {});
+      } else {
+        releaseThrottleReservation(rowReservationId).catch(() => {});
+      }
+    };
 
     const updateRecord = (status, message) => {
       if (!recordId) return;
@@ -784,8 +1013,10 @@ async function runBatchDirPublish(v, cfg) {
             id: recordId,
             date: recordDate,
             publishStatus: status,
-            publishSuccessCount: status === "success" ? 1 : 0,
-            publishFailCount: status === "failed" ? 1 : 0,
+            publishSuccessCount:
+              status === "success" || status === "draft" ? 1 : 0,
+            publishFailCount:
+              status === "failed" || status === "login_required" ? 1 : 0,
             publishAbnormalCount: status === "abnormal" ? 1 : 0,
             lastPublishMessage: message || "",
             lastPublishAt: Date.now(),
@@ -826,6 +1057,7 @@ async function runBatchDirPublish(v, cfg) {
         const msg = "CLI publish 超时（" + min + " 分钟）";
         console.error("[" + row.fileName + "] " + msg);
         updateRecord("failed", msg);
+        settleRowLedger("failed");
         finish(false, msg);
       }, CLI_PUBLISH_TIMEOUT_MS);
 
@@ -837,18 +1069,25 @@ async function runBatchDirPublish(v, cfg) {
             if (payload && payload.skipped) {
               const msg = payload.message || "用户关闭窗口，已跳过发布";
               updateRecord("skipped", msg);
+              settleRowLedger("skipped");
               finish(true, msg);
               return;
             }
-            const ok = payload && payload.status === true;
-            const abnormal = ok && payload.publishAbnormal === true;
-            const msg =
-              (payload && payload.message) || (ok ? "上传成功" : "上传失败");
-            updateRecord(
-              abnormal ? "abnormal" : ok ? "success" : "failed",
-              msg
-            );
-            finish(ok && !abnormal, msg);
+            const completion = resolvePublishCompletion({
+              ...(payload || {}),
+              publishMode:
+                (payload && payload.publishMode) ||
+                effectivePublishMode.publishMode,
+              publishToDraft:
+                (payload && payload.publishToDraft === true) ||
+                (payload && payload.publishMode === "draft") ||
+                effectivePublishMode.publishToDraft,
+            });
+            updateRecord(completion.recordStatus, completion.message);
+            settleRowLedger(completion.recordStatus, {
+              savedAsDraft: completion.savedAsDraft,
+            });
+            finish(completion.exitCode === 0, completion.message);
           } else if (channel === "puppeteer-noLogin") {
             if (payload && payload.taskId != null && payload.taskId !== taskId)
               return;
@@ -857,7 +1096,8 @@ async function runBatchDirPublish(v, cfg) {
               "[" + row.fileName + "] " + msg + ":",
               JSON.stringify(payload)
             );
-            updateRecord("failed", msg);
+            updateRecord("login_required", msg);
+            settleRowLedger("login_required");
             finish(false, msg);
           }
         },
@@ -888,7 +1128,11 @@ async function runBatchDirPublish(v, cfg) {
   ).length;
   const duplicateCount = results.filter((r) => r.status === "duplicate").length;
   const failed = results.filter(
-    (r) => r.status === "failed" || r.status === "skipped" || r.status === "duplicate"
+    (r) =>
+      r.status === "failed" ||
+      r.status === "skipped" ||
+      r.status === "duplicate" ||
+      r.status === "needs_attention"
   ).length;
   console.log(
     JSON.stringify({
@@ -1030,15 +1274,42 @@ export async function runCliMain(argv = process.argv) {
       phone: v.phone,
       pt: v.platform,
     });
+    const resolvedPhone =
+      v.phone || derivePhoneForRecord({ ...v, partition: resolvedPartition });
+    const effectivePublishMode = resolveAccountPublishMode({
+      phone: resolvedPhone,
+      pt: v.platform,
+      partition: resolvedPartition,
+      requestDraftMode: Boolean(v.draft),
+    });
+    const isDraftSingle = effectivePublishMode.publishToDraft === true;
     const candTitle = sanitizeTitle(v.title) || fileStem(v.file);
     const pushRecords = readPushDataRecordsForCli();
+
+    // 显式 --publish-at 先按 UTC+8 做格式与未来时间校验
+    const nowMs = Date.now();
+    let explicitPublishAtMs = null;
+    if (v.publishAt) {
+      const parsedAt = parsePublishAtUtc8(v.publishAt, nowMs);
+      if (!parsedAt.ok) {
+        console.error(parsedAt.error);
+        return 2;
+      }
+      explicitPublishAtMs = parsedAt.value;
+      v.publishAt = parsedAt.text;
+    }
+
     if (!allowDuplicate) {
-      const hit = findRecentDuplicatePublish(pushRecords, {
-        pt: v.platform,
-        phone: v.phone || derivePhoneForRecord({ ...v, partition: resolvedPartition }),
-        partition: resolvedPartition,
-        title: candTitle,
-      });
+      const hit = findRecentDuplicatePublish(
+        pushRecords,
+        {
+          pt: v.platform,
+          phone: resolvedPhone,
+          partition: resolvedPartition,
+          title: candTitle,
+        },
+        { now: nowMs, candidateScheduledAt: explicitPublishAtMs }
+      );
       if (hit) {
         console.log(
           JSON.stringify({
@@ -1063,67 +1334,133 @@ export async function runCliMain(argv = process.argv) {
       v.publishOptions = { ...(v.publishOptions || {}), allowDuplicate: true };
     }
 
-    // 显式 --publish-at 先做格式与未来时间校验，再过节流排期（只顺延不提前）
-    const nowMs = Date.now();
-    let explicitPublishAtMs = null;
-    if (v.publishAt) {
-      const parsedAt = parseLocalPublishAt(v.publishAt, nowMs);
-      if (!parsedAt.ok) {
-        console.error(parsedAt.error);
-        return 2;
-      }
-      explicitPublishAtMs = parsedAt.value;
-    }
+    const rawFileStr = String(v.file || "").trim();
+    const normalizedFilePath = /^https?:\/\//i.test(rawFileStr)
+      ? rawFileStr
+      : path.resolve(rawFileStr);
 
-    const planItem = planPublishTimes({
+    const planRes = await planAndReservePublishTimes({
       targets: [
         {
           platform: v.platform,
-          phone: v.phone || derivePhoneForRecord({ ...v, partition: resolvedPartition }),
+          phone: resolvedPhone,
           partition: resolvedPartition,
           publishAt: v.publishAt || null,
           publishAtMs: explicitPublishAtMs,
           noThrottle: Boolean(v.noThrottle),
+          isDraft: isDraftSingle,
+          filePath: normalizedFilePath,
+          textType: "local",
         },
       ],
       now: nowMs,
-      records: pushRecords,
-      settings: throttleSettings,
-    }).items[0];
+    });
+    if (!planRes.ok) {
+      const errMsg = planRes.message || planRes.error || "发布排期失败";
+      console.error(errMsg);
+      return planRes.code === "INVALID_PUBLISH_AT" ||
+        planRes.code === "EXPIRED_PUBLISH_AT"
+        ? 2
+        : planRes.code === "SCHEDULE_FULL"
+        ? 3
+        : 1;
+    }
+    const planItem = planRes.items[0];
+    v.throttleReservationId = (planItem && planItem.reservationId) || null;
 
     if (planItem && planItem.scheduled) {
       v.publishAt = planItem.publishAt;
       v.scheduledPublishAtMs = planItem.plannedAtMs;
       v.throttled = planItem.throttled;
       v.throttleReason = planItem.reason;
+      v.throttleReasons = planItem.reasons || [];
     } else {
       v.publishAt = null;
       v.scheduledPublishAtMs = null;
       v.throttled = false;
       v.throttleReason = "";
+      v.throttleReasons = [];
       // 仅即时发布使用短期票据防止 publishVideo 自撞；定时发布依赖持久化的 allowDuplicate/recordId
       registerPublishDedupeBypass({
         pt: v.platform,
-        phone: v.phone || derivePhoneForRecord({ ...v, partition: resolvedPartition }),
+        phone: resolvedPhone,
         partition: resolvedPartition,
         title: candTitle,
       });
     }
 
-    const result = await runSingleFilePublish(v);
+    let result;
+    try {
+      result = await runSingleFilePublish(v);
+    } catch (err) {
+      if (v.throttleReservationId) {
+        try {
+          await releaseThrottleReservation(v.throttleReservationId);
+        } catch (_) {}
+      }
+      throw err;
+    }
     const finalCs = result.creativeStatement || v.creativeStatement || "none";
-    if (result.scheduled) {
+    if (result.exitCode === 4 || result.status === "needs_attention") {
+      if (result.duplicate) {
+        console.log(
+          JSON.stringify({
+            success: false,
+            status: "needs_attention",
+            needsAttention: true,
+            duplicate: true,
+            id: result.id ?? null,
+            publishAt: result.publishAt ?? null,
+            plannedAtMs: result.plannedAtMs ?? null,
+            creativeStatement: finalCs,
+            ...(result.requestedCreativeStatement !== undefined
+              ? { requestedCreativeStatement: result.requestedCreativeStatement }
+              : {}),
+            message: result.message,
+          })
+        );
+      } else {
+        console.log(
+          JSON.stringify({
+            channel: "puppeteerFile-done",
+            status: false,
+            resultStatus: result.status,
+            publishMode: result.publishMode,
+            creativeStatement: finalCs,
+            outcome: result.outcome,
+            needsAttention: true,
+            // 草稿未确认场景透传诊断字段，便于 e2e/脚本消费（#42）
+            ...(result.draftUrlUnchanged !== undefined
+              ? { draftUrlUnchanged: result.draftUrlUnchanged }
+              : {}),
+            message: result.message,
+          })
+        );
+      }
+    } else if (result.scheduled) {
       const throttleReason = result.throttleReason || v.throttleReason || "";
+      const throttleReasons = Array.isArray(result.reasons)
+        ? result.reasons
+        : Array.isArray(v.throttleReasons)
+        ? v.throttleReasons
+        : throttleReason
+        ? [throttleReason]
+        : [];
       console.log(
         JSON.stringify({
           success: true,
           status: "scheduled",
           scheduled: true,
+          ...(result.duplicate ? { duplicate: true } : {}),
           id: result.id,
           publishAt: result.publishAt,
+          ...(result.plannedAtMs !== undefined
+            ? { plannedAtMs: result.plannedAtMs }
+            : {}),
           creativeStatement: finalCs,
           throttled: Boolean(result.throttled || v.throttled),
           ...(throttleReason ? { throttleReason, reason: throttleReason } : {}),
+          ...(throttleReasons.length > 0 ? { reasons: throttleReasons } : {}),
           message: result.message,
         })
       );
@@ -1139,23 +1476,6 @@ export async function runCliMain(argv = process.argv) {
           ...(result.draftVerified !== undefined
             ? { draftVerified: result.draftVerified }
             : {}),
-          ...(result.draftUrlUnchanged !== undefined
-            ? { draftUrlUnchanged: result.draftUrlUnchanged }
-            : {}),
-          message: result.message,
-        })
-      );
-    } else if (result.exitCode === 4) {
-      console.log(
-        JSON.stringify({
-          channel: "puppeteerFile-done",
-          status: false,
-          resultStatus: result.status,
-          publishMode: result.publishMode,
-          creativeStatement: finalCs,
-          outcome: result.outcome,
-          needsAttention: true,
-          // 草稿未确认场景透传诊断字段，便于 e2e/脚本消费（#42）
           ...(result.draftUrlUnchanged !== undefined
             ? { draftUrlUnchanged: result.draftUrlUnchanged }
             : {}),

@@ -1056,14 +1056,9 @@ async function testCase9_CliThrottleAndDefaultStatement() {
 
     // 9d. 显式 --publish-at 也会过节流且只顺延不提前（抖音 1h 前发过，--publish-at 设 5 分钟后 → 顺延到至少 5h 后）
     const soonMs = Date.now() + 5 * 60 * 1000;
-    const formatLocal = (ms) => {
-      const d = new Date(ms);
-      const p = (n) => String(n).padStart(2, "0");
-      return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
-    };
     const explicitRun = await runCli([
       "publish", "-p", "dy", "--phone", "A组", "-f", videoFile, "-t", "显式定时顺延视频",
-      "--publish-at", formatLocal(soonMs),
+      "--publish-at", formatUtc8DateTime(soonMs),
     ]);
     assert.strictEqual(explicitRun.code, 0, `CLI 显式定时顺延应退出 0，err=${explicitRun.err.join(" ")}`);
     const explicitJson = JSON.parse(explicitRun.out[explicitRun.out.length - 1]);
@@ -1262,9 +1257,36 @@ async function testCase11_GuiTemplatesAndDocsCheck() {
     );
     const stubs = Object.fromEntries(importedNames.map((n) => [n, () => {}]));
     const ipcCalls = [];
+    const mockPlanItems = [
+      {
+        ok: true,
+        platform: "抖音",
+        phone: "A组",
+        isDraft: false,
+        immediate: false,
+        scheduled: true,
+        throttled: true,
+        plannedAtMs: t8("2026-11-21T16:00:00"),
+        publishAt: "2026-11-21 16:00:00",
+        reason: "距上次抖音发布不足 6 小时",
+      },
+      {
+        ok: true,
+        platform: "快手",
+        phone: "A组",
+        isDraft: false,
+        immediate: true,
+        scheduled: false,
+        throttled: false,
+        plannedAtMs: t8("2026-11-21T10:00:00"),
+        publishAt: null,
+        reason: "",
+      },
+    ];
     const ctx = vm.createContext({
       ...stubs,
       ...csMod,
+      parsePublishAtUtc8: require("../src/shared/publishThrottle.js").parsePublishAtUtc8,
       ipcRenderer: {
         invoke: async (ch, arg) => {
           ipcCalls.push({ ch, arg });
@@ -1275,28 +1297,25 @@ async function testCase11_GuiTemplatesAndDocsCheck() {
             return {
               ok: true,
               enabled: true,
-              items: [
-                {
-                  platform: "抖音",
-                  phone: "A组",
-                  immediate: false,
-                  scheduled: true,
-                  throttled: true,
-                  plannedAtMs: t8("2026-11-21T16:00:00"),
-                  publishAt: "2026-11-21 16:00:00",
-                  reason: "距上次抖音发布不足 6 小时",
-                },
-                {
-                  platform: "快手",
-                  phone: "A组",
-                  immediate: true,
-                  scheduled: false,
-                  throttled: false,
-                  plannedAtMs: t8("2026-11-21T10:00:00"),
-                  publishAt: null,
-                  reason: "",
-                },
-              ],
+              items: mockPlanItems,
+            };
+          }
+          if (ch === "publish-throttle:commit-plan") {
+            return {
+              ok: true,
+              changed: false,
+              enabled: true,
+              reservationIds: ["res-1", "res-2"],
+              items: arg && arg.noThrottle
+                ? mockPlanItems.map((it, idx) => ({
+                    ...it,
+                    immediate: true,
+                    scheduled: false,
+                    throttled: false,
+                    publishAt: null,
+                    reservationId: `res-nt-${idx}`,
+                  }))
+                : mockPlanItems.map((it, idx) => ({ ...it, reservationId: `res-${idx}` })),
             };
           }
           return { ok: true };
@@ -1379,6 +1398,1474 @@ async function testCase11_GuiTemplatesAndDocsCheck() {
   console.log("✓ 11. GUI 4 个 Vue 组件模板编译、默认声明/预览表真跑与文档校验通过");
 }
 
+/* ============================================================================
+ * S11-fix 评审 13 条回归用例（每条按评审输入构造，修前失败、修后通过）
+ * ============================================================================ */
+
+const { execFileSync } = require("child_process");
+const { pathToFileURL } = require("url");
+
+async function createS11FixHarness(opts = {}) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-s11-fix-"));
+  const mediaDir = path.join(tmpDir, "media");
+  fs.mkdirSync(mediaDir, { recursive: true });
+  const clip1 = path.join(mediaDir, "clip.mp4");
+  const clip2 = path.join(mediaDir, "second.mp4");
+  const clip3 = path.join(mediaDir, "third.mp4");
+  fs.writeFileSync(clip1, "fake-video-1");
+  fs.writeFileSync(clip2, "fake-video-2");
+  fs.writeFileSync(clip3, "fake-video-3");
+
+  const coreBundle = path.join(tmpDir, "core.cjs");
+  const guardStub = path.join(tmpDir, "guardStub.js");
+  const pupStub = path.join(tmpDir, "pupStub.js");
+  const alertStub = path.join(tmpDir, "alertStub.js");
+  fs.writeFileSync(guardStub, `module.exports = { isTrustedLocalRequest: () => true };`);
+  fs.writeFileSync(alertStub, `module.exports = { handleAccountCollectOutcome: () => ({ ok: true }) };`);
+  fs.writeFileSync(
+    pupStub,
+    `export function registerPublishDedupeBypass() {}
+     export function runPuppeteerTask(payload, transport, done) {
+       return global.__S11_FIX_UPLOAD__(payload, transport, done);
+     }`
+  );
+
+  await esbuild.build({
+    stdin: {
+      contents: [
+        `export { default as router } from "./src/main/server/routes/index.js";`,
+        `export * from "./src/main/cli/index.js";`,
+        `export * from "./src/main/server/utils.js";`,
+        `export * from "./src/main/services/scheduledPublish.js";`,
+        `export * from "./src/main/services/publishThrottle.js";`,
+        `export * from "./src/main/services/scheduledDedupe.js";`,
+      ].join("\n"),
+      resolveDir: root,
+      sourcefile: "s11-fix-entry.js",
+    },
+    outfile: coreBundle,
+    bundle: true,
+    platform: "node",
+    format: "cjs",
+    external: [
+      "electron",
+      "express",
+      "xlsx",
+      "axios",
+      "puppeteer-core",
+      "puppeteer-extra",
+      "puppeteer-extra-plugin-stealth",
+      "puppeteer-in-electron",
+    ],
+    plugins: [
+      {
+        name: "s11-fix-stubs",
+        setup(build) {
+          build.onResolve({ filter: /^\.\.\/requestGuard$/ }, () => ({ path: guardStub }));
+          build.onResolve({ filter: /puppeteerFile(\.js)?$/ }, () => ({ path: pupStub }));
+          build.onResolve({ filter: /collectAlert\.js$/ }, () => ({ path: alertStub }));
+        },
+      },
+    ],
+  });
+
+  const RealDate = Date;
+  let fakeNow = t8(opts.initialTime || "2026-11-21T10:00:00");
+  global.Date = class MockDate extends RealDate {
+    constructor(...args) {
+      super(...(args.length ? args : [fakeNow]));
+    }
+    static now() {
+      return fakeNow;
+    }
+  };
+
+  let denyPushData = false;
+  let denyLedger = false;
+  const origWriteFileSync = fs.writeFileSync;
+  fs.writeFileSync = function (filePath, ...rest) {
+    const p = typeof filePath === "string" ? filePath : "";
+    if (denyPushData && p.includes(`${path.sep}pushData${path.sep}`)) {
+      const err = new Error("ENOSPC: no space left on device");
+      err.code = "ENOSPC";
+      throw err;
+    }
+    if (denyLedger && p.includes("publish-throttle-ledger.json")) {
+      const err = new Error("ENOSPC: no space left on device");
+      err.code = "ENOSPC";
+      throw err;
+    }
+    return origWriteFileSync.call(this, filePath, ...rest);
+  };
+
+  const handlers = new Map();
+  const listeners = new Map();
+  const uploads = [];
+  let axiosCalls = 0;
+  let uploadHandler = (payload, transport, done) => {
+    uploads.push(payload);
+    setImmediate(() => {
+      const isDraft =
+        payload.publishToDraft === true || payload.publishMode === "draft";
+      transport.reply("puppeteerFile-done", {
+        taskId: payload.taskId,
+        status: true,
+        ...(isDraft
+          ? { publishMode: "draft", publishToDraft: true, draftVerified: true, outcome: "draft_saved" }
+          : {}),
+        message: isDraft ? "草稿已保存" : "已发布",
+      });
+      if (done) done();
+    });
+  };
+  global.__S11_FIX_UPLOAD__ = (payload, transport, done) =>
+    uploadHandler(payload, transport, done);
+
+  const expressMod = require("express");
+  const xlsxMod = require("xlsx");
+  const origLoad = Module._load;
+  Module._load = function (request, parent, isMain) {
+    if (request === "express") return expressMod;
+    if (request === "xlsx") return xlsxMod;
+    if (request === "axios") {
+      return async () => {
+        axiosCalls += 1;
+        throw new Error("Request failed with status code 503");
+      };
+    }
+    if (request === "electron") {
+      return {
+        app: {
+          getPath: () => tmpDir,
+          getVersion: () => "0.15.0-test",
+          on: () => {},
+          once: () => {},
+          commandLine: { getSwitchValue: () => "" },
+        },
+        ipcMain: {
+          handle: (ch, fn) => handlers.set(ch, fn),
+          on: (ch, fn) => listeners.set(ch, fn),
+        },
+        BrowserWindow: function () {},
+        dialog: {},
+      };
+    }
+    if (request === "puppeteer-extra") {
+      return { addExtra: () => ({ use: () => {}, connect: () => {} }) };
+    }
+    if (request === "puppeteer-extra-plugin-stealth") {
+      return () => ({});
+    }
+    if (request.startsWith("puppeteer")) {
+      return { use: () => {}, connect: () => {} };
+    }
+    return origLoad.apply(this, arguments);
+  };
+
+  const core = require(coreBundle);
+  core.savePublishThrottleSettings(opts.settings || {});
+  core.registerPublishThrottleIpc(
+    { handle: (ch, fn) => handlers.set(ch, fn) },
+    {
+      changeData: core.changeData,
+      createScheduledRecord: core.createScheduledRecord,
+      notifyScheduledPublishChanged: core.notifyScheduledPublishChanged,
+      findExistingScheduled: core.findExistingScheduled,
+    }
+  );
+  const httpPublish = core.router.stack.find(
+    (l) => l.route && l.route.path === "/publish" && l.route.methods.post
+  ).route.stack[0].handle;
+
+  const post = async (body) => {
+    let statusCode = 200;
+    let payload = null;
+    await httpPublish(
+      {
+        body,
+        method: "POST",
+        headers: { origin: "http://localhost:30088" },
+        ip: "127.0.0.1",
+        socket: { remoteAddress: "127.0.0.1" },
+      },
+      {
+        status(c) {
+          statusCode = c;
+          return this;
+        },
+        json(p) {
+          payload = p;
+          return this;
+        },
+      }
+    );
+    return { statusCode, ...payload };
+  };
+
+  const cli = async (args) => {
+    const out = [];
+    const err = [];
+    const origLog = console.log;
+    const origErr = console.error;
+    console.log = (...a) => out.push(a.join(" "));
+    console.error = (...a) => err.push(a.join(" "));
+    try {
+      const code = await core.runCliMain(["electron", "cli", "publish", ...args]);
+      const receipts = out
+        .filter((s) => s.trim().startsWith("{"))
+        .map((s) => JSON.parse(s));
+      return { code, receipts, last: receipts[receipts.length - 1] || null, out, err };
+    } finally {
+      console.log = origLog;
+      console.error = origErr;
+    }
+  };
+
+  const addRecord = (patch) => {
+    const res = core.changeData({
+      fileName: "pushData",
+      type: "add",
+      item: {
+        pt: "抖音",
+        phone: "13800138000",
+        partition: "persist:13800138000抖音",
+        textType: "local",
+        textOtherName: "history",
+        title: "历史视频",
+        selectedFile: "old.mp4",
+        date: "2026-11-21",
+        ...patch,
+      },
+    });
+    assert.strictEqual(res.success, true, JSON.stringify(res));
+    return res.data[res.data.length - 1];
+  };
+
+  const listAllRecords = () => {
+    const res = core.changeData({
+      fileName: "pushData",
+      type: "get",
+      item: { page: 1, pageSize: 1000 },
+    });
+    return Object.values(res.data || {}).flat();
+  };
+
+  return {
+    tmpDir,
+    mediaDir,
+    clip1,
+    clip2,
+    clip3,
+    core,
+    handlers,
+    uploads,
+    getAxiosCalls: () => axiosCalls,
+    setNow: (ms) => {
+      fakeNow = ms;
+    },
+    getNow: () => fakeNow,
+    setDenyPushData: (v) => {
+      denyPushData = Boolean(v);
+    },
+    setDenyLedger: (v) => {
+      denyLedger = Boolean(v);
+    },
+    setUploadHandler: (fn) => {
+      uploadHandler = fn;
+    },
+    post,
+    cli,
+    addRecord,
+    listAllRecords,
+    cleanup: () => {
+      core.stopScheduledPublishScheduler();
+      fs.writeFileSync = origWriteFileSync;
+      global.Date = RealDate;
+      delete global.__S11_FIX_UPLOAD__;
+      Module._load = origLoad;
+      delete require.cache[coreBundle];
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    },
+  };
+}
+
+function loadLocalVideoPublishVm({ ipcInvoke, ipcSend, dataRequestFn, messageCalls }) {
+  const vm = require("vm");
+  const localPubSrc = fs.readFileSync(
+    path.join(root, "src/renderer/components/LocalVideoPublish.vue"),
+    "utf8"
+  );
+  const tmpGuiDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-s11-fix-gui-"));
+  const csBundle = path.join(tmpGuiDir, "cs.cjs");
+  const vmMetaBundle = path.join(tmpGuiDir, "vm.cjs");
+  const acctIdBundle = path.join(tmpGuiDir, "aid.cjs");
+  const acctModeBundle = path.join(tmpGuiDir, "amode.cjs");
+  const xhsBundle = path.join(tmpGuiDir, "xhs.cjs");
+  const vlinkBundle = path.join(tmpGuiDir, "vlink.cjs");
+  esbuild.buildSync({
+    entryPoints: [path.join(root, "src/shared/creativeStatement.js")],
+    outfile: csBundle,
+    bundle: true,
+    platform: "node",
+    format: "cjs",
+  });
+  esbuild.buildSync({
+    entryPoints: [path.join(root, "src/shared/videoMetadata.js")],
+    outfile: vmMetaBundle,
+    bundle: true,
+    platform: "node",
+    format: "cjs",
+  });
+  esbuild.buildSync({
+    entryPoints: [path.join(root, "src/shared/accountIdentity.js")],
+    outfile: acctIdBundle,
+    bundle: true,
+    platform: "node",
+    format: "cjs",
+  });
+  esbuild.buildSync({
+    entryPoints: [path.join(root, "src/shared/accountPublishSettings.js")],
+    outfile: acctModeBundle,
+    bundle: true,
+    platform: "node",
+    format: "cjs",
+  });
+  esbuild.buildSync({
+    entryPoints: [path.join(root, "src/shared/xhsPublishPolicy.js")],
+    outfile: xhsBundle,
+    bundle: true,
+    platform: "node",
+    format: "cjs",
+  });
+  esbuild.buildSync({
+    entryPoints: [path.join(root, "src/shared/videoLink.js")],
+    outfile: vlinkBundle,
+    bundle: true,
+    platform: "node",
+    format: "cjs",
+  });
+  const script = localPubSrc
+    .match(/<script>([\s\S]*?)<\/script>/)[1]
+    .replace(/^import[\s\S]*?from\s+["'][^"']+["'];\s*$/gm, "")
+    .replace("export default", "globalThis.component =");
+  const importedNames = [
+    ...localPubSrc.matchAll(/^import\s+([\s\S]*?)\s+from\s+["'][^"']+["'];/gm),
+  ].flatMap((m) =>
+    m[1]
+      .replace(/[{}]/g, "")
+      .split(",")
+      .map((x) => x.trim().split(/\s+as\s+/).pop())
+      .filter(Boolean)
+  );
+  const stubs = Object.fromEntries(importedNames.map((n) => [n, () => {}]));
+  const ctx = vm.createContext({
+    ...stubs,
+    ...require(csBundle),
+    ...require(vmMetaBundle),
+    ...require(acctIdBundle),
+    ...require(acctModeBundle),
+    ...require(xhsBundle),
+    ...require(vlinkBundle),
+    ...require("../src/shared/textSanitize.js"),
+    ...require("../src/shared/publishThrottle.js"),
+    moment: require("moment"),
+    require,
+    Date,
+    console,
+    setTimeout,
+    clearTimeout,
+    dataRequest: dataRequestFn || (async () => ({ success: true, data: [] })),
+    ipcRenderer: {
+      invoke: ipcInvoke,
+      send: ipcSend || (() => {}),
+    },
+  });
+  vm.runInContext(script, ctx);
+  const state = {
+    ...ctx.component.data(),
+    $set: (o, k, v) => {
+      o[k] = v;
+    },
+    $emit: () => {},
+    $message: {
+      warning: (m) => messageCalls.push({ type: "warning", m }),
+      error: (m) => messageCalls.push({ type: "error", m }),
+      success: (m) => messageCalls.push({ type: "success", m }),
+      info: (m) => messageCalls.push({ type: "info", m }),
+    },
+  };
+  for (const [k, fn] of Object.entries(ctx.component.methods)) {
+    state[k] = fn.bind(state);
+  }
+  return {
+    state,
+    cleanup: () => {
+      [csBundle, vmMetaBundle, acctIdBundle, acctModeBundle, xhsBundle, vlinkBundle].forEach(
+        (b) => delete require.cache[b]
+      );
+      fs.rmSync(tmpGuiDir, { recursive: true, force: true });
+    },
+  };
+}
+
+// #1 同一视频改标题复用同文件同时刻定时任务，不再节流顺延
+async function testFix01_ReuseSameFileSameTimeScheduledWithNewTitle() {
+  const h = await createS11FixHarness();
+  try {
+    const phone = "13800138000";
+    const r1 = await h.post({
+      platform: "dy",
+      phone,
+      file: h.clip1,
+      title: "初版标题",
+      publishAt: "2026-11-21 13:00:00",
+    });
+    assert.strictEqual(r1.success, true);
+    assert.strictEqual(r1.scheduled, true);
+    assert.strictEqual(r1.publishAt, "2026-11-21 13:00:00");
+    assert.ok(r1.id);
+
+    const r2 = await h.post({
+      platform: "dy",
+      phone,
+      file: h.clip1,
+      title: "改后标题",
+      publishAt: "2026-11-21 13:00:00",
+    });
+    assert.strictEqual(r2.success, true);
+    assert.strictEqual(r2.scheduled, true);
+    assert.strictEqual(r2.duplicate, true, "同文件同时刻改标题应复用既有定时任务");
+    assert.strictEqual(r2.id, r1.id, "应返回同一任务 ID，不得新建第二条");
+    assert.strictEqual(r2.publishAt, "2026-11-21 13:00:00", "不得被节流顺延至 19:00");
+    assert.strictEqual(h.core.listScheduledRecords().length, 1);
+    assert.strictEqual(h.core.readPublishThrottleLedger().entries.length, 1);
+    console.log("✓ Fix #1: 同文件同时刻改标题复用既有定时任务，不再顺延重复建任务");
+  } finally {
+    h.cleanup();
+  }
+}
+
+// #2 新增定时任务刷新不得取消刚到点的任务；超过 10 分钟宽限期且应用未运行才标 expired
+async function testFix02_NewScheduledTaskDoesNotExpireDueTask() {
+  const h = await createS11FixHarness({ initialTime: "2026-11-21T10:00:00" });
+  try {
+    const phone = "13800138000";
+    h.core.startScheduledPublishScheduler(h.getNow());
+
+    const rA = await h.post({
+      platform: "dy",
+      phone,
+      file: h.clip1,
+      title: "任务A",
+      publishAt: "2026-11-21 10:02:00",
+    });
+    assert.strictEqual(rA.scheduled, true);
+
+    // 10:02 到点瞬间先处理 B 的定时创建触发刷新
+    h.setNow(t8("2026-11-21T10:02:00"));
+    const rB = await h.post({
+      platform: "dy",
+      phone,
+      file: h.clip2,
+      title: "任务B",
+      publishAt: "2026-11-21 16:02:00",
+    });
+    assert.strictEqual(rB.scheduled, true);
+
+    // 等待异步上传完成
+    await new Promise((r) => setTimeout(r, 40));
+    assert.strictEqual(h.uploads.length, 1, "刚到点的任务 A 必须照常执行上传，不得被标 expired");
+    assert.strictEqual(h.uploads[0].data.title, "任务A");
+    const recA = h.listAllRecords().find((r) => r.id === rA.id);
+    assert.strictEqual(recA.publishStatus, "success");
+
+    // 模拟停机后重启：超过 10 分钟宽限期标 expired 并释放账本；宽限期内（5 分钟）照常执行
+    h.core.stopScheduledPublishScheduler();
+    h.uploads.length = 0;
+    const oldExpired = h.addRecord({
+      id: "sched-old-expired",
+      title: "关机错过超过10分钟",
+      filePath: h.clip1,
+      scheduledTask: true,
+      publishStatus: "scheduled",
+      scheduledPublishAt: t8("2026-11-21T09:40:00"),
+      scheduledPublishAtText: "2026-11-21 09:40:00",
+    });
+    const withinGrace = h.addRecord({
+      id: "sched-within-grace",
+      title: "关机错过5分钟宽限期内",
+      filePath: h.clip2,
+      scheduledTask: true,
+      publishStatus: "scheduled",
+      scheduledPublishAt: t8("2026-11-21T09:55:00"),
+      scheduledPublishAtText: "2026-11-21 09:55:00",
+    });
+    h.setNow(t8("2026-11-21T10:00:00"));
+    h.core.startScheduledPublishScheduler(h.getNow());
+    await new Promise((r) => setTimeout(r, 40));
+
+    const afterExpired = h.listAllRecords().find((r) => r.id === oldExpired.id);
+    const afterGrace = h.listAllRecords().find((r) => r.id === withinGrace.id);
+    assert.strictEqual(afterExpired.publishStatus, "expired", "超过 10 分钟宽限期且应用未运行应标 expired");
+    assert.strictEqual(afterGrace.publishStatus, "success", "10 分钟宽限期内应补执行");
+    assert.strictEqual(h.uploads.length, 1);
+    assert.strictEqual(h.uploads[0].data.title, "关机错过5分钟宽限期内");
+    console.log("✓ Fix #2: 刷新不取消刚到点任务、10 分钟宽限期与离线过期判定验证通过");
+  } finally {
+    h.cleanup();
+  }
+}
+
+// #3 定时任务落盘失败（pushData 或账本 ENOSPC）三端均返回失败，不得报 scheduled
+async function testFix03_DiskWriteFailureNeverReportsScheduled() {
+  const h = await createS11FixHarness({ initialTime: "2026-11-21T10:00:00" });
+  try {
+    const phone = "13800138000";
+    h.addRecord({
+      publishStatus: "success",
+      publishSuccessCount: 1,
+      lastPublishAt: t8("2026-11-21T09:00:00"),
+    });
+
+    // 3a. 模拟 pushData 写入 ENOSPC
+    h.setDenyPushData(true);
+
+    // HTTP
+    const httpRes = await h.post({
+      platform: "dy",
+      phone,
+      file: h.clip1,
+      title: "ENOSPC-HTTP",
+    });
+    assert.strictEqual(httpRes.success, false, "HTTP pushData ENOSPC 必须返回 success:false");
+    assert.notStrictEqual(httpRes.status, "scheduled", "不得报 scheduled");
+    assert.strictEqual(httpRes.scheduled, false);
+
+    // CLI 单文件
+    const cliSingle = await h.cli([
+      "-p", "dy", "--phone", phone, "-f", h.clip1, "-t", "ENOSPC-CLI单文件",
+    ]);
+    assert.notStrictEqual(cliSingle.code, 0, "CLI 单文件写盘失败必须返回非 0 退出码");
+
+    // CLI 目录批量
+    const xlsx = require("xlsx");
+    const wb = xlsx.utils.book_new();
+    xlsx.utils.book_append_sheet(
+      wb,
+      xlsx.utils.json_to_sheet([{ 文件名: "clip.mp4", 标题: "ENOSPC-CLI目录" }]),
+      "Sheet1"
+    );
+    const xlsxPath = path.join(h.mediaDir, "batch.xlsx");
+    fs.writeFileSync(xlsxPath, xlsx.write(wb, { bookType: "xlsx", type: "buffer" }));
+    const cliBatch = await h.cli([
+      "-p", "dy", "--phone", phone, "--dir", h.mediaDir, "--config", xlsxPath,
+    ]);
+    assert.notStrictEqual(cliBatch.code, 0, "CLI 目录批量写盘失败必须返回非 0 退出码");
+    assert.strictEqual(cliBatch.last.results[0].status, "failed");
+
+    // GUI IPC create-scheduled
+    const ipcRes = await h.handlers.get("publish-throttle:create-scheduled")(null, {
+      item: {
+        pt: "抖音",
+        phone,
+        partition: `persist:${phone}抖音`,
+        textType: "local",
+        textOtherName: "clip",
+        selectedFile: "clip.mp4",
+        title: "ENOSPC-GUI",
+        filePath: h.clip1,
+        date: "2026-11-21",
+        scheduledPublishAt: t8("2026-11-21T15:00:00"),
+        scheduledPublishAtText: "2026-11-21 15:00:00",
+      },
+    });
+    assert.strictEqual(ipcRes.ok, false, "GUI IPC pushData ENOSPC 必须返回 ok:false");
+
+    // 确认失败预留全部释放（账本仍只有导入的 09:00 一条）
+    h.setDenyPushData(false);
+    const ledgerAfterPushFail = h.core.readPublishThrottleLedger();
+    assert.strictEqual(ledgerAfterPushFail.entries.length, 1, "写盘失败的预留必须释放");
+
+    // 3b. 模拟账本写入 ENOSPC
+    h.setDenyLedger(true);
+    const httpLedgerFail = await h.post({
+      platform: "dy",
+      phone,
+      file: h.clip1,
+      title: "ENOSPC-账本-HTTP",
+    });
+    assert.strictEqual(httpLedgerFail.success, false);
+    assert.notStrictEqual(httpLedgerFail.status, "scheduled");
+    assert.strictEqual(h.core.listScheduledRecords().length, 0, "账本失败不得写入 pushData");
+
+    const cliLedgerFail = await h.cli([
+      "-p", "dy", "--phone", phone, "-f", h.clip1, "-t", "ENOSPC-账本-CLI",
+    ]);
+    assert.notStrictEqual(cliLedgerFail.code, 0);
+
+    const guiCommitFail = await h.handlers.get("publish-throttle:commit-plan")(null, {
+      targets: [{ platform: "dy", phone }],
+      now: h.getNow(),
+    });
+    assert.strictEqual(guiCommitFail.ok, false);
+    h.setDenyLedger(false);
+    console.log("✓ Fix #3: pushData / 账本写盘失败三端均报错并释放预留，绝不误报 scheduled");
+  } finally {
+    h.cleanup();
+  }
+}
+
+// #4 GUI 确认过期预览时拒绝提交且不走 dataRequest 备用写入路径
+async function testFix04_GuiExpiredPreviewRejectedNoFallbackWrite() {
+  const h = await createS11FixHarness({ initialTime: "2026-11-21T10:00:00" });
+  const fallbackWrites = [];
+  const messages = [];
+  const gui = loadLocalVideoPublishVm({
+    ipcInvoke: async (ch, arg) => {
+      const fn = h.handlers.get(ch);
+      assert.ok(fn, `missing IPC handler ${ch}`);
+      return fn(null, arg);
+    },
+    dataRequestFn: async (req) => {
+      fallbackWrites.push(req);
+      return h.core.changeData(req);
+    },
+    messageCalls: messages,
+  });
+  try {
+    const entries = [
+      {
+        key: "single:0:n1",
+        pt: "抖音",
+        phone: "13800138000",
+        partition: "persist:13800138000抖音",
+        filePath: h.clip1,
+        textType: "local",
+        title: "过期预览视频",
+        isDraft: false,
+      },
+    ];
+    // 10:00:00 打开显式定时 10:00:30 的预览
+    const p = gui.state.confirmThrottlePublishPlan(entries, {
+      publishAt: "2026-11-21 10:00:30",
+      publishAtMs: t8("2026-11-21T10:00:30"),
+    });
+    await new Promise((r) => setImmediate(r));
+    assert.strictEqual(gui.state.throttlePreviewVisible, true);
+
+    // 等到 10:00:31 再点确认
+    h.setNow(t8("2026-11-21T10:00:31"));
+    gui.state.resolveThrottlePreview("confirm");
+    const decision = await p;
+    assert.strictEqual(decision.proceed, false, "过期预览确认必须被拒绝");
+    assert.ok(
+      messages.some((m) => m.type === "warning" && String(m.m).includes("未来")),
+      `应提示时间已过让用户重选，实际=${JSON.stringify(messages)}`
+    );
+    assert.strictEqual(fallbackWrites.length, 0, "不得调用备用 dataRequest 写入");
+    assert.strictEqual(h.listAllRecords().length, 0, "历史中不得出现过期任务");
+
+    // 直接测 writeScheduledPublishRecord 遭遇 IPC 拒绝时绝不回退 dataRequest
+    const directRes = await gui.state.writeScheduledPublishRecord({
+      pt: "抖音",
+      phone: "13800138000",
+      partition: "persist:13800138000抖音",
+      textType: "local",
+      textOtherName: "clip",
+      selectedFile: "clip.mp4",
+      title: "过期直写",
+      filePath: h.clip1,
+      date: "2026-11-21",
+      scheduledPublishAt: t8("2026-11-21T10:00:30"),
+      scheduledPublishAtText: "2026-11-21 10:00:30",
+    });
+    assert.strictEqual(directRes.ok, false, "IPC 拒绝后 writeScheduledPublishRecord 必须返回 ok:false");
+    assert.strictEqual(fallbackWrites.length, 0, "严禁回退 dataRequest 写入过期记录");
+    assert.strictEqual(h.listAllRecords().length, 0);
+    console.log("✓ Fix #4: GUI 过期预览确认被主进程拒绝并提示重选，且彻底移除备用写入回退");
+  } finally {
+    gui.cleanup();
+    h.cleanup();
+  }
+}
+
+// #5 S10 不让后排同标题任务拦掉先排任务；allowDuplicate 只影响带它的那条
+async function testFix05_S10LaterScheduledDoesNotBlockEarlierTask() {
+  const h = await createS11FixHarness({ initialTime: "2026-11-21T02:00:00" });
+  const tmpPupDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-s11-fix5-pup-"));
+  const pupBundle = path.join(tmpPupDir, "pup.cjs");
+  try {
+    const phone = "13800138000";
+    // 02:00 依次提交两个不同文件、同标题，第二条带 allowDuplicate: true → 分别排到 06:00 和 12:00
+    const r1 = await h.post({
+      platform: "dy",
+      phone,
+      file: h.clip1,
+      title: "同标题双发测试",
+    });
+    assert.strictEqual(r1.scheduled, true);
+    assert.strictEqual(r1.publishAt, "2026-11-21 06:00:00");
+
+    const r2 = await h.post({
+      platform: "dy",
+      phone,
+      file: h.clip2,
+      title: "同标题双发测试",
+      allowDuplicate: true,
+    });
+    assert.strictEqual(r2.scheduled, true);
+    assert.strictEqual(r2.publishAt, "2026-11-21 12:00:00");
+
+    // 第三条不带 allowDuplicate：仍应被 S10 拦截（证明 allowDuplicate 只影响 r2）
+    const r3 = await h.post({
+      platform: "dy",
+      phone,
+      file: h.clip3,
+      title: "同标题双发测试",
+    });
+    assert.strictEqual(r3.status, "duplicate");
+    assert.strictEqual(r3.exitCode, 6);
+
+    // 纯函数校验：待发记录只拦截计划时刻更早或相同的同标题请求
+    const dedupe = require("../src/shared/publishDedupe.js");
+    const recs = h.listAllRecords();
+    const rec1 = recs.find((r) => r.id === r1.id);
+    const rec2 = recs.find((r) => r.id === r2.id);
+    assert.strictEqual(
+      dedupe.findRecentDuplicatePublish([rec2], {
+        pt: "抖音",
+        phone,
+        title: "同标题双发测试",
+      }, { now: t8("2026-11-21T06:00:00"), candidateScheduledAt: t8("2026-11-21T06:00:00") }),
+      null,
+      "12:00 的待发记录不得拦截 06:00 的请求"
+    );
+    assert.ok(
+      dedupe.findRecentDuplicatePublish([rec1], {
+        pt: "抖音",
+        phone,
+        title: "同标题双发测试",
+      }, { now: t8("2026-11-21T06:00:00"), candidateScheduledAt: t8("2026-11-21T12:00:00") }),
+      "06:00 的待发记录应拦截 12:00 的同标题请求"
+    );
+
+    // 用真实 puppeteerFile.checkPublishEntryDuplicate 验证 06:00 执行第一条、12:00 执行第二条均不被误拦
+    await esbuild.build({
+      entryPoints: [path.join(root, "src/main/services/puppeteerFile.js")],
+      outfile: pupBundle,
+      bundle: true,
+      platform: "node",
+      format: "cjs",
+      external: [
+        "electron",
+        "puppeteer-core",
+        "puppeteer-extra",
+        "puppeteer-extra-plugin-stealth",
+        "puppeteer-in-electron",
+      ],
+    });
+    const pupMod = require(pupBundle);
+    const payload1 = h.core.buildTaskPayloadFromRecord(rec1);
+    const payload2 = h.core.buildTaskPayloadFromRecord(rec2);
+    assert.strictEqual(payload1.scheduledPublishAt, t8("2026-11-21T06:00:00"));
+
+    // 06:00 第一条开始发布（自身已变 publishing，第二条仍是 12:00 scheduled）
+    const snapAt6 = recs.map((r) =>
+      r.id === rec1.id ? { ...r, publishStatus: "publishing", lastPublishAt: t8("2026-11-21T06:00:00") } : r
+    );
+    assert.strictEqual(
+      pupMod.checkPublishEntryDuplicate(payload1, snapAt6, {
+        now: t8("2026-11-21T06:00:00"),
+        skipBypass: true,
+      }),
+      null,
+      "06:00 执行第一条时不得被 12:00 待发记录拦掉"
+    );
+
+    // 12:00 第二条开始发布（第一条已 success，第二条带 allowDuplicate: true）
+    const snapAt12 = recs.map((r) =>
+      r.id === rec1.id
+        ? { ...r, publishStatus: "success", lastPublishAt: t8("2026-11-21T06:01:00") }
+        : { ...r, publishStatus: "publishing", lastPublishAt: t8("2026-11-21T12:00:00") }
+    );
+    assert.strictEqual(
+      pupMod.checkPublishEntryDuplicate(payload2, snapAt12, {
+        now: t8("2026-11-21T12:00:00"),
+        skipBypass: true,
+      }),
+      null,
+      "12:00 第二条带 allowDuplicate 应放行"
+    );
+    console.log("✓ Fix #5: 后排定时任务不再拦掉先排任务，allowDuplicate 仅作用于自身");
+  } finally {
+    delete require.cache[pupBundle];
+    fs.rmSync(tmpPupDir, { recursive: true, force: true });
+    h.cleanup();
+  }
+}
+
+// #6 并发 HTTP 请求串行排期 + GUI 过期预览检测偏移重确认
+async function testFix06_ConcurrentRequestsAndStaleGuiPreviewSerialized() {
+  const h = await createS11FixHarness({ initialTime: "2026-11-21T10:00:00" });
+  try {
+    const phone = "13800138000";
+    // 6a. 同一时刻并发提交两条不同文件不同标题到同一抖音账号
+    const [res1, res2] = await Promise.all([
+      h.post({ platform: "dy", phone, file: h.clip1, title: "并发第一条" }),
+      h.post({ platform: "dy", phone, file: h.clip2, title: "并发第二条" }),
+    ]);
+    await new Promise((r) => setTimeout(r, 30));
+
+    const results = [res1, res2];
+    const immediateOnes = results.filter((r) => r.success && !r.scheduled);
+    const scheduledOnes = results.filter((r) => r.success && r.scheduled);
+    assert.strictEqual(immediateOnes.length, 1, `应恰有 1 条立即发，实际=${JSON.stringify(results)}`);
+    assert.strictEqual(scheduledOnes.length, 1, `应恰有 1 条顺延定时，实际=${JSON.stringify(results)}`);
+    assert.strictEqual(scheduledOnes[0].publishAt, "2026-11-21 16:00:00");
+    assert.strictEqual(h.uploads.length, 1, "同一时刻同账号只能有一条进入立即上传");
+  } finally {
+    h.cleanup();
+  }
+
+  // 6b. GUI 预览显示「立即发布」→ 期间 HTTP 发了一条 → GUI 点确认必须收到偏移后的新排期再确认
+  const h2 = await createS11FixHarness({ initialTime: "2026-11-21T10:00:00" });
+  const messages = [];
+  const gui = loadLocalVideoPublishVm({
+    ipcInvoke: async (ch, arg) => h2.handlers.get(ch)(null, arg),
+    messageCalls: messages,
+  });
+  try {
+    const phone = "13800138000";
+    const entries = [
+      {
+        key: "single:0:n1",
+        pt: "抖音",
+        phone,
+        partition: `persist:${phone}抖音`,
+        filePath: h2.clip2,
+        textType: "local",
+        title: "GUI待确认视频",
+        isDraft: false,
+      },
+    ];
+    const p = gui.state.confirmThrottlePublishPlan(entries, {});
+    await new Promise((r) => setImmediate(r));
+    assert.strictEqual(gui.state.throttlePreviewRows[0].plannedTimeText, "立即发布");
+
+    // 预览期间 HTTP 抢先发了一条
+    const httpRes = await h2.post({
+      platform: "dy",
+      phone,
+      file: h2.clip1,
+      title: "HTTP插队视频",
+    });
+    assert.strictEqual(httpRes.success, true);
+    assert.ok(!httpRes.scheduled);
+
+    // GUI 第一次点确认：主进程重算发现偏移 → 返回 changed: true → 刷新预览表要求再次确认
+    gui.state.resolveThrottlePreview("confirm");
+    await new Promise((r) => setTimeout(r, 20));
+    assert.strictEqual(gui.state.throttlePreviewVisible, true, "排期偏移后预览窗应保持打开等待再确认");
+    assert.strictEqual(
+      gui.state.throttlePreviewRows[0].plannedTimeText,
+      "2026-11-21 16:00:00",
+      "预览表应刷新为最新 16:00 排期"
+    );
+
+    // 用户再次确认新排期 → 返回 16:00 定时计划并落账本预留
+    gui.state.resolveThrottlePreview("confirm");
+    const decision = await p;
+    assert.strictEqual(decision.proceed, true);
+    assert.strictEqual(decision.itemsByKey.get("single:0:n1").scheduled, true);
+    assert.strictEqual(decision.itemsByKey.get("single:0:n1").publishAt, "2026-11-21 16:00:00");
+    assert.ok(decision.itemsByKey.get("single:0:n1").reservationId);
+    console.log("✓ Fix #6: 主进程串行锁防并发连发 + GUI 旧预览偏移强制刷新重确认验证通过");
+  } finally {
+    gui.cleanup();
+    h2.cleanup();
+  }
+}
+
+// #7 节流账本独立记录多账号与同文件多次发布，不再被 pushData 合并漏算；失败释放预留
+async function testFix07_LedgerTracksMultiAccountAndMergedSameFileDailyLimit() {
+  // 7a. 同文件发给两个抖音账号：各自保留历史 ID 与账本记录，11:00 给第一账号发新视频排到 16:00
+  const h1 = await createS11FixHarness({ initialTime: "2026-11-21T10:00:00" });
+  try {
+    const rA = await h1.post({ platform: "dy", phone: "13800138001", file: h1.clip1, title: "双号同文件" });
+    const rB = await h1.post({ platform: "dy", phone: "13800138002", file: h1.clip1, title: "双号同文件" });
+    assert.strictEqual(rA.success, true);
+    assert.strictEqual(rB.success, true);
+    assert.notStrictEqual(rA.id, rB.id, "不同抖音账号不得共用同一 pushData 历史 ID");
+
+    h1.setNow(t8("2026-11-21T11:00:00"));
+    const rA2 = await h1.post({ platform: "dy", phone: "13800138001", file: h1.clip2, title: "账号1新视频" });
+    assert.strictEqual(rA2.scheduled, true, "账号1在 10:00 发过，11:00 必须顺延");
+    assert.strictEqual(rA2.publishAt, "2026-11-21 16:00:00");
+  } finally {
+    h1.cleanup();
+  }
+
+  // 7b. minInterval=0, dailyLimit=2：08:00 和 09:00 用不同标题发同一文件，10:00 第三条排到次日 06:00
+  const h2 = await createS11FixHarness({
+    initialTime: "2026-11-21T08:00:00",
+    settings: {
+      platforms: { dy: { minIntervalHours: 0, dailyLimit: 2, delayFromFirstHours: 0 } },
+    },
+  });
+  try {
+    const phone = "13800138000";
+    const t1 = await h2.post({ platform: "dy", phone, file: h2.clip1, title: "同文件标题一" });
+    assert.strictEqual(t1.success, true);
+    assert.ok(!t1.scheduled);
+
+    h2.setNow(t8("2026-11-21T09:00:00"));
+    const t2 = await h2.post({ platform: "dy", phone, file: h2.clip1, title: "同文件标题二" });
+    assert.strictEqual(t2.success, true);
+    assert.ok(!t2.scheduled);
+
+    // 即使 pushData 合并为 1 行，节流账本仍有 2 条记录
+    assert.strictEqual(h2.core.readPublishThrottleLedger().entries.length, 2);
+
+    h2.setNow(t8("2026-11-21T10:00:00"));
+    const t3 = await h2.post({ platform: "dy", phone, file: h2.clip2, title: "当日第三条" });
+    assert.strictEqual(t3.scheduled, true, "日上限 2 已满，第三条必须顺延到次日 06:00");
+    assert.strictEqual(t3.publishAt, "2026-11-22 06:00:00");
+  } finally {
+    h2.cleanup();
+  }
+
+  // 7c. 上传失败释放账本预留，后续发布不被误拦
+  const h3 = await createS11FixHarness({ initialTime: "2026-11-21T10:00:00" });
+  try {
+    h3.setUploadHandler((payload, transport, done) => {
+      h3.uploads.push(payload);
+      setImmediate(() => {
+        transport.reply("puppeteerFile-done", {
+          taskId: payload.taskId,
+          status: false,
+          message: "模拟上传失败",
+        });
+        if (done) done();
+      });
+    });
+    const failed = await h3.post({ platform: "dy", phone: "13800138000", file: h3.clip1, title: "失败释放" });
+    assert.strictEqual(failed.success, false);
+    await new Promise((r) => setTimeout(r, 20));
+    assert.strictEqual(h3.core.readPublishThrottleLedger().entries.length, 0, "上传失败应释放账本预留");
+    console.log("✓ Fix #7: 节流账本隔离多账号与同文件多次日上限计数、失败自动释放验证通过");
+  } finally {
+    h3.cleanup();
+  }
+}
+
+// #8 草稿（CLI --draft / HTTP draft / 账号默认草稿 / 定时草稿）一律不节流、不进账本、不计日上限
+async function testFix08_DraftNeverThrottledOrPollutesLedger() {
+  const h = await createS11FixHarness({ initialTime: "2026-11-21T10:00:00" });
+  try {
+    const phone = "13800138000";
+    h.addRecord({
+      publishStatus: "success",
+      publishSuccessCount: 1,
+      lastPublishAt: t8("2026-11-21T09:00:00"),
+    });
+
+    // 8a. CLI --draft 立即存草稿，不排到 15:00
+    const cliDraft = await h.cli([
+      "-p", "dy", "--phone", phone, "-f", h.clip1, "-t", "CLI草稿测试", "--draft",
+    ]);
+    assert.strictEqual(cliDraft.code, 0);
+    assert.notStrictEqual(cliDraft.last.status, "scheduled", "CLI --draft 不得被节流排期");
+    assert.strictEqual(cliDraft.last.publishMode, "draft");
+    assert.strictEqual(h.uploads.length, 1);
+
+    // 8b. HTTP 向开启「默认发布到草稿」的账号提交 → 立即存草稿，不排到 15:00
+    const draftPhone = "13900139000";
+    h.core.changeData({
+      fileName: "account",
+      type: "add",
+      item: {
+        pt: "抖音",
+        phone: draftPhone,
+        accountKey: draftPhone,
+        partition: `persist:${draftPhone}抖音`,
+        defaultPublishToDraft: true,
+        date: "2026-11-21",
+      },
+    });
+    h.addRecord({
+      pt: "抖音",
+      phone: draftPhone,
+      partition: `persist:${draftPhone}抖音`,
+      publishStatus: "success",
+      publishSuccessCount: 1,
+      lastPublishAt: t8("2026-11-21T09:00:00"),
+    });
+    const httpDefaultDraft = await h.post({
+      platform: "dy",
+      phone: draftPhone,
+      file: h.clip2,
+      title: "账号默认草稿测试",
+    });
+    assert.strictEqual(httpDefaultDraft.success, true);
+    assert.ok(!httpDefaultDraft.scheduled, "账号默认草稿不得被节流排期");
+    assert.strictEqual(httpDefaultDraft.publishMode, "draft");
+
+    // 8c. 定时草稿保存后记为 draft（不是 success），不推迟后续正式发布
+    const h2 = await createS11FixHarness({ initialTime: "2026-11-21T06:00:00" });
+    try {
+      const draftSched = h2.addRecord({
+        id: "sched-draft-1",
+        pt: "抖音",
+        phone,
+        partition: `persist:${phone}抖音`,
+        title: "定时草稿任务",
+        filePath: h2.clip1,
+        publishMode: "draft",
+        publishToDraft: true,
+        scheduledTask: true,
+        publishStatus: "scheduled",
+        scheduledPublishAt: t8("2026-11-21T06:00:00"),
+        scheduledPublishAtText: "2026-11-21 06:00:00",
+      });
+      h2.core.startScheduledPublishScheduler(h2.getNow());
+      await new Promise((r) => setTimeout(r, 40));
+      const afterDraft = h2.listAllRecords().find((r) => r.id === draftSched.id);
+      assert.strictEqual(afterDraft.publishStatus, "draft", "定时草稿完成后应记为 draft 而非 success");
+
+      h2.setNow(t8("2026-11-21T06:05:00"));
+      const formal = await h2.post({
+        platform: "dy",
+        phone,
+        file: h2.clip2,
+        title: "草稿后的正式发布",
+      });
+      assert.strictEqual(formal.success, true);
+      assert.ok(!formal.scheduled, "定时草稿不得推迟后续正式发布");
+    } finally {
+      h2.cleanup();
+    }
+    console.log("✓ Fix #8: CLI/HTTP/账号默认/定时草稿一律不节流、不进账本、回写 draft 状态验证通过");
+  } finally {
+    h.cleanup();
+  }
+}
+
+// #9 混合发布远程 URL 下载失败时，立即平台失败，待排平台照常建任务（到点再下载）
+async function testFix09_MixedRemoteDownloadFailureKeepsScheduledPlatform() {
+  const h = await createS11FixHarness({
+    initialTime: "2026-11-21T10:00:00",
+    settings: {
+      platforms: { bjh: { delayFromFirstHours: 10 } },
+    },
+  });
+  try {
+    const res = await h.post({
+      phone: "13800138000",
+      file: "https://media.example.invalid/clip.mp4",
+      title: "远程混合发布测试",
+      platforms: ["ks", "bjh"],
+    });
+    assert.strictEqual(res.results.length, 2);
+    const [rKs, rBjh] = res.results;
+    assert.strictEqual(rKs.platform, "快手");
+    assert.strictEqual(rKs.success, false);
+    assert.strictEqual(rKs.status, "failed");
+    assert.ok(rKs.message.includes("下载视频失败"));
+
+    assert.strictEqual(rBjh.platform, "百家号");
+    assert.strictEqual(rBjh.success, true, "立即平台下载失败不得影响百家号待排平台");
+    assert.strictEqual(rBjh.status, "scheduled");
+    assert.strictEqual(rBjh.scheduled, true);
+    assert.strictEqual(rBjh.publishAt, "2026-11-21 20:00:00");
+    assert.strictEqual(h.core.listScheduledRecords().length, 1);
+
+    // 快手下载失败的预留已释放，仅剩百家号 1 条
+    const ledger = h.core.readPublishThrottleLedger();
+    assert.strictEqual(ledger.entries.length, 1);
+    assert.strictEqual(ledger.entries[0].platform, "百家号");
+    console.log("✓ Fix #9: 混合平台远程下载失败仅失败立即平台，待排平台照常建 20:00 定时任务验证通过");
+  } finally {
+    h.cleanup();
+  }
+}
+
+// #10 publishAt 在请求解析与回执格式化中统一 UTC+8，在 Asia/Tokyo 主机时区下也严格一致
+async function testFix10_PublishAtUtc8TimezoneConsistentAcrossHosts() {
+  const script = `
+    const assert = require("assert");
+    const path = require("path");
+    const { parsePublishAtUtc8, parseLocalPublishAt, formatUtc8DateTime, planPublishTimes } = require("./src/shared/publishThrottle.js");
+    const now = Date.parse("2026-11-21T02:00:00Z"); // 2026-11-21 10:00:00 UTC+8
+    const expectedMs = Date.parse("2026-11-21T05:00:00Z"); // 2026-11-21 13:00:00 UTC+8
+    // 1. 自动节流回执 13:00:00 (05:00Z)
+    const p1 = planPublishTimes({
+      targets: [{ platform: "dy", phone: "13800138000" }],
+      now,
+      records: [{ pt: "抖音", phone: "13800138000", publishStatus: "success", lastPublishAt: Date.parse("2026-11-20T23:00:00Z") }],
+    });
+    assert.strictEqual(p1.items[0].publishAt, "2026-11-21 13:00:00");
+    assert.strictEqual(p1.items[0].plannedAtMs, expectedMs);
+
+    // 2. 将回执文本原样作为显式 publishAt + noThrottle 提交 → 必须仍是 05:00Z，绝不提前成 04:00Z
+    const parsed = parseLocalPublishAt(p1.items[0].publishAt, now);
+    assert.strictEqual(parsed.ok, true);
+    assert.strictEqual(parsed.value, expectedMs, "Asia/Tokyo 主机下显式 publishAt 必须仍解析为 05:00Z");
+    assert.strictEqual(parsed.text, "2026-11-21 13:00:00");
+
+    const p2 = planPublishTimes({
+      targets: [{ platform: "dy", phone: "13800138000", publishAt: parsed.text, publishAtMs: parsed.value }],
+      now,
+      records: [],
+      noThrottle: true,
+    });
+    assert.strictEqual(p2.items[0].plannedAtMs, expectedMs);
+    assert.strictEqual(p2.items[0].publishAt, "2026-11-21 13:00:00");
+    assert.strictEqual(formatUtc8DateTime(parsed.value), "2026-11-21 13:00:00");
+    assert.strictEqual(parsePublishAtUtc8("2026-11-21 13:00:00", now).value, expectedMs);
+  `;
+  for (const tz of ["Asia/Tokyo", "UTC", "America/New_York"]) {
+    execFileSync(process.execPath, ["-e", script], {
+      cwd: root,
+      env: { ...process.env, TZ: tz },
+      stdio: "pipe",
+    });
+  }
+  console.log("✓ Fix #10: publishAt 在 Asia/Tokyo / UTC / America/New_York 下统一 UTC+8 解析与回执验证通过");
+}
+
+// #11 Excel 显式声明（含 none）GUI 与 CLI 一致优先于默认；复用既有定时任务声明冲突返回 needs_attention 且回执反映实际声明
+async function testFix11_ExplicitCreativeStatementPriorityAndReuseConflict() {
+  const h = await createS11FixHarness({ initialTime: "2026-11-21T10:00:00" });
+  try {
+    const phone = "13800138000";
+
+    // 11a. CLI 目录批量 Excel 创作声明=none 优先于默认 ai_generated
+    const xlsx = require("xlsx");
+    const wb = xlsx.utils.book_new();
+    xlsx.utils.book_append_sheet(
+      wb,
+      xlsx.utils.json_to_sheet([
+        { 文件名: "clip.mp4", 标题: "Excel显式无声明", 创作声明: "none" },
+      ]),
+      "Sheet1"
+    );
+    const xlsxPath = path.join(h.mediaDir, "cs-none.xlsx");
+    fs.writeFileSync(xlsxPath, xlsx.write(wb, { bookType: "xlsx", type: "buffer" }));
+    const cliBatch = await h.cli([
+      "-p", "dy", "--phone", phone, "--dir", h.mediaDir, "--config", xlsxPath, "--no-throttle",
+    ]);
+    assert.strictEqual(cliBatch.code, 0);
+    assert.strictEqual(h.uploads[0].data.creativeStatement, "none", "CLI Excel 创作声明=none 必须提交 none");
+
+    // 11b. GUI 目录批量 Excel 创作声明=none 同样必须提交 none（不再被 ai_generated 覆盖）
+    const sentPayloads = [];
+    const messages = [];
+    const gui = loadLocalVideoPublishVm({
+      ipcInvoke: async (ch, arg) => {
+        if (ch === "publish:check-duplicate") return { duplicates: [] };
+        return h.handlers.get(ch)(null, arg);
+      },
+      ipcSend: (ch, payload) => {
+        if (ch === "puppeteerFile") sentPayloads.push(payload);
+      },
+      dataRequestFn: async (req) => h.core.changeData(req),
+      messageCalls: messages,
+    });
+    try {
+      await gui.state.loadPublishThrottleDefaults();
+      assert.strictEqual(gui.state.defaultCreativeStatement, "ai_generated");
+      const dyNode = {
+        id: "node-dy-1",
+        pt: "抖音",
+        phone,
+        accountKey: phone,
+        url: "https://creator.douyin.com/creator-micro/content/upload",
+      };
+      gui.state.ptConfig = {
+        抖音: {
+          useragent: "ua",
+          listIndex: "https://creator.douyin.com/",
+          upload: "https://creator.douyin.com/creator-micro/content/upload",
+        },
+      };
+      gui.state.$refs = {
+        tree: { getCheckedNodes: () => [dyNode] },
+      };
+      gui.state.initPlatformStatementsForLeaves([dyNode]);
+      gui.state.dirPath = h.mediaDir;
+      gui.state.dirBatchFiles = [
+        {
+          fileName: "second.mp4",
+          resolvedPath: h.clip2,
+          title: "GUI-Excel无声明",
+          description: "",
+          shortTitle: "",
+          tags: "",
+          coverResolved: "",
+          creativeStatement: "none",
+        },
+      ];
+      const submitP = gui.state.submitDirBatchPublish("publish");
+      await new Promise((r) => setTimeout(r, 20));
+      // 预览窗打开后点不节流立即提交
+      if (gui.state.throttlePreviewVisible) {
+        gui.state.resolveThrottlePreview("no_throttle");
+      }
+      await submitP;
+      assert.strictEqual(sentPayloads.length, 1);
+      assert.strictEqual(
+        sentPayloads[0].data.creativeStatement,
+        "none",
+        "GUI Excel 创作声明=none 必须提交 none，不得被默认 ai_generated 覆盖"
+      );
+    } finally {
+      gui.cleanup();
+    }
+
+    // 11c. HTTP / CLI 复用既有 AI 声明定时任务时传入 creativeStatement:"none" → 返回 needs_attention 且回执反映实际声明 ai_generated
+    const orig = await h.post({
+      platform: "dy",
+      phone,
+      file: h.clip3,
+      title: "初版AI任务",
+      publishAt: "2026-11-21 13:00:00",
+      noThrottle: true,
+    });
+    assert.strictEqual(orig.scheduled, true);
+    assert.strictEqual(orig.creativeStatement, "ai_generated");
+
+    const conflictHttp = await h.post({
+      platform: "dy",
+      phone,
+      file: h.clip3,
+      title: "更改声明冲突",
+      publishAt: "2026-11-21 13:00:00",
+      noThrottle: true,
+      creativeStatement: "none",
+    });
+    assert.strictEqual(conflictHttp.success, false);
+    assert.strictEqual(conflictHttp.status, "needs_attention", "声明冲突必须返回 needs_attention 不静默");
+    assert.strictEqual(conflictHttp.needsAttention, true);
+    assert.strictEqual(conflictHttp.exitCode, 4);
+    assert.strictEqual(conflictHttp.duplicate, true);
+    assert.strictEqual(conflictHttp.id, orig.id);
+    assert.strictEqual(
+      conflictHttp.creativeStatement,
+      "ai_generated",
+      "回执必须反映任务实际声明 ai_generated，与上传参数一致"
+    );
+    assert.strictEqual(conflictHttp.requestedCreativeStatement, "none");
+
+    const row = h.listAllRecords().find((r) => r.id === orig.id);
+    assert.strictEqual(row.creativeStatement, "ai_generated");
+    assert.strictEqual(h.core.buildTaskPayloadFromRecord(row).data.creativeStatement, "ai_generated");
+
+    const conflictCli = await h.cli([
+      "-p", "dy", "--phone", phone, "-f", h.clip3, "-t", "CLI更改声明冲突",
+      "--publish-at", "2026-11-21 13:00:00", "--no-throttle", "--cs", "none",
+    ]);
+    assert.strictEqual(conflictCli.code, 4);
+    assert.strictEqual(conflictCli.last.status, "needs_attention");
+    assert.strictEqual(conflictCli.last.creativeStatement, "ai_generated");
+    assert.strictEqual(conflictCli.last.requestedCreativeStatement, "none");
+    console.log("✓ Fix #11: Excel none 声明 GUI/CLI 一致优先 + 复用任务声明冲突返回 needs_attention 验证通过");
+  } finally {
+    h.cleanup();
+  }
+}
+
+// #12 MCP publish_video 透传 noThrottle，回执保留 creativeStatement 与结构化节流原因
+async function testFix12_McpNoThrottleAndReceiptFields() {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-s11-fix12-mcp-"));
+  const pubBundle = path.join(tmpDir, "publish.mjs");
+  const argsLog = path.join(tmpDir, "args.json");
+  const fakeBin = path.join(tmpDir, "fake-matrixmedia");
+  const origBin = process.env.MATRIXMEDIA_BIN;
+  try {
+    await esbuild.build({
+      entryPoints: [path.join(root, "mcp/src/tools/publish.ts")],
+      outfile: pubBundle,
+      bundle: true,
+      platform: "node",
+      format: "esm",
+      external: ["@modelcontextprotocol/sdk"],
+    });
+    const { publishVideoTool, handlePublishVideo } = await import(
+      pathToFileURL(pubBundle).href
+    );
+    assert.strictEqual(
+      publishVideoTool.inputSchema.properties.noThrottle.type,
+      "boolean",
+      "MCP publish_video schema 必须声明 boolean noThrottle"
+    );
+
+    // 12a. noThrottle: true → 透传 --no-throttle 且保留 creativeStatement
+    fs.writeFileSync(
+      fakeBin,
+      `#!/usr/bin/env node
+const fs = require('fs');
+fs.writeFileSync(${JSON.stringify(argsLog)}, JSON.stringify(process.argv.slice(2)));
+console.log(JSON.stringify({ channel: 'puppeteerFile-done', status: true, resultStatus: 'success', publishMode: 'publish', creativeStatement: 'ai_generated', message: '上传成功' }));
+`,
+      "utf8"
+    );
+    fs.chmodSync(fakeBin, 0o755);
+    process.env.MATRIXMEDIA_BIN = fakeBin;
+
+    const immediateOut = JSON.parse(
+      await handlePublishVideo({
+        platform: "dy",
+        phone: "13800138000",
+        file: "/tmp/v.mp4",
+        title: "绕过节流",
+        noThrottle: true,
+      })
+    );
+    const argv = JSON.parse(fs.readFileSync(argsLog, "utf8"));
+    assert.ok(argv.includes("--no-throttle"), `MCP 必须转发 --no-throttle，实际 argv=${JSON.stringify(argv)}`);
+    assert.strictEqual(immediateOut.status, "success");
+    assert.strictEqual(immediateOut.creativeStatement, "ai_generated");
+
+    // 12b. 定时节流回执 → 保留 creativeStatement / throttled / throttleReason / reason / reasons / plannedAtMs
+    fs.writeFileSync(
+      fakeBin,
+      `#!/usr/bin/env node
+console.log(JSON.stringify({
+  success: true,
+  status: 'scheduled',
+  scheduled: true,
+  id: 'sched-99',
+  publishAt: '2026-11-21 15:00:00',
+  plannedAtMs: 1795244400000,
+  creativeStatement: 'ai_generated',
+  throttled: true,
+  throttleReason: '距上次抖音发布不足 6 小时',
+  reason: '距上次抖音发布不足 6 小时',
+  reasons: ['距上次抖音发布不足 6 小时'],
+  message: '已按发布节流排期至 2026-11-21 15:00:00（距上次抖音发布不足 6 小时）'
+}));
+`,
+      "utf8"
+    );
+    const schedOut = JSON.parse(
+      await handlePublishVideo({
+        platform: "dy",
+        phone: "13800138000",
+        file: "/tmp/v.mp4",
+        title: "节流定时",
+      })
+    );
+    assert.strictEqual(schedOut.status, "scheduled");
+    assert.strictEqual(schedOut.scheduled, true);
+    assert.strictEqual(schedOut.creativeStatement, "ai_generated");
+    assert.strictEqual(schedOut.throttled, true);
+    assert.strictEqual(schedOut.throttleReason, "距上次抖音发布不足 6 小时");
+    assert.strictEqual(schedOut.reason, "距上次抖音发布不足 6 小时");
+    assert.deepStrictEqual(schedOut.reasons, ["距上次抖音发布不足 6 小时"]);
+    assert.strictEqual(schedOut.plannedAtMs, 1795244400000);
+    console.log("✓ Fix #12: MCP publish_video 透传 noThrottle 且回执保留 creativeStatement 与结构化节流原因验证通过");
+  } finally {
+    if (origBin === undefined) delete process.env.MATRIXMEDIA_BIN;
+    else process.env.MATRIXMEDIA_BIN = origBin;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+// #13 排期搜索设 60 天上限，超出返回「排期已满」错误而不是突破日上限
+async function testFix13_SearchLookaheadLimitReturnsFullError() {
+  const { MAX_PLAN_LOOKAHEAD_DAYS, DAY_MS } = require("../src/shared/publishThrottle.js");
+  assert.strictEqual(MAX_PLAN_LOOKAHEAD_DAYS, 60);
+  const startNow = t8("2026-11-21T10:00:00");
+  const settings = normalizePublishThrottleSettings({
+    platforms: {
+      dy: { minIntervalHours: 0, dailyLimit: 1, delayFromFirstHours: 0 },
+    },
+  });
+
+  // 13a. 连续 60 天满额（Day 0..59）→ 第 60 天（Day 60）仍在上限内可排入
+  const recs60 = [];
+  for (let d = 0; d < 60; d++) {
+    recs60.push({
+      pt: "抖音",
+      phone: "13800138000",
+      scheduledTask: true,
+      publishStatus: "scheduled",
+      scheduledPublishAt: startNow + d * DAY_MS,
+    });
+  }
+  const planOk = planPublishTimes({
+    targets: [{ platform: "dy", phone: "13800138000" }],
+    now: startNow,
+    records: recs60,
+    settings,
+  });
+  assert.strictEqual(planOk.ok, true);
+  assert.strictEqual(planOk.items[0].ok, true);
+  assert.strictEqual(planOk.items[0].publishAt, formatUtc8DateTime(t8("2027-01-20T06:00:00")));
+
+  // 13b. 连续 367 天满额（原评审复现输入）→ 返回 ok:false「排期已满」，绝不突破日上限
+  const recs367 = [];
+  for (let d = 0; d < 367; d++) {
+    recs367.push({
+      pt: "抖音",
+      phone: "13800138000",
+      scheduledTask: true,
+      publishStatus: "scheduled",
+      scheduledPublishAt: startNow + d * DAY_MS,
+    });
+  }
+  const planFull = planPublishTimes({
+    targets: [{ platform: "dy", phone: "13800138000" }],
+    now: startNow,
+    records: recs367,
+    settings,
+  });
+  assert.strictEqual(planFull.ok, false);
+  assert.strictEqual(planFull.items[0].ok, false);
+  assert.strictEqual(planFull.items[0].overflow, true);
+  assert.strictEqual(planFull.items[0].scheduled, false);
+  assert.strictEqual(planFull.items[0].publishAt, null);
+  assert.ok(planFull.items[0].error.includes("排期已满"), planFull.items[0].error);
+
+  // 13c. HTTP 与 CLI 端到端返回「排期已满」且不创建越限任务
+  const h = await createS11FixHarness({
+    initialTime: "2026-11-21T10:00:00",
+    settings: {
+      platforms: { dy: { minIntervalHours: 0, dailyLimit: 1, delayFromFirstHours: 0 } },
+    },
+  });
+  try {
+    for (let d = 0; d <= 60; d++) {
+      h.addRecord({
+        id: `full-${d}`,
+        title: `满额-${d}`,
+        scheduledTask: true,
+        publishStatus: "scheduled",
+        scheduledPublishAt: startNow + d * DAY_MS,
+        scheduledPublishAtText: formatUtc8DateTime(startNow + d * DAY_MS),
+      });
+    }
+    const httpFull = await h.post({
+      platform: "dy",
+      phone: "13800138000",
+      file: h.clip1,
+      title: "溢出测试HTTP",
+    });
+    assert.strictEqual(httpFull.success, false);
+    assert.strictEqual(httpFull.status, "failed");
+    assert.ok(httpFull.message.includes("排期已满"), httpFull.message);
+
+    const cliFull = await h.cli([
+      "-p", "dy", "--phone", "13800138000", "-f", h.clip1, "-t", "溢出测试CLI",
+    ]);
+    assert.notStrictEqual(cliFull.code, 0);
+    assert.ok(cliFull.err.join(" ").includes("排期已满"));
+    console.log("✓ Fix #13: 排期搜索 60 天上限超限返回「排期已满」错误，绝不突破日上限验证通过");
+  } finally {
+    h.cleanup();
+  }
+}
+
 async function main() {
   testCase1_IntervalPostponeAndBoundaries();
   testCase2_AllowedWindowRollover();
@@ -1391,6 +2878,19 @@ async function main() {
   await testCase9_CliThrottleAndDefaultStatement();
   await testCase10_RestartPersistenceOfScheduledTasks();
   await testCase11_GuiTemplatesAndDocsCheck();
+  await testFix01_ReuseSameFileSameTimeScheduledWithNewTitle();
+  await testFix02_NewScheduledTaskDoesNotExpireDueTask();
+  await testFix03_DiskWriteFailureNeverReportsScheduled();
+  await testFix04_GuiExpiredPreviewRejectedNoFallbackWrite();
+  await testFix05_S10LaterScheduledDoesNotBlockEarlierTask();
+  await testFix06_ConcurrentRequestsAndStaleGuiPreviewSerialized();
+  await testFix07_LedgerTracksMultiAccountAndMergedSameFileDailyLimit();
+  await testFix08_DraftNeverThrottledOrPollutesLedger();
+  await testFix09_MixedRemoteDownloadFailureKeepsScheduledPlatform();
+  await testFix10_PublishAtUtc8TimezoneConsistentAcrossHosts();
+  await testFix11_ExplicitCreativeStatementPriorityAndReuseConflict();
+  await testFix12_McpNoThrottleAndReceiptFields();
+  await testFix13_SearchLookaheadLimitReturnsFullError();
   console.log("\ntest-publish-throttle: 全部断言通过");
 }
 

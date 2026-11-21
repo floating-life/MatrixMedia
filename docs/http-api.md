@@ -160,12 +160,12 @@
 | `duplicate`                      | 触发 7 天内重复发布拦截时为 `true`                   |
 | `lastPublishAt` / `lastPublishAtText` | 触发重复发布拦截时返回上次匹配记录的时间戳（ms）与 UTC+8 时间文本 |
 | `creativeStatement`              | 单平台响应写出最终生效的创作声明（多平台写在每个 `results[]` 条目中） |
-| `throttled` / `throttleReason` / `reason` | 触发节流顺延为定时任务时返回 `throttled: true` 与顺延原因文案 |
+| `throttled` / `throttleReason` / `reason` / `reasons` | 触发节流顺延为定时任务时返回 `throttled: true`、顺延原因文案及结构化原因数组 `reasons` |
 | `message`                        | 结果说明（重复拦截时含上次发布时间；节流排期时含计划时间与原因） |
 | `total` / `succeeded` / `failed` | 多平台提交汇总；最终成功失败以 `pushData` 记录为准   |
-| `results`                        | 多平台时各平台提交明细数组（含最终 `creativeStatement`、`status`、`scheduled`、`publishAt`、`throttled`、`throttleReason`；重复平台单独标 `status: "duplicate"`、`exitCode: 6`，其余平台照常执行/排期） |
+| `results`                        | 多平台时各平台提交明细数组（含最终 `creativeStatement`、`status`、`scheduled`、`publishAt`、`throttled`、`throttleReason`、`reasons`；重复平台单独标 `status: "duplicate"`、`exitCode: 6`，混合平台中立即平台下载失败不影响待排平台照常建定时任务） |
 | `id`                             | 单平台时写入 `pushData` 的记录 id                    |
-| `scheduled` / `publishAt`        | 定时发布或被节流顺延为定时任务时返回                 |
+| `scheduled` / `publishAt`        | 定时发布或被节流顺延为定时任务时返回（所有 `publishAt` 统一按 UTC+8 解析与格式化；草稿不节流不进账本；复用同文件同时刻既有定时任务若声明冲突返回 `status: "needs_attention"`、`exitCode: 4`；排期搜索上限 60 天，超限返回「排期已满」） |
 
 **HTTP 状态码**：
 
