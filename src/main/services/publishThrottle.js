@@ -61,7 +61,7 @@ function monotonicNowMs() {
       process.hrtime &&
       typeof process.hrtime.bigint === "function"
     ) {
-      return Number(process.hrtime.bigint() / 1000000n);
+      return Number(process.hrtime.bigint() / BigInt(1000000)); // es2015 目标不支持 1000000n 字面量
     }
   } catch (_) {}
   return null;
