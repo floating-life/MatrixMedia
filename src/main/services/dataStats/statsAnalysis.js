@@ -719,15 +719,25 @@ function buildWorkDailyPlaySumMap(seriesByWork) {
   for (const series of seriesByWork.values()) {
     const playVals = series.vals && series.vals.play;
     if (!playVals) continue;
+    let lastPosPlay = null;
     for (let i = 0; i < series.len; i++) {
-      const p = playVals[i];
-      if (p === null || p <= 0) continue;
+      const rawP = playVals[i];
+      let effectiveP = null;
+      if (rawP !== null && rawP > 0) {
+        effectiveP = rawP;
+        lastPosPlay = rawP;
+      } else if (rawP === null && lastPosPlay !== null && lastPosPlay > 0) {
+        // 作品级当日播放因假 0 / 采集异常被置空时，沿用其上一次有效正播放，
+        // 避免误判为「作品级同步下降」而放过账号总播放骤降异常。
+        effectiveP = lastPosPlay;
+      }
+      if (effectiveP === null || effectiveP <= 0) continue;
       const dn = series.dayNums[i];
       const grp = series.groups[i] || series.group || "";
       const pgKey = `${series.platform}|${grp}\0${dn}`;
-      byPgDay.set(pgKey, (byPgDay.get(pgKey) || 0) + p);
+      byPgDay.set(pgKey, (byPgDay.get(pgKey) || 0) + effectiveP);
       const pKey = `${series.platform}\0${dn}`;
-      byPlatformDay.set(pKey, (byPlatformDay.get(pKey) || 0) + p);
+      byPlatformDay.set(pKey, (byPlatformDay.get(pKey) || 0) + effectiveP);
     }
   }
   return { byPgDay, byPlatformDay };
@@ -903,12 +913,30 @@ function prepareAccountSeries(accountRows, seriesByWork, cutoffTo) {
         prevValidDayNum = pt.dayNum;
       }
 
+      const playsAnomalyDetail = isPlaysAnom
+        ? {
+            prevDate: anomPrevDate,
+            prevValue: anomPrevVal,
+            rawValue: anomRawVal,
+            reason: anomReason,
+          }
+        : null;
+      const playsAnomalyNote = isPlaysAnom
+        ? `${anomReason}${
+            anomPrevVal !== null && anomRawVal !== null
+              ? `（${anomPrevDate ? `${anomPrevDate} ` : ""}${anomPrevVal}→${anomRawVal}，已排除播放日增）`
+              : "（已排除播放日增）"
+          }`
+        : null;
+
       cleanedAccountRows.push({
         ...pt,
         plays: cleanedPlays,
         fansDelta: nextFansDelta,
         playsDelta: cleanedPlaysDelta,
         playsAnomaly: isPlaysAnom,
+        playsAnomalyDetail,
+        playsAnomalyNote,
       });
     }
   }
@@ -1270,6 +1298,42 @@ function buildOverviewSection(
   };
 }
 
+/**
+ * 先按单作品判断是否 play > 0 再累计平台互动率分子/分母：
+ * - 分母：该平台 play > 0 的全部作品播放（互动全缺按 0 计入分子，仍保留在分母）
+ * - 零播放/空播放作品的互动绝不计入分子
+ */
+function accumulateWorkEngagement(agg, metrics) {
+  if (!agg || !metrics) return;
+  const play = hasOwn(metrics, "play") ? fastNormalizeMetric(metrics.play) : null;
+  if (typeof play === "number" && Number.isFinite(play) && play > 0) {
+    const like = hasOwn(metrics, "like") ? fastNormalizeMetric(metrics.like) : null;
+    const comment = hasOwn(metrics, "comment") ? fastNormalizeMetric(metrics.comment) : null;
+    const share = hasOwn(metrics, "share") ? fastNormalizeMetric(metrics.share) : null;
+    const favorite = hasOwn(metrics, "favorite") ? fastNormalizeMetric(metrics.favorite) : null;
+    agg.engPlaySum += play;
+    agg.engInteraction4Sum += (like || 0) + (comment || 0) + (share || 0) + (favorite || 0);
+    agg.engInteraction3Sum += (like || 0) + (comment || 0) + (share || 0);
+    agg.engWorkCount += 1;
+  }
+}
+
+function createEmptyPlatformAgg(platform) {
+  return {
+    platform,
+    play: null,
+    like: null,
+    comment: null,
+    share: null,
+    favorite: null,
+    fansDelta: null,
+    engPlaySum: 0,
+    engInteraction4Sum: 0,
+    engInteraction3Sum: 0,
+    engWorkCount: 0,
+  };
+}
+
 function collectCellWorkPwKeys(platform, cell) {
   const pwKeys = [];
   const seen = new Set();
@@ -1347,20 +1411,13 @@ function normalizeContentRows(summaryRows, cutoffTo, seriesByWork) {
       }
       let agg = bucket.byPlatform.get(series.platform);
       if (!agg) {
-        agg = {
-          platform: series.platform,
-          play: null,
-          like: null,
-          comment: null,
-          share: null,
-          favorite: null,
-          fansDelta: null,
-        };
+        agg = createEmptyPlatformAgg(series.platform);
         bucket.byPlatform.set(series.platform, agg);
       }
       for (const k of WORK_STAT_KEYS) {
         agg[k] = addNullable(agg[k], series.cleanedLatest[k]);
       }
+      accumulateWorkEngagement(agg, series.cleanedLatest);
     }
 
     const out = [];
@@ -1471,20 +1528,13 @@ function normalizeContentRows(summaryRows, cutoffTo, seriesByWork) {
 
         let agg = byPlatform.get(platform);
         if (!agg) {
-          agg = {
-            platform,
-            play: null,
-            like: null,
-            comment: null,
-            share: null,
-            favorite: null,
-            fansDelta: null,
-          };
+          agg = createEmptyPlatformAgg(platform);
           byPlatform.set(platform, agg);
         }
 
         const cellPwKeys = hasSeries ? collectCellWorkPwKeys(platform, cell) : [];
         let usedCleanedCell = false;
+        let accumulatedWorkEng = false;
         if (cellPwKeys.length > 0) {
           let allFound = true;
           let anyAnom = false;
@@ -1495,6 +1545,12 @@ function normalizeContentRows(summaryRows, cutoffTo, seriesByWork) {
               break;
             }
             if (s.hadAnomaly) anyAnom = true;
+          }
+          if (allFound) {
+            for (let i = 0; i < cellPwKeys.length; i++) {
+              accumulateWorkEngagement(agg, seriesByWork.get(cellPwKeys[i]).cleanedLatest);
+            }
+            accumulatedWorkEng = true;
           }
           if (allFound && anyAnom) {
             for (let i = 0; i < cellPwKeys.length; i++) {
@@ -1531,7 +1587,9 @@ function normalizeContentRows(summaryRows, cutoffTo, seriesByWork) {
                   const v = hasOwn(src, k) ? fastNormalizeMetric(src[k]) : null;
                   agg[k] = addNullable(agg[k], v);
                 }
+                accumulateWorkEngagement(agg, src);
               }
+              accumulatedWorkEng = true;
               usedCleanedCell = true;
               recomputedAnyCell = true;
             }
@@ -1544,7 +1602,9 @@ function normalizeContentRows(summaryRows, cutoffTo, seriesByWork) {
                 const k = WORK_STAT_KEYS[ki];
                 agg[k] = addNullable(agg[k], s.cleanedLatest[k]);
               }
+              accumulateWorkEngagement(agg, s.cleanedLatest);
             }
+            accumulatedWorkEng = true;
             usedCleanedCell = true;
             recomputedAnyCell = true;
           }
@@ -1555,6 +1615,26 @@ function normalizeContentRows(summaryRows, cutoffTo, seriesByWork) {
             const k = WORK_STAT_KEYS[ki];
             const v = hasOwn(cell, k) ? fastNormalizeMetric(cell[k]) : null;
             agg[k] = addNullable(agg[k], v);
+          }
+        }
+        if (!accumulatedWorkEng) {
+          const hasPerWorkMetrics =
+            Array.isArray(cell.works) &&
+            cell.works.length > 0 &&
+            cell.works.some((w) => isPlainObject(w) && WORK_STAT_KEYS.some((k) => hasOwn(w, k)));
+          if (hasPerWorkMetrics) {
+            for (const w of cell.works) {
+              if (!isPlainObject(w)) continue;
+              const p =
+                typeof w.platform === "string" && w.platform.trim() ? w.platform.trim() : platform;
+              const s =
+                hasSeries && w.workId != null
+                  ? seriesByWork.get(`${p}|${String(w.workId).trim()}`)
+                  : null;
+              accumulateWorkEngagement(agg, s ? s.cleanedLatest : w);
+            }
+          } else {
+            accumulateWorkEngagement(agg, cell);
           }
         }
       }
@@ -1694,22 +1774,15 @@ function buildPlatformComparisonSection(contentRows) {
         bucket.playSum += p.play;
         bucket.playCount += 1;
       }
-      // 平台级加权互动率：只统计 play > 0 的作品；缺某字段按 0 计
-      if (typeof p.play === "number" && Number.isFinite(p.play) && p.play > 0) {
-        const hasAny4 =
-          p.like !== null || p.comment !== null || p.share !== null || p.favorite !== null;
-        if (hasAny4) {
-          bucket.engPlaySum += p.play;
-          bucket.engInteractionSum +=
-            (p.like || 0) + (p.comment || 0) + (p.share || 0) + (p.favorite || 0);
-          bucket.engRateCount += 1;
-        }
-        const hasAny3 = p.like !== null || p.comment !== null || p.share !== null;
-        if (hasAny3) {
-          bucket.eng3PlaySum += p.play;
-          bucket.eng3InteractionSum += (p.like || 0) + (p.comment || 0) + (p.share || 0);
-          bucket.eng3RateCount += 1;
-        }
+      // 平台级加权互动率：分母 = 该平台 play > 0 的全部作品播放（互动缺失按 0 计），
+      // 先按作品判断 play > 0 再合并，零播放作品的互动不计入。
+      if (typeof p.engPlaySum === "number" && Number.isFinite(p.engPlaySum) && p.engPlaySum > 0) {
+        bucket.engPlaySum += p.engPlaySum;
+        bucket.engInteractionSum += p.engInteraction4Sum || 0;
+        bucket.engRateCount += p.engWorkCount || 1;
+        bucket.eng3PlaySum += p.engPlaySum;
+        bucket.eng3InteractionSum += p.engInteraction3Sum || 0;
+        bucket.eng3RateCount += p.engWorkCount || 1;
       }
       if (p.fansDelta !== null) {
         bucket.fansSum += p.fansDelta;
@@ -3454,7 +3527,7 @@ function buildStatsAnalysis({
     anomalies,
   });
 
-  return {
+  const result = {
     to: resolvedTo,
     period: resolvedPeriod,
     currentRange: { from: currentStart, to: resolvedTo },
@@ -3472,6 +3545,12 @@ function buildStatsAnalysis({
     anomalies,
     summary,
   };
+  Object.defineProperty(result, "_cleanedAccountRows", {
+    value: cleanedAccountRows,
+    enumerable: false,
+    configurable: true,
+  });
+  return result;
 }
 
 module.exports = {

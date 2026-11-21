@@ -14,6 +14,11 @@ import {
   VIDEO_LINK_TYPES,
   buildVideoLinkOption,
 } from "../../shared/videoLink.js";
+import {
+  sanitizeTitle,
+  sanitizeDescription,
+  splitAndSanitizeTags,
+} from "../../shared/textSanitize.js";
 
 export { PLATFORM_ALIASES, VIDEO_PUBLISH_CANONICAL, resolvePublishPlatform };
 
@@ -46,6 +51,7 @@ export function parsePublishArgs(subArgv) {
     cover: null,
     creativeStatement: null,
     draft: false,
+    allowDuplicate: false,
     noDownload: false,
     sphLinkType: null,
     sphLinkValue: null,
@@ -90,6 +96,8 @@ export function parsePublishArgs(subArgv) {
       out.creativeStatement = args[++i];
     } else if (a === "--draft") {
       out.draft = true;
+    } else if (a === "--allow-duplicate") {
+      out.allowDuplicate = true;
     } else if (a === "--no-download") {
       out.noDownload = true;
     } else if (a === "--sph-link-type") {
@@ -119,10 +127,19 @@ export function parsePublishArgs(subArgv) {
     return { ok: false, error: `未知平台: ${out.platform}` };
   }
   out.platform = pt;
-  if (out.bt2) {
-    if (out.platform === "视频号" && !out.shortTitle) out.shortTitle = out.bt2;
-    if (out.platform !== "视频号" && !out.description)
-      out.description = out.bt2;
+  if (out.title != null) out.title = sanitizeTitle(out.title);
+  out.description = sanitizeDescription(out.description);
+  out.shortTitle = sanitizeTitle(out.shortTitle);
+  if (out.bt2 != null) {
+    out.bt2 =
+      out.platform === "视频号"
+        ? sanitizeTitle(out.bt2)
+        : sanitizeDescription(out.bt2);
+    if (out.bt2) {
+      if (out.platform === "视频号" && !out.shortTitle) out.shortTitle = out.bt2;
+      if (out.platform !== "视频号" && !out.description)
+        out.description = out.bt2;
+    }
   }
 
   // 视频号链接是平台专属参数；误传给其他平台时直接忽略。
@@ -265,22 +282,19 @@ export function parsePublishArgs(subArgv) {
     }
   }
 
-  // 逗号等分隔符不再只告警：直接统一转空格。
+  // 逗号等分隔符不再只告警：直接统一转空格，走共享 splitAndSanitizeTags。
   // 日志里 21 次告警说明调用方一直在传逗号，而哔哩哔哩/小红书按空格切分，
   // 逗号会被当成标签内的字符，等于把标签写坏。
   if (out.bq && /[,，、;；|]/.test(out.bq)) {
     const before = String(out.bq);
-    out.bq = before
-      .replace(/[,，、;；|]+/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
+    out.bq = splitAndSanitizeTags(before).join(" ");
     console.log(
       `MatrixMedia: --tags 中的 ,，、;；| 已统一转为空格（原值: ${before}）`
     );
   }
 
   if (out.bq) {
-    const tags = String(out.bq).trim().split(/\s+/).filter(Boolean);
+    const tags = splitAndSanitizeTags(out.bq);
     if (tags.length > 4) {
       console.warn(
         `MatrixMedia: --tags 共 ${tags.length} 个，建议最多 4 个话题；多余标签会降低每个话题的权重，生成层请按相关性裁到 4 个以内。`
@@ -293,6 +307,8 @@ export function parsePublishArgs(subArgv) {
           String(t).startsWith("#") ? String(t) : `#${String(t).trim()}`
         )
         .join(" ");
+    } else {
+      out.bq = tags.join(" ");
     }
   }
 
@@ -310,11 +326,7 @@ function pickBodyValue(body, keys) {
 }
 
 function normalizeBodyTags(value) {
-  return String(value || "")
-    .split(/[\s,，、;；|]+/)
-    .map((item) => item.trim())
-    .filter(Boolean)
-    .join(" ");
+  return splitAndSanitizeTags(value).join(" ");
 }
 
 /**
@@ -387,6 +399,8 @@ export function publishBodyToArgv(body) {
   if (body.show === true) argv.push("--show");
   if (body.closeWindowAfterPublish === false) argv.push("--no-close-window");
   if (body.draft === true) argv.push("--draft");
+  if (body.allowDuplicate === true || body["allow-duplicate"] === true)
+    argv.push("--allow-duplicate");
   if (body.noDownload === true || body["no-download"] === true)
     argv.push("--no-download");
 
@@ -429,6 +443,8 @@ const SHARED_PUBLISH_BODY_KEYS = [
   "show",
   "closeWindowAfterPublish",
   "draft",
+  "allowDuplicate",
+  "allow-duplicate",
   "noDownload",
   "no-download",
   "platformOptions",
@@ -680,6 +696,7 @@ export function publishHelpText() {
       --no-close-window 发布后不自动关窗（仅 GUI 显示窗口时有效；CLI 始终后台运行）
       --draft           显式发布到草稿箱（小红书点「暂存离开」）。若账号在 GUI「媒体平台管理」
                             里开启了「默认发布到草稿」，即使不加该参数也会自动走草稿。
+      --allow-duplicate 放行 7 天内同平台+同账号+同标题的重复发布拦截（默认拒绝并退出码 6）
       --no-download     快手专用：取消勾选「允许下载此作品」并校验终态（其它平台忽略；
                             取消未确认会中止发布，宁可不发不可漏禁下载红线）
       --sph-product-id <id>   视频号商品上架（快捷参数，等价于 product + 商品编号）
@@ -690,7 +707,7 @@ export function publishHelpText() {
       --sph-link-value <v>    视频号链接值：商品编号，或短剧/剧集名称；只传该参数时默认按商品上架
   -h, --help            显示帮助
 
-退出码 (单文件): 0 成功, 1 异常, 2 参数错误, 3 任务失败（上传未成功）, 4 已转存草稿需检查
+退出码 (单文件): 0 成功, 1 异常, 2 参数错误, 3 任务失败（上传未成功）, 4 已转存草稿需检查, 6 近7天重复发布拦截
 退出码 (批量 --dir): 0 全部成功, 1 部分失败, 2 全部失败
 
 示例:

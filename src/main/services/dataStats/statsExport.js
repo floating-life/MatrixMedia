@@ -181,6 +181,7 @@ const ACCOUNT_DAILY_HEADERS = [
   "总分享",
   "粉丝日增",
   "播放日增",
+  "异常标注",
 ];
 
 const SCHEMA_HEADERS = ["sheet", "列名", "英文键", "含义/口径"];
@@ -2394,11 +2395,45 @@ function collectAccountDailyRows(accountsData, from, to, { sortRows = true } = {
   return { rows, allRows };
 }
 
+/** 用「分析」同款账号异常识别结果统一清洗「账号日快照」导出行（含旧 daily.json） */
+function reconcileAccountDailyRowsWithAnalysis(rows, analysis) {
+  const cleaned =
+    analysis && Array.isArray(analysis._cleanedAccountRows)
+      ? analysis._cleanedAccountRows
+      : [];
+  if (!cleaned.length) return rows;
+  const byKey = new Map();
+  for (let i = 0; i < cleaned.length; i++) {
+    const c = cleaned[i];
+    if (!c || !c.date || !c.platform) continue;
+    byKey.set(`${c.date}\0${c.platform}\0${c.group || ""}`, c);
+  }
+  return rows.map((r) => {
+    const c = byKey.get(`${r.date}\0${r.platform}\0${r.group || ""}`);
+    if (!c) return r;
+    const isAnom = Boolean(c.playsAnomaly);
+    return {
+      ...r,
+      plays: isAnom ? null : c.plays,
+      playsDelta: isAnom ? null : c.playsDelta,
+      playsAnomaly: isAnom,
+      playsAnomalyDetail: isAnom ? c.playsAnomalyDetail || r.playsAnomalyDetail || null : null,
+      playsAnomalyNote: isAnom ? c.playsAnomalyNote || "播放异常（已排除播放日增）" : null,
+    };
+  });
+}
+
 /** Sheet 4: 账号日快照 Excel 二维表格式化（仅 Excel 导出调用） */
 function formatAccountDailyAoa(rows) {
   const aoa = [ACCOUNT_DAILY_HEADERS.map(sanitizeTextCell)];
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i];
+    const anomNote = r.playsAnomaly
+      ? r.playsAnomalyNote ||
+        (r.playsAnomalyDetail && r.playsAnomalyDetail.reason
+          ? `${r.playsAnomalyDetail.reason}（已排除播放日增）`
+          : "播放异常（已排除播放日增）")
+      : null;
     aoa.push([
       sanitizeTextCell(r.date),
       sanitizeTextCell(r.platform),
@@ -2411,6 +2446,7 @@ function formatAccountDailyAoa(rows) {
       sanitizeNumberCell(r.shares),
       sanitizeNumberCell(r.fansDelta),
       sanitizeNumberCell(r.playsDelta),
+      sanitizeTextCell(anomNote),
     ]);
   }
   return aoa;
@@ -3217,7 +3253,13 @@ function buildSchemaSheet(dynamicSchemaEntries) {
       "账号日快照",
       "播放日增",
       "playsDelta",
-      "当日总播放 − 该账号上一有播放记录日的总播放（日增口径，跳过仅粉丝历史回填日；断档跨天时为多天合计变化）。",
+      "当日总播放 − 该账号上一有播放记录日的总播放（日增口径，跳过仅粉丝历史回填日与播放异常日；断档跨天时为多天合计变化）。",
+    ],
+    [
+      "账号日快照",
+      "异常标注",
+      "playsAnomalyNote",
+      "当账号总播放较上次有效正值骤降（归 0 或降幅 ≥50%）且作品级无对应下降时标注异常说明，并将该日「总播放」「播放日增」置空，与「分析」sheet 口径保持一致（含旧 daily.json）。",
     ],
 
     // 5. 分析（纯规则分析，多节长表，与 GUI「数据分析」tab 共用计算函数）
@@ -3584,7 +3626,6 @@ function buildStatsWorkbookData(options = {}, deps) {
     resolvedTo,
     { sortRows: true }
   );
-  const accountDailyAoa = formatAccountDailyAoa(accountDaily.rows);
   const analysisPeriod = resolveAnalysisPeriodFromRange(resolvedFrom, resolvedTo);
   const { summaryRows: analysisSummaryRows, workFallbackByPwKey } = resolveAnalysisPublishTimes(
     summaryRows,
@@ -3605,6 +3646,11 @@ function buildStatsWorkbookData(options = {}, deps) {
     period: analysisPeriod,
     now: nowVal,
   });
+  const reconciledAccountDailyRows = reconcileAccountDailyRowsWithAnalysis(
+    accountDaily.rows,
+    analysis
+  );
+  const accountDailyAoa = formatAccountDailyAoa(reconciledAccountDailyRows);
   const analysisAoa = buildAnalysisSheet(analysis);
   const schemaAoa = buildSchemaSheet(contentSummary.dynamicSchemaEntries);
 
@@ -4233,7 +4279,14 @@ function buildContentIntradayData(options = {}, depsArg) {
         const pts = worksList[w];
         let p = ptrs[w];
         while (p < pts.length && comparePointEvent(pts[p], ev) <= 0) {
-          curPlays[w] = pts[p].play;
+          const nextPlay = pts[p].play;
+          // 缺失播放（null）或已有正播放后出现假 0：沿用该作品上一次有效值，不产生负增量
+          if (
+            nextPlay !== null &&
+            !(nextPlay === 0 && curPlays[w] !== null && curPlays[w] > 0)
+          ) {
+            curPlays[w] = nextPlay;
+          }
           p += 1;
         }
         ptrs[w] = p;

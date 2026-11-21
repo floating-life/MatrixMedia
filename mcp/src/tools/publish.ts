@@ -68,6 +68,11 @@ export const publishVideoTool: Tool = {
         description:
           "If true, save the video to the platform draft box instead of publishing it.",
       },
+      allowDuplicate: {
+        type: "boolean",
+        description:
+          "If true, bypass the 7-day same-platform/same-account/same-title duplicate publish guard (forwards --allow-duplicate to CLI).",
+      },
       noDownload: {
         type: "boolean",
         description:
@@ -138,6 +143,7 @@ export async function handlePublishVideo(
   const publishAt = args.publishAt;
   const show = args.show;
   const draft = args.draft;
+  const allowDuplicate = args.allowDuplicate === true;
   const noDownload = args.noDownload === true;
   const creativeStatement =
     args.creativeStatement == null ? "" : String(args.creativeStatement).trim();
@@ -223,6 +229,7 @@ export async function handlePublishVideo(
     ...(publishAt ? ["--publish-at", String(publishAt)] : []),
     ...(show ? ["--show"] : []),
     ...(draft ? ["--draft"] : []),
+    ...(allowDuplicate ? ["--allow-duplicate"] : []),
     ...(noDownload ? ["--no-download"] : []),
     ...(creativeStatement ? ["--creative-statement", creativeStatement] : []),
     ...(cover ? ["--cover", cover] : []),
@@ -260,6 +267,28 @@ export async function handlePublishVideo(
       needsAttention: true,
       message:
         (result.lastJson as any)?.message ?? "已转存草稿，请检查视频号链接",
+    });
+  }
+
+  if (result.exitCode === 6) {
+    const lastJson =
+      result.lastJson !== null && typeof result.lastJson === "object"
+        ? (result.lastJson as Record<string, unknown>)
+        : {};
+    return JSON.stringify({
+      ...lastJson,
+      status: (lastJson.status as string) ?? "duplicate",
+      exitCode: 6,
+      duplicate: true,
+      ...(lastJson.lastPublishAt !== undefined
+        ? { lastPublishAt: lastJson.lastPublishAt }
+        : {}),
+      ...(lastJson.lastPublishAtText !== undefined
+        ? { lastPublishAtText: lastJson.lastPublishAtText }
+        : {}),
+      message:
+        (lastJson.message as string) ??
+        (result.stderr.trim() || "近 7 天内已有相同标题发布记录，已拦截重复发布"),
     });
   }
 

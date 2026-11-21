@@ -18,6 +18,7 @@ const {
   stripExcelEscapesAndCR,
   sanitizeTitle,
   sanitizeDescription,
+  splitAndSanitizeTags,
   sanitizeTags,
   normalizeBatchXlsxRows,
   sanitizePublishPayloadObject,
@@ -70,8 +71,13 @@ function main() {
     );
     assert.deepStrictEqual(
       sanitizeTags(["  #美食_x000d_\r\n", "_X000D_", "旅行\r日记"]),
-      ["#美食", "旅行 日记"],
-      "tags 数组应逐项清洗并过滤空项"
+      ["美食", "旅行", "日记"],
+      "tags 数组应统一走共享拆分与清洗并过滤空项"
+    );
+    assert.deepStrictEqual(
+      splitAndSanitizeTags("美食_x000d_\r\n旅行"),
+      ["美食", "旅行"],
+      "splitAndSanitizeTags 应将含 _x000d_ 与换行的标签拆成独立标签"
     );
 
     // 2. 真实 Excel 读写 + GUI / CLI / HTTP 三条链路一致性校验
@@ -202,19 +208,221 @@ function main() {
     assert.strictEqual(multiBody.platforms[0].title, "抖音专属 标题");
     assert.strictEqual(multiBody.platforms[1].shortTitle, "短标题一二三");
 
-    // 确认 ipcMain.js 与 cli/index.js 源码都已统一接入 normalizeBatchXlsxRows
+    // 3. S10-fix #1a：bt2 作为简介时保留换行，只有作为视频号短标题时才折行
+    {
+      const bt2Input = "第一行_x000d_\r\n第二行";
+
+      // B 站 CLI --bt2
+      const blblCliArgv = sanitizePublishCliArgs([
+        "-p",
+        "blbl",
+        "--phone",
+        "A组",
+        "-f",
+        cliVideoFile,
+        "-t",
+        "B站测试标题",
+        "--bt2",
+        bt2Input,
+      ]);
+      const blblCliParsed = parsePublish.parsePublishArgs(blblCliArgv);
+      assert.strictEqual(blblCliParsed.ok, true, blblCliParsed.error);
+      assert.strictEqual(
+        blblCliParsed.value.description,
+        "第一行\n第二行",
+        "B 站 CLI --bt2 作为简介必须保留换行"
+      );
+
+      // B 站 HTTP bt2 vs description
+      const blblHttpBt2 = parsePublish.parseMultiPublishRequest(
+        sanitizePublishPayloadObject({
+          platform: "blbl",
+          phone: "A组",
+          file: cliVideoFile,
+          title: "B站测试标题",
+          bt2: bt2Input,
+        })
+      );
+      const blblHttpDesc = parsePublish.parseMultiPublishRequest(
+        sanitizePublishPayloadObject({
+          platform: "blbl",
+          phone: "A组",
+          file: cliVideoFile,
+          title: "B站测试标题",
+          description: bt2Input,
+        })
+      );
+      assert.strictEqual(blblHttpBt2.ok, true);
+      assert.strictEqual(blblHttpDesc.ok, true);
+      assert.strictEqual(
+        blblHttpBt2.value.description,
+        "第一行\n第二行",
+        "B 站 HTTP bt2 作为简介必须保留换行"
+      );
+      assert.strictEqual(
+        blblHttpBt2.value.description,
+        blblHttpDesc.value.description,
+        "HTTP bt2 与 description 在 B 站结果必须一致"
+      );
+
+      // 视频号 CLI --bt2 与 HTTP bt2：作为短标题折行
+      const sphCliArgv = sanitizePublishCliArgs([
+        "--bt2",
+        bt2Input,
+        "-p",
+        "sph",
+        "--phone",
+        "A组",
+        "-f",
+        cliVideoFile,
+        "-t",
+        "视频号测试标题",
+      ]);
+      const sphCliParsed = parsePublish.parsePublishArgs(sphCliArgv);
+      assert.strictEqual(sphCliParsed.ok, true, sphCliParsed.error);
+      assert.strictEqual(
+        sphCliParsed.value.shortTitle,
+        "第一行 第二行",
+        "视频号 CLI --bt2 作为短标题应把换行折成空格"
+      );
+
+      const sphHttpBt2 = parsePublish.parseMultiPublishRequest(
+        sanitizePublishPayloadObject({
+          platform: "sph",
+          phone: "A组",
+          file: cliVideoFile,
+          title: "视频号测试标题",
+          bt2: bt2Input,
+        })
+      );
+      assert.strictEqual(sphHttpBt2.ok, true, sphHttpBt2.error);
+      assert.strictEqual(sphHttpBt2.value.shortTitle, "第一行 第二行");
+
+      // 多平台 HTTP 共享顶层 bt2：B 站保留换行、视频号折行
+      const multiBt2 = parsePublish.parseMultiPublishRequest(
+        sanitizePublishPayloadObject({
+          phone: "A组",
+          file: cliVideoFile,
+          title: "多平台bt2标题",
+          bt2: bt2Input,
+          platforms: ["blbl", "sph"],
+        })
+      );
+      assert.strictEqual(multiBt2.ok, true, multiBt2.error);
+      assert.strictEqual(multiBt2.value[0].description, "第一行\n第二行");
+      assert.strictEqual(multiBt2.value[1].shortTitle, "第一行 第二行");
+    }
+
+    // 4. S10-fix #1b：B 站标签 `美食_x000d_\r\n旅行` 在 GUI / CLI / HTTP 三条链路结果完全一致
+    {
+      const rawTagCell = "美食_x000d_\r\n旅行";
+      const tagXlsxPath = path.join(tmpDir, "blbl-tags.xlsx");
+      const wbTag = xlsx.utils.book_new();
+      xlsx.utils.book_append_sheet(
+        wbTag,
+        xlsx.utils.json_to_sheet([
+          {
+            "文件名": "demo.mp4",
+            "标题": "B站标签一致性",
+            "简介": "简介",
+            "标签": rawTagCell,
+          },
+        ]),
+        "Sheet1"
+      );
+      xlsx.writeFile(wbTag, tagXlsxPath);
+
+      const tagRows = normalizeBatchXlsxRows(
+        xlsx.utils.sheet_to_json(xlsx.readFile(tagXlsxPath).Sheets.Sheet1, { defval: "" })
+      );
+      // GUI 批量导入（与 LocalVideoPublish.vue 完全同路径：splitAndSanitizeTags -> normalizeVideoMetadata -> blbl normalizeVideoTags）
+      const guiBatchTagList = splitAndSanitizeTags(tagRows[0].tags);
+      const guiBatchMeta = videoMetadata.normalizeVideoMetadata(
+        { title: tagRows[0].title, description: tagRows[0].description, tags: guiBatchTagList },
+        "哔哩哔哩"
+      );
+      const guiBlblTags = videoMetadata.normalizeVideoTags(guiBatchMeta.tags);
+
+      // GUI 单视频发布（数组形态传入含换行的脏项）
+      const guiSingleMeta = videoMetadata.normalizeVideoMetadata(
+        { title: "B站标签一致性", tags: splitAndSanitizeTags([rawTagCell]) },
+        "哔哩哔哩"
+      );
+      const guiSingleBlblTags = videoMetadata.normalizeVideoTags(guiSingleMeta.tags);
+
+      // CLI 批量导入 Excel
+      const cliBatchTagList = splitAndSanitizeTags(tagRows[0].tags);
+      const cliBatchMeta = videoMetadata.normalizeVideoMetadata(
+        { title: tagRows[0].title, description: tagRows[0].description, tags: cliBatchTagList },
+        "哔哩哔哩"
+      );
+      const cliBatchBlblTags = videoMetadata.normalizeVideoTags(cliBatchMeta.tags);
+
+      // CLI 单文件 --tags
+      const cliSingleParsed = parsePublish.parsePublishArgs(
+        sanitizePublishCliArgs([
+          "-p",
+          "blbl",
+          "--phone",
+          "A组",
+          "-f",
+          cliVideoFile,
+          "-t",
+          "B站标签一致性",
+          "--tags",
+          rawTagCell,
+        ])
+      );
+      assert.strictEqual(cliSingleParsed.ok, true, cliSingleParsed.error);
+      const cliSingleBlblTags = videoMetadata.normalizeVideoTags(cliSingleParsed.value.bq);
+
+      // HTTP /publish
+      const httpParsedTags = parsePublish.parseMultiPublishRequest(
+        sanitizePublishPayloadObject({
+          platform: "blbl",
+          phone: "A组",
+          file: cliVideoFile,
+          title: "B站标签一致性",
+          tags: rawTagCell,
+        })
+      );
+      assert.strictEqual(httpParsedTags.ok, true, httpParsedTags.error);
+      const httpBlblTags = videoMetadata.normalizeVideoTags(httpParsedTags.value.bq);
+
+      for (const [label, got] of [
+        ["GUI 批量 Excel", guiBlblTags],
+        ["GUI 单发", guiSingleBlblTags],
+        ["CLI 批量 Excel", cliBatchBlblTags],
+        ["CLI 单发", cliSingleBlblTags],
+        ["HTTP /publish", httpBlblTags],
+      ]) {
+        assert.deepStrictEqual(
+          got,
+          ["美食", "旅行"],
+          `${label} B 站标签应拆分为 ["美食", "旅行"]，实际=${JSON.stringify(got)}`
+        );
+      }
+    }
+
+    // 确认 ipcMain.js / cli/index.js / LocalVideoPublish.vue / routes/index.js 统一接入共享清洗与标签拆分
     const ipcSrc = fs.readFileSync(path.join(root, "src/main/services/ipcMain.js"), "utf8");
     const cliSrc = fs.readFileSync(path.join(root, "src/main/cli/index.js"), "utf8");
     const routeSrc = fs.readFileSync(path.join(root, "src/main/server/routes/index.js"), "utf8");
+    const vueSrc = fs.readFileSync(
+      path.join(root, "src/renderer/components/LocalVideoPublish.vue"),
+      "utf8"
+    );
     assert.ok(ipcSrc.includes("normalizeBatchXlsxRows"), "ipcMain.js 应调用共享 normalizeBatchXlsxRows");
     assert.ok(cliSrc.includes("normalizeBatchXlsxRows"), "cli/index.js 应调用共享 normalizeBatchXlsxRows");
     assert.ok(cliSrc.includes("sanitizePublishCliArgs"), "cli/index.js 应调用 sanitizePublishCliArgs");
+    assert.ok(cliSrc.includes("splitAndSanitizeTags"), "cli/index.js 应调用共享 splitAndSanitizeTags");
+    assert.ok(vueSrc.includes("splitAndSanitizeTags"), "LocalVideoPublish.vue 应调用共享 splitAndSanitizeTags");
     assert.ok(
       routeSrc.includes("sanitizePublishPayloadObject"),
       "server/routes/index.js 应调用 sanitizePublishPayloadObject"
     );
 
-    console.log("✓ S10 #1 标题/文案共享清洗与 GUI/CLI/HTTP 三链路一致性验证通过");
+    console.log("✓ S10 #1 标题/文案共享清洗、bt2 简介换行与 GUI/CLI/HTTP 标签一致性验证通过");
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

@@ -15,6 +15,12 @@
 const EXCEL_CR_ESCAPE_RE = /_x000d_/gi;
 const ZERO_WIDTH_RE = /[\uFEFF\u200B\u200C\u200D]/g;
 const NBSP_RE = /\u00A0/g;
+const TAG_SPLIT_RE = /[\s,，、;；|]+/;
+
+function isShipinhaoPlatform(raw) {
+  const s = String(raw || "").trim().toLowerCase();
+  return s === "sph" || s === "视频号";
+}
 
 /**
  * 基础清洗：删除 Excel 回车转义 `_x000d_`（大小写不敏感、可连续），并将 `\r\n` / `\r` 统一为 `\n`。
@@ -60,15 +66,49 @@ function sanitizeDescription(raw) {
 }
 
 /**
- * 标签类字段清洗（tags / bq）：支持字符串或字符串数组。
+ * 标签统一清洗与拆分（GUI 单发/批量、CLI publish/xlsx、HTTP /publish、videoMetadata、平台上传共用）：
+ * - 支持字符串或字符串数组
+ * - 删除 `_x000d_`、`\r`、零宽字符、NBSP
+ * - 按空白（含换行）、中英文逗号/顿号/分号/竖线与 `#` 边界拆分
+ * - 去除前导 `#`，过滤空项并保序去重
+ * @param {unknown} raw
+ * @returns {string[]}
+ */
+function splitAndSanitizeTags(raw) {
+  const rawItems = Array.isArray(raw) ? raw : raw == null ? [] : [raw];
+  const out = [];
+  const seen = new Set();
+  for (const entry of rawItems) {
+    if (entry == null) continue;
+    const cleaned = stripExcelEscapesAndCR(entry)
+      .replace(ZERO_WIDTH_RE, "")
+      .replace(NBSP_RE, " ");
+    const parts = cleaned.split(TAG_SPLIT_RE);
+    for (const part of parts) {
+      if (!part) continue;
+      const hashParts = part.split(/(?=#)/);
+      for (const hp of hashParts) {
+        const tag = hp.replace(/^#+/, "").trim();
+        if (!tag || seen.has(tag)) continue;
+        seen.add(tag);
+        out.push(tag);
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * 标签类字段清洗（tags / bq）：支持字符串或字符串数组，统一走 splitAndSanitizeTags。
  * @param {unknown} raw
  * @returns {string|string[]}
  */
 function sanitizeTags(raw) {
+  const list = splitAndSanitizeTags(raw);
   if (Array.isArray(raw)) {
-    return raw.map((item) => sanitizeTitle(item)).filter(Boolean);
+    return list;
   }
-  return sanitizeTitle(raw);
+  return list.join(" ");
 }
 
 /**
@@ -151,17 +191,20 @@ function normalizeBatchXlsxRows(rows) {
     .filter((r) => r.fileName);
 }
 
-const TITLE_BODY_KEYS = ["title", "bt1", "shortTitle", "short_title", "bt2"];
+const TITLE_BODY_KEYS = ["title", "bt1", "shortTitle", "short_title"];
 const DESC_BODY_KEYS = ["description", "desc", "bdText"];
 const TAG_BODY_KEYS = ["tags", "bq"];
 
 /**
  * 清洗单条 HTTP /publish 请求体（或 platforms[] 子对象）的文案字段。
  * 返回浅拷贝，不修改入参原对象。
+ * 注意：旧字段 bt2 在视频号作为短标题（折换行），在其他平台作为简介（保留换行）；
+ * 多平台共享顶层的 bt2 先保留换行，交由 parsePublishArgs 按各目标平台语义最终归一化。
  * @param {Record<string, any>} raw
+ * @param {string} [parentPlatform]
  * @returns {Record<string, any>}
  */
-function sanitizePublishPayloadObject(raw) {
+function sanitizePublishPayloadObject(raw, parentPlatform = "") {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
   const out = { ...raw };
   for (const k of TITLE_BODY_KEYS) {
@@ -174,6 +217,19 @@ function sanitizePublishPayloadObject(raw) {
       out[k] = sanitizeDescription(out[k]);
     }
   }
+  if (Object.prototype.hasOwnProperty.call(out, "bt2") && out.bt2 != null) {
+    const ownPlatform =
+      out.platform != null
+        ? out.platform
+        : out.p != null
+        ? out.p
+        : out.pt != null
+        ? out.pt
+        : parentPlatform;
+    const isSphOnly =
+      !Array.isArray(out.platforms) && isShipinhaoPlatform(ownPlatform);
+    out.bt2 = isSphOnly ? sanitizeTitle(out.bt2) : sanitizeDescription(out.bt2);
+  }
   for (const k of TAG_BODY_KEYS) {
     if (Object.prototype.hasOwnProperty.call(out, k) && out[k] != null) {
       out[k] = sanitizeTags(out[k]);
@@ -182,25 +238,81 @@ function sanitizePublishPayloadObject(raw) {
   if (Array.isArray(out.platforms)) {
     out.platforms = out.platforms.map((item) =>
       item && typeof item === "object" && !Array.isArray(item)
-        ? sanitizePublishPayloadObject(item)
+        ? sanitizePublishPayloadObject(item, "")
         : item
     );
   }
   return out;
 }
 
-const CLI_TITLE_FLAGS = new Set(["-t", "--title", "--short-title", "--bt2"]);
+const CLI_TITLE_FLAGS = new Set(["-t", "--title", "--short-title"]);
 const CLI_DESC_FLAGS = new Set(["--description", "--desc"]);
 const CLI_TAG_FLAGS = new Set(["--tags", "--bq"]);
+const CLI_VALUE_FLAGS = new Set([
+  "-p",
+  "--platform",
+  "-f",
+  "--file",
+  "--phone",
+  "--partition",
+  "-t",
+  "--title",
+  "--description",
+  "--desc",
+  "--short-title",
+  "--name",
+  "--book-name",
+  "--bt2",
+  "--tags",
+  "--bq",
+  "--publish-at",
+  "--dir",
+  "--config",
+  "--xlsx",
+  "--cover",
+  "--creative-statement",
+  "--cs",
+  "--sph-link-type",
+  "--sph-link-value",
+  "--sph-product-id",
+  "--sph-drama-id",
+  "--sph-series-id",
+  "--address",
+]);
+
+function detectCliPublishPlatform(argv) {
+  let platform = "";
+  for (let i = 0; i < argv.length; i++) {
+    const arg = String(argv[i]);
+    const eqIdx = arg.indexOf("=");
+    if (eqIdx > 0) {
+      const flag = arg.slice(0, eqIdx);
+      if (flag === "-p" || flag === "--platform") {
+        platform = arg.slice(eqIdx + 1);
+      }
+      continue;
+    }
+    if ((arg === "-p" || arg === "--platform") && i + 1 < argv.length) {
+      platform = String(argv[++i]);
+      continue;
+    }
+    if (CLI_VALUE_FLAGS.has(arg) && i + 1 < argv.length) {
+      i += 1;
+    }
+  }
+  return platform;
+}
 
 /**
  * 清洗 CLI publish 参数数组中的标题/短标题/简介/标签值（支持 `--flag val` 与 `--flag=val`），
  * 确保在 parsePublishArgs 校验短标题长度/字符之前已完成 `_x000d_` 与 `\r` 清洗。
+ * 严格按参数位置解析，不吞其他选项的值；`--bt2` 仅在视频号折行，其他平台保留换行。
  * @param {string[]} argv
  * @returns {string[]}
  */
 function sanitizePublishCliArgs(argv) {
   if (!Array.isArray(argv)) return [];
+  const targetIsSph = isShipinhaoPlatform(detectCliPublishPlatform(argv));
   const out = [];
   for (let i = 0; i < argv.length; i++) {
     const arg = String(argv[i]);
@@ -214,6 +326,10 @@ function sanitizePublishCliArgs(argv) {
       }
       if (CLI_DESC_FLAGS.has(flag)) {
         out.push(`${flag}=${sanitizeDescription(val)}`);
+        continue;
+      }
+      if (flag === "--bt2") {
+        out.push(`${flag}=${targetIsSph ? sanitizeTitle(val) : sanitizeDescription(val)}`);
         continue;
       }
       if (CLI_TAG_FLAGS.has(flag)) {
@@ -231,8 +347,18 @@ function sanitizePublishCliArgs(argv) {
       i += 1;
       continue;
     }
+    if (arg === "--bt2" && i + 1 < argv.length) {
+      out.push(arg, targetIsSph ? sanitizeTitle(argv[i + 1]) : sanitizeDescription(argv[i + 1]));
+      i += 1;
+      continue;
+    }
     if (CLI_TAG_FLAGS.has(arg) && i + 1 < argv.length) {
       out.push(arg, sanitizeTags(argv[i + 1]));
+      i += 1;
+      continue;
+    }
+    if (CLI_VALUE_FLAGS.has(arg) && i + 1 < argv.length) {
+      out.push(arg, String(argv[i + 1]));
       i += 1;
       continue;
     }
@@ -245,6 +371,7 @@ module.exports = {
   stripExcelEscapesAndCR,
   sanitizeTitle,
   sanitizeDescription,
+  splitAndSanitizeTags,
   sanitizeTags,
   cleanExcelMetaCell,
   normalizeBatchXlsxRows,

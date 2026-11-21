@@ -670,7 +670,7 @@ import { normalizeVideoMetadata } from "../../shared/videoMetadata.js";
 import {
   sanitizeTitle,
   sanitizeDescription,
-  sanitizeTags,
+  splitAndSanitizeTags,
 } from "../../shared/textSanitize.js";
 import AiGenerateButton from "@/components/ai/AiGenerateButton.vue";
 
@@ -688,10 +688,7 @@ function fileStem(p) {
 }
 
 function parseBqToTags(raw) {
-  return String(raw || "")
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean);
+  return splitAndSanitizeTags(raw);
 }
 
 /** 话题平台依赖「#词」；标签多选无 # 时自动补上，已带 # 的不重复添加 */
@@ -1107,7 +1104,7 @@ export default {
         title: bt1,
         description: sanitizeDescription(this.form.description),
         shortTitle: sanitizeTitle(this.form.shortTitle),
-        tags: sanitizeTags(this.bqTags),
+        tags: splitAndSanitizeTags(this.bqTags),
       });
       return {
         bookName,
@@ -2461,14 +2458,8 @@ export default {
         const bt1 = sanitizeTitle(fileRow.title) || stem;
         const description = sanitizeDescription(fileRow.description);
         const shortTitle = sanitizeTitle(fileRow.shortTitle);
-        // tags: comma-separated -> space-separated with # prefix for hashtag platforms
-        const rawTags = sanitizeTags(fileRow.tags);
-        const tagList = rawTags
-          ? String(rawTags)
-              .split(",")
-              .map((t) => sanitizeTitle(t))
-              .filter(Boolean)
-          : [];
+        // 标签统一走共享 splitAndSanitizeTags（与 CLI / HTTP 保持完全一致）
+        const tagList = splitAndSanitizeTags(fileRow.tags);
         const bookName = bt1;
         const selectedFile = fileRow.fileName;
         const textOtherName = stem;

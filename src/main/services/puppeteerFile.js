@@ -31,6 +31,8 @@ import {
   deriveCanonicalPartition,
   normalizeTitleForDedupe,
   extractCandidateTitle,
+  flattenPushDataRecords,
+  readPushDataRecords,
   findRecentDuplicatePublish,
 } from "../../shared/publishDedupe.js";
 import { changeData } from "../server/utils.js";
@@ -318,16 +320,7 @@ function consumePublishDedupeBypass(data) {
 }
 
 function readPushDataRecordsSafe() {
-  try {
-    const res = changeData({
-      fileName: "pushData",
-      type: "get",
-      item: { page: 1, pageSize: 10000 },
-    });
-    return res && res.success && Array.isArray(res.data) ? res.data : [];
-  } catch (_) {
-    return [];
-  }
+  return readPushDataRecords(changeData);
 }
 
 export function checkPublishEntryDuplicate(data, records, options = {}) {
@@ -345,7 +338,10 @@ export function checkPublishEntryDuplicate(data, records, options = {}) {
     typeof options.now === "number" && Number.isFinite(options.now)
       ? options.now
       : Date.now();
-  const list = Array.isArray(records) ? records : readPushDataRecordsSafe();
+  const list =
+    records !== undefined && records !== null
+      ? flattenPushDataRecords(records)
+      : readPushDataRecordsSafe();
   const filtered = list.filter((rec) => {
     if (!rec || typeof rec !== "object") return false;
     // 排除 scheduledPublish.js 刚切为 publishing 的当前定时任务自身记录

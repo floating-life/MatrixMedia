@@ -1,7 +1,7 @@
 import {
   sanitizeTitle,
   sanitizeDescription,
-  stripExcelEscapesAndCR,
+  splitAndSanitizeTags,
 } from "./textSanitize.js";
 
 function firstText(...values) {
@@ -25,17 +25,7 @@ function semanticText(data, key, legacyKeys = [], { multiline = false } = {}) {
 }
 
 export function normalizeVideoTags(value) {
-  const items = Array.isArray(value)
-    ? value.map((item) => stripExcelEscapesAndCR(item))
-    : stripExcelEscapesAndCR(value).split(/[\s,，、;；|]+/);
-  return [
-    ...new Set(
-      items
-        .flatMap((item) => sanitizeTitle(item).split(/(?=#)/))
-        .map((item) => sanitizeTitle(item).replace(/^#+/, ""))
-        .filter(Boolean)
-    ),
-  ];
+  return splitAndSanitizeTags(value);
 }
 
 export function joinDescriptionAndTags(description, tags) {

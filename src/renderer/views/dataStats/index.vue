@@ -130,10 +130,10 @@
           <div class="collect-alert-items">
             <div
               v-for="al in collectAlerts"
-              :key="al.group + '|' + al.platform"
+              :key="al.key || (al.group + '|' + al.platform + '|' + (al.accountKey || ''))"
               class="collect-alert-item"
             >
-              <strong>{{ al.group }} · {{ al.platform }}</strong>
+              <strong>{{ al.account || (al.group + ' · ' + al.platform) }}</strong>
               <el-tag type="danger" size="mini" effect="dark" class="inline-tag">
                 {{ al.isLoginError ? "采集失败/需重新登录" : "采集失败" }}
               </el-tag>

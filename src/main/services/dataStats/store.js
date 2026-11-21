@@ -20,8 +20,43 @@ const METRIC_KEYS = ["fans", "plays", "likes", "comments", "favorites", "shares"
 const ACCOUNT_PLAYS_SHARP_DROP_RATIO = 0.5;
 const COLLECT_ALERTS_VERSION = 1;
 const COLLECT_ALERT_THRESHOLD = 2;
-const LOGIN_ERROR_RE =
-  /未登录|登录.*失效|登录.*过期|失效|重新登录|扫码|cookie|token|auth|unauthorized|401|403/i;
+
+const JSON_PARSE_ERROR_RE =
+  /SyntaxError|Unexpected token|Unexpected end of JSON|is not valid JSON|非JSON响应|响应格式异常/i;
+const EXPLICIT_LOGIN_HTTP_RE =
+  /\b(?:HTTP\s*(?:401|403)|status(?:Code)?\s*[:=]?\s*(?:401|403)|401\s*Unauthorized|403\s*Forbidden)\b/i;
+const EXPLICIT_LOGIN_TEXT_RE =
+  /未登录|登录态?已?失效|登录已?过期|需?重新登录|请先[^\n]*登录|跳[转至到]?登录页|重定向[^\n]*登录页|扫码登录|NOT_LOGGED_IN/i;
+const EXPLICIT_PLATFORM_LOGIN_CODE_RE =
+  /(?:(?:index\/stat|archives)\s*:\s*-101\b|\bcode\s*[:=]?\s*-101\b|(?:dashboard|work_list)\s*:\s*(?:8|10008)\b|\bstatus_code\s*[:=]?\s*(?:8|10008)\b|(?:fans_trend|post_list)\s*:\s*(?:300333|300334)\b|\berrCode\s*[:=]?\s*(?:300333|300334)\b|(?:personal_info|notes)\s*:\s*code\s*[:=]?\s*(?:-100|-101)\b|userInfo\s*:\s*(?:109|100001)\b|\berrno\s*[:=]?\s*(?:10001|10002|110003)\b)/i;
+
+/**
+ * 采集错误分类：
+ * - 登录失效只认明确的登录信号（err.code === "NOT_LOGGED_IN"、HTTP 401/403、平台未登录码、跳登录页/明确未登录文案）
+ * - JSON 解析错误、HTTP 5xx/非 2xx（除 401/403）、普通接口错误体均判为「接口错误」，绝不误报登录失效
+ */
+function classifyCollectError(reason, errObj = null) {
+  const msg = typeof reason === "string" ? reason.trim() : "";
+  if (errObj && errObj.code === "NOT_LOGGED_IN") {
+    return { isLoginError: true, errorType: "login_expired", errorTypeLabel: "登录失效" };
+  }
+  if (errObj && (errObj.status === 401 || errObj.status === 403)) {
+    return { isLoginError: true, errorType: "login_expired", errorTypeLabel: "登录失效" };
+  }
+  if (EXPLICIT_LOGIN_HTTP_RE.test(msg)) {
+    return { isLoginError: true, errorType: "login_expired", errorTypeLabel: "登录失效" };
+  }
+  if (EXPLICIT_LOGIN_TEXT_RE.test(msg)) {
+    return { isLoginError: true, errorType: "login_expired", errorTypeLabel: "登录失效" };
+  }
+  if (EXPLICIT_PLATFORM_LOGIN_CODE_RE.test(msg)) {
+    return { isLoginError: true, errorType: "login_expired", errorTypeLabel: "登录失效" };
+  }
+  if (JSON_PARSE_ERROR_RE.test(msg)) {
+    return { isLoginError: false, errorType: "api_error", errorTypeLabel: "接口错误" };
+  }
+  return { isLoginError: false, errorType: "api_error", errorTypeLabel: "接口错误" };
+}
 
 function baseDir() {
   return path.join(app.getPath("userData"), "data-stats");
@@ -80,12 +115,88 @@ function sumPositiveWorksPlay(works) {
   return { sum, hasAny };
 }
 
+function computeEffectiveCurrWorksPlaySum(group, platform, prevWorks, incomingWorks) {
+  const prevById = new Map();
+  for (const pw of Array.isArray(prevWorks) ? prevWorks : []) {
+    if (pw && pw.workId != null) prevById.set(String(pw.workId), pw);
+  }
+  let dailyHistoryByWork = null;
+  let dailyHistoryLoaded = false;
+  const ensureDailyHistory = () => {
+    if (!dailyHistoryLoaded) {
+      dailyHistoryLoaded = true;
+      try {
+        dailyHistoryByWork = readWorksDaily(group, platform);
+      } catch (_) {
+        dailyHistoryByWork = null;
+      }
+    }
+    return dailyHistoryByWork;
+  };
+  let sum = 0;
+  let hasAny = false;
+  for (const w of Array.isArray(incomingWorks) ? incomingWorks : []) {
+    if (!w || typeof w !== "object") continue;
+    const wid = w.workId != null ? String(w.workId) : "";
+    const existing = wid ? prevById.get(wid) : null;
+    const incomingPlay = normalizeMetric(w.play);
+    let histPosPlay = getWorkHistoricalPositivePlay(existing, null, wid);
+    if (histPosPlay <= 0 && (incomingPlay === 0 || incomingPlay === null)) {
+      histPosPlay = getWorkHistoricalPositivePlay(existing, ensureDailyHistory(), wid);
+    }
+    const isFalseZeroPlay = histPosPlay > 0 && (incomingPlay === 0 || incomingPlay === null);
+    if (isFalseZeroPlay) {
+      // 作品级被判定为假 0 / 缺失（将在 mergeWorks 中置空）时，不视为作品级真实下降，
+      // 沿用其既有正播放参与对比，联动让账号级总播放也判定异常。
+      const existingPos = existing ? normalizeMetric(existing.play) : null;
+      const carry = existingPos !== null && existingPos > 0 ? existingPos : histPosPlay;
+      sum += carry;
+      hasAny = true;
+    } else {
+      const lp = normalizeMetric(w.lastPositivePlay);
+      const v =
+        incomingPlay !== null && incomingPlay > 0
+          ? incomingPlay
+          : lp !== null && lp > 0
+          ? lp
+          : null;
+      if (v !== null) {
+        sum += v;
+        hasAny = true;
+      }
+    }
+  }
+  return { sum, hasAny };
+}
+
 function findPrevValidAccountPlays(daily, today) {
   if (!isPlainObject(daily)) return null;
+  // 1) 同日多次采集优先与当日上一次有效正播放比较（避免同日骤降拿昨天做基准）
+  const todayEntry = daily[today];
+  if (isPlainObject(todayEntry)) {
+    if (todayEntry.playsAnomaly !== true) {
+      const todayPlays = normalizeMetric(todayEntry.plays);
+      if (todayPlays !== null && todayPlays > 0) {
+        return { date: today, value: todayPlays };
+      }
+    } else {
+      const savedValid = normalizeMetric(todayEntry.lastValidPlays);
+      if (savedValid !== null && savedValid > 0) {
+        return { date: today, value: savedValid };
+      }
+      const detail = isPlainObject(todayEntry.playsAnomalyDetail)
+        ? todayEntry.playsAnomalyDetail
+        : null;
+      const detailPrevVal = detail ? normalizeMetric(detail.prevValue) : null;
+      if (detail && detail.prevDate === today && detailPrevVal !== null && detailPrevVal > 0) {
+        return { date: today, value: detailPrevVal };
+      }
+    }
+  }
+  // 2) 当日尚无有效正播放时，回溯早于 today 的最近正常正值日
   const dates = Object.keys(daily)
     .filter((d) => typeof d === "string" && /^\d{4}-\d{2}-\d{2}$/.test(d))
     .sort();
-  let best = null;
   for (let i = dates.length - 1; i >= 0; i--) {
     const d = dates[i];
     if (d >= today) continue;
@@ -93,17 +204,10 @@ function findPrevValidAccountPlays(daily, today) {
     if (!isPlainObject(entry) || entry.playsAnomaly === true) continue;
     const v = normalizeMetric(entry.plays);
     if (v !== null && v > 0) {
-      best = { date: d, value: v };
-      break;
+      return { date: d, value: v };
     }
   }
-  if (!best && isPlainObject(daily[today]) && daily[today].playsAnomaly !== true) {
-    const todayPlays = normalizeMetric(daily[today].plays);
-    if (todayPlays !== null && todayPlays > 0) {
-      best = { date: today, value: todayPlays };
-    }
-  }
-  return best;
+  return null;
 }
 
 /**
@@ -137,7 +241,12 @@ function mergeDaily(group, platform, overview, fansHistory, now = Date.now(), op
         if (opts && Array.isArray(opts.works)) {
           const prevWorks = readWorks(group, platform).works;
           const prevSumInfo = sumPositiveWorksPlay(prevWorks);
-          const currSumInfo = sumPositiveWorksPlay(opts.works);
+          const currSumInfo = computeEffectiveCurrWorksPlaySum(
+            group,
+            platform,
+            prevWorks,
+            opts.works
+          );
           if (prevSumInfo.hasAny && prevSumInfo.sum > 0) {
             const worksDrop = prevSumInfo.sum - (currSumInfo.hasAny ? currSumInfo.sum : 0);
             const worksDropRatio = worksDrop / prevSumInfo.sum;
@@ -153,6 +262,9 @@ function mergeDaily(group, platform, overview, fansHistory, now = Date.now(), op
         if (!hasCorrespondingWorkDrop) {
           mergedToday.plays = null;
           mergedToday.playsAnomaly = true;
+          if (prev.date === today) {
+            mergedToday.lastValidPlays = prev.value;
+          }
           mergedToday.playsAnomalyDetail = {
             prevDate: prev.date,
             prevValue: prev.value,
@@ -162,14 +274,17 @@ function mergeDaily(group, platform, overview, fansHistory, now = Date.now(), op
         } else {
           delete mergedToday.playsAnomaly;
           delete mergedToday.playsAnomalyDetail;
+          delete mergedToday.lastValidPlays;
         }
       } else if (incomingPlays > 0) {
         delete mergedToday.playsAnomaly;
         delete mergedToday.playsAnomalyDetail;
+        delete mergedToday.lastValidPlays;
       }
     } else if (incomingPlays !== null && incomingPlays > 0) {
       delete mergedToday.playsAnomaly;
       delete mergedToday.playsAnomalyDetail;
+      delete mergedToday.lastValidPlays;
     }
   }
 
@@ -1243,14 +1358,66 @@ function getPreviousWorkCount(group, platform) {
   return Math.max(metaPos, metaCur, works.length);
 }
 
-/* ---------------- 采集失败告警（持久化状态） ---------------- */
+/* ---------------- 采集失败告警（持久化状态，按「平台 + 账号」独立键控） ---------------- */
 
 function collectAlertsFile() {
   return path.join(baseDir(), "collect-alerts.json");
 }
 
-function collectAlertKey(group, platform) {
-  return `${String(group || "")}|${String(platform || "")}`;
+function extractAccountIdFromPartition(partition, platform) {
+  let raw = typeof partition === "string" ? partition.trim() : "";
+  if (!raw) return "";
+  if (raw.startsWith("persist:")) raw = raw.slice("persist:".length);
+  const pt = typeof platform === "string" ? platform.trim() : "";
+  if (pt && raw.endsWith(pt) && raw.length > pt.length) {
+    raw = raw.slice(0, raw.length - pt.length);
+  }
+  return raw.trim();
+}
+
+function hasExplicitAccountMeta(meta) {
+  if (!isPlainObject(meta)) return false;
+  return Boolean(
+    (typeof meta.accountKey === "string" && meta.accountKey.trim()) ||
+      (typeof meta.partition === "string" && meta.partition.trim()) ||
+      (typeof meta.accountName === "string" && meta.accountName.trim()) ||
+      (typeof meta.phone === "string" && meta.phone.trim())
+  );
+}
+
+function resolveCollectAlertAccountKey(group, platform, meta = null) {
+  const m = isPlainObject(meta) ? meta : null;
+  if (m && typeof m.accountKey === "string" && m.accountKey.trim()) {
+    return m.accountKey.trim();
+  }
+  if (m && typeof m.partition === "string" && m.partition.trim()) {
+    const fromPart = extractAccountIdFromPartition(m.partition, platform);
+    if (fromPart) return fromPart;
+    return m.partition.trim();
+  }
+  if (m && typeof m.accountName === "string" && m.accountName.trim()) {
+    return m.accountName.trim();
+  }
+  if (m && typeof m.phone === "string" && m.phone.trim()) {
+    return m.phone.trim();
+  }
+  return String(group || "").trim();
+}
+
+function collectAlertKey(group, platform, meta = null) {
+  const pt = String(platform || "").trim();
+  const accId = resolveCollectAlertAccountKey(group, pt, meta);
+  return `${pt}|${accId}`;
+}
+
+function formatCollectAlertAccountLabel(group, platform, accountKey, accountName) {
+  const g = String(group || "").trim();
+  const pt = String(platform || "").trim();
+  const disp = String(accountName || accountKey || "").trim();
+  if (disp && g && disp !== g) {
+    return `${g}·${disp}·${pt}`;
+  }
+  return `${g || disp}·${pt}`;
 }
 
 function emptyCollectAlertsDoc() {
@@ -1263,9 +1430,18 @@ function emptyCollectAlertsDoc() {
 
 function normalizeCollectAlertEntry(raw) {
   if (!isPlainObject(raw)) return null;
-  const group = typeof raw.group === "string" ? raw.group : "";
-  const platform = typeof raw.platform === "string" ? raw.platform : "";
-  if (!group || !platform) return null;
+  const group = typeof raw.group === "string" ? raw.group.trim() : "";
+  const platform = typeof raw.platform === "string" ? raw.platform.trim() : "";
+  if (!platform) return null;
+  const partition = typeof raw.partition === "string" ? raw.partition.trim() : "";
+  const accountName = typeof raw.accountName === "string" ? raw.accountName.trim() : "";
+  const accountKey = resolveCollectAlertAccountKey(group, platform, {
+    accountKey: raw.accountKey,
+    partition,
+    accountName,
+    phone: raw.phone,
+  });
+  if (!group && !accountKey) return null;
   const consecutiveFailures =
     typeof raw.consecutiveFailures === "number" &&
     Number.isInteger(raw.consecutiveFailures) &&
@@ -1281,19 +1457,41 @@ function normalizeCollectAlertEntry(raw) {
       ? raw.lastFailedAt
       : firstFailedAt;
   const reason = typeof raw.reason === "string" && raw.reason.trim() ? raw.reason.trim() : "采集失败";
+  const classified = classifyCollectError(reason);
   const isLoginError =
-    typeof raw.isLoginError === "boolean" ? raw.isLoginError : LOGIN_ERROR_RE.test(reason);
+    typeof raw.isLoginError === "boolean" ? raw.isLoginError : classified.isLoginError;
+  const errorType =
+    typeof raw.errorType === "string" && raw.errorType.trim()
+      ? raw.errorType.trim()
+      : isLoginError
+      ? "login_expired"
+      : classified.errorType;
+  const errorTypeLabel =
+    typeof raw.errorTypeLabel === "string" && raw.errorTypeLabel.trim()
+      ? raw.errorTypeLabel.trim()
+      : errorType === "login_expired"
+      ? "登录失效"
+      : errorType === "zero_works"
+      ? "空作品异常"
+      : "接口错误";
   const alerted = consecutiveFailures >= COLLECT_ALERT_THRESHOLD;
   const notified = Boolean(raw.notified);
   const notifiedAt =
     typeof raw.notifiedAt === "number" && Number.isFinite(raw.notifiedAt) && raw.notifiedAt > 0
       ? raw.notifiedAt
       : null;
+  const key = collectAlertKey(group, platform, { accountKey, partition, accountName });
   return {
-    group,
+    key,
+    group: group || accountKey,
     platform,
-    account: `${group}·${platform}`,
+    accountKey,
+    accountName: accountName || accountKey,
+    partition,
+    account: formatCollectAlertAccountLabel(group || accountKey, platform, accountKey, accountName),
     reason,
+    errorType,
+    errorTypeLabel,
     isLoginError,
     firstFailedAt,
     lastFailedAt,
@@ -1324,7 +1522,7 @@ function readCollectAlerts() {
       const desc = Object.getOwnPropertyDescriptor(parsed.accounts, k);
       const norm = normalizeCollectAlertEntry(desc ? desc.value : null);
       if (norm) {
-        accounts[collectAlertKey(norm.group, norm.platform)] = norm;
+        accounts[norm.key] = norm;
       }
     }
     return {
@@ -1348,7 +1546,7 @@ function writeCollectAlerts(doc, now = Date.now()) {
   for (const k of Object.keys(src)) {
     const norm = normalizeCollectAlertEntry(src[k]);
     if (norm) {
-      plainAccounts[collectAlertKey(norm.group, norm.platform)] = norm;
+      plainAccounts[norm.key] = norm;
     }
   }
   const payload = {
@@ -1360,20 +1558,53 @@ function writeCollectAlerts(doc, now = Date.now()) {
   return payload;
 }
 
-function recordCollectFailure(group, platform, reason, now = Date.now()) {
+function recordCollectFailure(group, platform, reason, now = Date.now(), meta = null) {
   const ts = typeof now === "number" && Number.isFinite(now) ? now : Date.now();
+  const m = isPlainObject(meta) ? meta : null;
   const doc = readCollectAlerts();
-  const key = collectAlertKey(group, platform);
+  const key = collectAlertKey(group, platform, m);
   const prev = doc.accounts[key] || null;
   const cleanReason =
     typeof reason === "string" && reason.trim() ? reason.trim() : "采集失败";
+  const classified = classifyCollectError(cleanReason, m ? m.errorObj : null);
+  const isLoginError =
+    m && typeof m.isLoginError === "boolean" ? m.isLoginError : classified.isLoginError;
+  const errorType =
+    m && typeof m.errorType === "string" && m.errorType.trim()
+      ? m.errorType.trim()
+      : isLoginError
+      ? "login_expired"
+      : classified.errorType;
+  const errorTypeLabel =
+    errorType === "login_expired"
+      ? "登录失效"
+      : errorType === "zero_works"
+      ? "空作品异常"
+      : "接口错误";
   const consecutiveFailures = prev ? prev.consecutiveFailures + 1 : 1;
+  const accountKey = resolveCollectAlertAccountKey(group, platform, m);
+  const partition =
+    (m && typeof m.partition === "string" && m.partition.trim()) ||
+    (prev && prev.partition) ||
+    "";
+  const accountName =
+    (m && typeof m.accountName === "string" && m.accountName.trim()) ||
+    (prev && prev.accountName) ||
+    accountKey;
+  const groupStr = String(group || "").trim() || accountKey;
+  const platformStr = String(platform || "").trim();
   const state = {
-    group: String(group || ""),
-    platform: String(platform || ""),
-    account: `${String(group || "")}·${String(platform || "")}`,
+    key,
+    group: groupStr,
+    platform: platformStr,
+    accountKey,
+    accountName,
+    partition,
+    account: formatCollectAlertAccountLabel(groupStr, platformStr, accountKey, accountName),
     reason: cleanReason,
-    isLoginError: LOGIN_ERROR_RE.test(cleanReason),
+    errorType,
+    errorTypeLabel,
+    isLoginError,
     firstFailedAt: prev && prev.firstFailedAt > 0 ? prev.firstFailedAt : ts,
     lastFailedAt: ts,
     consecutiveFailures,
@@ -1390,10 +1621,10 @@ function recordCollectFailure(group, platform, reason, now = Date.now()) {
   };
 }
 
-function markCollectAlertNotified(group, platform, now = Date.now()) {
+function markCollectAlertNotified(group, platform, now = Date.now(), meta = null) {
   const ts = typeof now === "number" && Number.isFinite(now) ? now : Date.now();
   const doc = readCollectAlerts();
-  const key = collectAlertKey(group, platform);
+  const key = collectAlertKey(group, platform, meta);
   const entry = doc.accounts[key];
   if (!entry) return null;
   entry.notified = true;
@@ -1402,33 +1633,64 @@ function markCollectAlertNotified(group, platform, now = Date.now()) {
   return entry;
 }
 
-function clearCollectFailure(group, platform, now = Date.now()) {
+function clearCollectFailure(group, platform, now = Date.now(), meta = null) {
   const doc = readCollectAlerts();
-  const key = collectAlertKey(group, platform);
+  const key = collectAlertKey(group, platform, meta);
   if (!doc.accounts[key]) return false;
   delete doc.accounts[key];
   writeCollectAlerts(doc, now);
   return true;
 }
 
-function getAccountCollectFailureState(group, platform) {
-  const doc = readCollectAlerts();
-  return doc.accounts[collectAlertKey(group, platform)] || null;
+function sortCollectAlerts(list) {
+  return list.sort((a, b) => {
+    if (a.group !== b.group) return a.group < b.group ? -1 : 1;
+    if (a.platform !== b.platform) return a.platform < b.platform ? -1 : 1;
+    const ak = a.accountKey || "";
+    const bk = b.accountKey || "";
+    return ak < bk ? -1 : ak > bk ? 1 : 0;
+  });
 }
 
-function getAccountCollectAlert(group, platform) {
-  const state = getAccountCollectFailureState(group, platform);
+function getAccountCollectFailureState(group, platform, meta = null) {
+  const doc = readCollectAlerts();
+  const key = collectAlertKey(group, platform, meta);
+  if (doc.accounts[key]) return doc.accounts[key];
+  if (hasExplicitAccountMeta(meta)) return null;
+  const g = String(group || "").trim();
+  const pt = String(platform || "").trim();
+  const matched = Object.values(doc.accounts).filter(
+    (entry) => entry && entry.group === g && entry.platform === pt
+  );
+  if (!matched.length) return null;
+  matched.sort((a, b) => {
+    if (Boolean(b.alerted) !== Boolean(a.alerted)) return b.alerted ? 1 : -1;
+    return (b.lastFailedAt || 0) - (a.lastFailedAt || 0);
+  });
+  return matched[0];
+}
+
+function getAccountCollectAlert(group, platform, meta = null) {
+  const state = getAccountCollectFailureState(group, platform, meta);
   return state && state.alerted ? state : null;
+}
+
+function getAccountCollectAlerts(group, platform) {
+  const doc = readCollectAlerts();
+  const g = String(group || "").trim();
+  const pt = String(platform || "").trim();
+  return sortCollectAlerts(
+    Object.values(doc.accounts).filter(
+      (entry) => entry && entry.alerted && entry.group === g && entry.platform === pt
+    )
+  );
 }
 
 function listActiveCollectAlerts() {
   const doc = readCollectAlerts();
-  return Object.values(doc.accounts)
-    .filter((entry) => entry && entry.alerted)
-    .sort((a, b) => {
-      if (a.group !== b.group) return a.group < b.group ? -1 : 1;
-      return a.platform < b.platform ? -1 : a.platform > b.platform ? 1 : 0;
-    });
+  return sortCollectAlerts(
+    Object.values(doc.accounts).filter((entry) => entry && entry.alerted)
+  );
 }
 
 /* ---------------- 采集日志 ---------------- */
@@ -2090,13 +2352,15 @@ function mergeWorksOverride(workKeys, now = Date.now(), title = "") {
 
 /** 单账号完整数据（平台页用） */
 function readAccount(group, platform) {
+  const alerts = getAccountCollectAlerts(group, platform);
   return {
     group,
     platform,
     daily: readDaily(group, platform),
     works: readWorks(group, platform).works,
     meta: readJson(path.join(accountDir(group, platform), "meta.json"), {}),
-    collectAlert: getAccountCollectAlert(group, platform),
+    collectAlert: alerts[0] || getAccountCollectAlert(group, platform),
+    collectAlerts: alerts,
   };
 }
 
@@ -2139,16 +2403,18 @@ function readOverview() {
         if (Number.isFinite(v)) merged[date][k] += v;
       }
     }
-    const alertState = alertsDoc.accounts[collectAlertKey(acc.group, acc.platform)] || null;
-    const collectAlert = alertState && alertState.alerted ? alertState : null;
-    return { ...acc, latest, collectAlert };
+    const matchedAlerts = sortCollectAlerts(
+      Object.values(alertsDoc.accounts).filter(
+        (entry) =>
+          entry && entry.alerted && entry.group === acc.group && entry.platform === acc.platform
+      )
+    );
+    const collectAlert = matchedAlerts[0] || null;
+    return { ...acc, latest, collectAlert, collectAlerts: matchedAlerts };
   });
-  const collectAlerts = Object.values(alertsDoc.accounts)
-    .filter((entry) => entry && entry.alerted)
-    .sort((a, b) => {
-      if (a.group !== b.group) return a.group < b.group ? -1 : 1;
-      return a.platform < b.platform ? -1 : a.platform > b.platform ? 1 : 0;
-    });
+  const collectAlerts = sortCollectAlerts(
+    Object.values(alertsDoc.accounts).filter((entry) => entry && entry.alerted)
+  );
   return { daily: merged, accounts, collectAlerts };
 }
 
@@ -2179,6 +2445,9 @@ module.exports = {
   writeMeta,
   getPreviousWorkCount,
   collectAlertsFile,
+  collectAlertKey,
+  resolveCollectAlertAccountKey,
+  classifyCollectError,
   readCollectAlerts,
   writeCollectAlerts,
   recordCollectFailure,
@@ -2186,6 +2455,7 @@ module.exports = {
   clearCollectFailure,
   getAccountCollectFailureState,
   getAccountCollectAlert,
+  getAccountCollectAlerts,
   listActiveCollectAlerts,
   appendCollectLog,
   readCollectLogs,

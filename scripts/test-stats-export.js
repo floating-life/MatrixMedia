@@ -778,6 +778,7 @@ async function main() {
       null,
       null,
       null,
+      null,
     ]);
     const aDy10 = findS4("2026-11-10", "抖音", "A组");
     assert.strictEqual(aDy10[9], 5, "11-10 粉丝日增应相对 11-09 回填日计算");

@@ -23,9 +23,33 @@ const DAY_MS = 86400000;
 
 /** 页面内 fetch 公共封装（每个脚本开头注入） */
 const FETCH_HELPER = `
+  const __parseResponse = async (res, url) => {
+    const status = res && typeof res.status === "number" ? res.status : 0;
+    const finalUrl = res && typeof res.url === "string" ? res.url : "";
+    const text = await res.text();
+    if (status === 401 || status === 403) {
+      throw new Error("接口认证失效(HTTP " + status + "): " + url);
+    }
+    if (finalUrl && /(?:login|passport|qrcode)/i.test(finalUrl)) {
+      throw new Error("登录态已失效（接口跳转登录页）: " + finalUrl);
+    }
+    if (status < 200 || status >= 300) {
+      throw new Error("采集接口错误(HTTP " + status + "): " + url);
+    }
+    let json;
+    try {
+      json = JSON.parse(text);
+    } catch (_parseErr) {
+      throw new Error("采集接口错误(非JSON响应, HTTP " + status + "): " + url);
+    }
+    if (!json || typeof json !== "object") {
+      throw new Error("采集接口错误(响应格式异常, HTTP " + status + "): " + url);
+    }
+    return { status, json };
+  };
   const __get = async (url) => {
     const res = await fetch(url, { headers: { accept: "application/json, text/plain, */*" }, credentials: "include" });
-    return { status: res.status, json: JSON.parse(await res.text()) };
+    return __parseResponse(res, url);
   };
   const __post = async (url, body) => {
     const res = await fetch(url, {
@@ -34,7 +58,7 @@ const FETCH_HELPER = `
       credentials: "include",
       body: JSON.stringify(body),
     });
-    return { status: res.status, json: JSON.parse(await res.text()) };
+    return __parseResponse(res, url);
   };
   const __sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const __num = (v) => Number(v) || 0;
@@ -55,7 +79,7 @@ const ADAPTERS = {
     recent_days: 30,
     date_range: { start_date: fmt(Date.now() - 30 * ${DAY_MS}), end_date: fmt(Date.now() - ${DAY_MS}) },
   });
-  if (dash.json.status_code !== 0) throw new Error("dashboard: " + (dash.json.status_msg || dash.json.status_code));
+  if (dash.json.status_code !== 0) throw new Error("dashboard: status_code=" + dash.json.status_code + " " + (dash.json.status_msg || ""));
   for (const m of dash.json.metrics || []) {
     if (m.english_metric_name === "total_fans_cnt") {
       out.overview.fans = __num(m.metric_value);
@@ -74,7 +98,7 @@ const ADAPTERS = {
         cursor + "&aid=1128&support_h265=1"
     );
     const j = r.json;
-    if (j.status_code !== 0) throw new Error("work_list: " + (j.status_msg || j.status_code));
+    if (j.status_code !== 0) throw new Error("work_list: status_code=" + j.status_code + " " + (j.status_msg || ""));
     for (const it of j.items || []) {
       const mt = it.metrics || {};
       const w = {
@@ -124,7 +148,7 @@ const ADAPTERS = {
     _log_finder_uin: "", _log_finder_id: "", rawKeyBuff: "",
     pluginSessionId: null, scene: 7, reqScene: 7,
   });
-  if (fans.json.errCode !== 0) throw new Error("fans_trend: " + (fans.json.errMsg || fans.json.errCode));
+  if (fans.json.errCode !== 0) throw new Error("fans_trend: errCode=" + fans.json.errCode + " " + (fans.json.errMsg || ""));
   const totals = (fans.json.data && fans.json.data.total) || [];
   if (totals.length) {
     out.overview.fans = totals[totals.length - 1];
@@ -144,7 +168,7 @@ const ADAPTERS = {
       pluginSessionId: null, scene: 7, reqScene: 7,
     });
     const j = r.json;
-    if (j.errCode !== 0) throw new Error("post_list: " + (j.errMsg || j.errCode));
+    if (j.errCode !== 0) throw new Error("post_list: errCode=" + j.errCode + " " + (j.errMsg || ""));
     const data = j.data || {};
     for (const v of data.list || []) {
       const d = v.desc || {};
@@ -232,7 +256,7 @@ const ADAPTERS = {
   const out = { overview: {}, fansHistory: [], works: [] };
   // 1) 账号总量看板（含昨日增量）
   const stat = await __get("/x/web/data/index/stat");
-  if (stat.json.code !== 0) throw new Error("index/stat: " + (stat.json.message || stat.json.code));
+  if (stat.json.code !== 0) throw new Error("index/stat: code=" + stat.json.code + " " + (stat.json.message || ""));
   const s = stat.json.data || {};
   out.overview = {
     fans: __num(s.total_fans),
@@ -249,7 +273,7 @@ const ADAPTERS = {
       "/x/web/archives?status=is_pubing,pubed,not_pubed&pn=" + pn + "&ps=20&coop=1&interactive=1"
     );
     const j = r.json;
-    if (j.code !== 0) throw new Error("archives: " + (j.message || j.code));
+    if (j.code !== 0) throw new Error("archives: code=" + j.code + " " + (j.message || ""));
     const data = j.data || {};
     for (const item of data.arc_audits || []) {
       const a = item.Archive || {};
@@ -287,8 +311,17 @@ const ADAPTERS = {
   const out = { overview: {}, fansHistory: [], works: [] };
   // 1) 首页概览
   const home = await __get("/pcui/home/index");
+  if (
+    (home.json.errno != null && Number(home.json.errno) !== 0) ||
+    (home.json.code != null && Number(home.json.code) !== 0) ||
+    home.json.error
+  ) {
+    const errCode = home.json.errno != null ? home.json.errno : home.json.code;
+    const errMsg = home.json.errmsg || home.json.message || home.json.error || errCode;
+    throw new Error("采集接口错误: home/index: errno=" + errCode + " " + errMsg);
+  }
   const core = (home.json.data && home.json.data.coreData) || home.json.coreData;
-  if (!core) throw new Error("home/index: 未取到 coreData（可能未登录）");
+  if (!core) throw new Error("采集接口错误: home/index 缺少 coreData");
   out.overview = { fans: __num(core.fansCount), plays: __num(core.viewCount) };
   // 2) 内容列表（页码分页；video_set 合集跳过）
   const __parseUtc8Time = (raw) => {
@@ -332,7 +365,22 @@ const ADAPTERS = {
         "&pageSize=10&search=&type=&collection=&startDate=&endDate=&clearBeforeFetch=false&dynamic=1"
     );
     const j = r.json;
-    const list = Array.isArray(j.list) ? j.list : (j.data && j.data.list) || [];
+    if (
+      (j.errno != null && Number(j.errno) !== 0) ||
+      (j.code != null && Number(j.code) !== 0) ||
+      (j.status != null && Number(j.status) !== 0 && j.status !== "ok" && j.status !== "success") ||
+      j.error
+    ) {
+      const errCode = j.errno != null ? j.errno : (j.code != null ? j.code : j.status);
+      const errMsg = j.errmsg || j.message || j.error || errCode;
+      throw new Error("采集接口错误: article/lists: errno=" + errCode + " " + errMsg);
+    }
+    const list = Array.isArray(j.list)
+      ? j.list
+      : (j.data && Array.isArray(j.data.list) ? j.data.list : null);
+    if (list === null) {
+      throw new Error("采集接口错误: article/lists 缺少列表字段");
+    }
     const pageInfo = j.page || (j.data && j.data.page) || {};
     for (const it of list) {
       if (it.type === "video_set") continue; // 合集不是单作品
@@ -370,8 +418,18 @@ const ADAPTERS = {
   const out = { overview: {}, fansHistory: [], works: [] };
   // 1) 首页聚合：粉丝总量 + 总播放阅读
   const home = await __get("/mp/fe_api/home/merge_v2?app_id=1231");
+  if (
+    (home.json.code != null && Number(home.json.code) !== 0) ||
+    (home.json.err_no != null && Number(home.json.err_no) !== 0) ||
+    (home.json.status_code != null && Number(home.json.status_code) !== 0) ||
+    home.json.error
+  ) {
+    const errCode = home.json.err_no != null ? home.json.err_no : (home.json.code != null ? home.json.code : home.json.status_code);
+    const errMsg = home.json.message || home.json.errmsg || home.json.error || errCode;
+    throw new Error("采集接口错误: home/merge_v2: code=" + errCode + " " + errMsg);
+  }
   const st = home.json && home.json.data && home.json.data.statistic && home.json.data.statistic.data;
-  if (!st) throw new Error("home/merge_v2: 未取到 statistic（可能未登录）");
+  if (!st) throw new Error("采集接口错误: home/merge_v2 未取到 statistic");
   out.overview.fans = __num(st.total_subscribe_count);
   out.overview.plays = __num(st.total_read_play_count);
   // 2) 作品列表（offset 毫秒游标分页；visited_uid 从 localStorage 取）
@@ -395,7 +453,20 @@ const ADAPTERS = {
         "&offset=" + offset + "&count=200&keyword=&client_extra_params=" + clientExtra + "&app_id=1231"
     );
     const j = r.json;
-    const list = j.data || [];
+    if (
+      (j.err_no != null && Number(j.err_no) !== 0) ||
+      (j.code != null && Number(j.code) !== 0) ||
+      (j.status_code != null && Number(j.status_code) !== 0) ||
+      j.error
+    ) {
+      const errCode = j.err_no != null ? j.err_no : (j.code != null ? j.code : j.status_code);
+      const errMsg = j.message || j.errmsg || j.error || errCode;
+      throw new Error("采集接口错误: mp_provider/v1: code=" + errCode + " " + errMsg);
+    }
+    if (!Array.isArray(j.data)) {
+      throw new Error("采集接口错误: mp_provider/v1 缺少 data 列表");
+    }
+    const list = j.data;
     if (list.length === 0) break; // 空页即终止（has_more 是 feed 惯性标记，不可信）
     for (const it of list) {
       const cell = (it.assembleCell && it.assembleCell.itemCell) || {};
@@ -542,12 +613,12 @@ const ADAPTERS = {
     if (sign["X-t"]) headers["x-t"] = String(sign["X-t"]);
     if (sign["X-s-common"]) headers["x-s-common"] = sign["X-s-common"];
     const res = await fetch(url, { headers, credentials: "include" });
-    return { status: res.status, json: JSON.parse(await res.text()) };
+    return __parseResponse(res, url);
   };
   // 1) 个人信息（粉丝 / 获赞与收藏）
   const info = await __signed("/api/galaxy/creator/home/personal_info");
   const d = (info.json && info.json.data) || {};
-  if (info.json.code !== 0) throw new Error("personal_info: code=" + info.json.code);
+  if (info.json.code !== 0) throw new Error("personal_info: code=" + info.json.code + " " + (info.json.msg || info.json.message || ""));
   out.overview.fans = __num(d.fans_count);
   // 2) 笔记列表（page 递增，响应 page=-1 终止）
   const __parseUtc8Time = (raw) => {
@@ -588,8 +659,11 @@ const ADAPTERS = {
   while (guard++ < 50) {
     const r = await __signed("/api/galaxy/v2/creator/note/user/posted?tab=0&page=" + page);
     const j = r.json;
-    if (j.code !== 0) throw new Error("notes: code=" + j.code);
-    const notes = (j.data && j.data.notes) || [];
+    if (j.code !== 0) throw new Error("notes: code=" + j.code + " " + (j.msg || j.message || ""));
+    if (!j.data || !Array.isArray(j.data.notes)) {
+      throw new Error("采集接口错误: notes 缺少 notes 列表");
+    }
+    const notes = j.data.notes;
     for (const n of notes) {
       const w = {
         workId: String(n.id || ""),

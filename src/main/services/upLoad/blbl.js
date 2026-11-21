@@ -240,7 +240,7 @@ export default async function (page, data, window, event) {
     console.error("❌ 输入简介失败", e);
   }
   try {
-    const tag = normalizeVideoTags(data.data.tags);
+    const tag = normalizeVideoTags(data.data.tags ?? data.data.bq);
     const selector = ".tag-container .input-instance input";
     await page.waitForSelector(selector, { timeout: WAIT_SELECTOR_APPEAR_MS });
     const input = await page.$(selector);

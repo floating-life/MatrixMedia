@@ -234,15 +234,77 @@ function statusDisplayName(status) {
 }
 
 /**
+ * 兼容 pushData 返回的两种结构，统一平铺为发布记录数组：
+ * 1) 真实 changeData({ fileName: "pushData", type: "get" }) 返回的按日期分组对象 { "YYYY-MM-DD": [...] }
+ * 2) 完整响应体 { success: true, data: ... } 或平铺数组 [...]
+ *
+ * @param {unknown} raw
+ * @returns {Array<object>}
+ */
+function flattenPushDataRecords(raw) {
+  if (!raw) return [];
+  if (Array.isArray(raw)) {
+    return raw.filter((item) => item && typeof item === "object");
+  }
+  if (typeof raw !== "object") return [];
+  if (
+    Object.prototype.hasOwnProperty.call(raw, "success") &&
+    Object.prototype.hasOwnProperty.call(raw, "data")
+  ) {
+    if (raw.success === false) return [];
+    return flattenPushDataRecords(raw.data);
+  }
+  const rows = [];
+  for (const dateKey of Object.keys(raw)) {
+    const list = raw[dateKey];
+    if (!Array.isArray(list)) continue;
+    for (let i = 0; i < list.length; i++) {
+      const it = list[i];
+      if (!it || typeof it !== "object") continue;
+      rows.push(it.date ? it : { ...it, date: dateKey });
+    }
+  }
+  return rows;
+}
+
+/**
+ * GUI / CLI / HTTP / puppeteerFile 查重共用的 pushData 读取函数。
+ * 统一通过 changeData({ fileName: "pushData", type: "get" }) 读取并兼容按日期分组对象与数组。
+ *
+ * @param {Function} changeDataFn
+ * @param {object} [options]
+ * @returns {Array<object>}
+ */
+function readPushDataRecords(changeDataFn, options = {}) {
+  if (typeof changeDataFn !== "function") return [];
+  try {
+    const pageSize =
+      typeof options.pageSize === "number" && options.pageSize > 0
+        ? options.pageSize
+        : 10000;
+    const res = changeDataFn({
+      fileName: "pushData",
+      type: "get",
+      item: { page: 1, pageSize },
+    });
+    if (!res || res.success === false) return [];
+    return flattenPushDataRecords(res.data);
+  } catch (_) {
+    return [];
+  }
+}
+
+/**
  * 在 pushData 发布记录中查找同平台 + 同账号 + 清洗归一后标题相同、且 7 天内有成功/进行中记录的最近一条。
  *
- * @param {Array<object>} records pushData 记录数组
+ * @param {Array<object>|Record<string, Array<object>>} records pushData 记录数组或按日期分组对象
  * @param {object} candidate { pt|platform, phone?, partition?, accountKey?, title?, bt1?, bookName?, data? }
  * @param {object} [options] { now?: number, windowMs?: number, excludeRecordId?: string|number }
  * @returns {object|null}
  */
 function findRecentDuplicatePublish(records, candidate, options = {}) {
-  if (!Array.isArray(records) || records.length === 0 || !candidate) return null;
+  const list = Array.isArray(records) ? records : flattenPushDataRecords(records);
+  if (list.length === 0 || !candidate) return null;
   const now =
     typeof options.now === "number" && Number.isFinite(options.now)
       ? options.now
@@ -268,8 +330,8 @@ function findRecentDuplicatePublish(records, candidate, options = {}) {
   let bestRecord = null;
   let bestTimeMs = -1;
 
-  for (let i = 0; i < records.length; i++) {
-    const rec = records[i];
+  for (let i = 0; i < list.length; i++) {
+    const rec = list[i];
     if (!rec || typeof rec !== "object") continue;
     if (excludeRecordId && rec.id != null && String(rec.id) === excludeRecordId) {
       continue;
@@ -344,11 +406,13 @@ function findRecentDuplicatePublish(records, candidate, options = {}) {
  */
 function findDuplicatePublishesForTargets(records, targets, options = {}) {
   if (!Array.isArray(targets) || targets.length === 0) return [];
+  const list = Array.isArray(records) ? records : flattenPushDataRecords(records);
+  if (list.length === 0) return [];
   const hits = [];
   for (let i = 0; i < targets.length; i++) {
     const t = targets[i];
     if (!t || t.allowDuplicate === true) continue;
-    const hit = findRecentDuplicatePublish(records, t, options);
+    const hit = findRecentDuplicatePublish(list, t, options);
     if (hit) {
       hits.push({ index: i, target: t, hit });
     }
@@ -370,6 +434,8 @@ module.exports = {
   extractRecordPublishTimeMs,
   formatUtc8DateTime,
   isBlockingPublishRecord,
+  flattenPushDataRecords,
+  readPushDataRecords,
   findRecentDuplicatePublish,
   findDuplicatePublishesForTargets,
 };

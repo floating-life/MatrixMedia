@@ -624,6 +624,8 @@ async function collectAccounts(accounts, sender, options = {}) {
       : null;
   const collectedAutoPartitions = Object.create(null);
   const attemptedAutoPartitions = Object.create(null);
+  // 一轮采集内同一个「平台 + 账号」的告警状态只计一次，防止重复累加或互清
+  const roundAlertCounted = new Set();
   let firstAutoAttemptAt = 0;
   let hasCollectedAny = false;
 
@@ -697,6 +699,16 @@ async function collectAccounts(accounts, sender, options = {}) {
     }
 
     progress("running");
+    const alertMeta = {
+      accountKey: acc.accountKey,
+      partition: acc.partition,
+      phone: acc.phone,
+      accountName: acc.accountName,
+    };
+    const alertKey =
+      typeof store.collectAlertKey === "function"
+        ? store.collectAlertKey(acc.group, acc.platform, alertMeta)
+        : `${String(acc.platform || "")}|${String(acc.accountKey || acc.partition || acc.group || "")}`;
     const prevWorkCount =
       typeof store.getPreviousWorkCount === "function"
         ? store.getPreviousWorkCount(acc.group, acc.platform)
@@ -708,14 +720,41 @@ async function collectAccounts(accounts, sender, options = {}) {
       });
       // 以采集返回时刻的 UTC+8 日期为整次写入的唯一日期，daily/works-daily/intraday 统一按 collectNow 归档
       const collectNow = Date.now();
-      const outcome = handleAccountCollectOutcome({
-        group: acc.group,
-        platform: acc.platform,
-        success: true,
-        works: data.works,
-        prevWorkCount,
-        now: collectNow,
-      });
+      let outcome;
+      if (!roundAlertCounted.has(alertKey)) {
+        roundAlertCounted.add(alertKey);
+        outcome = handleAccountCollectOutcome({
+          group: acc.group,
+          platform: acc.platform,
+          ...alertMeta,
+          success: true,
+          works: data.works,
+          prevWorkCount,
+          now: collectNow,
+        });
+      } else {
+        const workLen = Array.isArray(data.works) ? data.works.length : 0;
+        const zeroWorksAnomaly = prevWorkCount > 0 && workLen === 0;
+        const curState =
+          typeof store.getAccountCollectFailureState === "function"
+            ? store.getAccountCollectFailureState(acc.group, acc.platform, alertMeta)
+            : null;
+        outcome = zeroWorksAnomaly
+          ? {
+              ok: false,
+              zeroWorksAnomaly: true,
+              reason: `上次作品数 ${prevWorkCount}，本次采集为 0（疑似接口异常或登录态异常）`,
+              alert: curState,
+              notified: false,
+            }
+          : {
+              ok: true,
+              zeroWorksAnomaly: false,
+              reason: "",
+              alert: null,
+              notified: false,
+            };
+      }
       if (!outcome.ok && outcome.zeroWorksAnomaly) {
         try {
           store.writeMeta(acc.group, acc.platform, {
@@ -731,6 +770,8 @@ async function collectAccounts(accounts, sender, options = {}) {
         results.push({
           group: acc.group,
           platform: acc.platform,
+          ...(acc.accountKey ? { accountKey: acc.accountKey } : {}),
+          ...(acc.partition ? { partition: acc.partition } : {}),
           success: false,
           workCount: 0,
           error: outcome.reason,
@@ -770,6 +811,8 @@ async function collectAccounts(accounts, sender, options = {}) {
       results.push({
         group: acc.group,
         platform: acc.platform,
+        ...(acc.accountKey ? { accountKey: acc.accountKey } : {}),
+        ...(acc.partition ? { partition: acc.partition } : {}),
         success: true,
         workCount: data.works.length,
         collectedAt: collectNow,
@@ -780,15 +823,22 @@ async function collectAccounts(accounts, sender, options = {}) {
       const failNow = Date.now();
       let alertState = null;
       try {
-        const outcome = handleAccountCollectOutcome({
-          group: acc.group,
-          platform: acc.platform,
-          success: false,
-          error: message,
-          prevWorkCount,
-          now: failNow,
-        });
-        alertState = outcome.alert;
+        if (!roundAlertCounted.has(alertKey)) {
+          roundAlertCounted.add(alertKey);
+          const outcome = handleAccountCollectOutcome({
+            group: acc.group,
+            platform: acc.platform,
+            ...alertMeta,
+            success: false,
+            error: message,
+            errorObj: err,
+            prevWorkCount,
+            now: failNow,
+          });
+          alertState = outcome.alert;
+        } else if (typeof store.getAccountCollectFailureState === "function") {
+          alertState = store.getAccountCollectFailureState(acc.group, acc.platform, alertMeta);
+        }
       } catch (alertErr) {
         console.warn(
           "[dataStats] 记录采集失败告警异常:",
@@ -809,6 +859,8 @@ async function collectAccounts(accounts, sender, options = {}) {
       results.push({
         group: acc.group,
         platform: acc.platform,
+        ...(acc.accountKey ? { accountKey: acc.accountKey } : {}),
+        ...(acc.partition ? { partition: acc.partition } : {}),
         success: false,
         error: message,
         ...(alertState ? { alert: alertState } : {}),
@@ -1902,6 +1954,7 @@ function registerDataStatsIpc(options = {}) {
           const outcome = handleAccountCollectOutcome({
             group,
             platform,
+            partition,
             success: true,
             works: data.works,
             prevWorkCount,
@@ -1958,8 +2011,10 @@ function registerDataStatsIpc(options = {}) {
             handleAccountCollectOutcome({
               group,
               platform,
+              partition,
               success: false,
               error: message,
+              errorObj: err,
               prevWorkCount,
               now: Date.now(),
             });

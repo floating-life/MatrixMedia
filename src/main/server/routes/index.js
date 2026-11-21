@@ -6,6 +6,7 @@ const { sanitizePublishPayloadObject } = require("../../../shared/textSanitize.j
 const {
   DUPLICATE_EXIT_CODE,
   findRecentDuplicatePublish,
+  readPushDataRecords,
 } = require("../../../shared/publishDedupe.js");
 const { handleAccountCollectOutcome } = require("../../services/dataStats/collectAlert.js");
 
@@ -85,16 +86,7 @@ function fileStemForDedupe(rawFile) {
 }
 
 function readPushDataRecordsForHttp() {
-  try {
-    const res = changeData({
-      fileName: "pushData",
-      type: "get",
-      item: { page: 1, pageSize: 10000 },
-    });
-    return res && res.success && Array.isArray(res.data) ? res.data : [];
-  } catch (_) {
-    return [];
-  }
+  return readPushDataRecords(changeData);
 }
 
 router.post("/publish", async function (req, res) {
@@ -140,7 +132,7 @@ router.post("/publish", async function (req, res) {
         pt: target.platform,
       });
       const candTitle = target.title || fileStemForDedupe(target.file);
-      if (!rootAllowDuplicate) {
+      if (!(rootAllowDuplicate || target.allowDuplicate === true)) {
         const hit = findRecentDuplicatePublish(records, {
           pt: target.platform,
           phone: target.phone,
@@ -171,22 +163,6 @@ router.post("/publish", async function (req, res) {
       result = await publishService.runSingleFilePublish(target);
     } else {
       // platforms 数组（1 个或多个平台）：逐平台查重，仅拦截重复的那几个平台，其余平台照常执行
-      const rawPlatformItems = Array.isArray(sanitizedBody.platforms)
-        ? sanitizedBody.platforms
-        : [];
-      const allowDupByAccount = new Map();
-      for (const rawItem of rawPlatformItems) {
-        if (rawItem && typeof rawItem === "object") {
-          const rawPt = String(rawItem.platform || rawItem.pt || "").trim();
-          const ptName =
-            PLATFORM_ALIASES[rawPt] || PLATFORM_ALIASES[rawPt.toLowerCase()] || rawPt;
-          const itemPhone = String(rawItem.phone || sanitizedBody.phone || "").trim();
-          if (ptName && rawItem.allowDuplicate === true) {
-            allowDupByAccount.set(`${ptName}|${itemPhone}`, true);
-          }
-        }
-      }
-
       const targets = parsed.value;
       const allowedTargets = [];
       const allowedIndices = [];
@@ -200,10 +176,7 @@ router.post("/publish", async function (req, res) {
           pt: t.platform,
         });
         const candTitle = t.title || fileStemForDedupe(t.file);
-        const targetPhone = String(t.phone || "").trim();
-        const allowDup =
-          rootAllowDuplicate ||
-          allowDupByAccount.get(`${t.platform}|${targetPhone}`) === true;
+        const allowDup = Boolean(t.allowDuplicate);
         if (!allowDup) {
           const hit = findRecentDuplicatePublish(records, {
             pt: t.platform,
@@ -389,6 +362,7 @@ router.post("/stats/sync", async function (req, res) {
     typeof store.getPreviousWorkCount === "function"
       ? store.getPreviousWorkCount(phone, pt)
       : 0;
+  let syncPartition = "";
   try {
     const { collectAccount } = require("../../services/dataStats/collector.js");
     // 与登录窗口同一套 partition 规则：优先按账号记录的 accountKey（新分组模型），
@@ -396,14 +370,17 @@ router.post("/stats/sync", async function (req, res) {
     const { resolveTaskPartition } = await import(
       "../../services/accountLookup.js"
     );
+    syncPartition = resolveTaskPartition({ phone, pt });
+    const alertMeta = { partition: syncPartition, phone };
     const data = await collectAccount({
-      partition: resolveTaskPartition({ phone, pt }),
+      partition: syncPartition,
       platform: pt,
     });
     const collectNow = Date.now();
     const outcome = handleAccountCollectOutcome({
       group: phone,
       platform: pt,
+      ...alertMeta,
       success: true,
       works: data.works,
       prevWorkCount,
@@ -426,7 +403,7 @@ router.post("/stats/sync", async function (req, res) {
         platform: pt,
         error: outcome.reason,
         zeroWorksAnomaly: true,
-        collectAlert: store.getAccountCollectAlert(phone, pt),
+        collectAlert: store.getAccountCollectAlert(phone, pt, alertMeta),
       });
     }
     store.mergeDaily(phone, pt, data.overview, data.fansHistory, collectNow, {
@@ -460,15 +437,18 @@ router.post("/stats/sync", async function (req, res) {
     let collectAlert = null;
     try {
       const failNow = Date.now();
+      const alertMeta = { partition: syncPartition, phone };
       handleAccountCollectOutcome({
         group: phone,
         platform: pt,
+        ...alertMeta,
         success: false,
         error: message,
+        errorObj: error,
         prevWorkCount,
         now: failNow,
       });
-      collectAlert = store.getAccountCollectAlert(phone, pt);
+      collectAlert = store.getAccountCollectAlert(phone, pt, alertMeta);
       store.writeMeta(phone, pt, { lastCollectAt: failNow, lastError: message });
       store.appendCollectLog({
         startedAt,

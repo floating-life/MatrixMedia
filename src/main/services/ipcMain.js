@@ -28,7 +28,10 @@ import { registerDataStatsIpc } from "./dataStats/index.js";
 import { runSphChromeLogin } from "./cliLogin/sphChromeLogin.js";
 import { prepareSphAccountLoginSession } from "./sphLoginSession.js";
 import { normalizeBatchXlsxRows } from "../../shared/textSanitize.js";
-import { findDuplicatePublishesForTargets } from "../../shared/publishDedupe.js";
+import {
+  findDuplicatePublishesForTargets,
+  readPushDataRecords,
+} from "../../shared/publishDedupe.js";
 import { changeData } from "../server/utils.js";
 import {
   closeOtherAccountLoginWindows,
@@ -643,13 +646,7 @@ export default {
           ? payload.targets
           : [];
         if (!targets.length) return { duplicates: [] };
-        const res = changeData({
-          fileName: "pushData",
-          type: "get",
-          item: { page: 1, pageSize: 10000 },
-        });
-        const records =
-          res && res.success && Array.isArray(res.data) ? res.data : [];
+        const records = readPushDataRecords(changeData);
         const hits = findDuplicatePublishesForTargets(records, targets);
         return {
           duplicates: hits.map((h) => ({

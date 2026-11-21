@@ -107,15 +107,36 @@ export default {
         this.accounts.map((a) => [`${a.group}/${a.platform}`, a.latest])
       );
       const alertOf = new Map();
+      const pushAlert = (al) => {
+        if (!al || !al.alerted) return;
+        const mapKey = `${al.group}/${al.platform}`;
+        const prev = alertOf.get(mapKey);
+        if (!prev) {
+          alertOf.set(mapKey, al);
+        } else if (
+          (al.key && prev.key && al.key !== prev.key) ||
+          (al.accountKey && prev.accountKey && al.accountKey !== prev.accountKey)
+        ) {
+          alertOf.set(mapKey, {
+            ...prev,
+            isLoginError: Boolean(prev.isLoginError || al.isLoginError),
+            consecutiveFailures: Math.max(
+              prev.consecutiveFailures || 0,
+              al.consecutiveFailures || 0
+            ),
+            reason: `${prev.account || prev.accountKey}：${prev.reason}；${al.account || al.accountKey}：${al.reason}`,
+          });
+        }
+      };
       for (const a of this.accounts) {
-        if (a && a.collectAlert && a.collectAlert.alerted) {
-          alertOf.set(`${a.group}/${a.platform}`, a.collectAlert);
+        if (Array.isArray(a && a.collectAlerts) && a.collectAlerts.length) {
+          a.collectAlerts.forEach(pushAlert);
+        } else if (a && a.collectAlert && a.collectAlert.alerted) {
+          pushAlert(a.collectAlert);
         }
       }
       for (const al of this.collectAlerts || []) {
-        if (al && al.alerted) {
-          alertOf.set(`${al.group}/${al.platform}`, al);
-        }
+        pushAlert(al);
       }
       const rows = [];
       for (const g of groups) {

@@ -23,13 +23,14 @@
     </div>
     <collect-log-dialog :visible.sync="logVisible" :logs="logs" />
     <el-alert
-      v-if="collectAlert && collectAlert.alerted"
+      v-for="al in activeCollectAlerts"
+      :key="al.key || (al.group + '|' + al.platform + '|' + (al.accountKey || ''))"
       type="error"
       :closable="false"
       show-icon
       class="collect-alert-banner"
-      :title="collectAlertTitle"
-      :description="collectAlertDesc"
+      :title="formatCollectAlertTitle(al)"
+      :description="formatCollectAlertDesc(al)"
     />
     <el-tabs v-model="activeTab" class="group-tabs">
       <el-tab-pane label="数据" name="stats">
@@ -71,6 +72,7 @@ export default {
       works: [],
       meta: {},
       collectAlert: null,
+      collectAlerts: [],
       syncing: false,
       logVisible: false,
       logs: [],
@@ -97,34 +99,42 @@ export default {
         d.getHours()
       )}:${p(d.getMinutes())}`;
     },
-    collectAlertTitle() {
-      if (!this.collectAlert) return "";
-      const tag = this.collectAlert.isLoginError
-        ? "采集失败/需重新登录"
-        : "采集失败";
-      return `${tag}（连续失败 ${this.collectAlert.consecutiveFailures} 次）`;
-    },
-    collectAlertDesc() {
-      if (!this.collectAlert) return "";
-      const ts = this.collectAlert.firstFailedAt
-        ? new Date(this.collectAlert.firstFailedAt + 8 * 3600e3)
-            .toISOString()
-            .slice(0, 19)
-            .replace("T", " ")
-        : "";
-      return `原因：${this.collectAlert.reason}${ts ? `（首次失败时间：${ts}）` : ""}`;
+    activeCollectAlerts() {
+      if (Array.isArray(this.collectAlerts) && this.collectAlerts.length) {
+        return this.collectAlerts.filter((al) => al && al.alerted);
+      }
+      return this.collectAlert && this.collectAlert.alerted ? [this.collectAlert] : [];
     },
   },
   created() {
     this.refresh();
   },
   methods: {
+    formatCollectAlertTitle(al) {
+      if (!al) return "";
+      const tag = al.isLoginError ? "采集失败/需重新登录" : "采集失败";
+      const label = al.account && al.account !== `${this.groupName}·${this.platform}`
+        ? `${al.account} · `
+        : "";
+      return `${label}${tag}（连续失败 ${al.consecutiveFailures} 次）`;
+    },
+    formatCollectAlertDesc(al) {
+      if (!al) return "";
+      const ts = al.firstFailedAt
+        ? new Date(al.firstFailedAt + 8 * 3600e3)
+            .toISOString()
+            .slice(0, 19)
+            .replace("T", " ")
+        : "";
+      return `原因：${al.reason}${ts ? `（首次失败时间：${ts}）` : ""}`;
+    },
     async refresh() {
       const data = await getAccountStats(this.groupName, this.platform);
       this.daily = data.daily || {};
       this.works = data.works || [];
       this.meta = data.meta || {};
       this.collectAlert = data.collectAlert || null;
+      this.collectAlerts = Array.isArray(data.collectAlerts) ? data.collectAlerts : [];
     },
     async openLogs() {
       const all = await getCollectLogs();

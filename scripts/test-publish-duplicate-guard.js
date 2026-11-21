@@ -14,6 +14,7 @@ const assert = require("assert");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { pathToFileURL } = require("url");
 const Module = require("module");
 const esbuild = require("esbuild");
 const compiler = require("vue-template-compiler");
@@ -23,6 +24,8 @@ const root = path.resolve(__dirname, "..");
 const {
   DUPLICATE_EXIT_CODE,
   DUPLICATE_WINDOW_MS,
+  flattenPushDataRecords,
+  readPushDataRecords,
   findRecentDuplicatePublish,
   findDuplicatePublishesForTargets,
 } = require("../src/shared/publishDedupe.js");
@@ -146,26 +149,39 @@ async function testHttpPublishRouteDedupe() {
   fs.writeFileSync(videoFile, "video-stub");
 
   const now = Date.now();
-  const mockRecords = [
-    {
-      id: "http-rec-1",
-      pt: "抖音",
-      phone: "A组",
-      partition: "persist:A组抖音",
-      title: "重发测试标题",
-      publishStatus: "success",
-      lastPublishAt: now - 3600000,
-    },
-    {
-      id: "http-rec-2",
-      pt: "抖音",
-      phone: "B组",
-      partition: "persist:B组抖音",
-      title: "重发测试标题",
-      publishStatus: "success",
-      lastPublishAt: now - 1800000,
-    },
-  ];
+  const todayKey = new Date(now + 8 * 3600000).toISOString().slice(0, 10);
+  // 使用真实 server/utils.js changeData({ fileName: "pushData", type: "get" }) 返回的按日期分组对象结构
+  const mockRecords = {
+    [todayKey]: [
+      {
+        id: "http-rec-1",
+        pt: "抖音",
+        phone: "A组",
+        partition: "persist:A组抖音",
+        title: "重发测试标题",
+        publishStatus: "success",
+        lastPublishAt: now - 3600000,
+      },
+      {
+        id: "http-rec-2",
+        pt: "抖音",
+        phone: "B组",
+        partition: "persist:B组抖音",
+        title: "重发测试标题",
+        publishStatus: "success",
+        lastPublishAt: now - 1800000,
+      },
+      {
+        id: "http-rec-3",
+        pt: "抖音",
+        phone: "A组",
+        partition: "persist:A组抖音",
+        title: "样例_x000d_\r\n互动",
+        publishStatus: "success",
+        lastPublishAt: now - 3600000,
+      },
+    ],
+  };
 
   // 使用 esbuild 打包 routes/index.js（把动态 import() 转为可注入 stub 的 require）
   const routesBundle = path.join(tmpDir, "routesIndex.cjs");
@@ -368,7 +384,22 @@ async function testHttpPublishRouteDedupe() {
     assert.strictEqual(rMultiAllBlocked.payload.status, "duplicate");
     assert.strictEqual(rMultiAllBlocked.payload.exitCode, 6);
 
-    console.log("✓ 2. HTTP POST /publish 单平台/多平台重复拦截与 allowDuplicate 放行验证通过");
+    // 2f. S10-fix #6a：按日期分组真实结构下，历史为 `样例_x000d_\r\n互动`，现提交 `样例 互动` 同时请求抖音和快手 -> 仅提交快手
+    const rSampleMulti = await invoke({
+      phone: "A组",
+      file: videoFile,
+      title: "样例 互动",
+      platforms: ["dy", "ks"],
+    });
+    assert.strictEqual(stubState.multiCalls.length, 3);
+    assert.strictEqual(stubState.multiCalls[2].length, 1);
+    assert.strictEqual(stubState.multiCalls[2][0].platform, "快手");
+    assert.strictEqual(rSampleMulti.payload.results[0].status, "duplicate");
+    assert.strictEqual(rSampleMulti.payload.results[0].exitCode, 6);
+    assert.strictEqual(rSampleMulti.payload.results[1].platform, "快手");
+    assert.strictEqual(rSampleMulti.payload.results[1].success, true);
+
+    console.log("✓ 2. HTTP POST /publish 按日期分组真实记录单/多平台拦截与 allowDuplicate 放行验证通过");
   } finally {
     delete global.__MM_S10_HTTP_STUB__;
     Module._load = origLoad;
@@ -509,24 +540,38 @@ async function testCliAndPuppeteerEntryDedupe() {
        return { exitCode: 0, status: "success", publishMode: "publish", message: "ok" };
      }`
   );
+  const todayKey = new Date(now + 8 * 3600000).toISOString().slice(0, 10);
   fs.writeFileSync(
     utilsStub,
     `export function changeData({ fileName, type }) {
        if (fileName === "pushData" && type === "get") {
          return {
            success: true,
-           data: [{
-             id: "cli-dup-1",
-             pt: "抖音",
-             phone: "A组",
-             partition: "persist:A组抖音",
-             title: "CLI重复标题",
-             publishStatus: "success",
-             lastPublishAt: ${now - 1800000}
-           }]
+           data: {
+             ${JSON.stringify(todayKey)}: [
+               {
+                 id: "cli-dup-1",
+                 pt: "抖音",
+                 phone: "A组",
+                 partition: "persist:A组抖音",
+                 title: "CLI重复标题",
+                 publishStatus: "success",
+                 lastPublishAt: ${now - 1800000}
+               },
+               {
+                 id: "cli-dup-sample",
+                 pt: "抖音",
+                 phone: "A组",
+                 partition: "persist:A组抖音",
+                 title: "样例_x000d_\\r\\n互动",
+                 publishStatus: "success",
+                 lastPublishAt: ${now - 3600000}
+               }
+             ]
+           }
          };
        }
-       return { success: true, data: [] };
+       return { success: true, data: {} };
      }`
   );
 
@@ -612,6 +657,61 @@ async function testCliAndPuppeteerEntryDedupe() {
       assert.strictEqual(json1.exitCode, 6);
       assert.ok(json1.message.includes("上次发布时间"), `CLI message 必须含上次时间: ${json1.message}`);
 
+      // 4b. S10-fix #6a：按日期分组真实结构下，历史为 `样例_x000d_\r\n互动`，CLI 提交 `样例 互动` -> duplicate / 6
+      const codeSample = await cliMod.runCliMain([
+        "node",
+        ".",
+        "cli",
+        "publish",
+        "-p",
+        "dy",
+        "--phone",
+        "A组",
+        "-f",
+        videoFile,
+        "-t",
+        "样例 互动",
+      ]);
+      assert.strictEqual(codeSample, 6, `真实按日期分组结构下 CLI 应拦截并返回 6，实际=${codeSample}`);
+
+      // 4c. S10-fix #6b：CLI 使用 `-t '--allow-duplicate'` 不得吞掉标题值
+      const codeOptionLikeTitle = await cliMod.runCliMain([
+        "node",
+        ".",
+        "cli",
+        "publish",
+        "-p",
+        "dy",
+        "--phone",
+        "A组",
+        "-f",
+        videoFile,
+        "-t",
+        "--allow-duplicate",
+      ]);
+      assert.strictEqual(
+        codeOptionLikeTitle,
+        0,
+        `-t '--allow-duplicate' 应按字面标题发布返回 0（不得报缺少标题退 2），实际=${codeOptionLikeTitle}`
+      );
+      const parsedOptTitle = cliMod.parsePublishArgs([
+        "-p",
+        "dy",
+        "--phone",
+        "A组",
+        "-f",
+        videoFile,
+        "-t",
+        "--allow-duplicate",
+      ]);
+      assert.strictEqual(parsedOptTitle.ok, true);
+      assert.strictEqual(parsedOptTitle.value.title, "--allow-duplicate");
+      assert.strictEqual(
+        parsedOptTitle.value.allowDuplicate,
+        false,
+        "作为 -t 值的 --allow-duplicate 不得开启 allowDuplicate 开关"
+      );
+
       // 带 --allow-duplicate 放行
       const code2 = await cliMod.runCliMain([
         "node",
@@ -634,7 +734,7 @@ async function testCliAndPuppeteerEntryDedupe() {
       console.error = origErr;
     }
 
-    console.log("✓ 4. CLI publish 重复拦截（exitCode 6）与 --allow-duplicate 放行验证通过");
+    console.log("✓ 4. CLI publish 按日期分组查重、-t '--allow-duplicate' 字面标题与 --allow-duplicate 放行验证通过");
   } finally {
     Module._load = origLoad;
     delete require.cache[cliBundle];
@@ -667,11 +767,213 @@ function testGuiLocalVideoPublishCheck() {
   console.log("✓ 5. GUI LocalVideoPublish.vue 确认框接线、模板编译与文档字段校验通过");
 }
 
+function testRealDiskPushDataAndGuiCheck() {
+  // S10-fix #6a：使用真实 server/utils.js 落盘 YYYY-MM-DD.json + readPushDataRecords 验证 GUI / 共享读取函数
+  const tmpDocs = fs.mkdtempSync(path.join(os.tmpdir(), "mm-s10-real-pushdata-"));
+  const origLoad = Module._load;
+  const utilsPath = path.resolve(root, "src/main/server/utils.js");
+  delete require.cache[utilsPath];
+  Module._load = function (request, parent, isMain) {
+    if (request === "electron") {
+      return {
+        app: { getPath: () => tmpDocs },
+      };
+    }
+    return origLoad.apply(this, arguments);
+  };
+  try {
+    const { changeData } = require(utilsPath);
+    const now = Date.now();
+    const todayKey = new Date(now + 8 * 3600000).toISOString().slice(0, 10);
+    const addRes = changeData({
+      fileName: "pushData",
+      type: "add",
+      item: {
+        pt: "抖音",
+        phone: "A组",
+        partition: "persist:A组抖音",
+        title: "样例_x000d_\r\n互动",
+        publishStatus: "success",
+        lastPublishAt: now - 3600000,
+        date: todayKey,
+      },
+    });
+    assert.strictEqual(addRes.success, true);
+
+    // 确认真实 changeData({ type: "get" }) 返回的是按日期分组对象（非数组）
+    const rawGet = changeData({ fileName: "pushData", type: "get", item: { page: 1, pageSize: 10000 } });
+    assert.strictEqual(rawGet.success, true);
+    assert.strictEqual(Array.isArray(rawGet.data), false, "真实 pushData get 应返回按日期分组的对象");
+    assert.ok(Array.isArray(rawGet.data[todayKey]) && rawGet.data[todayKey].length === 1);
+
+    // 共享 readPushDataRecords 正确平铺并命中 GUI 查重
+    const records = readPushDataRecords(changeData);
+    assert.strictEqual(records.length, 1);
+    const guiHits = findDuplicatePublishesForTargets(
+      records,
+      [{ pt: "抖音", phone: "A组", partition: "persist:A组抖音", title: "样例 互动" }],
+      { now }
+    );
+    assert.strictEqual(guiHits.length, 1, "真实按日期分组结构下 GUI 查重必须命中");
+    assert.strictEqual(guiHits[0].hit.status, "duplicate");
+    assert.strictEqual(guiHits[0].hit.exitCode, 6);
+    assert.ok(guiHits[0].hit.message.includes("上次发布时间"));
+
+    // 兼容数组结构
+    assert.strictEqual(flattenPushDataRecords(records).length, 1);
+    assert.strictEqual(flattenPushDataRecords(rawGet).length, 1);
+    assert.strictEqual(flattenPushDataRecords(rawGet.data).length, 1);
+
+    // 确认三条入口与 puppeteerFile 统一调用 readPushDataRecords
+    for (const rel of [
+      "src/main/services/ipcMain.js",
+      "src/main/cli/index.js",
+      "src/main/server/routes/index.js",
+      "src/main/services/puppeteerFile.js",
+    ]) {
+      const src = fs.readFileSync(path.join(root, rel), "utf8");
+      assert.ok(src.includes("readPushDataRecords"), `${rel} 应使用共享 readPushDataRecords`);
+    }
+    console.log("✓ 6. 真实按日期分组 pushData（含磁盘读写）与四处入口共用 readPushDataRecords 验证通过");
+  } finally {
+    Module._load = origLoad;
+    delete require.cache[utilsPath];
+    fs.rmSync(tmpDocs, { recursive: true, force: true });
+  }
+}
+
+async function testMcpPublishVideoDuplicateHandling() {
+  // S10-fix #6c：用 esbuild 直接编译 mcp/src/tools/publish.ts 与 mcp/src/jobs.ts，
+  // 实测 publish_video schema、allowDuplicate 透传 --allow-duplicate，以及 exit 6 duplicate 回执原样返回
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-s10-mcp-dup-"));
+  const publishBundle = path.join(tmpDir, "mcpPublish.mjs");
+  const jobsBundle = path.join(tmpDir, "mcpJobs.mjs");
+  await esbuild.build({
+    entryPoints: [path.join(root, "mcp/src/tools/publish.ts")],
+    outfile: publishBundle,
+    bundle: true,
+    platform: "node",
+    format: "esm",
+  });
+  await esbuild.build({
+    entryPoints: [path.join(root, "mcp/src/jobs.ts")],
+    outfile: jobsBundle,
+    bundle: true,
+    platform: "node",
+    format: "esm",
+  });
+
+  const { publishVideoTool, handlePublishVideo } = await import(pathToFileURL(publishBundle).href);
+  const { startJob, waitForJob, describeJob } = await import(pathToFileURL(jobsBundle).href);
+
+  const argsLogFile = path.join(tmpDir, "argv.json");
+  const modeFile = path.join(tmpDir, "mode.txt");
+  const fakeBin = path.join(tmpDir, "fake-matrixmedia");
+  const dupReceipt = {
+    status: "duplicate",
+    exitCode: 6,
+    duplicate: true,
+    platform: "抖音",
+    phone: "13800138000",
+    title: "样例 互动",
+    lastPublishAt: 1795190400000,
+    lastPublishAtText: "2026-11-21 16:00:00",
+    message: "抖音（13800138000）近 7 天内已有相同标题「样例 互动」的发布成功记录（上次发布时间：2026-11-21 16:00:00），已拦截重复发布",
+  };
+  fs.writeFileSync(
+    fakeBin,
+    `#!/usr/bin/env node
+const fs = require("fs");
+fs.writeFileSync(${JSON.stringify(argsLogFile)}, JSON.stringify(process.argv.slice(2)));
+const mode = fs.readFileSync(${JSON.stringify(modeFile)}, "utf8").trim();
+if (mode === "dup") {
+  console.log(${JSON.stringify(JSON.stringify(dupReceipt))});
+  console.error(${JSON.stringify(dupReceipt.message)});
+  process.exit(6);
+}
+console.log(JSON.stringify({ resultStatus: "success", publishMode: "publish", message: "上传成功" }));
+process.exit(0);
+`,
+    "utf8"
+  );
+  fs.chmodSync(fakeBin, 0o755);
+
+  const prevBin = process.env.MATRIXMEDIA_BIN;
+  process.env.MATRIXMEDIA_BIN = fakeBin;
+  try {
+    // 1. schema 包含 allowDuplicate
+    assert.ok(
+      publishVideoTool &&
+        publishVideoTool.inputSchema &&
+        publishVideoTool.inputSchema.properties &&
+        publishVideoTool.inputSchema.properties.allowDuplicate &&
+        publishVideoTool.inputSchema.properties.allowDuplicate.type === "boolean",
+      "MCP publish_video schema 必须含 boolean 类型的 allowDuplicate"
+    );
+
+    // 2. CLI 返回 exit 6 duplicate 回执时，原样返回 duplicate 状态与上次发布时间，绝不报「未知错误 exit 6」
+    fs.writeFileSync(modeFile, "dup");
+    const dupArgs = {
+      platform: "dy",
+      phone: "13800138000",
+      file: "/tmp/demo.mp4",
+      title: "样例 互动",
+    };
+    const dupRaw = await handlePublishVideo(dupArgs);
+    const dupBody = JSON.parse(dupRaw);
+    assert.strictEqual(dupBody.status, "duplicate");
+    assert.strictEqual(dupBody.exitCode, 6);
+    assert.strictEqual(dupBody.duplicate, true);
+    assert.strictEqual(dupBody.lastPublishAt, dupReceipt.lastPublishAt);
+    assert.strictEqual(dupBody.lastPublishAtText, dupReceipt.lastPublishAtText);
+    assert.ok(dupBody.message.includes("2026-11-21 16:00:00"));
+    const argvNoFlag = JSON.parse(fs.readFileSync(argsLogFile, "utf8"));
+    assert.strictEqual(argvNoFlag.includes("--allow-duplicate"), false);
+
+    // 2b. 经 jobs.ts runAsJob 同款包装（describeJob），exit 6 回执仍保持 duplicate 与上次发布时间
+    const { job } = startJob(
+      "publish_video",
+      "dup-check-job",
+      { platform: "dy", phone: "13800138000", title: "样例 互动", file: "/tmp/demo.mp4" },
+      () => handlePublishVideo(dupArgs)
+    );
+    await waitForJob(job, 5000);
+    assert.strictEqual(job.status, "succeeded");
+    const described = describeJob(job);
+    assert.strictEqual(described.status, "duplicate");
+    assert.strictEqual(described.exitCode, 6);
+    assert.strictEqual(described.lastPublishAtText, dupReceipt.lastPublishAtText);
+
+    // 3. 传 allowDuplicate: true 透传 --allow-duplicate 给 CLI
+    fs.writeFileSync(modeFile, "ok");
+    const allowRaw = await handlePublishVideo({
+      ...dupArgs,
+      allowDuplicate: true,
+    });
+    const allowBody = JSON.parse(allowRaw);
+    assert.strictEqual(allowBody.status, "success");
+    const argvWithFlag = JSON.parse(fs.readFileSync(argsLogFile, "utf8"));
+    assert.strictEqual(
+      argvWithFlag.includes("--allow-duplicate"),
+      true,
+      "MCP allowDuplicate: true 必须转发 --allow-duplicate"
+    );
+
+    console.log("✓ 7. MCP publish_video allowDuplicate 透传与 exit 6 duplicate 回执原样返回验证通过");
+  } finally {
+    if (prevBin === undefined) delete process.env.MATRIXMEDIA_BIN;
+    else process.env.MATRIXMEDIA_BIN = prevBin;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
 async function main() {
   testPureDedupeRules();
   await testHttpPublishRouteDedupe();
   await testCliAndPuppeteerEntryDedupe();
   testGuiLocalVideoPublishCheck();
+  testRealDiskPushDataAndGuiCheck();
+  await testMcpPublishVideoDuplicateHandling();
   console.log("\ntest-publish-duplicate-guard: 全部断言通过");
 }
 

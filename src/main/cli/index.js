@@ -42,10 +42,12 @@ import {
   normalizeBatchXlsxRows,
   sanitizePublishCliArgs,
   sanitizeTitle,
+  splitAndSanitizeTags,
 } from "../../shared/textSanitize.js";
 import {
   DUPLICATE_EXIT_CODE,
   findRecentDuplicatePublish,
+  readPushDataRecords,
 } from "../../shared/publishDedupe.js";
 import dataStatsStore from "../services/dataStats/store.js";
 import { collectAccount as collectStatsAccount } from "../services/dataStats/collector.js";
@@ -105,16 +107,7 @@ function parseXlsxRows(xlsxPath) {
 }
 
 function readPushDataRecordsForCli() {
-  try {
-    const res = changeData({
-      fileName: "pushData",
-      type: "get",
-      item: { page: 1, pageSize: 10000 },
-    });
-    return res && res.success && Array.isArray(res.data) ? res.data : [];
-  } catch (_) {
-    return [];
-  }
+  return readPushDataRecords(changeData);
 }
 
 function formatAlertUtc8Time(ms) {
@@ -186,19 +179,22 @@ async function runStatsSyncWithAlerts(opts, deps = {}) {
   const errLog = deps.error || console.error;
 
   const startedAt = Date.now();
+  const resolvedPartition = resolvePartFn({ phone: opts.phone, pt: opts.platform });
+  const alertMeta = { partition: resolvedPartition, phone: opts.phone };
   const prevWorkCount =
     typeof storeApi.getPreviousWorkCount === "function"
       ? storeApi.getPreviousWorkCount(opts.phone, opts.platform)
       : 0;
   try {
     const data = await collectorFn({
-      partition: resolvePartFn({ phone: opts.phone, pt: opts.platform }),
+      partition: resolvedPartition,
       platform: opts.platform,
     });
     const collectNow = Date.now();
     const outcome = outcomeFn({
       group: opts.phone,
       platform: opts.platform,
+      ...alertMeta,
       success: true,
       works: data.works,
       prevWorkCount,
@@ -219,7 +215,7 @@ async function runStatsSyncWithAlerts(opts, deps = {}) {
       });
       const collectAlert =
         typeof storeApi.getAccountCollectAlert === "function"
-          ? storeApi.getAccountCollectAlert(opts.phone, opts.platform)
+          ? storeApi.getAccountCollectAlert(opts.phone, opts.platform, alertMeta)
           : null;
       const failPayload = {
         success: false,
@@ -289,13 +285,15 @@ async function runStatsSyncWithAlerts(opts, deps = {}) {
       outcomeFn({
         group: opts.phone,
         platform: opts.platform,
+        ...alertMeta,
         success: false,
         error: message,
+        errorObj: err,
         prevWorkCount,
         now: failNow,
       });
       if (typeof storeApi.getAccountCollectAlert === "function") {
-        collectAlert = storeApi.getAccountCollectAlert(opts.phone, opts.platform);
+        collectAlert = storeApi.getAccountCollectAlert(opts.phone, opts.platform, alertMeta);
       }
       storeApi.writeMeta(opts.phone, opts.platform, {
         lastCollectAt: failNow,
@@ -504,19 +502,15 @@ async function runBatchDirPublish(v, cfg) {
       coverPath = absCover;
     }
 
-    // Format tags: split by comma (xlsx format), then # prefix for hashtag platforms
-    const rawTags = String(row.tags || "").trim();
+    // 标签统一走共享 splitAndSanitizeTags（与 GUI / HTTP 保持完全一致）
+    const tagList = splitAndSanitizeTags(row.tags);
     let bq = "";
-    if (rawTags) {
-      const tagList = rawTags
-        .split(",")
-        .map((t) => t.trim())
-        .filter(Boolean);
+    if (tagList.length) {
       const hashtagPlatforms = new Set(["视频号", "抖音", "快手"]);
       if (hashtagPlatforms.has(v.platform)) {
         bq = tagList.map((t) => (t.startsWith("#") ? t : "#" + t)).join(" ");
       } else {
-        bq = tagList.map((t) => t.replace(/^#/, "")).join(" ");
+        bq = tagList.join(" ");
       }
     }
 
@@ -526,7 +520,7 @@ async function runBatchDirPublish(v, cfg) {
         title: bt1,
         description: row.description,
         shortTitle: row.shortTitle,
-        tags: bq,
+        tags: tagList,
       },
       v.platform
     );
@@ -876,10 +870,7 @@ export async function runCliMain(argv = process.argv) {
   }
 
   if (cmd === "publish") {
-    const rawPublishArgs = sub.slice(1);
-    const allowDuplicate = rawPublishArgs.includes("--allow-duplicate");
-    const filteredArgs = rawPublishArgs.filter((a) => a !== "--allow-duplicate");
-    const sanitizedArgs = sanitizePublishCliArgs(filteredArgs);
+    const sanitizedArgs = sanitizePublishCliArgs(sub.slice(1));
     const parsed = parsePublishArgs(sanitizedArgs);
     if (!parsed.ok) {
       console.error(parsed.error);
@@ -890,7 +881,8 @@ export async function runCliMain(argv = process.argv) {
       return 0;
     }
 
-    const v = { ...parsed.value, allowDuplicate };
+    const v = parsed.value;
+    const allowDuplicate = Boolean(v.allowDuplicate);
     const cfg = ptConfig[v.platform];
     if (!cfg) {
       console.error("内部错误: 未找到平台配置", v.platform);
