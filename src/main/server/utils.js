@@ -307,6 +307,18 @@ function changeDataUnsafe({ item, fileName, type } = {}) {
             // 成败计数保留历史累计（newItem 登记时只是初始 0，结果回写走 update 按 id 覆盖）
             publishSuccessCount: Number(oldItem.publishSuccessCount) || 0,
             publishFailCount: Number(oldItem.publishFailCount) || 0,
+            // 复用旧记录重新登记时保留「上次成功时间」，供 7 天查重使用：
+            // 入口查重会按记录 id 排除本次登记，若不保留，同一篇已成功的内容重发会被漏拦。
+            priorSuccessAt: (() => {
+              const st = String(oldItem.publishStatus || "").trim().toLowerCase();
+              const okSt = st === "success" || st === "published" || st === "draft" || st === "draft_saved";
+              const legacyOk = !st && (Number(oldItem.publishSuccessCount) > 0 || Boolean(oldItem.videoLink));
+              if (okSt || legacyOk) {
+                const t = Number(oldItem.lastPublishAt) || Date.parse(oldItem.lastPublishAt) || null;
+                if (t) return t;
+              }
+              return oldItem.priorSuccessAt || null;
+            })(),
             publishStatus: "publishing",
             // 重新发布已开始，清掉上一轮的失败截图，避免回看到旧画面
             failScreenshot: "",

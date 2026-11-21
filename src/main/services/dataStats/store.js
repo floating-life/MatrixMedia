@@ -1392,7 +1392,12 @@ function getPreviousWorkCount(group, platform, accountMeta = null) {
   // 显式指定账号时只和同一账号自己的历史比较：已有其他账号记录或账号键与分组名不同时，绝不借用同组其他账号的作品数
   if (hasExplicitAccountMeta(accountMeta)) {
     const groupStr = String(group || "").trim();
-    if ((byAcc && Object.keys(byAcc).length > 0) || accId !== groupStr) {
+    // 以分组名为键的条目是未带账号信息时写入的旧式记录，不算「按账号」历史
+    const hasPerAccount = Boolean(byAcc) && Object.keys(byAcc).some((k) => k !== groupStr);
+    // 升级迁移：尚无按账号记录、且组内该平台只有这一个账号时，旧的按分组作品数就是它自己的历史
+    const soleLegacyAccount =
+      !hasPerAccount && Number(accountMeta && accountMeta.groupPlatformAccountCount) === 1;
+    if (!soleLegacyAccount && (hasPerAccount || accId !== groupStr)) {
       return 0;
     }
   }

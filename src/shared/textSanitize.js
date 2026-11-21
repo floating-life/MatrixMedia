@@ -15,8 +15,11 @@
 const EXCEL_CR_ESCAPE_RE = /_x000d_/gi;
 const ZERO_WIDTH_RE = /[\uFEFF\u200B\u200C\u200D]/g;
 const NBSP_RE = /\u00A0/g;
-// 标签只按逗号/中文逗号/顿号/换行与 `#` 分隔，不按空格拆，以保留含空格标签（如 "Final Cut Pro"）
+// 标签分隔：字符串里出现逗号/中文逗号/顿号/换行/`#` 任一「强分隔符」时只按强分隔符拆
+// （保留含空格标签如 "Final Cut Pro,剪辑"）；没有强分隔符时按空格拆（"游戏 解说 开黑" → 3 个，与 CLI 帮助一致）。
+// 数组元素各自视为整体，不按空格拆。
 const TAG_SPLIT_RE = /[\n,，、]+/;
+const TAG_STRONG_SEP_RE = /[\n,，、#]/;
 
 function isShipinhaoPlatform(raw) {
   const s = String(raw || "").trim().toLowerCase();
@@ -85,7 +88,8 @@ function splitAndSanitizeTags(raw) {
       .replace(ZERO_WIDTH_RE, "")
       .replace(NBSP_RE, " ")
       .replace(/\t+/g, " ");
-    const parts = cleaned.split(TAG_SPLIT_RE);
+    const useSpace = !Array.isArray(raw) && !TAG_STRONG_SEP_RE.test(cleaned);
+    const parts = useSpace ? cleaned.split(/\s+/) : cleaned.split(TAG_SPLIT_RE);
     for (const part of parts) {
       if (!part) continue;
       const hashParts = part.split(/(?=#)/);
@@ -111,6 +115,8 @@ function sanitizeTags(raw) {
   if (Array.isArray(raw)) {
     return list;
   }
+  // 单个含空格标签拼回时补尾逗号，保证再次拆分仍按强分隔符处理（无损可逆）
+  if (list.length === 1 && /\s/.test(list[0])) return `${list[0]},`;
   return list.join(",");
 }
 

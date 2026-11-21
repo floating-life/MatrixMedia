@@ -704,6 +704,10 @@ async function collectAccounts(accounts, sender, options = {}) {
       partition: acc.partition,
       phone: acc.phone,
       accountName: acc.accountName,
+      // 同组同平台账号数：升级前旧数据只按分组记了作品数，组内仅 1 个账号时可安全沿用
+      groupPlatformAccountCount: accounts.filter(
+        (a) => a && a.group === acc.group && a.platform === acc.platform
+      ).length,
     };
     const alertKey =
       typeof store.collectAlertKey === "function"

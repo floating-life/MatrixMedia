@@ -336,10 +336,14 @@ function findRecentDuplicatePublish(records, candidate, options = {}) {
   for (let i = 0; i < list.length; i++) {
     const rec = list[i];
     if (!rec || typeof rec !== "object") continue;
+    let rec2 = rec;
     if (excludeRecordId && rec.id != null && String(rec.id) === excludeRecordId) {
-      continue;
+      // 本次登记的记录本身不算重复；但若它是复用的旧记录且之前成功过，按上次成功时间参与查重
+      const prior = Number(rec.priorSuccessAt);
+      if (!(prior > 0)) continue;
+      rec2 = { ...rec, publishStatus: "success", lastPublishAt: prior };
     }
-    if (!isBlockingPublishRecord(rec)) continue;
+    if (!isBlockingPublishRecord(rec2)) continue;
 
     // 区分文章与视频记录
     const recType = String(rec.textType || "").trim().toLowerCase();
@@ -357,8 +361,8 @@ function findRecentDuplicatePublish(records, candidate, options = {}) {
     const recTitle = normalizeTitleForDedupe(extractCandidateTitle(rec));
     if (!recTitle || recTitle !== normTitle) continue;
 
-    const recStatus = String(rec.publishStatus || "").trim().toLowerCase();
-    const recTimeMs = extractRecordPublishTimeMs(rec);
+    const recStatus = String(rec2.publishStatus || "").trim().toLowerCase();
+    const recTimeMs = extractRecordPublishTimeMs(rec2);
     if (recTimeMs === null) continue;
 
     const ageMs = now - recTimeMs;
@@ -371,7 +375,7 @@ function findRecentDuplicatePublish(records, candidate, options = {}) {
 
     if (recTimeMs > bestTimeMs) {
       bestTimeMs = recTimeMs;
-      bestRecord = rec;
+      bestRecord = rec2;
     }
   }
 
