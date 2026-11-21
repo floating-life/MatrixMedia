@@ -1,33 +1,48 @@
+import {
+  sanitizeTitle,
+  sanitizeDescription,
+  stripExcelEscapesAndCR,
+} from "./textSanitize.js";
+
 function firstText(...values) {
-  return values.map((value) => String(value ?? "").trim()).find(Boolean) || "";
+  return values.map((value) => sanitizeTitle(value)).find(Boolean) || "";
+}
+
+function firstDescriptionText(...values) {
+  return values.map((value) => sanitizeDescription(value)).find(Boolean) || "";
 }
 
 function hasOwn(object, key) {
   return Object.prototype.hasOwnProperty.call(object, key);
 }
 
-function semanticText(data, key, legacyKeys = []) {
-  if (hasOwn(data, key)) return String(data[key] ?? "").trim();
-  return firstText(...legacyKeys.map((legacyKey) => data[legacyKey]));
+function semanticText(data, key, legacyKeys = [], { multiline = false } = {}) {
+  const clean = multiline ? sanitizeDescription : sanitizeTitle;
+  if (hasOwn(data, key)) return clean(data[key]);
+  return (multiline ? firstDescriptionText : firstText)(
+    ...legacyKeys.map((legacyKey) => data[legacyKey])
+  );
 }
 
 export function normalizeVideoTags(value) {
   const items = Array.isArray(value)
-    ? value
-    : String(value || "").split(/[\s,，、;；|]+/);
+    ? value.map((item) => stripExcelEscapesAndCR(item))
+    : stripExcelEscapesAndCR(value).split(/[\s,，、;；|]+/);
   return [
     ...new Set(
       items
-        .flatMap((item) => String(item || "").split(/(?=#)/))
-        .map((item) => String(item || "").trim().replace(/^#+/, ""))
+        .flatMap((item) => sanitizeTitle(item).split(/(?=#)/))
+        .map((item) => sanitizeTitle(item).replace(/^#+/, ""))
         .filter(Boolean)
     ),
   ];
 }
 
 export function joinDescriptionAndTags(description, tags) {
-  const tagsText = Array.isArray(tags) ? tags.join(" ") : String(tags || "");
-  return [String(description || "").trim(), tagsText.trim()]
+  const tagsText = Array.isArray(tags)
+    ? tags.map((t) => sanitizeTitle(t)).filter(Boolean).join(" ")
+    : sanitizeTitle(tags);
+  return [sanitizeDescription(description), tagsText]
     .filter(Boolean)
     .join(" ");
 }
@@ -66,7 +81,7 @@ export function formatTagsForPlatform(platform, tags) {
 
 export function buildPlatformVideoText(platform, metadata = {}) {
   const title = firstText(metadata.title, metadata.bt1);
-  const description = firstText(metadata.description, metadata.bdText);
+  const description = firstDescriptionText(metadata.description, metadata.bdText);
   const tagsText = formatTagsForPlatform(
     platform,
     metadata.tags ?? metadata.bq
@@ -93,10 +108,12 @@ export function buildPlatformVideoText(platform, metadata = {}) {
 export function normalizeVideoMetadata(raw = {}, platform = "") {
   const data = raw.data || raw;
   const title = semanticText(data, "title", ["bt1"]);
-  const description = semanticText(data, "description", [
-    "bdText",
-    ...(platform === "视频号" ? [] : ["bt2"]),
-  ]);
+  const description = semanticText(
+    data,
+    "description",
+    ["bdText", ...(platform === "视频号" ? [] : ["bt2"])],
+    { multiline: true }
+  );
   const shortTitle = semanticText(data, "shortTitle", [
     "bt2Filled",
     ...(platform === "视频号" ? ["bt2"] : []),
@@ -121,7 +138,7 @@ export function normalizeVideoMetadata(raw = {}, platform = "") {
 export function normalizeVideoRecordMetadata(record = {}) {
   const platform = record.pt || record.platform || "";
   const title = hasOwn(record, "title")
-    ? String(record.title ?? "").trim()
+    ? sanitizeTitle(record.title)
     : firstText(record.bt, record.bt1);
   const data = { ...record, title };
 

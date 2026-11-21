@@ -1,6 +1,13 @@
 var express = require("express");
+var path = require("path");
 const { changeData } = require("../utils");
 const { isTrustedLocalRequest } = require("../requestGuard");
+const { sanitizePublishPayloadObject } = require("../../../shared/textSanitize.js");
+const {
+  DUPLICATE_EXIT_CODE,
+  findRecentDuplicatePublish,
+} = require("../../../shared/publishDedupe.js");
+const { handleAccountCollectOutcome } = require("../../services/dataStats/collectAlert.js");
 
 var router = express.Router();
 
@@ -68,6 +75,28 @@ router.post("/changeData", function (req, res) {
     });
 });
 
+function fileStemForDedupe(rawFile) {
+  const s = String(rawFile || "").trim();
+  if (!s) return "";
+  const clean = s.split("?")[0].split("#")[0];
+  const base = path.basename(clean);
+  const dot = base.lastIndexOf(".");
+  return dot > 0 ? base.slice(0, dot) : base;
+}
+
+function readPushDataRecordsForHttp() {
+  try {
+    const res = changeData({
+      fileName: "pushData",
+      type: "get",
+      item: { page: 1, pageSize: 10000 },
+    });
+    return res && res.success && Array.isArray(res.data) ? res.data : [];
+  } catch (_) {
+    return [];
+  }
+}
+
 router.post("/publish", async function (req, res) {
   // 守卫必须放在解析参数之前：本接口接受 http(s) 远程视频 URL
   // （resolvePublishFile 会先下载再发布到已登录账号），漏掉守卫时
@@ -80,8 +109,15 @@ router.post("/publish", async function (req, res) {
       "../../cli/parsePublishArgs.js"
     );
     const publishService = await import("../../services/publishVideo.js");
+    const { resolveTaskPartition } = await import(
+      "../../services/accountLookup.js"
+    );
+    const { registerPublishDedupeBypass } = await import(
+      "../../services/puppeteerFile.js"
+    );
 
-    const parsed = parseMultiPublishRequest(req.body || {});
+    const sanitizedBody = sanitizePublishPayloadObject(req.body || {});
+    const parsed = parseMultiPublishRequest(sanitizedBody);
     if (!parsed.ok) {
       return res.status(400).json({
         success: false,
@@ -90,9 +126,172 @@ router.post("/publish", async function (req, res) {
       });
     }
 
-    const result = parsed.multi
-      ? await publishService.runMultiPlatformPublish(parsed.value)
-      : await publishService.runSingleFilePublish(parsed.value);
+    const rootAllowDuplicate = Boolean(
+      sanitizedBody && sanitizedBody.allowDuplicate === true
+    );
+    const records = readPushDataRecordsForHttp();
+
+    let result;
+    if (!Array.isArray(parsed.value)) {
+      const target = parsed.value;
+      const resolvedPartition = resolveTaskPartition({
+        partition: target.partition,
+        phone: target.phone,
+        pt: target.platform,
+      });
+      const candTitle = target.title || fileStemForDedupe(target.file);
+      if (!rootAllowDuplicate) {
+        const hit = findRecentDuplicatePublish(records, {
+          pt: target.platform,
+          phone: target.phone,
+          partition: resolvedPartition,
+          title: candTitle,
+        });
+        if (hit) {
+          return res.status(200).json({
+            success: false,
+            status: "duplicate",
+            exitCode: DUPLICATE_EXIT_CODE,
+            duplicate: true,
+            platform: hit.platform,
+            phone: hit.phone,
+            title: hit.title,
+            lastPublishAt: hit.lastPublishAt,
+            lastPublishAtText: hit.lastPublishAtText,
+            message: hit.message,
+          });
+        }
+      }
+      registerPublishDedupeBypass({
+        pt: target.platform,
+        phone: target.phone,
+        partition: resolvedPartition,
+        title: candTitle,
+      });
+      result = await publishService.runSingleFilePublish(target);
+    } else {
+      // platforms 数组（1 个或多个平台）：逐平台查重，仅拦截重复的那几个平台，其余平台照常执行
+      const rawPlatformItems = Array.isArray(sanitizedBody.platforms)
+        ? sanitizedBody.platforms
+        : [];
+      const allowDupByAccount = new Map();
+      for (const rawItem of rawPlatformItems) {
+        if (rawItem && typeof rawItem === "object") {
+          const rawPt = String(rawItem.platform || rawItem.pt || "").trim();
+          const ptName =
+            PLATFORM_ALIASES[rawPt] || PLATFORM_ALIASES[rawPt.toLowerCase()] || rawPt;
+          const itemPhone = String(rawItem.phone || sanitizedBody.phone || "").trim();
+          if (ptName && rawItem.allowDuplicate === true) {
+            allowDupByAccount.set(`${ptName}|${itemPhone}`, true);
+          }
+        }
+      }
+
+      const targets = parsed.value;
+      const allowedTargets = [];
+      const allowedIndices = [];
+      const blockedByIndex = new Map();
+
+      for (let i = 0; i < targets.length; i++) {
+        const t = targets[i];
+        const resolvedPartition = resolveTaskPartition({
+          partition: t.partition,
+          phone: t.phone,
+          pt: t.platform,
+        });
+        const candTitle = t.title || fileStemForDedupe(t.file);
+        const targetPhone = String(t.phone || "").trim();
+        const allowDup =
+          rootAllowDuplicate ||
+          allowDupByAccount.get(`${t.platform}|${targetPhone}`) === true;
+        if (!allowDup) {
+          const hit = findRecentDuplicatePublish(records, {
+            pt: t.platform,
+            phone: t.phone,
+            partition: resolvedPartition,
+            title: candTitle,
+          });
+          if (hit) {
+            blockedByIndex.set(i, {
+              platform: t.platform,
+              phone: t.phone || "",
+              success: false,
+              status: "duplicate",
+              exitCode: DUPLICATE_EXIT_CODE,
+              duplicate: true,
+              title: hit.title,
+              lastPublishAt: hit.lastPublishAt,
+              lastPublishAtText: hit.lastPublishAtText,
+              message: hit.message,
+            });
+            continue;
+          }
+        }
+        registerPublishDedupeBypass({
+          pt: t.platform,
+          phone: t.phone,
+          partition: resolvedPartition,
+          title: candTitle,
+        });
+        allowedTargets.push(t);
+        allowedIndices.push(i);
+      }
+
+      if (allowedTargets.length === 0) {
+        const blockedList = targets.map((_, idx) => blockedByIndex.get(idx)).filter(Boolean);
+        result = {
+          success: false,
+          status: "duplicate",
+          exitCode: DUPLICATE_EXIT_CODE,
+          duplicate: true,
+          total: blockedList.length,
+          succeeded: 0,
+          failed: blockedList.length,
+          message: blockedList.map((r) => r.message).join("；"),
+          results: blockedList,
+        };
+      } else if (blockedByIndex.size === 0) {
+        result = parsed.multi
+          ? await publishService.runMultiPlatformPublish(allowedTargets)
+          : await publishService.runSingleFilePublish(allowedTargets[0]);
+      } else {
+        const runRes = await publishService.runMultiPlatformPublish(allowedTargets);
+        const runResults = Array.isArray(runRes && runRes.results) ? runRes.results : [];
+        const mergedResults = new Array(targets.length);
+        for (const [idx, blocked] of blockedByIndex.entries()) {
+          mergedResults[idx] = blocked;
+        }
+        for (let k = 0; k < allowedIndices.length; k++) {
+          mergedResults[allowedIndices[k]] = runResults[k] || {
+            platform: allowedTargets[k].platform,
+            success: false,
+            status: "failed",
+            exitCode: 1,
+            message: "发布未返回结果",
+          };
+        }
+        const total = mergedResults.length;
+        const succeeded = mergedResults.filter(
+          (r) => r && (r.success === true || r.exitCode === 0)
+        ).length;
+        const failed = total - succeeded;
+        result = {
+          ...(runRes || {}),
+          success: failed === 0,
+          status: succeeded > 0 ? "partial_duplicate" : "duplicate",
+          exitCode: failed === 0 ? 0 : DUPLICATE_EXIT_CODE,
+          total,
+          succeeded,
+          failed,
+          results: mergedResults,
+          message: `共 ${total} 个平台：成功 ${succeeded} 个，拦截重复 ${blockedByIndex.size} 个${
+            failed - blockedByIndex.size > 0
+              ? `，失败 ${failed - blockedByIndex.size} 个`
+              : ""
+          }`,
+        };
+      }
+    }
 
     const success = result.success === true || result.exitCode === 0;
     const httpStatus =
@@ -163,6 +362,8 @@ router.get("/stats", function (req, res) {
       latest: latestDate ? acc.daily[latestDate] : null,
       lastCollectAt: acc.meta.lastCollectAt || null,
       workCount: (acc.works || []).length,
+      collectAlert: acc.collectAlert || null,
+      hasCollectAlert: Boolean(acc.collectAlert && acc.collectAlert.alerted),
       ...(latestDate ? {} : { hint: "本地暂无数据，请先调用 POST /stats/sync 采集" }),
     });
   } catch (error) {
@@ -183,9 +384,13 @@ router.post("/stats/sync", async function (req, res) {
     });
   }
   const startedAt = Date.now();
+  const store = require("../../services/dataStats/store.js");
+  const prevWorkCount =
+    typeof store.getPreviousWorkCount === "function"
+      ? store.getPreviousWorkCount(phone, pt)
+      : 0;
   try {
     const { collectAccount } = require("../../services/dataStats/collector.js");
-    const store = require("../../services/dataStats/store.js");
     // 与登录窗口同一套 partition 规则：优先按账号记录的 accountKey（新分组模型），
     // 未命中记录时回退历史「phone "-" 前缀」规则，否则带 "-" 的账号读不到登录态
     const { resolveTaskPartition } = await import(
@@ -195,10 +400,41 @@ router.post("/stats/sync", async function (req, res) {
       partition: resolveTaskPartition({ phone, pt }),
       platform: pt,
     });
-    store.mergeDaily(phone, pt, data.overview, data.fansHistory);
-    store.mergeWorks(phone, pt, data.works);
+    const collectNow = Date.now();
+    const outcome = handleAccountCollectOutcome({
+      group: phone,
+      platform: pt,
+      success: true,
+      works: data.works,
+      prevWorkCount,
+      now: collectNow,
+    });
+    if (!outcome.ok && outcome.zeroWorksAnomaly) {
+      store.writeMeta(phone, pt, {
+        lastCollectAt: collectNow,
+        lastError: outcome.reason,
+      });
+      store.appendCollectLog({
+        startedAt,
+        finishedAt: collectNow,
+        cancelled: false,
+        results: [{ group: phone, platform: pt, success: false, error: outcome.reason }],
+      });
+      return res.status(200).json({
+        success: false,
+        group: phone,
+        platform: pt,
+        error: outcome.reason,
+        zeroWorksAnomaly: true,
+        collectAlert: store.getAccountCollectAlert(phone, pt),
+      });
+    }
+    store.mergeDaily(phone, pt, data.overview, data.fansHistory, collectNow, {
+      works: data.works,
+    });
+    store.mergeWorks(phone, pt, data.works, collectNow);
     store.writeMeta(phone, pt, {
-      lastCollectAt: Date.now(),
+      lastCollectAt: collectNow,
       lastError: "",
       workCount: data.works.length,
     });
@@ -217,12 +453,23 @@ router.post("/stats/sync", async function (req, res) {
       overview: data.overview,
       workCount: data.works.length,
       fansHistoryPoints: data.fansHistory.length,
+      collectAlert: null,
     });
   } catch (error) {
     const message = String((error && error.message) || error);
+    let collectAlert = null;
     try {
-      const store = require("../../services/dataStats/store.js");
-      store.writeMeta(phone, pt, { lastCollectAt: Date.now(), lastError: message });
+      const failNow = Date.now();
+      handleAccountCollectOutcome({
+        group: phone,
+        platform: pt,
+        success: false,
+        error: message,
+        prevWorkCount,
+        now: failNow,
+      });
+      collectAlert = store.getAccountCollectAlert(phone, pt);
+      store.writeMeta(phone, pt, { lastCollectAt: failNow, lastError: message });
       store.appendCollectLog({
         startedAt,
         finishedAt: Date.now(),
@@ -230,7 +477,13 @@ router.post("/stats/sync", async function (req, res) {
         results: [{ group: phone, platform: pt, success: false, error: message }],
       });
     } catch (_) { /* ignore */ }
-    res.status(200).json({ success: false, group: phone, platform: pt, error: message });
+    res.status(200).json({
+      success: false,
+      group: phone,
+      platform: pt,
+      error: message,
+      collectAlert,
+    });
   }
 });
 

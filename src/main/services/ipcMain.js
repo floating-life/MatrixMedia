@@ -27,6 +27,9 @@ import { createAiKeyStore } from "./aiKeyStore.js";
 import { registerDataStatsIpc } from "./dataStats/index.js";
 import { runSphChromeLogin } from "./cliLogin/sphChromeLogin.js";
 import { prepareSphAccountLoginSession } from "./sphLoginSession.js";
+import { normalizeBatchXlsxRows } from "../../shared/textSanitize.js";
+import { findDuplicatePublishesForTargets } from "../../shared/publishDedupe.js";
+import { changeData } from "../server/utils.js";
 import {
   closeOtherAccountLoginWindows,
   getAccountLoginWindowByPartition,
@@ -626,63 +629,40 @@ export default {
         const sheetName = workbook.SheetNames[0];
         const sheet = workbook.Sheets[sheetName];
         const rows = xlsx.utils.sheet_to_json(sheet, { defval: "" });
-        // 清洗 xlsx 单元格：去 BOM / 零宽 / NBSP / 换行 / 前后空白。
-        // trim() 处理不了 ﻿ / ​ /  ，这些是从网页复制单元格最常踩的坑。
-        const cleanCell = (v) =>
-          String(v || "")
-            .replace(/[﻿​‌‍ ]/g, "")
-            .replace(/[\r\n\t]/g, "")
-            .trim();
-        // Normalize: support Chinese and semantic English column headers.
-        // 列头本身也可能带不可见字符，做一份归一化映射。
-        const normalizedRows = rows
-          .map((row) => {
-            const map = {};
-            Object.keys(row).forEach((k) => {
-              const key = cleanCell(k).toLowerCase();
-              map[key] = row[k];
-            });
-            return {
-              fileName: cleanCell(
-                map["文件名"] != null
-                  ? map["文件名"]
-                  : map["filename"] != null
-                  ? map["filename"]
-                  : map["file"] || ""
-              ),
-              title: cleanCell(
-                map["标题"] != null ? map["标题"] : map["title"] || ""
-              ),
-              description: cleanCell(
-                map["简介"] != null
-                  ? map["简介"]
-                  : map["description"] != null
-                  ? map["description"]
-                  : ""
-              ),
-              shortTitle: cleanCell(
-                map["视频号短标题"] != null
-                  ? map["视频号短标题"]
-                  : map["shorttitle"] != null
-                  ? map["shorttitle"]
-                  : ""
-              ),
-              tags: cleanCell(
-                map["标签"] != null ? map["标签"] : map["tags"] || ""
-              ),
-              coverPath: cleanCell(
-                map["封面"] != null
-                  ? map["封面"]
-                  : map["cover"] != null
-                  ? map["cover"]
-                  : map["coverpath"] || ""
-              ),
-            };
-          })
-          .filter((r) => r.fileName);
-        return normalizedRows;
+        // 统一走共享 sanitize（去 _x000d_ / \r，标题折换行并 trim，description 保留 \n）
+        return normalizeBatchXlsxRows(rows);
       } catch (e) {
         return { error: e && e.message ? e.message : String(e) };
+      }
+    });
+
+    // 同平台重复发布查重（GUI 批量发布 / 单视频发布提交前调用）
+    ipcMain.handle("publish:check-duplicate", async (_event, payload) => {
+      try {
+        const targets = Array.isArray(payload && payload.targets)
+          ? payload.targets
+          : [];
+        if (!targets.length) return { duplicates: [] };
+        const res = changeData({
+          fileName: "pushData",
+          type: "get",
+          item: { page: 1, pageSize: 10000 },
+        });
+        const records =
+          res && res.success && Array.isArray(res.data) ? res.data : [];
+        const hits = findDuplicatePublishesForTargets(records, targets);
+        return {
+          duplicates: hits.map((h) => ({
+            index: h.index,
+            ...h.hit,
+          })),
+        };
+      } catch (e) {
+        console.warn(
+          "[publish:check-duplicate] 查重异常:",
+          (e && e.message) || e
+        );
+        return { duplicates: [] };
       }
     });
 

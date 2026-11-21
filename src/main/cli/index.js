@@ -23,7 +23,10 @@ import { runHistoryCli } from "./runHistoryCli";
 import { runStatsCli } from "./runStatsCli";
 import { runCommentsCli } from "./runCommentsCli";
 import ptConfig from "../config/ptConfig";
-import { runPuppeteerTask } from "../services/puppeteerFile";
+import {
+  runPuppeteerTask,
+  registerPublishDedupeBypass,
+} from "../services/puppeteerFile";
 import { runDouyinCliLogin } from "../services/cliLogin/douyinCliLogin";
 import { runSphCliLogin } from "../services/cliLogin/sphCliLogin";
 import { runSphChromeLogin } from "../services/cliLogin/sphChromeLogin";
@@ -35,6 +38,18 @@ import { resolveAccountPublishMode } from "../services/accountPublishSettingsRes
 import { resolveTaskPartition } from "../services/accountLookup.js";
 import { ensureAccountRecordsMigrated } from "../services/accountMigration.js";
 import { normalizeVideoMetadata } from "../../shared/videoMetadata.js";
+import {
+  normalizeBatchXlsxRows,
+  sanitizePublishCliArgs,
+  sanitizeTitle,
+} from "../../shared/textSanitize.js";
+import {
+  DUPLICATE_EXIT_CODE,
+  findRecentDuplicatePublish,
+} from "../../shared/publishDedupe.js";
+import dataStatsStore from "../services/dataStats/store.js";
+import { collectAccount as collectStatsAccount } from "../services/dataStats/collector.js";
+import { handleAccountCollectOutcome } from "../services/dataStats/collectAlert.js";
 
 export {
   isCliMode,
@@ -49,6 +64,9 @@ export {
   accountsHelpText,
   parseHistoryArgs,
   historyHelpText,
+  parseXlsxRows,
+  runStatsGetWithAlerts,
+  runStatsSyncWithAlerts,
 };
 
 function fileStem(filePath) {
@@ -76,67 +94,241 @@ function derivePhoneForRecord(v) {
 }
 
 /**
- * Parse xlsx rows for batch publish. Mirrors ipcMain.js dialog:openBatchXlsx logic.
+ * Parse xlsx rows for batch publish. Shares normalizeBatchXlsxRows with ipcMain.js dialog:openBatchXlsx.
  * Returns video metadata rows filtered to rows with non-empty fileName.
  */
 function parseXlsxRows(xlsxPath) {
   const workbook = xlsx.readFile(xlsxPath);
   const sheet = workbook.Sheets[workbook.SheetNames[0]];
   const rows = xlsx.utils.sheet_to_json(sheet, { defval: "" });
-  const cleanCell = (val) =>
-    String(val || "")
-      .replace(/[﻿​‌‍ ]/g, "")
-      .replace(/[\n\t]/g, "")
-      .trim();
-  return rows
-    .map((row) => {
-      const map = {};
-      Object.keys(row).forEach((k) => {
-        map[cleanCell(k).toLowerCase()] = row[k];
+  return normalizeBatchXlsxRows(rows);
+}
+
+function readPushDataRecordsForCli() {
+  try {
+    const res = changeData({
+      fileName: "pushData",
+      type: "get",
+      item: { page: 1, pageSize: 10000 },
+    });
+    return res && res.success && Array.isArray(res.data) ? res.data : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+function formatAlertUtc8Time(ms) {
+  if (typeof ms !== "number" || !Number.isFinite(ms) || ms <= 0) return "";
+  return new Date(ms + 8 * 3600e3).toISOString().slice(0, 19).replace("T", " ");
+}
+
+/**
+ * `cli stats` 输出增强：在原字段基础上附带 collectAlert / hasCollectAlert，便于远程脚本监控采集失败告警。
+ */
+async function runStatsGetWithAlerts(opts, deps = {}) {
+  const storeApi = deps.store || dataStatsStore;
+  const outLog = deps.log || console.log;
+  const acc = storeApi.readAccount(opts.phone, opts.platform);
+  const dates = Object.keys(acc.daily || {}).sort();
+  const latestDate = dates.length ? dates[dates.length - 1] : null;
+  const latest = latestDate ? acc.daily[latestDate] : null;
+  const collectAlert = acc.collectAlert || null;
+  const hasCollectAlert = Boolean(collectAlert && collectAlert.alerted);
+  const payload = {
+    success: Boolean(latestDate),
+    action: "get",
+    group: opts.phone,
+    platform: opts.platform,
+    latestDate,
+    latest,
+    lastCollectAt: (acc.meta && acc.meta.lastCollectAt) || null,
+    workCount: (acc.works || []).length,
+    collectAlert,
+    hasCollectAlert,
+    ...(latestDate ? {} : { hint: "本地暂无数据，请先运行 cli stats-sync 采集" }),
+  };
+
+  if (opts.json) {
+    outLog(JSON.stringify(payload, null, 2));
+  } else {
+    if (!latestDate) {
+      outLog(`${opts.phone} · ${opts.platform}: 本地暂无数据，请先运行 cli stats-sync 采集`);
+    } else {
+      const n = (v) => (v == null ? "-" : Number(v).toLocaleString("zh-CN"));
+      outLog(`${opts.phone} · ${opts.platform}（最新快照 ${latestDate}）`);
+      outLog(
+        `  粉丝 ${n(latest.fans)} | 播放 ${n(latest.plays)} | 点赞 ${n(latest.likes)} | 评论 ${n(
+          latest.comments
+        )} | 收藏 ${n(latest.favorites)} | 作品 ${payload.workCount} 条`
+      );
+    }
+    if (hasCollectAlert) {
+      const label = collectAlert.isLoginError ? "采集失败/需重新登录" : "采集失败";
+      outLog(
+        `  告警: ${label}（连续 ${collectAlert.consecutiveFailures} 次，首次失败 ${formatAlertUtc8Time(
+          collectAlert.firstFailedAt
+        )}）— ${collectAlert.reason}`
+      );
+    }
+  }
+  return latestDate ? 0 : 3;
+}
+
+/**
+ * `cli stats-sync` 接入采集失败告警持久化与账号总播放防假 0 保护。
+ */
+async function runStatsSyncWithAlerts(opts, deps = {}) {
+  const storeApi = deps.store || dataStatsStore;
+  const collectorFn = deps.collectAccount || collectStatsAccount;
+  const resolvePartFn = deps.resolveTaskPartition || resolveTaskPartition;
+  const outcomeFn = deps.handleAccountCollectOutcome || handleAccountCollectOutcome;
+  const outLog = deps.log || console.log;
+  const errLog = deps.error || console.error;
+
+  const startedAt = Date.now();
+  const prevWorkCount =
+    typeof storeApi.getPreviousWorkCount === "function"
+      ? storeApi.getPreviousWorkCount(opts.phone, opts.platform)
+      : 0;
+  try {
+    const data = await collectorFn({
+      partition: resolvePartFn({ phone: opts.phone, pt: opts.platform }),
+      platform: opts.platform,
+    });
+    const collectNow = Date.now();
+    const outcome = outcomeFn({
+      group: opts.phone,
+      platform: opts.platform,
+      success: true,
+      works: data.works,
+      prevWorkCount,
+      now: collectNow,
+    });
+    if (!outcome.ok && outcome.zeroWorksAnomaly) {
+      storeApi.writeMeta(opts.phone, opts.platform, {
+        lastCollectAt: collectNow,
+        lastError: outcome.reason,
       });
-      return {
-        fileName: cleanCell(
-          map["文件名"] != null
-            ? map["文件名"]
-            : map["filename"] != null
-            ? map["filename"]
-            : map["file"] || ""
-        ),
-        title: cleanCell(
-          map["标题"] != null ? map["标题"] : map["title"] || ""
-        ),
-        description: cleanCell(
-          map["简介"] != null
-            ? map["简介"]
-            : map["description"] != null
-            ? map["description"]
-            : ""
-        ),
-        shortTitle: cleanCell(
-          map["视频号短标题"] != null
-            ? map["视频号短标题"]
-            : map["shorttitle"] != null
-            ? map["shorttitle"]
-            : ""
-        ),
-        tags: cleanCell(map["标签"] != null ? map["标签"] : map["tags"] || ""),
-        coverPath: cleanCell(
-          map["封面"] != null
-            ? map["封面"]
-            : map["cover"] != null
-            ? map["cover"]
-            : map["coverpath"] || ""
-        ),
-        creativeStatement: cleanCell(
-          map["创作声明"] != null
-            ? map["创作声明"]
-            : map["creativestatement"] != null
-            ? map["creativestatement"]
-            : map["cs"] || ""
-        ),
+      storeApi.appendCollectLog({
+        startedAt,
+        finishedAt: collectNow,
+        cancelled: false,
+        results: [
+          { group: opts.phone, platform: opts.platform, success: false, error: outcome.reason },
+        ],
+      });
+      const collectAlert =
+        typeof storeApi.getAccountCollectAlert === "function"
+          ? storeApi.getAccountCollectAlert(opts.phone, opts.platform)
+          : null;
+      const failPayload = {
+        success: false,
+        action: "sync",
+        group: opts.phone,
+        platform: opts.platform,
+        error: outcome.reason,
+        zeroWorksAnomaly: true,
+        collectAlert,
+        hasCollectAlert: Boolean(collectAlert && collectAlert.alerted),
       };
-    })
-    .filter((r) => r.fileName);
+      if (opts.json) {
+        outLog(JSON.stringify(failPayload, null, 2));
+      } else {
+        errLog(`✗ 采集异常 ${opts.phone} · ${opts.platform}: ${outcome.reason}`);
+      }
+      return 3;
+    }
+    storeApi.mergeDaily(opts.phone, opts.platform, data.overview, data.fansHistory, collectNow, {
+      works: data.works,
+    });
+    storeApi.mergeWorks(opts.phone, opts.platform, data.works, collectNow);
+    storeApi.writeMeta(opts.phone, opts.platform, {
+      lastCollectAt: collectNow,
+      lastError: "",
+      workCount: data.works.length,
+    });
+    storeApi.appendCollectLog({
+      startedAt,
+      finishedAt: Date.now(),
+      cancelled: false,
+      results: [
+        {
+          group: opts.phone,
+          platform: opts.platform,
+          success: true,
+          workCount: data.works.length,
+        },
+      ],
+    });
+    const payload = {
+      success: true,
+      action: "sync",
+      group: opts.phone,
+      platform: opts.platform,
+      overview: data.overview,
+      workCount: data.works.length,
+      fansHistoryPoints: (data.fansHistory || []).length,
+      collectAlert: null,
+      hasCollectAlert: false,
+    };
+    if (opts.json) {
+      outLog(JSON.stringify(payload, null, 2));
+    } else {
+      outLog(
+        `✓ 已采集 ${opts.phone} · ${opts.platform}：粉丝 ${data.overview.fans ?? "-"}，作品 ${
+          data.works.length
+        } 条`
+      );
+    }
+    return 0;
+  } catch (err) {
+    const message = (err && err.message) || String(err);
+    const failNow = Date.now();
+    let collectAlert = null;
+    try {
+      outcomeFn({
+        group: opts.phone,
+        platform: opts.platform,
+        success: false,
+        error: message,
+        prevWorkCount,
+        now: failNow,
+      });
+      if (typeof storeApi.getAccountCollectAlert === "function") {
+        collectAlert = storeApi.getAccountCollectAlert(opts.phone, opts.platform);
+      }
+      storeApi.writeMeta(opts.phone, opts.platform, {
+        lastCollectAt: failNow,
+        lastError: message,
+      });
+      storeApi.appendCollectLog({
+        startedAt,
+        finishedAt: Date.now(),
+        cancelled: false,
+        results: [{ group: opts.phone, platform: opts.platform, success: false, error: message }],
+      });
+    } catch (_) {}
+    if (opts.json) {
+      outLog(
+        JSON.stringify(
+          {
+            success: false,
+            action: "sync",
+            group: opts.phone,
+            platform: opts.platform,
+            error: message,
+            collectAlert,
+            hasCollectAlert: Boolean(collectAlert && collectAlert.alerted),
+          },
+          null,
+          2
+        )
+      );
+    } else {
+      errLog(`✗ 采集失败 ${opts.phone} · ${opts.platform}: ${message}`);
+    }
+    return 3;
+  }
 }
 
 /**
@@ -346,6 +538,33 @@ async function runBatchDirPublish(v, cfg) {
       phone: v.phone,
       pt: v.platform,
     });
+    if (!v.allowDuplicate) {
+      const dup = findRecentDuplicatePublish(readPushDataRecordsForCli(), {
+        pt: v.platform,
+        phone: derivePhoneForRecord(v),
+        partition: v.partition,
+        title: metadata.title,
+      });
+      if (dup) {
+        const r = {
+          index: i + 1,
+          total: rows.length,
+          fileName: row.fileName,
+          title: metadata.title,
+          platform: v.platform,
+          phone: v.phone || "",
+          status: "duplicate",
+          exitCode: DUPLICATE_EXIT_CODE,
+          duplicate: true,
+          lastPublishAt: dup.lastPublishAt,
+          lastPublishAtText: dup.lastPublishAtText,
+          message: dup.message,
+        };
+        results.push(r);
+        console.log(JSON.stringify({ progress: true, ...r }));
+        continue;
+      }
+    }
     const effectivePublishMode = resolveAccountPublishMode({
       phone: derivePhoneForRecord(v),
       pt: v.platform,
@@ -356,6 +575,7 @@ async function runBatchDirPublish(v, cfg) {
     const taskId = Date.now() + Math.random();
     const taskPayload = {
       taskId,
+      allowDuplicate: true,
       bookName,
       textType: "local",
       data: {
@@ -553,8 +773,9 @@ async function runBatchDirPublish(v, cfg) {
 
   // Summary
   const succeeded = results.filter((r) => r.status === "success").length;
+  const duplicateCount = results.filter((r) => r.status === "duplicate").length;
   const failed = results.filter(
-    (r) => r.status === "failed" || r.status === "skipped"
+    (r) => r.status === "failed" || r.status === "skipped" || r.status === "duplicate"
   ).length;
   console.log(
     JSON.stringify({
@@ -562,12 +783,21 @@ async function runBatchDirPublish(v, cfg) {
       total: rows.length,
       succeeded,
       failed,
-      message: "成功 " + succeeded + " / 失败 " + failed,
+      duplicate: duplicateCount,
+      message:
+        "成功 " +
+        succeeded +
+        " / 失败 " +
+        failed +
+        (duplicateCount > 0 ? "（含重复拦截 " + duplicateCount + "）" : ""),
       results,
     })
   );
 
   if (failed === 0) return 0;
+  if (succeeded === 0 && duplicateCount === results.length && duplicateCount > 0) {
+    return DUPLICATE_EXIT_CODE;
+  }
   if (succeeded === 0) return 2;
   return 1;
 }
@@ -646,7 +876,11 @@ export async function runCliMain(argv = process.argv) {
   }
 
   if (cmd === "publish") {
-    const parsed = parsePublishArgs(sub.slice(1));
+    const rawPublishArgs = sub.slice(1);
+    const allowDuplicate = rawPublishArgs.includes("--allow-duplicate");
+    const filteredArgs = rawPublishArgs.filter((a) => a !== "--allow-duplicate");
+    const sanitizedArgs = sanitizePublishCliArgs(filteredArgs);
+    const parsed = parsePublishArgs(sanitizedArgs);
     if (!parsed.ok) {
       console.error(parsed.error);
       return 2;
@@ -656,7 +890,7 @@ export async function runCliMain(argv = process.argv) {
       return 0;
     }
 
-    const v = parsed.value;
+    const v = { ...parsed.value, allowDuplicate };
     const cfg = ptConfig[v.platform];
     if (!cfg) {
       console.error("内部错误: 未找到平台配置", v.platform);
@@ -667,6 +901,44 @@ export async function runCliMain(argv = process.argv) {
     if (v.dir) {
       return await runBatchDirPublish(v, cfg);
     }
+
+    const resolvedPartition = resolveTaskPartition({
+      partition: v.partition,
+      phone: v.phone,
+      pt: v.platform,
+    });
+    const candTitle = sanitizeTitle(v.title) || fileStem(v.file);
+    if (!allowDuplicate) {
+      const hit = findRecentDuplicatePublish(readPushDataRecordsForCli(), {
+        pt: v.platform,
+        phone: v.phone || derivePhoneForRecord({ ...v, partition: resolvedPartition }),
+        partition: resolvedPartition,
+        title: candTitle,
+      });
+      if (hit) {
+        console.log(
+          JSON.stringify({
+            status: "duplicate",
+            exitCode: DUPLICATE_EXIT_CODE,
+            duplicate: true,
+            platform: hit.platform,
+            phone: hit.phone,
+            title: hit.title,
+            lastPublishAt: hit.lastPublishAt,
+            lastPublishAtText: hit.lastPublishAtText,
+            message: hit.message,
+          })
+        );
+        console.error(hit.message);
+        return DUPLICATE_EXIT_CODE;
+      }
+    }
+    registerPublishDedupeBypass({
+      pt: v.platform,
+      phone: v.phone || derivePhoneForRecord({ ...v, partition: resolvedPartition }),
+      partition: resolvedPartition,
+      title: candTitle,
+    });
 
     const result = await runSingleFilePublish(v);
     if (result.scheduled) {
@@ -1052,6 +1324,12 @@ export async function runCliMain(argv = process.argv) {
       return 0;
     }
     try {
+      if (cmd === "stats" && typeof runStatsGetWithAlerts === "function") {
+        return await runStatsGetWithAlerts(parsed.value);
+      }
+      if (cmd === "stats-sync" && typeof runStatsSyncWithAlerts === "function") {
+        return await runStatsSyncWithAlerts(parsed.value);
+      }
       return await runStatsCli(parsed.value);
     } catch (e) {
       if (cmd === "stats-export") {

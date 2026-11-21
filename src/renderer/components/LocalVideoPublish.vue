@@ -667,6 +667,11 @@ import {
   validateVideohaoBt2 as validateVideohaoBt2Value,
 } from "@/utils/localVideoPublishBt2";
 import { normalizeVideoMetadata } from "../../shared/videoMetadata.js";
+import {
+  sanitizeTitle,
+  sanitizeDescription,
+  sanitizeTags,
+} from "../../shared/textSanitize.js";
 import AiGenerateButton from "@/components/ai/AiGenerateButton.vue";
 
 function fileBaseName(p) {
@@ -1096,13 +1101,13 @@ export default {
 
     buildVideoPayload() {
       const bookName =
-        (this.form.title && this.form.title.trim()) || this.defaultBookName();
-      const bt1 = this.form.bt1.trim();
+        sanitizeTitle(this.form.title) || this.defaultBookName();
+      const bt1 = sanitizeTitle(this.form.bt1);
       const metadata = normalizeVideoMetadata({
         title: bt1,
-        description: this.form.description,
-        shortTitle: this.form.shortTitle,
-        tags: this.bqTags,
+        description: sanitizeDescription(this.form.description),
+        shortTitle: sanitizeTitle(this.form.shortTitle),
+        tags: sanitizeTags(this.bqTags),
       });
       return {
         bookName,
@@ -1115,11 +1120,60 @@ export default {
           shortTitle: metadata.shortTitle,
           tags: metadata.tags,
           ...metadata.legacy,
-          bq: formatBqFromTags(this.bqTags),
+          bq: formatBqFromTags(metadata.tags),
           coverPath: (this.form.coverPath || "").trim(),
           noDownload: this.form.noDownload === true,
         },
       };
+    },
+    async confirmDuplicatePublishTargets(targets) {
+      if (
+        !Array.isArray(targets) ||
+        targets.length === 0 ||
+        !ipcRenderer ||
+        typeof ipcRenderer.invoke !== "function"
+      ) {
+        return { proceed: true, allowDuplicate: true };
+      }
+      let duplicates = [];
+      try {
+        const res = await ipcRenderer.invoke("publish:check-duplicate", {
+          targets,
+        });
+        duplicates = res && Array.isArray(res.duplicates) ? res.duplicates : [];
+      } catch (_) {
+        return { proceed: true, allowDuplicate: true };
+      }
+      if (!duplicates.length) {
+        return { proceed: true, allowDuplicate: true };
+      }
+      const lines = duplicates
+        .slice(0, 6)
+        .map(
+          (d) =>
+            `${d.platform}（${d.phone || "当前账号"}）「${d.title}」— 上次发布时间：${
+              d.lastPublishAtText || "近 7 天内"
+            }`
+        );
+      if (duplicates.length > 6) {
+        lines.push(`…等共 ${duplicates.length} 条重复记录`);
+      }
+      try {
+        await this.$confirm(
+          `检测到以下平台 7 天内已有相同标题的成功/进行中发布记录：\n${lines.join(
+            "\n"
+          )}\n是否仍然发布？`,
+          "重复发布提醒",
+          {
+            confirmButtonText: "仍然发布",
+            cancelButtonText: "取消",
+            type: "warning",
+          }
+        );
+        return { proceed: true, allowDuplicate: true };
+      } catch (_) {
+        return { proceed: false, allowDuplicate: false };
+      }
     },
     buildPlatformVideoPayload(platformNode, baseVideo) {
       const link = buildVideoLinkOption(
@@ -1936,6 +1990,18 @@ export default {
         return 0;
       });
 
+      const dupCheckTargets = platforms.map((p) => ({
+        pt: p.pt,
+        phone: p.phone,
+        accountKey: p.accountKey,
+        partition: buildAccountPartitionOf(p, p.pt),
+        title: baseVideo.data.title || baseVideo.bookName,
+      }));
+      const dupDecision = await this.confirmDuplicatePublishTargets(dupCheckTargets);
+      if (!dupDecision.proceed) {
+        return;
+      }
+
       const scheduledWriteTasks = [];
       for (let p of platforms) {
         const partition = buildAccountPartitionOf(p, p.pt);
@@ -2008,6 +2074,7 @@ export default {
         const publishPayload = applyXhsConservativePublishOptions({
           ...p,
           taskId,
+          allowDuplicate: true,
           ...video,
           textOtherName: video.data.textOtherName,
           selectedFile,
@@ -2366,21 +2433,40 @@ export default {
       let scheduledSubmitted = 0;
       const scheduledWriteTasks = [];
 
+      const dirDupTargets = [];
+      for (const fileRow of this.dirBatchFiles) {
+        const stem = fileRow.fileName.replace(/\.[^/.]+$/, "");
+        const rowTitle = sanitizeTitle(fileRow.title) || stem;
+        for (const p of platforms) {
+          dirDupTargets.push({
+            pt: p.pt,
+            phone: p.phone,
+            accountKey: p.accountKey,
+            partition: buildAccountPartitionOf(p, p.pt),
+            title: rowTitle,
+          });
+        }
+      }
+      const dirDupDecision = await this.confirmDuplicatePublishTargets(dirDupTargets);
+      if (!dirDupDecision.proceed) {
+        return;
+      }
+
       for (const fileRow of this.dirBatchFiles) {
         // 优先使用 onDirPublishNext 里 IPC 解析好的真实路径（已做存在性 + 后缀补全）。
         // 兜底：老入口或刷新后 resolvedPath 丢失时，回退到 dirPath + fileName 拼接。
         const filePath =
           fileRow.resolvedPath || path.join(this.dirPath, fileRow.fileName);
         const stem = fileRow.fileName.replace(/\.[^/.]+$/, "");
-        const bt1 = (fileRow.title || stem).trim();
-        const description = String(fileRow.description || "").trim();
-        const shortTitle = String(fileRow.shortTitle || "").trim();
+        const bt1 = sanitizeTitle(fileRow.title) || stem;
+        const description = sanitizeDescription(fileRow.description);
+        const shortTitle = sanitizeTitle(fileRow.shortTitle);
         // tags: comma-separated -> space-separated with # prefix for hashtag platforms
-        const rawTags = String(fileRow.tags || "").trim();
+        const rawTags = sanitizeTags(fileRow.tags);
         const tagList = rawTags
-          ? rawTags
+          ? String(rawTags)
               .split(",")
-              .map((t) => t.trim())
+              .map((t) => sanitizeTitle(t))
               .filter(Boolean)
           : [];
         const bookName = bt1;
@@ -2497,6 +2583,7 @@ export default {
           const publishPayload = applyXhsConservativePublishOptions({
             ...p,
             taskId,
+            allowDuplicate: true,
             bookName,
             textType: "local",
             data: {

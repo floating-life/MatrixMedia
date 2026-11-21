@@ -42,6 +42,23 @@
         <span class="num">{{ showNum(row.favorites) }}</span>
       </template>
     </el-table-column>
+    <el-table-column label="采集状态" min-width="200">
+      <template #default="{ row }">
+        <span v-if="row.isGroupTotal" class="status-muted">-</span>
+        <div v-else-if="row.collectAlert && row.collectAlert.alerted" class="alert-cell">
+          <el-tag type="danger" size="mini" effect="dark" class="collect-alert-tag">
+            {{ row.collectAlert.isLoginError ? "采集失败/需重新登录" : "采集失败" }}
+          </el-tag>
+          <span
+            class="collect-alert-reason"
+            :title="row.collectAlert.reason"
+          >
+            连续{{ row.collectAlert.consecutiveFailures }}次：{{ row.collectAlert.reason }}
+          </span>
+        </div>
+        <span v-else class="status-ok">正常</span>
+      </template>
+    </el-table-column>
     <template #empty>
       <span class="empty-text">暂无数据，点击右上角「同步全部数据」从平台拉取</span>
     </template>
@@ -58,8 +75,10 @@ const EXCLUDED = new Set(["番茄视频", "掘金"]);
 export default {
   name: "GroupStatsTable",
   props: {
-    // [{ group, platform, meta, latest }] —— latest 为该账号最新日快照（可能为 null）
+    // [{ group, platform, meta, latest, collectAlert }] —— latest 为该账号最新日快照（可能为 null）
     accounts: { type: Array, default: () => [] },
+    // 持久化的活跃采集失败告警数组（可选，兜底尚未产出 daily.json 的账号）
+    collectAlerts: { type: Array, default: () => [] },
   },
   computed: {
     rows() {
@@ -87,6 +106,17 @@ export default {
       const latestOf = new Map(
         this.accounts.map((a) => [`${a.group}/${a.platform}`, a.latest])
       );
+      const alertOf = new Map();
+      for (const a of this.accounts) {
+        if (a && a.collectAlert && a.collectAlert.alerted) {
+          alertOf.set(`${a.group}/${a.platform}`, a.collectAlert);
+        }
+      }
+      for (const al of this.collectAlerts || []) {
+        if (al && al.alerted) {
+          alertOf.set(`${al.group}/${al.platform}`, al);
+        }
+      }
       const rows = [];
       for (const g of groups) {
         const total = { fans: 0, likes: 0, comments: 0, favorites: 0 };
@@ -101,6 +131,7 @@ export default {
             key: `${g.phone}/${pt}`,
             group: g.phone,
             platform: pt,
+            collectAlert: alertOf.get(`${g.phone}/${pt}`) || null,
             // 分组列合并范围 = 平台明细行 + 末尾分组总计行
             groupRowspan: idx === 0 ? g.pts.length + 1 : 0,
             ...(snap || {}),
@@ -204,5 +235,32 @@ export default {
 .empty-text {
   font-size: 13px;
   color: #909399;
+}
+
+.alert-cell {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.collect-alert-tag {
+  flex-shrink: 0;
+}
+
+.collect-alert-reason {
+  font-size: 12px;
+  color: #f56c6c;
+  line-height: 1.4;
+  word-break: break-all;
+}
+
+.status-ok {
+  font-size: 12px;
+  color: #67c23a;
+}
+
+.status-muted {
+  color: #c0c4cc;
 }
 </style>

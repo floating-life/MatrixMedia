@@ -17,6 +17,11 @@ const { app } = require("electron");
 const { WORK_STAT_KEYS, normalizeMetric } = require("./statsTable");
 
 const METRIC_KEYS = ["fans", "plays", "likes", "comments", "favorites", "shares"];
+const ACCOUNT_PLAYS_SHARP_DROP_RATIO = 0.5;
+const COLLECT_ALERTS_VERSION = 1;
+const COLLECT_ALERT_THRESHOLD = 2;
+const LOGIN_ERROR_RE =
+  /未登录|登录.*失效|登录.*过期|失效|重新登录|扫码|cookie|token|auth|unauthorized|401|403/i;
 
 function baseDir() {
   return path.join(app.getPath("userData"), "data-stats");
@@ -59,18 +64,116 @@ function writeDaily(group, platform, daily) {
   writeWorksDailyAtomic(file, daily);
 }
 
+function sumPositiveWorksPlay(works) {
+  let sum = 0;
+  let hasAny = false;
+  for (const w of Array.isArray(works) ? works : []) {
+    if (!w || typeof w !== "object") continue;
+    const p = normalizeMetric(w.play);
+    const lp = normalizeMetric(w.lastPositivePlay);
+    const v = p !== null && p > 0 ? p : lp !== null && lp > 0 ? lp : null;
+    if (v !== null) {
+      sum += v;
+      hasAny = true;
+    }
+  }
+  return { sum, hasAny };
+}
+
+function findPrevValidAccountPlays(daily, today) {
+  if (!isPlainObject(daily)) return null;
+  const dates = Object.keys(daily)
+    .filter((d) => typeof d === "string" && /^\d{4}-\d{2}-\d{2}$/.test(d))
+    .sort();
+  let best = null;
+  for (let i = dates.length - 1; i >= 0; i--) {
+    const d = dates[i];
+    if (d >= today) continue;
+    const entry = daily[d];
+    if (!isPlainObject(entry) || entry.playsAnomaly === true) continue;
+    const v = normalizeMetric(entry.plays);
+    if (v !== null && v > 0) {
+      best = { date: d, value: v };
+      break;
+    }
+  }
+  if (!best && isPlainObject(daily[today]) && daily[today].playsAnomaly !== true) {
+    const todayPlays = normalizeMetric(daily[today].plays);
+    if (todayPlays !== null && todayPlays > 0) {
+      best = { date: today, value: todayPlays };
+    }
+  }
+  return best;
+}
+
 /**
  * 合并一次采集到 daily：以 collectNow 的 UTC+8 日期写入当日总量快照；fansHistory 只回填缺失日期。
+ * 防假 0 / 骤降覆写：若本次账号总播放相对上次有效正值骤降（归 0 或降幅 ≥50%）且作品级无对应下降，
+ * 标记 playsAnomaly=true 且本次 plays 写 null，避免账号日增出现大负数。
  */
-function mergeDaily(group, platform, overview, fansHistory, now = Date.now()) {
+function mergeDaily(group, platform, overview, fansHistory, now = Date.now(), options = null) {
+  const opts = isPlainObject(options) ? options : null;
   const daily = readDaily(group, platform);
   const today = todayStr(now);
   const snap = {};
   for (const k of METRIC_KEYS) {
-    const v = Number(overview && overview[k]);
-    if (Number.isFinite(v)) snap[k] = v;
+    if (overview && Object.prototype.hasOwnProperty.call(overview, k) && overview[k] !== null && overview[k] !== undefined && overview[k] !== "") {
+      const v = Number(overview[k]);
+      if (Number.isFinite(v)) snap[k] = v;
+    }
   }
-  const nextDaily = { ...daily, [today]: { ...daily[today], ...snap } };
+
+  const mergedToday = { ...(isPlainObject(daily[today]) ? daily[today] : {}), ...snap };
+  if (Object.prototype.hasOwnProperty.call(snap, "plays")) {
+    const incomingPlays = normalizeMetric(snap.plays);
+    const prev = findPrevValidAccountPlays(daily, today);
+    if (prev && prev.value > 0 && incomingPlays !== null) {
+      const drop = prev.value - incomingPlays;
+      const dropRatio = drop / prev.value;
+      const isSharpDrop =
+        incomingPlays === 0 || (drop > 0 && dropRatio >= ACCOUNT_PLAYS_SHARP_DROP_RATIO);
+      if (isSharpDrop) {
+        let hasCorrespondingWorkDrop = false;
+        if (opts && Array.isArray(opts.works)) {
+          const prevWorks = readWorks(group, platform).works;
+          const prevSumInfo = sumPositiveWorksPlay(prevWorks);
+          const currSumInfo = sumPositiveWorksPlay(opts.works);
+          if (prevSumInfo.hasAny && prevSumInfo.sum > 0) {
+            const worksDrop = prevSumInfo.sum - (currSumInfo.hasAny ? currSumInfo.sum : 0);
+            const worksDropRatio = worksDrop / prevSumInfo.sum;
+            if (
+              worksDrop > 0 &&
+              worksDrop >= drop * 0.5 &&
+              worksDropRatio >= dropRatio * 0.5
+            ) {
+              hasCorrespondingWorkDrop = true;
+            }
+          }
+        }
+        if (!hasCorrespondingWorkDrop) {
+          mergedToday.plays = null;
+          mergedToday.playsAnomaly = true;
+          mergedToday.playsAnomalyDetail = {
+            prevDate: prev.date,
+            prevValue: prev.value,
+            rawValue: incomingPlays,
+            reason: "账号总播放较上次骤降且作品级无对应下降",
+          };
+        } else {
+          delete mergedToday.playsAnomaly;
+          delete mergedToday.playsAnomalyDetail;
+        }
+      } else if (incomingPlays > 0) {
+        delete mergedToday.playsAnomaly;
+        delete mergedToday.playsAnomalyDetail;
+      }
+    } else if (incomingPlays !== null && incomingPlays > 0) {
+      delete mergedToday.playsAnomaly;
+      delete mergedToday.playsAnomalyDetail;
+    }
+  }
+
+  const nextDaily = { ...daily, [today]: mergedToday };
   for (const point of fansHistory || []) {
     if (!point || !point.date) continue;
     if (!nextDaily[point.date]) nextDaily[point.date] = {};
@@ -169,10 +272,46 @@ function parseValidPublishTime(raw) {
   return ms;
 }
 
+function maxPositiveMetric(...vals) {
+  let max = 0;
+  for (const raw of vals) {
+    const v = normalizeMetric(raw);
+    if (v !== null && v > max) max = v;
+  }
+  return max;
+}
+
+function getWorkHistoricalPositivePlay(existing, dailyHistoryByWork, workId) {
+  let max = existing
+    ? maxPositiveMetric(
+        existing.play,
+        existing.lastPositivePlay,
+        existing.baselineStats && existing.baselineStats.play,
+        existing.closedStats && existing.closedStats.play
+      )
+    : 0;
+  if (max > 0) return max;
+  if (dailyHistoryByWork && workId != null) {
+    const wid = String(workId);
+    const dateMap = dailyHistoryByWork[wid];
+    if (isPlainObject(dateMap)) {
+      for (const snap of Object.values(dateMap)) {
+        if (isPlainObject(snap)) {
+          max = maxPositiveMetric(max, snap.play);
+        }
+      }
+    }
+  }
+  return max;
+}
+
 /**
  * 合并作品列表，实现「发布增长」口径：
  * - 新出现的作品：登记基线（首次见到时的值），并封闭「比它早且尚未封闭」的最近一条
  * - 已有作品：更新当前累计值；若重采得到有效 publishTime（>0 且可解析）同步更新
+ * - 防假 0 覆写：若该作品历史已有 play>0，本次 play===0 或缺失，视为接口缺省，
+ *   快照（works-daily / works-intraday）本次 play 写 null（其他字段正常写），
+ *   works.json 保留原正 play 不被假 0 覆写
  * - 展示时优先用封闭值（closedStats），未封闭用当前值
  */
 function mergeWorks(group, platform, newWorks, now = Date.now(), options = null) {
@@ -189,11 +328,48 @@ function mergeWorks(group, platform, newWorks, now = Date.now(), options = null)
     .filter((w) => w && w.workId)
     .sort((a, b) => (parseValidPublishTime(a.publishTime) || 0) - (parseValidPublishTime(b.publishTime) || 0));
 
+  // 仅当存在「本次 play 为 0/缺失且 works.json 未记录正 play」的作品时，懒加载 works-daily 历史兜底检查
+  let dailyHistoryByWork = null;
+  let dailyHistoryLoaded = false;
+  const ensureDailyHistory = () => {
+    if (!dailyHistoryLoaded) {
+      dailyHistoryLoaded = true;
+      try {
+        dailyHistoryByWork = readWorksDaily(group, platform);
+      } catch (_) {
+        dailyHistoryByWork = null;
+      }
+    }
+    return dailyHistoryByWork;
+  };
+
+  const snapshotWorks = [];
+
   for (const w of sorted) {
     const validPubTime = parseValidPublishTime(w.publishTime);
     const existing = byId.get(w.workId);
+    const incomingPlay = normalizeMetric(w.play);
+    let histPosPlay = getWorkHistoricalPositivePlay(existing, null, w.workId);
+    if (histPosPlay <= 0 && (incomingPlay === 0 || incomingPlay === null)) {
+      histPosPlay = getWorkHistoricalPositivePlay(existing, ensureDailyHistory(), w.workId);
+    }
+    const isFalseZeroPlay = histPosPlay > 0 && (incomingPlay === 0 || incomingPlay === null);
+    const snapWork = isFalseZeroPlay ? { ...w, play: null } : w;
+    snapshotWorks.push(snapWork);
+
     if (existing) {
-      Object.assign(existing, pickStats(w), { updatedAt: now });
+      const nextStats = pickStats(w);
+      if (isFalseZeroPlay) {
+        const existingPosPlay = normalizeMetric(existing.play);
+        nextStats.play =
+          existingPosPlay !== null && existingPosPlay > 0 ? existingPosPlay : null;
+      }
+      Object.assign(existing, nextStats, { updatedAt: now });
+      if (incomingPlay !== null && incomingPlay > 0) {
+        existing.lastPositivePlay = maxPositiveMetric(existing.lastPositivePlay, incomingPlay);
+      } else if (histPosPlay > 0) {
+        existing.lastPositivePlay = histPosPlay;
+      }
       if (w.title) existing.title = w.title;
       if (w.url) existing.url = w.url;
       if (validPubTime !== null) existing.publishTime = validPubTime;
@@ -215,19 +391,24 @@ function mergeWorks(group, platform, newWorks, now = Date.now(), options = null)
         earlier.closedAt = now;
       }
     }
+    const initStats = pickStats(snapWork);
     const row = {
       workId: w.workId,
       title: w.title || "(无标题)",
       altTitles: normalizeAltTitles(w.altTitles),
       url: w.url || "",
       publishTime: newPubTime,
-      ...pickStats(w),
-      baselineStats: pickStats(w),
+      ...initStats,
+      baselineStats: { ...initStats },
       closedStats: null,
       closedAt: null,
       firstSeenAt: now,
       updatedAt: now,
     };
+    const posPlay = maxPositiveMetric(histPosPlay, incomingPlay);
+    if (posPlay > 0) {
+      row.lastPositivePlay = posPlay;
+    }
     data.works.push(row);
     byId.set(row.workId, row);
   }
@@ -237,10 +418,11 @@ function mergeWorks(group, platform, newWorks, now = Date.now(), options = null)
 
   // 整次写入统一以 collectNow（now）的 UTC+8 日期归档，不因写入耗时跨零点而中途放弃
   writeWorks(group, platform, data);
-  recordWorksDaily(group, platform, sorted, now);
-  recordWorksIntraday(group, platform, sorted, {
+  recordWorksDaily(group, platform, snapshotWorks, now);
+  recordWorksIntraday(group, platform, snapshotWorks, {
     ...(opts || {}),
     now,
+    _falseZeroChecked: true,
   });
   return data;
 }
@@ -799,9 +981,42 @@ function recordWorksIntraday(group, platform, works, optionsOrNow, extraOpts) {
 
   try {
     const existingSlots = parseIntradayDayFile(file) || Object.create(null);
+    let knownWorksById = null;
+    const ensureKnownWorks = () => {
+      if (knownWorksById === null) {
+        knownWorksById = new Map();
+        try {
+          const wd = readWorks(group, platform);
+          for (const item of wd.works || []) {
+            if (item && item.workId != null) knownWorksById.set(String(item.workId), item);
+          }
+        } catch (_) {}
+      }
+      return knownWorksById;
+    };
+    const hasEarlierPositiveInSlots = (wid) => {
+      for (const sKey of Object.keys(existingSlots)) {
+        if (sKey >= slotTime) continue;
+        const se = existingSlots[sKey];
+        const prevSnap = se && se.works && se.works[wid];
+        if (prevSnap && normalizeMetric(prevSnap.play) > 0) return true;
+      }
+      return false;
+    };
     const slotWorks = Object.create(null);
     for (const w of validWorks) {
-      slotWorks[String(w.workId)] = pickWorkDailyStats(w);
+      const wid = String(w.workId);
+      const stats = pickWorkDailyStats(w);
+      if (opts._falseZeroChecked !== true && (stats.play === 0 || stats.play === null)) {
+        const known = ensureKnownWorks().get(wid);
+        const histPos =
+          getWorkHistoricalPositivePlay(known, null, wid) > 0 ||
+          hasEarlierPositiveInSlots(wid);
+        if (histPos) {
+          stats.play = null;
+        }
+      }
+      slotWorks[wid] = stats;
     }
     existingSlots[slotTime] = {
       collectedAt: now,
@@ -1002,10 +1217,218 @@ function readWorksIntradayLatestCollectedAt(group, platform, cutoffDate = "") {
 
 /* ---------------- meta ---------------- */
 
+function readMeta(group, platform) {
+  return readJson(path.join(accountDir(group, platform), "meta.json"), {});
+}
+
 function writeMeta(group, platform, patch) {
   const file = path.join(accountDir(group, platform), "meta.json");
   const meta = readJson(file, {});
-  writeJson(file, { ...meta, ...patch });
+  const next = { ...meta, ...patch };
+  if (typeof patch.workCount === "number" && Number.isFinite(patch.workCount) && patch.workCount > 0) {
+    next.lastPositiveWorkCount = patch.workCount;
+  }
+  writeJson(file, next);
+}
+
+function getPreviousWorkCount(group, platform) {
+  const meta = readMeta(group, platform);
+  const works = readWorks(group, platform).works || [];
+  const metaPos =
+    typeof meta.lastPositiveWorkCount === "number" && Number.isFinite(meta.lastPositiveWorkCount)
+      ? meta.lastPositiveWorkCount
+      : 0;
+  const metaCur =
+    typeof meta.workCount === "number" && Number.isFinite(meta.workCount) ? meta.workCount : 0;
+  return Math.max(metaPos, metaCur, works.length);
+}
+
+/* ---------------- 采集失败告警（持久化状态） ---------------- */
+
+function collectAlertsFile() {
+  return path.join(baseDir(), "collect-alerts.json");
+}
+
+function collectAlertKey(group, platform) {
+  return `${String(group || "")}|${String(platform || "")}`;
+}
+
+function emptyCollectAlertsDoc() {
+  return {
+    version: COLLECT_ALERTS_VERSION,
+    updatedAt: 0,
+    accounts: Object.create(null),
+  };
+}
+
+function normalizeCollectAlertEntry(raw) {
+  if (!isPlainObject(raw)) return null;
+  const group = typeof raw.group === "string" ? raw.group : "";
+  const platform = typeof raw.platform === "string" ? raw.platform : "";
+  if (!group || !platform) return null;
+  const consecutiveFailures =
+    typeof raw.consecutiveFailures === "number" &&
+    Number.isInteger(raw.consecutiveFailures) &&
+    raw.consecutiveFailures > 0
+      ? raw.consecutiveFailures
+      : 1;
+  const firstFailedAt =
+    typeof raw.firstFailedAt === "number" && Number.isFinite(raw.firstFailedAt) && raw.firstFailedAt > 0
+      ? raw.firstFailedAt
+      : 0;
+  const lastFailedAt =
+    typeof raw.lastFailedAt === "number" && Number.isFinite(raw.lastFailedAt) && raw.lastFailedAt > 0
+      ? raw.lastFailedAt
+      : firstFailedAt;
+  const reason = typeof raw.reason === "string" && raw.reason.trim() ? raw.reason.trim() : "采集失败";
+  const isLoginError =
+    typeof raw.isLoginError === "boolean" ? raw.isLoginError : LOGIN_ERROR_RE.test(reason);
+  const alerted = consecutiveFailures >= COLLECT_ALERT_THRESHOLD;
+  const notified = Boolean(raw.notified);
+  const notifiedAt =
+    typeof raw.notifiedAt === "number" && Number.isFinite(raw.notifiedAt) && raw.notifiedAt > 0
+      ? raw.notifiedAt
+      : null;
+  return {
+    group,
+    platform,
+    account: `${group}·${platform}`,
+    reason,
+    isLoginError,
+    firstFailedAt,
+    lastFailedAt,
+    consecutiveFailures,
+    alerted,
+    notified,
+    notifiedAt,
+  };
+}
+
+function readCollectAlerts() {
+  const file = collectAlertsFile();
+  let raw;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch (err) {
+    if (!err || err.code === "ENOENT") return emptyCollectAlertsDoc();
+    console.warn(`[dataStats] 读取 collect-alerts.json 失败 (${file}):`, (err && err.message) || err);
+    return emptyCollectAlertsDoc();
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!isPlainObject(parsed) || !isPlainObject(parsed.accounts)) {
+      return emptyCollectAlertsDoc();
+    }
+    const accounts = Object.create(null);
+    for (const k of Object.keys(parsed.accounts)) {
+      const desc = Object.getOwnPropertyDescriptor(parsed.accounts, k);
+      const norm = normalizeCollectAlertEntry(desc ? desc.value : null);
+      if (norm) {
+        accounts[collectAlertKey(norm.group, norm.platform)] = norm;
+      }
+    }
+    return {
+      version: COLLECT_ALERTS_VERSION,
+      updatedAt:
+        typeof parsed.updatedAt === "number" && Number.isFinite(parsed.updatedAt)
+          ? parsed.updatedAt
+          : 0,
+      accounts,
+    };
+  } catch (err) {
+    console.warn(`[dataStats] collect-alerts.json JSON 损坏 (${file}):`, (err && err.message) || err);
+    return emptyCollectAlertsDoc();
+  }
+}
+
+function writeCollectAlerts(doc, now = Date.now()) {
+  const ts = typeof now === "number" && Number.isFinite(now) ? now : Date.now();
+  const plainAccounts = {};
+  const src = doc && isPlainObject(doc.accounts) ? doc.accounts : {};
+  for (const k of Object.keys(src)) {
+    const norm = normalizeCollectAlertEntry(src[k]);
+    if (norm) {
+      plainAccounts[collectAlertKey(norm.group, norm.platform)] = norm;
+    }
+  }
+  const payload = {
+    version: COLLECT_ALERTS_VERSION,
+    updatedAt: ts,
+    accounts: plainAccounts,
+  };
+  writeWorksDailyAtomic(collectAlertsFile(), payload);
+  return payload;
+}
+
+function recordCollectFailure(group, platform, reason, now = Date.now()) {
+  const ts = typeof now === "number" && Number.isFinite(now) ? now : Date.now();
+  const doc = readCollectAlerts();
+  const key = collectAlertKey(group, platform);
+  const prev = doc.accounts[key] || null;
+  const cleanReason =
+    typeof reason === "string" && reason.trim() ? reason.trim() : "采集失败";
+  const consecutiveFailures = prev ? prev.consecutiveFailures + 1 : 1;
+  const state = {
+    group: String(group || ""),
+    platform: String(platform || ""),
+    account: `${String(group || "")}·${String(platform || "")}`,
+    reason: cleanReason,
+    isLoginError: LOGIN_ERROR_RE.test(cleanReason),
+    firstFailedAt: prev && prev.firstFailedAt > 0 ? prev.firstFailedAt : ts,
+    lastFailedAt: ts,
+    consecutiveFailures,
+    alerted: consecutiveFailures >= COLLECT_ALERT_THRESHOLD,
+    notified: prev ? Boolean(prev.notified) : false,
+    notifiedAt: prev ? prev.notifiedAt || null : null,
+  };
+  doc.accounts[key] = state;
+  writeCollectAlerts(doc, ts);
+  return {
+    state,
+    alerted: state.alerted,
+    shouldNotify: state.alerted && !state.notified,
+  };
+}
+
+function markCollectAlertNotified(group, platform, now = Date.now()) {
+  const ts = typeof now === "number" && Number.isFinite(now) ? now : Date.now();
+  const doc = readCollectAlerts();
+  const key = collectAlertKey(group, platform);
+  const entry = doc.accounts[key];
+  if (!entry) return null;
+  entry.notified = true;
+  entry.notifiedAt = ts;
+  writeCollectAlerts(doc, ts);
+  return entry;
+}
+
+function clearCollectFailure(group, platform, now = Date.now()) {
+  const doc = readCollectAlerts();
+  const key = collectAlertKey(group, platform);
+  if (!doc.accounts[key]) return false;
+  delete doc.accounts[key];
+  writeCollectAlerts(doc, now);
+  return true;
+}
+
+function getAccountCollectFailureState(group, platform) {
+  const doc = readCollectAlerts();
+  return doc.accounts[collectAlertKey(group, platform)] || null;
+}
+
+function getAccountCollectAlert(group, platform) {
+  const state = getAccountCollectFailureState(group, platform);
+  return state && state.alerted ? state : null;
+}
+
+function listActiveCollectAlerts() {
+  const doc = readCollectAlerts();
+  return Object.values(doc.accounts)
+    .filter((entry) => entry && entry.alerted)
+    .sort((a, b) => {
+      if (a.group !== b.group) return a.group < b.group ? -1 : 1;
+      return a.platform < b.platform ? -1 : a.platform > b.platform ? 1 : 0;
+    });
 }
 
 /* ---------------- 采集日志 ---------------- */
@@ -1673,6 +2096,7 @@ function readAccount(group, platform) {
     daily: readDaily(group, platform),
     works: readWorks(group, platform).works,
     meta: readJson(path.join(accountDir(group, platform), "meta.json"), {}),
+    collectAlert: getAccountCollectAlert(group, platform),
   };
 }
 
@@ -1697,9 +2121,10 @@ function listAccounts() {
   return out;
 }
 
-/** 全账号按日聚合（所有账号总览页用）；accounts 附最新快照供平台分布/分组表使用 */
+/** 全账号按日聚合（所有账号总览页用）；accounts 附最新快照与采集失败告警 */
 function readOverview() {
   const merged = {};
+  const alertsDoc = readCollectAlerts();
   const accounts = listAccounts().map((acc) => {
     const daily = readDaily(acc.group, acc.platform);
     const dates = Object.keys(daily).sort();
@@ -1709,17 +2134,30 @@ function readOverview() {
         merged[date] = { fans: 0, plays: 0, likes: 0, comments: 0, favorites: 0, shares: 0 };
       }
       for (const k of METRIC_KEYS) {
-        merged[date][k] += Number(snap[k]) || 0;
+        if (k === "plays" && snap && snap.playsAnomaly === true) continue;
+        const v = Number(snap && snap[k]);
+        if (Number.isFinite(v)) merged[date][k] += v;
       }
     }
-    return { ...acc, latest };
+    const alertState = alertsDoc.accounts[collectAlertKey(acc.group, acc.platform)] || null;
+    const collectAlert = alertState && alertState.alerted ? alertState : null;
+    return { ...acc, latest, collectAlert };
   });
-  return { daily: merged, accounts };
+  const collectAlerts = Object.values(alertsDoc.accounts)
+    .filter((entry) => entry && entry.alerted)
+    .sort((a, b) => {
+      if (a.group !== b.group) return a.group < b.group ? -1 : 1;
+      return a.platform < b.platform ? -1 : a.platform > b.platform ? 1 : 0;
+    });
+  return { daily: merged, accounts, collectAlerts };
 }
 
 module.exports = {
   METRIC_KEYS,
   WORK_STAT_KEYS,
+  ACCOUNT_PLAYS_SHARP_DROP_RATIO,
+  COLLECT_ALERTS_VERSION,
+  COLLECT_ALERT_THRESHOLD,
   DEFAULT_INTRADAY_RETENTION_DAYS,
   mergeDaily,
   mergeWorks,
@@ -1737,7 +2175,18 @@ module.exports = {
   readAccount,
   readOverview,
   listAccounts,
+  readMeta,
   writeMeta,
+  getPreviousWorkCount,
+  collectAlertsFile,
+  readCollectAlerts,
+  writeCollectAlerts,
+  recordCollectFailure,
+  markCollectAlertNotified,
+  clearCollectFailure,
+  getAccountCollectFailureState,
+  getAccountCollectAlert,
+  listActiveCollectAlerts,
   appendCollectLog,
   readCollectLogs,
   MAX_AUTO_RUN_DATES,

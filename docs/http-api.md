@@ -140,6 +140,7 @@
 | `platformOptions`    | 否     | 平台专属参数容器；视频号商品也可用 `platformOptions.sph.link`，不会应用到其他平台                                                        |
 | `creativeStatement`  | 否     | 全局创作声明，等同 GUI「批量设置创作声明」；支持 value、中文 label 或平台页面原文案（如 `内容由AI生成`）                                 |
 | `creativeStatements` | 否     | 按平台覆盖声明，key 用 code 或中文名，如 `{ "dy": "ai_generated", "blbl": "fiction" }`；某平台不支持所选值时回退 `none`                  |
+| `allowDuplicate`     | 否     | 默认 `false`；7 天内同平台+同账号+清洗后同标题已有成功/进行中记录时默认拦截，传 `true` 才放行（亦可在多平台 `platforms[]` 子对象内按平台单独指定） |
 
 **创作声明优先级**（与 GUI 一致）：`platforms[].creativeStatement` > `creativeStatements[平台]` > `creativeStatement`。
 
@@ -150,11 +151,13 @@
 | 字段                             | 说明                                                 |
 | -------------------------------- | ---------------------------------------------------- |
 | `success`                        | 请求是否被接受；多平台表示已成功提交到发布队列       |
-| `status`                         | 单平台为最终状态；多平台提交成功为 `submitted`       |
-| `exitCode`                       | 单平台同 CLI；多平台提交成功为 `0`                   |
-| `message`                        | 结果说明                                             |
+| `status`                         | 单平台为最终状态（重复拦截为 `duplicate`）；多平台提交成功为 `submitted`，部分平台被拦截重复为 `partial_duplicate`，全拦截为 `duplicate` |
+| `exitCode`                       | 单平台同 CLI（重复拦截为 `6`）；多平台提交成功为 `0` |
+| `duplicate`                      | 触发 7 天内重复发布拦截时为 `true`                   |
+| `lastPublishAt` / `lastPublishAtText` | 触发重复发布拦截时返回上次匹配记录的时间戳（ms）与 UTC+8 时间文本 |
+| `message`                        | 结果说明（重复拦截时含上次发布时间）                 |
 | `total` / `succeeded` / `failed` | 多平台提交汇总；最终成功失败以 `pushData` 记录为准   |
-| `results`                        | 多平台时各平台提交明细数组（含 `creativeStatement`） |
+| `results`                        | 多平台时各平台提交明细数组（含 `creativeStatement`；重复平台单独标 `status: "duplicate"`、`exitCode: 6`，其余平台照常执行） |
 | `id`                             | 单平台时写入 `pushData` 的记录 id                    |
 | `scheduled` / `publishAt`        | 定时发布时返回                                       |
 
@@ -164,7 +167,8 @@
 - 单平台发布失败（如上传/填写失败）：HTTP `200`，但 `success: false`、`exitCode: 3`
 - 登录态失效：HTTP `200`，`success: false`、`status: login_required`、`exitCode: 5`（需重新扫码后重跑）
 - 视频号链接添加失败但草稿保存成功：HTTP `200`，`success: false`、`status: needs_attention`、`exitCode: 4`
-- 多平台：HTTP 只表示任务是否提交成功，最终结果请查询发布记录
+- 7 天内同平台重复发布拦截：HTTP `200`，`success: false`、`status: duplicate`、`exitCode: 6`、`duplicate: true`（`message` 写明上次发布时间；传 `allowDuplicate: true` 可放行）
+- 多平台：HTTP 只表示任务是否提交成功（重复平台仅拦截对应平台，其余照常提交），最终结果请查询发布记录
 - 服务已配置 CORS，浏览器或本机脚本均可调用
 
 ## 示例
@@ -334,7 +338,7 @@ curl -X POST http://127.0.0.1:30088/publish \
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/stats?phone=<分组>&pt=<平台>` | 读本地快照中的账号粉丝数据 |
+| GET | `/stats?phone=<分组>&pt=<平台>` | 读本地快照中的账号粉丝数据（同步返回 `collectAlert` / `hasCollectAlert` 连续采集失败告警状态） |
 | POST | `/stats/sync` | 主动采集：`{"phone":"123","pt":"blbl"}` |
 | GET | `/stats/work?phone=<分组>&pt=<平台>&title=<标题>` | 按完整标题查视频发布数据 |
 

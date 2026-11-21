@@ -2340,14 +2340,20 @@ function collectAccountDailyRows(accountsData, from, to, { sortRows = true } = {
       for (const k of ACCOUNT_METRIC_KEYS) {
         vals[k] = hasOwn(snap, k) ? fastNormalizeMetric(snap[k]) : null;
       }
+      const isPlaysAnomaly = snap.playsAnomaly === true;
+      if (isPlaysAnomaly) {
+        vals.plays = null;
+      }
 
       const fansDelta =
         vals.fans !== null && prevFans !== null ? vals.fans - prevFans : null;
       const playsDelta =
-        vals.plays !== null && prevPlays !== null ? vals.plays - prevPlays : null;
+        !isPlaysAnomaly && vals.plays !== null && prevPlays !== null
+          ? vals.plays - prevPlays
+          : null;
 
       if (vals.fans !== null) prevFans = vals.fans;
-      if (vals.plays !== null) prevPlays = vals.plays;
+      if (!isPlaysAnomaly && vals.plays !== null) prevPlays = vals.plays;
 
       if (to && date > to) continue;
 
@@ -2363,6 +2369,14 @@ function collectAccountDailyRows(accountsData, from, to, { sortRows = true } = {
         shares: vals.shares,
         fansDelta: fansDelta === 0 ? 0 : fansDelta,
         playsDelta: playsDelta === 0 ? 0 : playsDelta,
+        ...(isPlaysAnomaly
+          ? {
+              playsAnomaly: true,
+              playsAnomalyDetail: isPlainObject(snap.playsAnomalyDetail)
+                ? snap.playsAnomalyDetail
+                : null,
+            }
+          : {}),
       });
     }
   }
@@ -2419,25 +2433,50 @@ function buildAnalysisSheet(analysis) {
   }
   aoa.push([]);
 
-  // 第 1 节：总览（本周期 vs 上一周期）
-  aoa.push([
-    sanitizeTextCell(
-      `一、总览（本周期 ${curRange.from} ~ ${curRange.to} vs 上周期 ${prevRange.from} ~ ${prevRange.to}，周期 ${period} 天）`
-    ),
-  ]);
-  aoa.push(["指标", "本周期日增", "上周期日增", "环比(%)"].map(sanitizeTextCell));
-  const metrics = isPlainObject(a.overview) && isPlainObject(a.overview.metrics)
-    ? a.overview.metrics
-    : {};
-  for (const k of WORK_STAT_KEYS) {
-    const m = metrics[k];
-    if (!m) continue;
-    aoa.push([
-      sanitizeTextCell(m.label || k),
-      sanitizeNumberCell(m.current),
-      sanitizeNumberCell(m.previous),
-      sanitizeNumberCell(m.momPct),
-    ]);
+  // 第 1 节：总览（本周期 vs 上一周期；明确统计区间与实际覆盖天数；涨粉以账号日快照为主、单作品为辅）
+  const cov =
+    isPlainObject(a.overview) && isPlainObject(a.overview.coverage)
+      ? a.overview.coverage
+      : isPlainObject(a.coverage)
+      ? a.coverage
+      : null;
+  const overviewTitle = cov && cov.rangeText
+    ? `一、总览（${cov.rangeText}；对比上周期 ${prevRange.from} ~ ${prevRange.to}）`
+    : `一、总览（统计区间 ${curRange.from} ~ ${curRange.to}，对比上周期 ${prevRange.from} ~ ${prevRange.to}，周期 ${period} 天）`;
+  aoa.push([sanitizeTextCell(overviewTitle)]);
+  if (cov && cov.isPartial && cov.partialNotice) {
+    aoa.push([sanitizeTextCell(`覆盖提示：${cov.partialNotice}`)]);
+  }
+  aoa.push(["指标", "本周期增量", "上周期增量", "环比(%)", "数据来源"].map(sanitizeTextCell));
+  const overviewMetricRows =
+    isPlainObject(a.overview) && Array.isArray(a.overview.metricRows)
+      ? a.overview.metricRows
+      : null;
+  if (overviewMetricRows) {
+    for (const m of overviewMetricRows) {
+      if (!m) continue;
+      aoa.push([
+        sanitizeTextCell(m.label || m.key),
+        sanitizeNumberCell(m.current),
+        sanitizeNumberCell(m.previous),
+        sanitizeNumberCell(m.momPct),
+        sanitizeTextCell(m.source || null),
+      ]);
+    }
+  } else {
+    const metrics =
+      isPlainObject(a.overview) && isPlainObject(a.overview.metrics) ? a.overview.metrics : {};
+    for (const k of WORK_STAT_KEYS) {
+      const m = metrics[k];
+      if (!m) continue;
+      aoa.push([
+        sanitizeTextCell(m.label || k),
+        sanitizeNumberCell(m.current),
+        sanitizeNumberCell(m.previous),
+        sanitizeNumberCell(m.momPct),
+        sanitizeTextCell(m.source || null),
+      ]);
+    }
   }
   aoa.push([]);
 
@@ -2474,9 +2513,21 @@ function buildAnalysisSheet(analysis) {
   aoa.push([]);
 
   // 第 2 节：平台对比（仅覆盖 >=2 平台内容）
-  aoa.push([sanitizeTextCell("二、平台对比（仅覆盖 ≥2 平台内容）")]);
+  aoa.push([
+    sanitizeTextCell(
+      "二、平台对比（仅覆盖 ≥2 平台内容；加权互动率=Σ(点赞+评论+分享+收藏)/Σ播放，另附三项互动率供跨平台对比）"
+    ),
+  ]);
   aoa.push(
-    ["平台", "样本数", "平均播放", "互动率(%)", "平均涨粉", "备注"].map(sanitizeTextCell)
+    [
+      "平台",
+      "样本数",
+      "平均播放",
+      "加权互动率(%)",
+      "三项互动率(%)",
+      "平均涨粉",
+      "备注",
+    ].map(sanitizeTextCell)
   );
   const pc = isPlainObject(a.platformComparison) ? a.platformComparison : {};
   for (const p of Array.isArray(pc.platforms) ? pc.platforms : []) {
@@ -2485,6 +2536,7 @@ function buildAnalysisSheet(analysis) {
       sanitizeNumberCell(p.sampleCount),
       sanitizeNumberCell(p.avgPlay),
       sanitizeNumberCell(p.engagementRatePct),
+      sanitizeNumberCell(p.engagementRate3Pct),
       sanitizeNumberCell(p.avgFansDelta),
       sanitizeTextCell(p.note || null),
     ]);
@@ -3179,19 +3231,19 @@ function buildSchemaSheet(dynamicSchemaEntries) {
       "分析",
       "总览与环比",
       "overview",
-      "本周期（to 往前 analysisPeriod 天，含起止日）与紧邻上一同长周期的播放/点赞/评论/分享/收藏/涨粉日增合计及各平台播放贡献占比(%)。环比(%) = (本周期 − 上周期) / |上周期| × 100，上期为 0 或无数据时为空（不写 Infinity）。",
+      "展示「统计区间 X ~ Y，其中作品日数据实际覆盖 A ~ B（共 K 天）」，K < 区间天数时明确提示。播放/点赞/评论/分享/收藏取作品日明细日增合计；总览涨粉优先采用《账号日快照》各平台区间首尾粉丝差合计（覆盖快手等无单作品涨粉的平台），并保留单作品涨粉日增合计作为辅助行，两行均在「数据来源」列标明口径。环比(%) = (本周期 − 上周期) / |上周期| × 100，上期为 0 或无数据时为空（不写 Infinity）。",
     ],
     [
       "分析",
       "平台对比与互动率公式",
       "platformComparison",
-      "仅取覆盖 ≥2 个去重平台的同款内容，按平台统计平均播放、互动率(%)、平均涨粉与样本数。互动率公式 = (点赞 + 评论 + 分享) / 播放（单条播放为 0 或空时不计入，输出为百分数）；均播相差 <5% 视为并列并标注「播放接近」；样本数 <3 时标注「样本少，仅供参考」。",
+      "仅取覆盖 ≥2 个去重平台的同款内容，按平台统计平均播放、加权互动率(%)、三项互动率(%)、平均涨粉与样本数。平台级加权互动率 = Σ(点赞 + 评论 + 分享 + 收藏) / Σ播放（只统计 play > 0 的作品；平台缺失字段按 0 计：快手缺分享、收藏，头条缺分享，均在备注中注明）；同时保留不含收藏的「三项互动率(%) = Σ(点赞 + 评论 + 分享) / Σ播放」供跨平台对比；均播相差 <5% 视为并列并标注「播放接近」；样本数 <3 时标注「样本少，仅供参考」。",
     ],
     [
       "分析",
       "作品排行与平台偏科",
       "rankings",
-      "按跨平台合并后的内容截至 to 的总播放 / 互动率（总播放 ≥100 才参与，按原始比率排序后输出舍入值）/ 总涨粉各取 Top10、Bottom10。平台偏科：同一内容某平台播放 ≥ 其它平台平均播放 × 3 且该平台播放 ≥ 500 时列出。",
+      "按跨平台合并后的内容截至 to 的总播放 / 互动率（总播放 ≥100 才参与，公式为 (点赞 + 评论 + 分享 + 收藏) / 播放，按原始比率排序后输出舍入值）/ 总涨粉各取 Top10、Bottom10。平台偏科：同一内容某平台播放 ≥ 其它平台平均播放 × 3 且该平台播放 ≥ 500 时列出。",
     ],
     [
       "分析",
@@ -3209,7 +3261,7 @@ function buildSchemaSheet(dynamicSchemaEntries) {
       "分析",
       "异常提醒与剔除说明",
       "anomalies",
-      "异常规则：①疑似采集异常：某作品某指标某日为 0 或缺失，而前后有记录日都 >0（掉 0 又涨回），使用全历史快照（含截止日之后恢复快照）识别；剔除说明：此类异常点在第 1–5 节全部计算中剔除，并按截止日内有效快照重算日增、走势与排行。②疑似上推荐：仅对单日实测日增（断档后首日不触发）判定，单日播放日增 ≥ 前 7 个日历日窗口日均 × 5 且 ≥ 1000（窗内跨断档增量按天数均摊）。",
+      "异常规则：①疑似采集异常：某作品某指标某日为 0 或缺失，而前后有记录日都 >0（掉 0 又涨回），使用全历史快照（含截止日之后恢复快照）识别；以及账号级总播放相对上次有效正值骤降（归 0 或降幅 ≥50%）且作品级无对应下降时标为异常并剔除；剔除说明：此类异常点在第 1–5 节全部计算中剔除，并按截止日内有效快照重算日增、走势与排行。②疑似上推荐：仅对单日实测日增（断档后首日不触发）判定，单日播放日增 ≥ 前 7 个日历日窗口日均 × 5 且 ≥ 1000（窗内跨断档增量按天数均摊）。",
     ],
 
     // 6. 字段说明

@@ -25,6 +25,15 @@ import {
 import { canonicalAccountPartition } from "../../shared/accountPartition.js";
 import { normalizeVideoMetadata } from "../../shared/videoMetadata.js";
 import { capturePublishFailureScreenshot } from "./upLoad/failureScreenshot.js";
+import {
+  DUPLICATE_EXIT_CODE,
+  resolveCanonicalPlatform,
+  deriveCanonicalPartition,
+  normalizeTitleForDedupe,
+  extractCandidateTitle,
+  findRecentDuplicatePublish,
+} from "../../shared/publishDedupe.js";
+import { changeData } from "../server/utils.js";
 
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 
@@ -276,6 +285,87 @@ export function normalizePuppeteerVideoTaskData(data) {
   return data;
 }
 
+// CLI / HTTP 入口在完成查重或收到 allowDuplicate 后登记一次性放行票据，
+// 防止下游 publishVideo.js 刚写入的 publishing 记录触发自撞拦截。
+const dedupeBypassTickets = new Map();
+const DEDUPE_BYPASS_TTL_MS = 60 * 1000;
+
+function buildDedupeBypassKey(target) {
+  const pt = resolveCanonicalPlatform(target && (target.pt || target.platform));
+  const part = deriveCanonicalPartition(target, pt);
+  const title = normalizeTitleForDedupe(extractCandidateTitle(target));
+  if (!pt || !part || !title) return "";
+  return `${pt}|${part}|${title}`;
+}
+
+export function registerPublishDedupeBypass(target) {
+  const key = buildDedupeBypassKey(target);
+  if (!key) return;
+  const now = Date.now();
+  for (const [k, exp] of dedupeBypassTickets.entries()) {
+    if (exp <= now) dedupeBypassTickets.delete(k);
+  }
+  dedupeBypassTickets.set(key, now + DEDUPE_BYPASS_TTL_MS);
+}
+
+function consumePublishDedupeBypass(data) {
+  const key = buildDedupeBypassKey(data);
+  if (!key) return false;
+  const exp = dedupeBypassTickets.get(key);
+  if (exp === undefined) return false;
+  dedupeBypassTickets.delete(key);
+  return exp > Date.now();
+}
+
+function readPushDataRecordsSafe() {
+  try {
+    const res = changeData({
+      fileName: "pushData",
+      type: "get",
+      item: { page: 1, pageSize: 10000 },
+    });
+    return res && res.success && Array.isArray(res.data) ? res.data : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+export function checkPublishEntryDuplicate(data, records, options = {}) {
+  if (!data || !data.pt || String(data.pt).endsWith("状态")) return null;
+  if (
+    data.allowDuplicate === true ||
+    (data.publishOptions && data.publishOptions.allowDuplicate === true)
+  ) {
+    return null;
+  }
+  if (!options.skipBypass && consumePublishDedupeBypass(data)) {
+    return null;
+  }
+  const now =
+    typeof options.now === "number" && Number.isFinite(options.now)
+      ? options.now
+      : Date.now();
+  const list = Array.isArray(records) ? records : readPushDataRecordsSafe();
+  const filtered = list.filter((rec) => {
+    if (!rec || typeof rec !== "object") return false;
+    // 排除 scheduledPublish.js 刚切为 publishing 的当前定时任务自身记录
+    if (
+      rec.scheduledTask === true &&
+      String(rec.publishStatus || "").toLowerCase() === "publishing" &&
+      rec.lastPublishMessage === "定时任务开始发布" &&
+      typeof rec.lastPublishAt === "number" &&
+      Math.abs(now - rec.lastPublishAt) < 10000
+    ) {
+      return false;
+    }
+    return true;
+  });
+  return findRecentDuplicatePublish(filtered, data, {
+    now,
+    excludeRecordId: data.recordId,
+  });
+}
+
 async function doUpload(data, transport, queueDone, runtimeTask) {
   data = applyXhsConservativePublishOptions(data);
   normalizePuppeteerVideoTaskData(data);
@@ -286,6 +376,27 @@ async function doUpload(data, transport, queueDone, runtimeTask) {
     data.partition,
     String(data.pt || "").replace(/状态$/, "")
   );
+
+  // 发布入口兜底查重（7 天内同平台+同账号+清洗后同标题成功/进行中记录默认拦截）
+  const duplicateHit = checkPublishEntryDuplicate(data);
+  if (duplicateHit) {
+    try {
+      transport.reply("puppeteerFile-done", {
+        ...data,
+        status: false,
+        duplicate: true,
+        publishStatus: "duplicate",
+        exitCode: DUPLICATE_EXIT_CODE,
+        lastPublishAt: duplicateHit.lastPublishAt,
+        lastPublishAtText: duplicateHit.lastPublishAtText,
+        message: duplicateHit.message,
+      });
+    } catch (err) {
+      console.error("发送重复发布拦截回执失败:", err);
+    }
+    if (queueDone) queueDone();
+    return;
+  }
   const isXhsTask = isXhsPlatform(data.pt);
   const maxRetries = getPublishAttemptLimit(data, 5);
   let currentAttempt = 0;

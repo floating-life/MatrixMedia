@@ -104,6 +104,9 @@
     "test:scheduled-dedupe": "node scripts/test-scheduled-dedupe.js",
     "test:fans-history": "node scripts/test-fans-history.js",
     "test:toutiao-stats": "node scripts/test-toutiao-stats.js",
+    "test:text-sanitize": "node scripts/test-text-sanitize.js",
+    "test:stats-quality": "node scripts/test-stats-quality.js",
+    "test:publish-duplicate-guard": "node scripts/test-publish-duplicate-guard.js",
     "test:fork-guard": "node scripts/test-fork-guard.js"
   },
   "build": {

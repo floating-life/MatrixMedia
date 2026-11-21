@@ -870,10 +870,20 @@ function buildPlatformComparisonOption(analysis) {
         const lines = [
           `<div style="font-weight:600;margin-bottom:4px;">${escapeHtml(row.platform)}（样本 ${row.sampleCount} 条${row.lowSample ? " · 样本少" : ""}）</div>`,
           `<div>平均播放：<b>${escapeHtml(formatNum(row.avgPlay))}</b></div>`,
-          `<div>互动率：<b>${row.engagementRatePct != null ? `${escapeHtml(row.engagementRatePct)}%` : "-"}</b></div>`,
+          `<div>加权互动率（含收藏）：<b>${row.engagementRatePct != null ? `${escapeHtml(row.engagementRatePct)}%` : "-"}</b></div>`,
         ];
+        if (row.engagementRate3Pct != null) {
+          lines.push(
+            `<div>三项互动率（不含收藏）：<b>${escapeHtml(row.engagementRate3Pct)}%</b></div>`
+          );
+        }
         if (row.avgFansDelta != null) {
           lines.push(`<div>平均涨粉：<b>${escapeHtml(formatNum(row.avgFansDelta))}</b></div>`);
+        }
+        if (row.missingFieldsNote) {
+          lines.push(
+            `<div style="color:#909399;">字段口径：${escapeHtml(row.missingFieldsNote)}</div>`
+          );
         }
         return lines.join("");
       },

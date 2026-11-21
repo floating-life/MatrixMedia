@@ -119,6 +119,7 @@ matrixmedia.exe cli publish -p dy --phone 13800138000 -f C:\video.mp4 -t "标题
 | `--sph-series-id` | 视频号剧集挂载快捷参数（**剧集名称**，视频号原生剧集）；其他平台忽略                           |
 | `--sph-link-type`          | 视频号链接类型，支持 `none` / `product` / `mini_drama` / `sph_series`（也接受 `短剧` / `drama` / `剧集` / `series` 等别名）；其他平台忽略                  |
 | `--sph-link-value`         | 视频号链接值：商品编号，或短剧 / 剧集**名称**；只传该参数时默认按商品上架                                 |
+| `--allow-duplicate`        | 允许重复发布；默认同平台+同账号+清洗归一后同标题在 7 天内已有成功/进行中记录时拒绝并返回退出码 `6`（`status: "duplicate"`，message 含上次时间），显式传本参数才放行 |
 
 完整说明请执行：
 
@@ -136,6 +137,7 @@ matrixmedia.exe cli publish -p dy --phone 13800138000 -f C:\video.mp4 -t "标题
 | 3   | 任务失败（如上传失败、填写失败）               |
 | 4   | 视频号链接添加失败，视频已转存草稿，需人工检查 |
 | 5   | 登录态失效，需重新扫码登录后再重跑             |
+| 6   | 7 天内同平台重复发布被拦截（`status: "duplicate"`，传 `--allow-duplicate` 放行） |
 
 视频号商品上架并保存草稿：
 
@@ -223,7 +225,7 @@ electron . cli publish-article -p juejin --phone 13800138000 -t "文章标题" -
 
 | 命令 | 说明 |
 | --- | --- |
-| `cli stats -p <平台> --phone <分组>` | 读取本地快照中的账号粉丝数据 |
+| `cli stats -p <平台> --phone <分组> [--json]` | 读取本地快照中的账号粉丝数据；`--json` 输出同时附带采集失败告警字段 `collectAlert`（含 `platform`/`group`/`reason`/`firstFailedAt`/`consecutiveFailures`/`alerted`）与 `hasCollectAlert`，便于远程脚本巡检 |
 | `cli stats-sync -p <平台> --phone <分组>` | 主动采集该账号最新数据并写入本地快照 |
 | `cli stats-work -p <平台> --phone <分组> --title <标题>` | 按完整标题查询某个视频的发布数据（含发布时间） |
 | `cli stats-export --out <路径.xlsx> [--from YYYY-MM-DD] [--to YYYY-MM-DD]` | 将作品日明细、跨平台汇总、平台日汇总与账号日快照导出为 Excel（`--out` 须以 `.xlsx` 结尾；默认截至最新有数据日的近 30 天；单表超过 200,000 行拒绝导出并返回退出码 `3`；stdout 仅输出一份 JSON `{ success, out, from, to, counts }`，启动诊断日志输出到 stderr） |

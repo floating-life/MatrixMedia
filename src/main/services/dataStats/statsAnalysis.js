@@ -38,6 +38,14 @@ const METRIC_LABELS = Object.freeze({
   fansDelta: "涨粉",
 });
 
+// 各平台作品级缺失的互动字段（与 adapters.js / 字段说明保持一致；加权互动率计算时缺失按 0 计）
+const PLATFORM_MISSING_INTERACTION_FIELDS = Object.freeze({
+  快手: Object.freeze(["分享", "收藏"]),
+  头条: Object.freeze(["分享"]),
+});
+
+const ACCOUNT_PLAYS_SHARP_DROP_RATIO = 0.5;
+
 // 分析阈值常量（导出便于单测与后续调优）
 const DEFAULT_ANALYSIS_PERIOD = 30;
 const MIN_PLATFORM_COMPARE_PLATFORMS = 2;
@@ -705,7 +713,276 @@ function addNullable(acc, val) {
   return next === 0 ? 0 : next;
 }
 
-/** 1. 总览：本周期 vs 上一周期的 6 项日增合计、环比%、各平台播放贡献占比与分日趋势 */
+function buildWorkDailyPlaySumMap(seriesByWork) {
+  const byPgDay = new Map();
+  const byPlatformDay = new Map();
+  for (const series of seriesByWork.values()) {
+    const playVals = series.vals && series.vals.play;
+    if (!playVals) continue;
+    for (let i = 0; i < series.len; i++) {
+      const p = playVals[i];
+      if (p === null || p <= 0) continue;
+      const dn = series.dayNums[i];
+      const grp = series.groups[i] || series.group || "";
+      const pgKey = `${series.platform}|${grp}\0${dn}`;
+      byPgDay.set(pgKey, (byPgDay.get(pgKey) || 0) + p);
+      const pKey = `${series.platform}\0${dn}`;
+      byPlatformDay.set(pKey, (byPlatformDay.get(pKey) || 0) + p);
+    }
+  }
+  return { byPgDay, byPlatformDay };
+}
+
+/**
+ * 账号级总播放防假 0 / 骤降异常检测（复用 anomaly 机制）：
+ * - 已由采集落盘标记 playsAnomaly=true 的记录，或相对上次有效正值骤降（归 0 或降幅 ≥50%）
+ *   且作品级总播放无对应下降时，标为异常、不参与账号 playsDelta 计算并输出到 anomalies.collectionAnomalies。
+ */
+function prepareAccountSeries(accountRows, seriesByWork, cutoffTo) {
+  const cutoffDayNum = dateStrToDayNum(cutoffTo);
+  const byAccount = new Map();
+
+  for (const ar of Array.isArray(accountRows) ? accountRows : []) {
+    if (!isPlainObject(ar) || typeof ar.date !== "string") continue;
+    const date = ar.date.trim();
+    const dn = dateStrToDayNum(date);
+    if (dn === null || dn > cutoffDayNum) continue;
+    const platform = ar.platform == null ? "" : String(ar.platform).trim();
+    if (!platform) continue;
+    const group = ar.group == null ? "" : String(ar.group).trim();
+    const key = `${platform}|${group}`;
+    let bucket = byAccount.get(key);
+    if (!bucket) {
+      bucket = { platform, group, byDay: new Map() };
+      byAccount.set(key, bucket);
+    }
+    const prevSameDay = bucket.byDay.get(dn);
+    const entry = {
+      date,
+      dayNum: dn,
+      platform,
+      group,
+      fans: fastNormalizeMetric(ar.fans),
+      plays: fastNormalizeMetric(ar.plays),
+      likes: fastNormalizeMetric(ar.likes),
+      comments: fastNormalizeMetric(ar.comments),
+      favorites: fastNormalizeMetric(ar.favorites),
+      shares: fastNormalizeMetric(ar.shares),
+      fansDelta: fastNormalizeMetric(ar.fansDelta),
+      playsDelta: fastNormalizeMetric(ar.playsDelta),
+      playsAnomaly: ar.playsAnomaly === true,
+      playsAnomalyDetail: isPlainObject(ar.playsAnomalyDetail) ? ar.playsAnomalyDetail : null,
+    };
+    if (!prevSameDay) {
+      bucket.byDay.set(dn, entry);
+    } else {
+      bucket.byDay.set(dn, {
+        ...prevSameDay,
+        fans:
+          entry.fans !== null && (prevSameDay.fans === null || entry.fans > prevSameDay.fans)
+            ? entry.fans
+            : prevSameDay.fans,
+        plays:
+          entry.plays !== null && (prevSameDay.plays === null || entry.plays > prevSameDay.plays)
+            ? entry.plays
+            : prevSameDay.plays,
+        playsAnomaly: prevSameDay.playsAnomaly || entry.playsAnomaly,
+        playsAnomalyDetail: entry.playsAnomalyDetail || prevSameDay.playsAnomalyDetail,
+      });
+    }
+  }
+
+  const workPlayMaps = buildWorkDailyPlaySumMap(seriesByWork);
+  const cleanedAccountRows = [];
+  const accountPlaysAnomalies = [];
+
+  for (const bucket of byAccount.values()) {
+    const points = [...bucket.byDay.values()].sort((a, b) => a.dayNum - b.dayNum);
+    let prevValidPlays = null;
+    let prevValidDate = null;
+    let prevValidDayNum = null;
+    let prevValidFans = null;
+
+    for (let i = 0; i < points.length; i++) {
+      const pt = points[i];
+      let isPlaysAnom = pt.playsAnomaly === true;
+      let anomRawVal =
+        pt.playsAnomalyDetail && pt.playsAnomalyDetail.rawValue !== undefined
+          ? fastNormalizeMetric(pt.playsAnomalyDetail.rawValue)
+          : pt.plays;
+      let anomPrevDate =
+        (pt.playsAnomalyDetail && pt.playsAnomalyDetail.prevDate) || prevValidDate;
+      let anomPrevVal =
+        pt.playsAnomalyDetail && pt.playsAnomalyDetail.prevValue !== undefined
+          ? fastNormalizeMetric(pt.playsAnomalyDetail.prevValue)
+          : prevValidPlays;
+      let anomReason =
+        (pt.playsAnomalyDetail && pt.playsAnomalyDetail.reason) ||
+        "账号总播放较上次骤降且作品级无对应下降";
+
+      if (!isPlaysAnom && prevValidPlays !== null && prevValidPlays > 0 && pt.plays !== null) {
+        const drop = prevValidPlays - pt.plays;
+        const dropRatio = drop / prevValidPlays;
+        if (pt.plays === 0 || (drop > 0 && dropRatio >= ACCOUNT_PLAYS_SHARP_DROP_RATIO)) {
+          const prevWorkSum =
+            workPlayMaps.byPgDay.get(`${pt.platform}|${pt.group}\0${prevValidDayNum}`) ??
+            workPlayMaps.byPlatformDay.get(`${pt.platform}\0${prevValidDayNum}`) ??
+            null;
+          const currWorkSum =
+            workPlayMaps.byPgDay.get(`${pt.platform}|${pt.group}\0${pt.dayNum}`) ??
+            workPlayMaps.byPlatformDay.get(`${pt.platform}\0${pt.dayNum}`) ??
+            null;
+          let hasCorrespondingWorkDrop = false;
+          if (prevWorkSum !== null && prevWorkSum > 0 && currWorkSum !== null) {
+            const worksDrop = prevWorkSum - currWorkSum;
+            const worksDropRatio = worksDrop / prevWorkSum;
+            if (
+              worksDrop > 0 &&
+              worksDrop >= drop * 0.5 &&
+              worksDropRatio >= dropRatio * 0.5
+            ) {
+              hasCorrespondingWorkDrop = true;
+            }
+          }
+          if (!hasCorrespondingWorkDrop) {
+            isPlaysAnom = true;
+            anomRawVal = pt.plays;
+            anomPrevDate = prevValidDate;
+            anomPrevVal = prevValidPlays;
+          }
+        }
+      }
+
+      let nextFansDelta = pt.fansDelta;
+      if (pt.fans !== null && prevValidFans !== null) {
+        nextFansDelta = normalizeZero(pt.fans - prevValidFans);
+      }
+      if (pt.fans !== null) prevValidFans = pt.fans;
+
+      let cleanedPlays = pt.plays;
+      let cleanedPlaysDelta = null;
+      if (isPlaysAnom) {
+        cleanedPlays = null;
+        cleanedPlaysDelta = null;
+        let nextDate = null;
+        let nextValue = null;
+        for (let j = i + 1; j < points.length; j++) {
+          if (!points[j].playsAnomaly && points[j].plays !== null && points[j].plays > 0) {
+            nextDate = points[j].date;
+            nextValue = points[j].plays;
+            break;
+          }
+        }
+        accountPlaysAnomalies.push({
+          scope: "account",
+          date: pt.date,
+          platform: pt.platform,
+          group: pt.group,
+          workId: "(账号总计)",
+          pwKey: `account:${pt.platform}|${pt.group}`,
+          contentKey: null,
+          title: pt.group ? `${pt.platform}·${pt.group}（账号总播放）` : `${pt.platform}（账号总播放）`,
+          url: "",
+          metric: "plays",
+          metricLabel: "账号总播放",
+          value: anomRawVal,
+          prevDate: anomPrevDate,
+          prevValue: anomPrevVal,
+          nextDate,
+          nextValue,
+          reason: anomReason,
+        });
+      } else if (pt.plays !== null) {
+        if (prevValidPlays !== null) {
+          cleanedPlaysDelta = normalizeZero(pt.plays - prevValidPlays);
+        } else if (pt.playsDelta !== null) {
+          cleanedPlaysDelta = pt.playsDelta;
+        }
+        prevValidPlays = pt.plays;
+        prevValidDate = pt.date;
+        prevValidDayNum = pt.dayNum;
+      }
+
+      cleanedAccountRows.push({
+        ...pt,
+        plays: cleanedPlays,
+        fansDelta: nextFansDelta,
+        playsDelta: cleanedPlaysDelta,
+        playsAnomaly: isPlaysAnom,
+      });
+    }
+  }
+
+  accountPlaysAnomalies.sort((a, b) => {
+    if (a.date !== b.date) return compareText(b.date, a.date);
+    const pc = comparePlatform(a.platform, b.platform);
+    if (pc !== 0) return pc;
+    return compareText(a.group, b.group);
+  });
+
+  return { cleanedAccountRows, accountPlaysAnomalies };
+}
+
+/** 计算《账号日快照》各平台/账号在 [startDay, endDay] 区间内的首尾粉丝差合计 */
+function computeAccountFansRangeDiff(accountRows, startDay, endDay) {
+  const byAccount = new Map();
+  for (const ar of Array.isArray(accountRows) ? accountRows : []) {
+    if (!isPlainObject(ar)) continue;
+    const dn =
+      typeof ar.dayNum === "number" && Number.isInteger(ar.dayNum)
+        ? ar.dayNum
+        : typeof ar.date === "string"
+        ? dateStrToDayNum(ar.date.trim())
+        : null;
+    if (dn === null || dn < startDay || dn > endDay) continue;
+    const fans = fastNormalizeMetric(ar.fans);
+    if (fans === null) continue;
+    const platform = ar.platform == null ? "" : String(ar.platform).trim();
+    if (!platform) continue;
+    const group = ar.group == null ? "" : String(ar.group).trim();
+    const key = `${platform}|${group}`;
+    let rec = byAccount.get(key);
+    if (!rec) {
+      rec = {
+        platform,
+        group,
+        firstDay: dn,
+        firstFans: fans,
+        lastDay: dn,
+        lastFans: fans,
+      };
+      byAccount.set(key, rec);
+    } else {
+      if (dn < rec.firstDay || (dn === rec.firstDay && fans > rec.firstFans)) {
+        rec.firstDay = dn;
+        rec.firstFans = fans;
+      }
+      if (dn > rec.lastDay || (dn === rec.lastDay && fans > rec.lastFans)) {
+        rec.lastDay = dn;
+        rec.lastFans = fans;
+      }
+    }
+  }
+
+  let total = null;
+  let accountCount = 0;
+  const byPlatformMap = new Map();
+  for (const rec of byAccount.values()) {
+    if (rec.lastDay <= rec.firstDay) continue;
+    const diff = normalizeZero(rec.lastFans - rec.firstFans);
+    total = addNullable(total, diff);
+    accountCount += 1;
+    const prevPt = byPlatformMap.has(rec.platform) ? byPlatformMap.get(rec.platform) : null;
+    byPlatformMap.set(rec.platform, addNullable(prevPt, diff));
+  }
+  const byPlatform = [...byPlatformMap.entries()]
+    .sort((a, b) => comparePlatform(a[0], b[0]))
+    .map(([platform, fansGrowth]) => ({ platform, fansGrowth }));
+
+  return { total, accountCount, byPlatform };
+}
+
+/** 1. 总览：本周期 vs 上一周期的 6 项日增合计、环比%、实际覆盖天数、账号日快照涨粉主口径、各平台播放贡献占比与分日趋势 */
 function buildOverviewSection(
   seriesByWork,
   accountRows,
@@ -730,11 +1007,13 @@ function buildOverviewSection(
 
   const byPlatform = new Map();
   const trendByPlatform = new Map();
+  const coveredDayNums = new Set();
 
   for (const series of seriesByWork.values()) {
     const dayNums = series.dayNums;
     const len = series.len;
     const deltas = series.deltas;
+    const vals = series.vals;
     let ptAgg = null;
     let ptTrend = null;
 
@@ -747,6 +1026,15 @@ function buildOverviewSection(
       if (!inCur && !inPrev) continue;
 
       if (inCur) {
+        let hasValidWorkVal = false;
+        for (let ki = 0; ki < WORK_STAT_KEYS.length; ki++) {
+          if (vals[WORK_STAT_KEYS[ki]][i] !== null) {
+            hasValidWorkVal = true;
+            break;
+          }
+        }
+        if (hasValidWorkVal) coveredDayNums.add(dn);
+
         if (!ptAgg) {
           ptAgg = byPlatform.get(series.platform);
           if (!ptAgg) {
@@ -802,6 +1090,36 @@ function buildOverviewSection(
     }
   }
 
+  // 统计区间内作品日数据实际覆盖口径
+  let coveredMinDay = Infinity;
+  let coveredMaxDay = -Infinity;
+  for (const dn of coveredDayNums) {
+    if (dn < coveredMinDay) coveredMinDay = dn;
+    if (dn > coveredMaxDay) coveredMaxDay = dn;
+  }
+  const coveredDays = coveredDayNums.size;
+  const coveredFrom = coveredDays > 0 ? dayNumToDateStr(coveredMinDay) : null;
+  const coveredTo = coveredDays > 0 ? dayNumToDateStr(coveredMaxDay) : null;
+  const isPartial = coveredDays < periodDays;
+  const rangeText =
+    coveredDays > 0
+      ? `统计区间 ${currentStart} ~ ${currentEnd}，其中作品日数据实际覆盖 ${coveredFrom} ~ ${coveredTo}（共 ${coveredDays} 天）`
+      : `统计区间 ${currentStart} ~ ${currentEnd}，其中作品日数据实际覆盖暂无（共 0 天）`;
+  const partialNotice = isPartial
+    ? `实际覆盖 ${coveredDays} 天，少于统计区间 ${periodDays} 天，汇总与环比仅反映已采集天数。`
+    : "";
+  const coverage = {
+    rangeFrom: currentStart,
+    rangeTo: currentEnd,
+    periodDays,
+    coveredFrom,
+    coveredTo,
+    coveredDays,
+    isPartial,
+    rangeText,
+    partialNotice,
+  };
+
   const metrics = {};
   for (const k of WORK_STAT_KEYS) {
     metrics[k] = {
@@ -810,8 +1128,48 @@ function buildOverviewSection(
       current: curSums[k],
       previous: prevSums[k],
       momPct: computeMomPct(curSums[k], prevSums[k]),
+      source:
+        k === "fansDelta"
+          ? "单作品涨粉日增合计（辅助，仅含抖音/视频号等有单作品涨粉平台）"
+          : "作品日明细日增合计",
     };
   }
+
+  // 总览涨粉：优先用《账号日快照》各平台区间首尾粉丝差合计（覆盖快手等无单作品涨粉平台），单作品涨粉合计作为辅助行
+  const curAccFansRange = computeAccountFansRangeDiff(accountRows, curStartDay, curEndDay);
+  const prevAccFansRange = computeAccountFansRangeDiff(accountRows, prevStartDay, prevEndDay);
+  const accountFansGrowth = {
+    key: "accountFansGrowth",
+    label: "涨粉（账号快照）",
+    current: curAccFansRange.total,
+    previous: prevAccFansRange.total,
+    momPct: computeMomPct(curAccFansRange.total, prevAccFansRange.total),
+    accountCount: curAccFansRange.accountCount,
+    byPlatform: curAccFansRange.byPlatform,
+    source: "账号日快照各平台区间首尾粉丝差合计（主口径，覆盖快手等全平台）",
+    isPrimary: true,
+  };
+  const workFansGrowth = {
+    key: "workFansDelta",
+    label: "涨粉（单作品）",
+    current: curSums.fansDelta,
+    previous: prevSums.fansDelta,
+    momPct: computeMomPct(curSums.fansDelta, prevSums.fansDelta),
+    source: "单作品涨粉日增合计（辅助行，仅含抖音/视频号等有单作品涨粉字段的平台）",
+    isAuxiliary: true,
+  };
+  const primaryFansGrowth =
+    accountFansGrowth.current !== null ? accountFansGrowth : workFansGrowth;
+
+  const metricRows = [
+    metrics.play,
+    metrics.like,
+    metrics.comment,
+    metrics.share,
+    metrics.favorite,
+    accountFansGrowth,
+    workFansGrowth,
+  ];
 
   // 各平台贡献占比（按本周期播放日增）
   const platformRows = [...byPlatform.values()];
@@ -853,17 +1211,20 @@ function buildOverviewSection(
       return comparePlatform(a.platform, b.platform);
     });
 
-  // 补充账号级日增（来自 accountRows，可选展示）
+  // 补充账号级日增（来自清洗后的 accountRows，已剔除 playsAnomaly）
   let accFansCur = null;
   let accFansPrev = null;
   let accPlaysCur = null;
   let accPlaysPrev = null;
   for (const ar of Array.isArray(accountRows) ? accountRows : []) {
     if (!isPlainObject(ar) || typeof ar.date !== "string") continue;
-    const dn = dateStrToDayNum(ar.date.trim());
+    const dn =
+      typeof ar.dayNum === "number" && Number.isInteger(ar.dayNum)
+        ? ar.dayNum
+        : dateStrToDayNum(ar.date.trim());
     if (dn === null || dn > curEndDay) continue;
     const fd = fastNormalizeMetric(ar.fansDelta);
-    const pd = fastNormalizeMetric(ar.playsDelta);
+    const pd = ar.playsAnomaly ? null : fastNormalizeMetric(ar.playsDelta);
     if (dn >= curStartDay && dn <= curEndDay) {
       accFansCur = addNullable(accFansCur, fd);
       accPlaysCur = addNullable(accPlaysCur, pd);
@@ -878,7 +1239,12 @@ function buildOverviewSection(
   );
 
   return {
+    coverage,
     metrics,
+    metricRows,
+    accountFansGrowth,
+    workFansGrowth,
+    primaryFansGrowth,
     platformContribution,
     dailyTrend: {
       dates: trendDates,
@@ -889,6 +1255,11 @@ function buildOverviewSection(
         current: accFansCur,
         previous: accFansPrev,
         momPct: computeMomPct(accFansCur, accFansPrev),
+      },
+      fansRangeDiff: {
+        current: curAccFansRange.total,
+        previous: prevAccFansRange.total,
+        momPct: computeMomPct(curAccFansRange.total, prevAccFansRange.total),
       },
       playsDelta: {
         current: accPlaysCur,
@@ -1258,7 +1629,16 @@ function normalizeContentRows(summaryRows, cutoffTo, seriesByWork) {
   return out;
 }
 
-function computeItemEngagementRate(play, like, comment, share) {
+function computeItemEngagementRate(play, like, comment, share, favorite = null) {
+  if (typeof play !== "number" || !Number.isFinite(play) || play <= 0) return null;
+  const hasAnyInteraction =
+    like !== null || comment !== null || share !== null || favorite !== null;
+  if (!hasAnyInteraction) return null;
+  const interactions = (like || 0) + (comment || 0) + (share || 0) + (favorite || 0);
+  return interactions / play;
+}
+
+function computeItemEngagementRate3(play, like, comment, share) {
   if (typeof play !== "number" || !Number.isFinite(play) || play <= 0) return null;
   const hasAnyInteraction = like !== null || comment !== null || share !== null;
   if (!hasAnyInteraction) return null;
@@ -1282,7 +1662,7 @@ function isAvgPlayClose(a, b) {
   return hi - lo < hi * PLATFORM_PLAY_CLOSE_DIFF_RATIO;
 }
 
-/** 2. 平台对比：只取覆盖 ≥2 平台的内容 */
+/** 2. 平台对比：只取覆盖 ≥2 平台的内容；平台互动率改加权（含收藏四项 + 不含收藏三项对比） */
 function buildPlatformComparisonSection(contentRows) {
   const multiPlatformContents = contentRows.filter(
     (c) => !c.isUnlinked && c.platformCount >= MIN_PLATFORM_COMPARE_PLATFORMS
@@ -1298,8 +1678,12 @@ function buildPlatformComparisonSection(contentRows) {
           sampleCount: 0,
           playSum: 0,
           playCount: 0,
-          engRateSum: 0,
+          engPlaySum: 0,
+          engInteractionSum: 0,
           engRateCount: 0,
+          eng3PlaySum: 0,
+          eng3InteractionSum: 0,
+          eng3RateCount: 0,
           fansSum: 0,
           fansCount: 0,
         };
@@ -1310,10 +1694,22 @@ function buildPlatformComparisonSection(contentRows) {
         bucket.playSum += p.play;
         bucket.playCount += 1;
       }
-      const rate = computeItemEngagementRate(p.play, p.like, p.comment, p.share);
-      if (rate !== null) {
-        bucket.engRateSum += rate;
-        bucket.engRateCount += 1;
+      // 平台级加权互动率：只统计 play > 0 的作品；缺某字段按 0 计
+      if (typeof p.play === "number" && Number.isFinite(p.play) && p.play > 0) {
+        const hasAny4 =
+          p.like !== null || p.comment !== null || p.share !== null || p.favorite !== null;
+        if (hasAny4) {
+          bucket.engPlaySum += p.play;
+          bucket.engInteractionSum +=
+            (p.like || 0) + (p.comment || 0) + (p.share || 0) + (p.favorite || 0);
+          bucket.engRateCount += 1;
+        }
+        const hasAny3 = p.like !== null || p.comment !== null || p.share !== null;
+        if (hasAny3) {
+          bucket.eng3PlaySum += p.play;
+          bucket.eng3InteractionSum += (p.like || 0) + (p.comment || 0) + (p.share || 0);
+          bucket.eng3RateCount += 1;
+        }
       }
       if (p.fansDelta !== null) {
         bucket.fansSum += p.fansDelta;
@@ -1325,24 +1721,44 @@ function buildPlatformComparisonSection(contentRows) {
   const enrichedPlatforms = [...statsByPlatform.values()]
     .map((b) => {
       const rawAvgPlay = b.playCount > 0 ? b.playSum / b.playCount : null;
-      const rawEngagementRate = b.engRateCount > 0 ? b.engRateSum / b.engRateCount : null;
+      const rawEngagementRate =
+        b.engPlaySum > 0 ? b.engInteractionSum / b.engPlaySum : null;
+      const rawEngagementRate3 =
+        b.eng3PlaySum > 0 ? b.eng3InteractionSum / b.eng3PlaySum : null;
       const rawAvgFansDelta = b.fansCount > 0 ? b.fansSum / b.fansCount : null;
       const avgPlay = rawAvgPlay !== null ? round2(rawAvgPlay) : null;
       const engagementRate = rawEngagementRate !== null ? round4(rawEngagementRate) : null;
       const engagementRatePct =
         rawEngagementRate !== null ? round2(rawEngagementRate * 100) : null;
+      const engagementRate3 = rawEngagementRate3 !== null ? round4(rawEngagementRate3) : null;
+      const engagementRate3Pct =
+        rawEngagementRate3 !== null ? round2(rawEngagementRate3 * 100) : null;
       const avgFansDelta = rawAvgFansDelta !== null ? round2(rawAvgFansDelta) : null;
       const lowSample = b.sampleCount < LOW_SAMPLE_THRESHOLD;
+      const missingFields = PLATFORM_MISSING_INTERACTION_FIELDS[b.platform]
+        ? [...PLATFORM_MISSING_INTERACTION_FIELDS[b.platform]]
+        : [];
+      const missingFieldsNote = missingFields.length
+        ? `缺${missingFields.join("、")}（按0计）`
+        : "";
+      const note = [lowSample ? "样本少，仅供参考" : "", missingFieldsNote]
+        .filter(Boolean)
+        .join("；");
       return {
         platform: b.platform,
         sampleCount: b.sampleCount,
         avgPlay,
         engagementRate,
         engagementRatePct,
+        engagementRate3,
+        engagementRate3Pct,
         engagementSampleCount: b.engRateCount,
+        engagement3SampleCount: b.eng3RateCount,
         avgFansDelta,
         lowSample,
-        note: lowSample ? "样本少，仅供参考" : "",
+        missingFields,
+        missingFieldsNote,
+        note,
         _rawAvgPlay: rawAvgPlay,
         _rawEngagementRate: rawEngagementRate,
         _rawAvgFansDelta: rawAvgFansDelta,
@@ -1497,9 +1913,14 @@ function buildPlatformComparisonSection(contentRows) {
     avgPlay: p.avgPlay,
     engagementRate: p.engagementRate,
     engagementRatePct: p.engagementRatePct,
+    engagementRate3: p.engagementRate3,
+    engagementRate3Pct: p.engagementRate3Pct,
     engagementSampleCount: p.engagementSampleCount,
+    engagement3SampleCount: p.engagement3SampleCount,
     avgFansDelta: p.avgFansDelta,
     lowSample: p.lowSample,
+    missingFields: p.missingFields,
+    missingFieldsNote: p.missingFieldsNote,
     note: p.note,
   }));
 
@@ -1513,10 +1934,17 @@ function buildPlatformComparisonSection(contentRows) {
   };
 }
 
-/** 3. 作品排行（总播放 / 互动率[总播放>=100] / 总涨粉 各 Top10 & Bottom10）+ 平台偏科 */
+/** 3. 作品排行（总播放 / 互动率[总播放>=100，计入收藏] / 总涨粉 各 Top10 & Bottom10）+ 平台偏科 */
 function buildRankingsSection(contentRows) {
   const enriched = contentRows.map((c) => {
     const rawEng = computeItemEngagementRate(
+      c.totalPlay,
+      c.totalLike,
+      c.totalComment,
+      c.totalShare,
+      c.totalFavorite
+    );
+    const rawEng3 = computeItemEngagementRate3(
       c.totalPlay,
       c.totalLike,
       c.totalComment,
@@ -1537,6 +1965,7 @@ function buildRankingsSection(contentRows) {
       totalFavorite: c.totalFavorite,
       totalFansDelta: c.totalFansDelta,
       rawEngagementRate: rawEng,
+      rawEngagementRate3: rawEng3,
       engagementEligible,
       platforms: c.platforms,
     };
@@ -1552,11 +1981,23 @@ function buildRankingsSection(contentRows) {
     engagementRate: item.rawEngagementRate !== null ? round4(item.rawEngagementRate) : null,
     engagementRatePct:
       item.rawEngagementRate !== null ? round2(item.rawEngagementRate * 100) : null,
+    engagementRate3: item.rawEngagementRate3 !== null ? round4(item.rawEngagementRate3) : null,
+    engagementRate3Pct:
+      item.rawEngagementRate3 !== null ? round2(item.rawEngagementRate3 * 100) : null,
     totalFansDelta: item.totalFansDelta,
     platforms: (Array.isArray(item.platforms) ? item.platforms : []).map((p) => {
-      const pRate = computeItemEngagementRate(p.play, p.like, p.comment, p.share);
-      const hasInt = p.like !== null || p.comment !== null || p.share !== null;
-      const interactions = hasInt ? (p.like || 0) + (p.comment || 0) + (p.share || 0) : null;
+      const pRate = computeItemEngagementRate(
+        p.play,
+        p.like,
+        p.comment,
+        p.share,
+        p.favorite
+      );
+      const hasInt =
+        p.like !== null || p.comment !== null || p.share !== null || p.favorite !== null;
+      const interactions = hasInt
+        ? (p.like || 0) + (p.comment || 0) + (p.share || 0) + (p.favorite || 0)
+        : null;
       const rawEngagementContribPct =
         item.totalPlay !== null && item.totalPlay > 0 && interactions !== null
           ? normalizeZero((interactions / item.totalPlay) * 100)
@@ -1569,6 +2010,7 @@ function buildRankingsSection(contentRows) {
         like: p.like,
         comment: p.comment,
         share: p.share,
+        favorite: p.favorite,
         fansDelta: p.fansDelta,
         engagementRatePct: pRate !== null ? round2(pRate * 100) : null,
         engagementContribPct,
@@ -2206,10 +2648,24 @@ function buildPublishTimeSection(contentMetaByKey, worksByContent, cutoffTo) {
  * - 疑似上推荐：仅对单日实测日增（daySpan === 1，断档后首日不触发）判定，
  *   基线严格限定在前 7 个日历日窗口 [d - 7, d - 1]，跨断档增量按覆盖天数均摊。
  */
-function buildAnomaliesSection(seriesByWork, allCollectionAnomalies, { currentStart, to }) {
-  const collectionAnomalies = allCollectionAnomalies.filter(
+function buildAnomaliesSection(
+  seriesByWork,
+  allCollectionAnomalies,
+  { currentStart, to },
+  accountPlaysAnomalies = []
+) {
+  const workAnomalies = allCollectionAnomalies.filter(
     (a) => a.date >= currentStart && a.date <= to
   );
+  const accAnomalies = (Array.isArray(accountPlaysAnomalies) ? accountPlaysAnomalies : []).filter(
+    (a) => a.date >= currentStart && a.date <= to
+  );
+  const collectionAnomalies = [...workAnomalies, ...accAnomalies].sort((a, b) => {
+    if (a.date !== b.date) return compareText(b.date, a.date);
+    const pc = comparePlatform(a.platform, b.platform);
+    if (pc !== 0) return pc;
+    return compareText(a.workId || "", b.workId || "");
+  });
 
   const curStartDay = dateStrToDayNum(currentStart);
   const toDay = dateStrToDayNum(to);
@@ -2298,8 +2754,9 @@ function buildAnomaliesSection(seriesByWork, allCollectionAnomalies, { currentSt
 
   return {
     collectionAnomalies,
+    accountAnomalies: accAnomalies,
     recommendSpikes,
-    excludedPointCount: allCollectionAnomalies.length,
+    excludedPointCount: allCollectionAnomalies.length + (Array.isArray(accountPlaysAnomalies) ? accountPlaysAnomalies.length : 0),
     totalCount: collectionAnomalies.length + recommendSpikes.length,
   };
 }
@@ -2399,27 +2856,55 @@ function buildSummarySection({
 }) {
   const lines = [];
 
-  // 1. 总量与环比
+  // 1. 总量与环比（明确统计区间与作品日数据实际覆盖天数；涨粉优先取《账号日快照》首尾差合计）
   const m = overview.metrics;
+  const cov = overview.coverage || {
+    rangeText: `统计区间 ${currentStart} ~ ${to}`,
+    isPartial: false,
+    partialNotice: "",
+  };
+  const accFans = overview.accountFansGrowth || null;
+  const workFans = overview.workFansGrowth || m.fansDelta || null;
+  const hasAccFans = accFans && accFans.current !== null;
+  const hasWorkFans = workFans && workFans.current !== null;
+  const partialSuffix = cov.isPartial && cov.partialNotice ? `（${cov.partialNotice.replace(/。$/, "")}）` : "";
+
   if (
     m.play.current === null &&
     m.like.current === null &&
     m.comment.current === null &&
-    m.fansDelta.current === null
+    !hasAccFans &&
+    !hasWorkFans
   ) {
-    lines.push(`总量与环比：近${period}天（${currentStart} ~ ${to}）暂无可计算的作品日增数据。`);
+    lines.push(`总量与环比：${cov.rangeText}${partialSuffix}，暂无可计算的作品日增或账号涨粉数据。`);
   } else {
-    const parts = [
-      `新增播放 ${formatIntText(m.play.current)}（环比 ${formatMomText(m.play.momPct)}）`,
-      `点赞 ${formatIntText(m.like.current)}（环比 ${formatMomText(m.like.momPct)}）`,
-      `评论 ${formatIntText(m.comment.current)}`,
-    ];
-    if (m.fansDelta.current !== null) {
+    const parts = [];
+    if (m.play.current !== null) {
+      parts.push(`新增播放 ${formatIntText(m.play.current)}（环比 ${formatMomText(m.play.momPct)}）`);
+    }
+    if (m.like.current !== null) {
+      parts.push(`点赞 ${formatIntText(m.like.current)}（环比 ${formatMomText(m.like.momPct)}）`);
+    }
+    if (m.comment.current !== null) {
+      parts.push(`评论 ${formatIntText(m.comment.current)}`);
+    }
+    if (hasAccFans) {
+      const workFansNote = hasWorkFans
+        ? `；单作品涨粉合计 ${formatIntText(workFans.current)}`
+        : "";
       parts.push(
-        `涨粉 ${formatIntText(m.fansDelta.current)}（环比 ${formatMomText(m.fansDelta.momPct)}）`
+        `涨粉 ${formatIntText(accFans.current)}（账号日快照首尾差合计，环比 ${formatMomText(
+          accFans.momPct
+        )}${workFansNote}）`
+      );
+    } else if (hasWorkFans) {
+      parts.push(
+        `涨粉 ${formatIntText(workFans.current)}（单作品涨粉合计，环比 ${formatMomText(
+          workFans.momPct
+        )}）`
       );
     }
-    lines.push(`总量与环比：近${period}天（${currentStart} ~ ${to}）${parts.join("、")}。`);
+    lines.push(`总量与环比：${cov.rangeText}${partialSuffix}；${parts.join("、")}。`);
   }
 
   // 2. 表现最好的平台
@@ -2913,7 +3398,13 @@ function buildStatsAnalysis({
     contentMetaByKey.set(c.contentKey, c);
   }
 
-  const overview = buildOverviewSection(seriesByWork, accountRows, {
+  const { cleanedAccountRows, accountPlaysAnomalies } = prepareAccountSeries(
+    accountRows,
+    seriesByWork,
+    resolvedTo
+  );
+
+  const overview = buildOverviewSection(seriesByWork, cleanedAccountRows, {
     currentStart,
     currentEnd: resolvedTo,
     prevStart,
@@ -2937,11 +3428,16 @@ function buildStatsAnalysis({
     summaryWorkToContent
   );
   const publishTime = buildPublishTimeSection(contentMetaByKey, worksByContent, resolvedTo);
-  const anomalies = buildAnomaliesSection(seriesByWork, allCollectionAnomalies, {
-    currentStart,
-    to: resolvedTo,
-  });
-  const fansTrend = buildFansTrendSection(accountRows, {
+  const anomalies = buildAnomaliesSection(
+    seriesByWork,
+    allCollectionAnomalies,
+    {
+      currentStart,
+      to: resolvedTo,
+    },
+    accountPlaysAnomalies
+  );
+  const fansTrend = buildFansTrendSection(cleanedAccountRows, {
     currentStart,
     currentEnd: resolvedTo,
   });
@@ -2963,6 +3459,7 @@ function buildStatsAnalysis({
     period: resolvedPeriod,
     currentRange: { from: currentStart, to: resolvedTo },
     previousRange: { from: prevStart, to: prevEnd },
+    coverage: overview.coverage,
     snapshotDays,
     thresholds: ANALYSIS_THRESHOLDS,
     overview,
@@ -2999,6 +3496,8 @@ module.exports = {
   RECOMMEND_SPIKE_MIN_PLAY_DELTA,
   MIN_ACCUMULATED_DAYS_NOTICE,
   LOW_HISTORY_NOTICE_TEXT,
+  PLATFORM_MISSING_INTERACTION_FIELDS,
+  ACCOUNT_PLAYS_SHARP_DROP_RATIO,
   ANALYSIS_THRESHOLDS,
   classifyTrajectory,
   buildStatsAnalysis,

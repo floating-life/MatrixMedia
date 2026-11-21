@@ -31,6 +31,7 @@ const electron = require("electron");
 const { ipcMain } = electron;
 const { collectAccount } = require("./collector");
 const store = require("./store");
+const { handleAccountCollectOutcome } = require("./collectAlert");
 const {
   normalizeStatusTitle,
   buildTitleIndex,
@@ -696,6 +697,10 @@ async function collectAccounts(accounts, sender, options = {}) {
     }
 
     progress("running");
+    const prevWorkCount =
+      typeof store.getPreviousWorkCount === "function"
+        ? store.getPreviousWorkCount(acc.group, acc.platform)
+        : 0;
     try {
       const data = await collectAccount({
         partition: acc.partition,
@@ -703,12 +708,45 @@ async function collectAccounts(accounts, sender, options = {}) {
       });
       // 以采集返回时刻的 UTC+8 日期为整次写入的唯一日期，daily/works-daily/intraday 统一按 collectNow 归档
       const collectNow = Date.now();
+      const outcome = handleAccountCollectOutcome({
+        group: acc.group,
+        platform: acc.platform,
+        success: true,
+        works: data.works,
+        prevWorkCount,
+        now: collectNow,
+      });
+      if (!outcome.ok && outcome.zeroWorksAnomaly) {
+        try {
+          store.writeMeta(acc.group, acc.platform, {
+            lastCollectAt: collectNow,
+            lastError: outcome.reason,
+          });
+        } catch (metaErr) {
+          console.warn(
+            "[dataStats] 写入空作品异常 meta 失败:",
+            (metaErr && metaErr.message) || metaErr
+          );
+        }
+        results.push({
+          group: acc.group,
+          platform: acc.platform,
+          success: false,
+          workCount: 0,
+          error: outcome.reason,
+          zeroWorksAnomaly: true,
+          alert: outcome.alert,
+        });
+        progress("failed", { error: outcome.reason });
+        continue;
+      }
       store.mergeDaily(
         acc.group,
         acc.platform,
         data.overview,
         data.fansHistory,
-        collectNow
+        collectNow,
+        { works: data.works }
       );
       store.mergeWorks(acc.group, acc.platform, data.works, collectNow, {
         slot: slot || undefined,
@@ -739,9 +777,27 @@ async function collectAccounts(accounts, sender, options = {}) {
       progress("success");
     } catch (err) {
       const message = (err && err.message) || String(err);
+      const failNow = Date.now();
+      let alertState = null;
+      try {
+        const outcome = handleAccountCollectOutcome({
+          group: acc.group,
+          platform: acc.platform,
+          success: false,
+          error: message,
+          prevWorkCount,
+          now: failNow,
+        });
+        alertState = outcome.alert;
+      } catch (alertErr) {
+        console.warn(
+          "[dataStats] 记录采集失败告警异常:",
+          (alertErr && alertErr.message) || alertErr
+        );
+      }
       try {
         store.writeMeta(acc.group, acc.platform, {
-          lastCollectAt: Date.now(),
+          lastCollectAt: failNow,
           lastError: message,
         });
       } catch (metaErr) {
@@ -755,6 +811,7 @@ async function collectAccounts(accounts, sender, options = {}) {
         platform: acc.platform,
         success: false,
         error: message,
+        ...(alertState ? { alert: alertState } : {}),
       });
       progress("failed", { error: message });
     }
@@ -1834,16 +1891,43 @@ function registerDataStatsIpc(options = {}) {
       const entries = [...groupsMap.values()];
       for (let i = 0; i < entries.length; i++) {
         const { partition, platform, group, tasks: groupTasks } = entries[i];
+        const prevWorkCount =
+          typeof store.getPreviousWorkCount === "function"
+            ? store.getPreviousWorkCount(group, platform)
+            : 0;
         try {
           const data = await collectAccount({ partition, platform });
           // 以采集返回时刻的 UTC+8 日期为整次写入的唯一日期，daily/works-daily/intraday 统一按 collectNow 归档
           const collectNow = Date.now();
+          const outcome = handleAccountCollectOutcome({
+            group,
+            platform,
+            success: true,
+            works: data.works,
+            prevWorkCount,
+            now: collectNow,
+          });
+          if (!outcome.ok && outcome.zeroWorksAnomaly) {
+            try {
+              store.writeMeta(group, platform, {
+                lastCollectAt: collectNow,
+                lastError: outcome.reason,
+              });
+            } catch (_) {}
+            errors.push({ group, platform, error: outcome.reason });
+            for (const t of groupTasks) {
+              matches[t.key] = { found: false, error: outcome.reason };
+            }
+            if (i < entries.length - 1) await sleep(2000);
+            continue;
+          }
           store.mergeDaily(
             group,
             platform,
             data.overview,
             data.fansHistory,
-            collectNow
+            collectNow,
+            { works: data.works }
           );
           store.mergeWorks(group, platform, data.works, collectNow);
           store.writeMeta(group, platform, {
@@ -1870,6 +1954,16 @@ function registerDataStatsIpc(options = {}) {
           }
         } catch (err) {
           const message = (err && err.message) || String(err);
+          try {
+            handleAccountCollectOutcome({
+              group,
+              platform,
+              success: false,
+              error: message,
+              prevWorkCount,
+              now: Date.now(),
+            });
+          } catch (_) {}
           errors.push({ group, platform, error: message });
           for (const t of groupTasks) {
             matches[t.key] = { found: false, error: message };

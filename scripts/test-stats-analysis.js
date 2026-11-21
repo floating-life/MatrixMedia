@@ -726,9 +726,12 @@ async function main() {
     assert.strictEqual(dy.engagementRate, 0.05);
     assert.strictEqual(dy.engagementRatePct, 5);
     assert.strictEqual(dy.avgPlay, 500, "平均播放应计入合法 0（(0+1000)/2=500）");
-    // 视频号：条2 play=null 不计入互动率，条1 (100+20+30)/1000 = 0.15 (15%)
+    // 视频号：条2 play=null 不计入互动率，条1 含收藏加权互动率 (100+20+30+10)/1000 = 0.16 (16%)，三项互动率 = 0.15 (15%)
     assert.strictEqual(sph.engagementSampleCount, 1);
-    assert.strictEqual(sph.engagementRate, 0.15);
+    assert.strictEqual(sph.engagementRate, 0.16);
+    assert.strictEqual(sph.engagementRatePct, 16);
+    assert.strictEqual(sph.engagementRate3, 0.15);
+    assert.strictEqual(sph.engagementRate3Pct, 15);
     assert.strictEqual(sph.lowSample, true);
     assert.ok(
       rCmp.platformComparison.conclusions.some((c) => c.includes("样本少，仅供参考")),

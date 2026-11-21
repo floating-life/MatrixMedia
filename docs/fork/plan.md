@@ -22,6 +22,15 @@
 | S7 | feat/stats-analysis | 纯规则「数据分析」页（7 节分析 + 采集掉0异常剔除重算 + 上推荐识别 + 文字小结）+ Excel「分析」sheet（与 GUI 共用计算与默认截止日） |
 | S8 | feat/stats-charts | ECharts 5.5.1 按需封装 `StatsChart.vue` +「数据分析」6 节可视化图表 + 导出单图/全部图表 PNG +「作品汇总」单内容播放走势弹窗 |
 | S9 | feat/stats-intraday | 固定时段内每 N 小时（默认 2）自动采集 + 分时段作品快照 `works-intraday/YYYY-MM-DD.json`（含保留期清理）+ 作品趋势「按天/按时段」+「最近采集」列 +「新作品前 24 小时」图 + Excel「作品时段明细」sheet |
+| S10 | feat/stats-quality | 标题/文案共享清洗（`_x000d_`/`\r`）+ 分析页加权互动率与三项互动率 + 总览实际覆盖天数与账号快照涨粉主口径 + 作品/账号防假 0 覆写 + 连续采集失败告警与系统通知 + 7 天同平台重复发布拦截（GUI/CLI/HTTP） |
+
+## S10：数据质量与发布防呆（`feat/stats-quality`）
+- **标题/文案共享清洗（`src/shared/textSanitize.js` + `videoMetadata.js` + `ipcMain.js` + `cli/index.js` + `server/routes/index.js` + `LocalVideoPublish.vue`）**：统一删除 Excel 转义字面量 `_x000d_`（大小写不敏感、可连续），将 `\r\n`/`\r` 转为 `\n`；标题类字段（`title`/`shortTitle`/`bt1`）将换行折成空格并 trim，简介类字段（`description`/`bdText`）保留 `\n` 并 trim。GUI 批量导入、CLI `publish`/xlsx、HTTP `POST /publish` 共用同一清洗链路，结果完全一致。
+- **分析页平台互动率改加权 + 三项互动率 + 作品排行含收藏（`statsAnalysis.js` + `statsExport.js` + `dataStats/index.vue` + `statsChartOptions.js`）**：平台级改为加权互动率 `Σ(点赞+评论+分享+收藏)/Σ播放`（仅统计 `play > 0` 作品；缺项按 0 计并在备注与字段说明中注明快手缺分享/收藏、头条缺分享），同时保留不含收藏的「三项互动率」列供跨平台公平对比；作品级排行保持 `play ≥ 100` 门槛并将 `favorite` 计入互动率。GUI、Excel「分析」sheet 与「字段说明」同步更新。
+- **分析总览实际覆盖口径与涨粉主口径（`statsAnalysis.js` + `statsExport.js` + `dataStats/index.vue`）**：总览周期改写为「统计区间 X ~ Y，其中作品日数据实际覆盖 A ~ B（共 K 天）」，`K < 区间天数` 时明确提示；总览涨粉优先使用《账号日快照》各平台区间首尾粉丝差合计（覆盖快手等无单作品涨粉平台），保留单作品涨粉日增合计作为辅助行，二者均标明数据来源。
+- **防假 0 覆写（`store.js` + `statsExport.js` + `statsAnalysis.js`）**：作品快照写入（`mergeWorks`/`works-daily`/`works-intraday`）时，若作品历史已有 `play > 0` 而本次 `play === 0` 或缺失，则本次快照 `play` 写 `null`（其余字段正常写、`works.json` 保留原正值），避免日增/时段增量出现大负数；账号级总播放相对上次有效正值骤降（归 0 或降幅 ≥50%）且作品级无对应下降时标 `playsAnomaly = true`、`plays = null` 并归入 `anomalies.collectionAnomalies`，不参与增量。
+- **采集失败告警（`store.js` + `collectAlert.js` + `dataStats/index.js` + `server/routes/index.js` + `cli/index.js` + `dataStats/*.vue`）**：自动/手动/HTTP/CLI 采集中账号报错或「上次作品数 > 0 本次 = 0」连续 2 次时写入 `<userData>/data-stats/collect-alerts.json`（含平台、账号、原因、首次失败时间、连续次数），GUI 账号数据页显示红色「采集失败/需重新登录」标记与原因，第 2 次连续失败弹一次 Electron 系统通知（恢复前不重复弹），任意一次有效采集成功即清除；`cli stats --json` 与 `GET /stats` 同步返回 `collectAlert` / `hasCollectAlert`。
+- **同平台重复发布拦截（`src/shared/publishDedupe.js` + `ipcMain.js` + `puppeteerFile.js` + `server/routes/index.js` + `cli/index.js` + `LocalVideoPublish.vue`）**：发布前查 `pushData`，同平台 + 同账号 + 清洗归一后标题相同且 7 天内有成功/进行中记录时，GUI 弹确认框（显示上次发布时间，可「仍然发布」）；CLI/HTTP 默认拦截并返回 `status: "duplicate"`、`exitCode: 6` 与含上次时间的 `message`，传 `allowDuplicate: true` / `--allow-duplicate` 才放行；多平台请求仅拦截重复的平台，其余平台照常执行；`docs/http-api.md` 与 `docs/cli.md` 同步补充字段说明。
 
 ## S9：固定时段循环自动采集 + 作品分时段数据（`feat/stats-intraday`）
 - **设置与时段槽调度（`src/renderer/utils/statsScheduler.js` + `src/main/services/dataStats/index.js` + `store.js`）**：

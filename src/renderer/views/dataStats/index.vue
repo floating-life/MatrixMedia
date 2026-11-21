@@ -119,6 +119,28 @@
     </div>
     <el-tabs v-model="activeTab" class="stats-tabs">
       <el-tab-pane label="账号总览" name="overview">
+        <el-alert
+          v-if="collectAlerts.length"
+          type="error"
+          :closable="false"
+          show-icon
+          class="collect-alert-banner"
+          :title="`有 ${collectAlerts.length} 个账号连续采集失败，请检查登录态或接口状态`"
+        >
+          <div class="collect-alert-items">
+            <div
+              v-for="al in collectAlerts"
+              :key="al.group + '|' + al.platform"
+              class="collect-alert-item"
+            >
+              <strong>{{ al.group }} · {{ al.platform }}</strong>
+              <el-tag type="danger" size="mini" effect="dark" class="inline-tag">
+                {{ al.isLoginError ? "采集失败/需重新登录" : "采集失败" }}
+              </el-tag>
+              <span>（连续 {{ al.consecutiveFailures }} 次）：{{ al.reason }}</span>
+            </div>
+          </div>
+        </el-alert>
         <stats-overview :rows="rows" />
         <div class="platform-card">
           <div class="card-head">
@@ -133,7 +155,7 @@
             <span class="card-title">分组统计</span>
             <span class="card-tip">点击行进入对应账号统计页</span>
           </div>
-          <group-stats-table :accounts="accounts" />
+          <group-stats-table :accounts="accounts" :collect-alerts="collectAlerts" />
         </div>
       </el-tab-pane>
       <el-tab-pane label="作品汇总" name="works" lazy>
@@ -784,10 +806,16 @@
                   placeholder="默认最新快照日"
                   @change="loadAnalysis"
                 />
-                <span v-if="analysisData && analysisData.currentRange" class="card-tip">
-                  周期：{{ analysisData.currentRange.from }} ~ {{ analysisData.to }} · 已积累
-                  {{ analysisData.snapshotDays }} 天作品快照
+                <span v-if="analysisCoverageText" class="card-tip">
+                  {{ analysisCoverageText }} · 累计已采集 {{ analysisData.snapshotDays }} 天作品快照
                 </span>
+                <el-tag
+                  v-if="analysisCoverage && analysisCoverage.isPartial"
+                  type="warning"
+                  size="mini"
+                >
+                  实际覆盖不足 {{ analysisCoverage.periodDays }} 天
+                </el-tag>
               </div>
               <div class="analysis-actions">
                 <el-button
@@ -839,10 +867,18 @@
               <div class="card-head">
                 <span class="card-title">1. 总览（周期对比与平台贡献）</span>
                 <span v-if="analysisData.previousRange" class="card-tip">
-                  对比上周期：{{ analysisData.previousRange.from }} ~
+                  {{ analysisCoverageText }} · 对比上周期：{{ analysisData.previousRange.from }} ~
                   {{ analysisData.previousRange.to }}（已剔除疑似采集异常点）
                 </span>
               </div>
+              <el-alert
+                v-if="analysisCoverage && analysisCoverage.isPartial"
+                type="warning"
+                :closable="false"
+                show-icon
+                class="coverage-warning-alert"
+                :title="analysisCoverage.partialNotice"
+              />
               <div class="chart-grid-overview">
                 <div class="chart-box">
                   <div class="chart-box-head">
@@ -906,22 +942,42 @@
                 stripe
                 class="analysis-table"
               >
-                <el-table-column prop="label" label="指标" width="100" />
-                <el-table-column label="本周期日增" align="right" min-width="120">
+                <el-table-column label="指标" width="150">
+                  <template #default="{ row }">
+                    <span>{{ row.label }}</span>
+                    <el-tag
+                      v-if="row.isPrimary"
+                      type="primary"
+                      size="mini"
+                      class="inline-tag"
+                    >
+                      主口径
+                    </el-tag>
+                    <el-tag
+                      v-else-if="row.isAuxiliary"
+                      type="info"
+                      size="mini"
+                      class="inline-tag"
+                    >
+                      辅助
+                    </el-tag>
+                  </template>
+                </el-table-column>
+                <el-table-column label="本周期增量" align="right" min-width="110">
                   <template #default="{ row }">
                     <span class="num" :class="{ muted: row.current == null }">
                       {{ showNum(row.current) }}
                     </span>
                   </template>
                 </el-table-column>
-                <el-table-column label="上周期日增" align="right" min-width="120">
+                <el-table-column label="上周期增量" align="right" min-width="110">
                   <template #default="{ row }">
                     <span class="num" :class="{ muted: row.previous == null }">
                       {{ showNum(row.previous) }}
                     </span>
                   </template>
                 </el-table-column>
-                <el-table-column label="环比" align="right" width="120">
+                <el-table-column label="环比" align="right" width="110">
                   <template #default="{ row }">
                     <span
                       v-if="row.momPct != null"
@@ -931,6 +987,11 @@
                       {{ row.momPct > 0 ? "+" : "" }}{{ row.momPct }}%
                     </span>
                     <span v-else class="num muted">-</span>
+                  </template>
+                </el-table-column>
+                <el-table-column prop="source" label="数据来源" min-width="220" show-overflow-tooltip>
+                  <template #default="{ row }">
+                    <span class="card-tip">{{ row.source || "-" }}</span>
                   </template>
                 </el-table-column>
               </el-table>
@@ -1003,7 +1064,7 @@
                       ? analysisData.platformComparison.multiPlatformContentCount
                       : 0
                   }}
-                  条跨平台内容 · 互动率=(点赞+评论+分享)/播放
+                  条跨平台内容 · 加权互动率=Σ(点赞+评论+分享+收藏)/Σ播放（缺失字段按0计，另附不含收藏的三项互动率）
                 </span>
               </div>
               <div v-if="analysisPlatformConclusions.length" class="conclusion-box">
@@ -1066,7 +1127,7 @@
                     </div>
                   </template>
                 </el-table-column>
-                <el-table-column label="互动率" min-width="170">
+                <el-table-column label="加权互动率" min-width="160">
                   <template #default="{ row }">
                     <div class="bar-cell">
                       <div class="css-bar-track">
@@ -1089,11 +1150,23 @@
                     </div>
                   </template>
                 </el-table-column>
-                <el-table-column label="平均涨粉" align="right" width="100">
+                <el-table-column label="三项互动率" align="right" width="104">
+                  <template #default="{ row }">
+                    <span class="num" :class="{ muted: row.engagementRate3Pct == null }">
+                      {{ row.engagementRate3Pct != null ? row.engagementRate3Pct + "%" : "-" }}
+                    </span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="平均涨粉" align="right" width="96">
                   <template #default="{ row }">
                     <span class="num" :class="{ muted: row.avgFansDelta == null }">
                       {{ showNum(row.avgFansDelta) }}
                     </span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="字段说明/备注" min-width="170" show-overflow-tooltip>
+                  <template #default="{ row }">
+                    <span class="card-tip">{{ row.note || "-" }}</span>
                   </template>
                 </el-table-column>
                 <template #empty>
@@ -1107,7 +1180,7 @@
               <div class="card-head">
                 <span class="card-title">3. 作品排行与平台偏科</span>
                 <span class="card-tip">
-                  跨平台合并后截至 {{ analysisData.to }} · 互动率仅统计总播放 ≥ 100 的内容
+                  跨平台合并后截至 {{ analysisData.to }} · 互动率=(点赞+评论+分享+收藏)/播放（仅统计总播放 ≥ 100 的内容）
                 </span>
               </div>
               <div class="analysis-sub-controls">
@@ -1964,6 +2037,24 @@ export default {
         return title.includes(kw) || file.includes(kw) || ck.includes(kw);
       });
     },
+    collectAlerts() {
+      return Array.isArray(this.overview && this.overview.collectAlerts)
+        ? this.overview.collectAlerts
+        : [];
+    },
+    analysisCoverage() {
+      const ov = this.analysisData && this.analysisData.overview;
+      return (ov && ov.coverage) || (this.analysisData && this.analysisData.coverage) || null;
+    },
+    analysisCoverageText() {
+      if (this.analysisCoverage && this.analysisCoverage.rangeText) {
+        return this.analysisCoverage.rangeText;
+      }
+      if (this.analysisData && this.analysisData.currentRange) {
+        return `统计区间 ${this.analysisData.currentRange.from} ~ ${this.analysisData.to}`;
+      }
+      return "";
+    },
     analysisSummaryLines() {
       const s = this.analysisData && this.analysisData.summary;
       return s && Array.isArray(s.lines) ? s.lines : [];
@@ -1973,8 +2064,12 @@ export default {
       return s && typeof s.text === "string" ? s.text : this.analysisSummaryLines.join("\n");
     },
     analysisOverviewMetricRows() {
-      const m =
-        this.analysisData && this.analysisData.overview && this.analysisData.overview.metrics;
+      const ov = this.analysisData && this.analysisData.overview;
+      if (!ov) return [];
+      if (Array.isArray(ov.metricRows) && ov.metricRows.length) {
+        return ov.metricRows;
+      }
+      const m = ov.metrics;
       if (!m) return [];
       return ["play", "like", "comment", "share", "favorite", "fansDelta"]
         .map((k) => m[k])
@@ -3546,6 +3641,26 @@ export default {
   align-items: center;
   flex-wrap: wrap;
   gap: 10px;
+}
+
+.collect-alert-banner {
+  margin-bottom: 12px;
+}
+
+.collect-alert-items {
+  margin-top: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+}
+
+.collect-alert-item {
+  line-height: 1.5;
+}
+
+.coverage-warning-alert {
+  margin-bottom: 10px;
 }
 
 .trend-dialog-tip {
