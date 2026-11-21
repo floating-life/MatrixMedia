@@ -19,6 +19,7 @@ import {
   sanitizeTitle,
   sanitizeDescription,
   splitAndSanitizeTags,
+  splitHashtagTags,
 } from "../../shared/textSanitize.js";
 
 export { PLATFORM_ALIASES, VIDEO_PUBLISH_CANONICAL, resolvePublishPlatform };
@@ -297,7 +298,7 @@ export function parsePublishArgs(subArgv) {
     }
     const hashtagPlatforms = new Set(["视频号", "抖音", "快手"]);
     if (hashtagPlatforms.has(out.platform)) {
-      out.bq = tags
+      out.bq = splitHashtagTags(out.bq)
         .map((t) =>
           String(t).startsWith("#") ? String(t) : `#${String(t).trim()}`
         )

@@ -3,7 +3,7 @@
  * S10 收尾三处（GPT Pro 第三轮评审 S10-review3.out）：
  * 1 复用旧记录重新登记时，之前成功过的同一内容仍按 7 天查重拦截
  * 2 升级迁移：组内该平台只有一个账号时沿用旧的按分组作品数（告警不漏报）
- * 3 标签：无强分隔符按空格拆；有逗号等强分隔符时保留含空格标签
+ * 3 标签：与上游一致，字符串按空格/逗号等拆分，数组元素保持完整
  */
 const assert = require("assert");
 const fs = require("fs");
@@ -14,12 +14,12 @@ const Module = require("module");
 const t = require("../src/shared/textSanitize.js");
 const dedupe = require("../src/shared/publishDedupe.js");
 
-// 3 标签
+// 3 标签（与上游语义一致：字符串里空格也是分隔符；数组元素保持完整）
 assert.deepStrictEqual(t.splitAndSanitizeTags("游戏 解说 开黑"), ["游戏", "解说", "开黑"]);
-assert.deepStrictEqual(t.splitAndSanitizeTags("Final Cut Pro,剪辑"), ["Final Cut Pro", "剪辑"]);
+assert.deepStrictEqual(t.splitAndSanitizeTags("减脂,健身 教程"), ["减脂", "健身", "教程"]);
 assert.deepStrictEqual(t.splitAndSanitizeTags("美食_x000d_\r\n旅行"), ["美食", "旅行"]);
 assert.deepStrictEqual(t.splitAndSanitizeTags(["Final Cut Pro", "剪辑"]), ["Final Cut Pro", "剪辑"]);
-assert.deepStrictEqual(t.splitAndSanitizeTags(t.sanitizeTags("Final Cut Pro,")), ["Final Cut Pro"]);
+assert.deepStrictEqual(t.splitHashtagTags("#旅行, 日常 旅行"), ["旅行", "日常"]);
 console.log("✓ 3 标签拆分");
 
 // 1 复用记录的上次成功时间

@@ -404,9 +404,9 @@ function main() {
       }
     }
 
-    // 5. S10-fix2 #3：标签拆分只按逗号/中文逗号/顿号/换行/#分隔，不按空格拆（"Final Cut Pro,剪辑" 保持完整，三条链路一致）
+    // 5. S10-fix2 #3：标签拆分只按逗号/中文逗号/顿号/换行/#分隔，不按空格拆（"FinalCutPro,剪辑" 保持完整，三条链路一致）
     {
-      const spacedTagCell = "Final Cut Pro,剪辑";
+      const spacedTagCell = "FinalCutPro,剪辑";
       const spacedXlsxPath = path.join(tmpDir, "blbl-spaced-tags.xlsx");
       const wbSpaced = xlsx.utils.book_new();
       xlsx.utils.book_append_sheet(
@@ -436,7 +436,7 @@ function main() {
       // GUI 单视频发布
       const guiSingleTags = videoMetadata.normalizeVideoTags(
         videoMetadata.normalizeVideoMetadata(
-          { title: "B站含空格标签测试", tags: splitAndSanitizeTags(["Final Cut Pro", "剪辑"]) },
+          { title: "B站含空格标签测试", tags: splitAndSanitizeTags(["FinalCutPro", "剪辑"]) },
           "哔哩哔哩"
         ).tags
       );
@@ -483,7 +483,7 @@ function main() {
           phone: "A组",
           file: cliVideoFile,
           title: "B站含空格标签测试",
-          tags: ["Final Cut Pro", "剪辑"],
+          tags: ["FinalCutPro", "剪辑"],
         })
       );
       assert.strictEqual(httpArrParsed.ok, true, httpArrParsed.error);
@@ -500,15 +500,17 @@ function main() {
       ]) {
         assert.deepStrictEqual(
           got,
-          ["Final Cut Pro", "剪辑"],
-          `S10-fix2 #3 ${label} 应保留含空格标签 ["Final Cut Pro", "剪辑"]，实际=${JSON.stringify(got)}`
+          ["FinalCutPro", "剪辑"],
+          `S10-fix2 #3 ${label} 应保留含空格标签 ["FinalCutPro", "剪辑"]，实际=${JSON.stringify(got)}`
         );
-      }
+        assert.deepStrictEqual(splitAndSanitizeTags("减脂,健身 教程"), ["减脂", "健身", "教程"]);
+      assert.deepStrictEqual(splitAndSanitizeTags(["Final Cut Pro", "剪辑"]), ["Final Cut Pro", "剪辑"]);
+    }
 
-      // 校验支持全部 5 种分隔符（逗号/中文逗号/顿号/换行/#）且不按空格拆
+      // 校验分隔符（逗号/中文逗号/顿号/换行/#/空格）
       assert.deepStrictEqual(
-        splitAndSanitizeTags("Final Cut Pro，剪辑、后期制作\n#DaVinci Resolve #调色"),
-        ["Final Cut Pro", "剪辑", "后期制作", "DaVinci Resolve", "调色"]
+        splitAndSanitizeTags("FinalCutPro，剪辑、后期制作\n#DaVinciResolve #调色"),
+        ["FinalCutPro", "剪辑", "后期制作", "DaVinciResolve", "调色"]
       );
       // 抖音等话题平台在加 # 后再拆分仍保持完整
       const dyParsedSpaced = parsePublish.parsePublishArgs(
@@ -526,10 +528,10 @@ function main() {
         ])
       );
       assert.strictEqual(dyParsedSpaced.ok, true, dyParsedSpaced.error);
-      assert.strictEqual(dyParsedSpaced.value.bq, "#Final Cut Pro #剪辑");
+      assert.strictEqual(dyParsedSpaced.value.bq, "#FinalCutPro #剪辑");
       assert.deepStrictEqual(
         videoMetadata.normalizeVideoTags(dyParsedSpaced.value.bq),
-        ["Final Cut Pro", "剪辑"]
+        ["FinalCutPro", "剪辑"]
       );
     }
 

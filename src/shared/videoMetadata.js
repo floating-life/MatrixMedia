@@ -2,6 +2,7 @@ import {
   sanitizeTitle,
   sanitizeDescription,
   splitAndSanitizeTags,
+  splitHashtagTags,
 } from "./textSanitize.js";
 
 function firstText(...values) {
@@ -56,7 +57,7 @@ export const PLATFORM_TAG_LIMITS = {
 
 export function formatTagsForPlatform(platform, tags) {
   const prefix = platform === "哔哩哔哩" ? "" : "#";
-  let normalized = normalizeVideoTags(tags);
+  let normalized = prefix ? splitHashtagTags(tags) : normalizeVideoTags(tags);
   const limit = PLATFORM_TAG_LIMITS[platform] || 0;
   if (limit > 0 && normalized.length > limit) {
     const dropped = normalized.slice(limit);

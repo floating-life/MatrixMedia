@@ -32,6 +32,13 @@ const overrides = new Map([
   ["src/main/services/upLoad/closeWindow.js", asModule(`
     export default function maybeClosePublishWindow() {}
   `)],
+  // textSanitize.js 是 CommonJS（主进程 require 与渲染层 import 共用），data: ESM 无法直接 import 具名导出，这里用 createRequire 转接
+  ["src/shared/textSanitize.js", asModule(`
+    import { createRequire } from "node:module";
+    const m = createRequire(${JSON.stringify(path.join(root, "package.json"))})(${JSON.stringify(path.join(root, "src/shared/textSanitize.js"))});
+    export const { ${Object.keys(require(path.join(root, "src/shared/textSanitize.js"))).join(", ")} } = m;
+    export default m;
+  `)],
 ]);
 const moduleCache = new Map();
 function moduleUrl(file) {

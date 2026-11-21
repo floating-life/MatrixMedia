@@ -18,8 +18,7 @@ const NBSP_RE = /\u00A0/g;
 // 标签分隔：字符串里出现逗号/中文逗号/顿号/换行/`#` 任一「强分隔符」时只按强分隔符拆
 // （保留含空格标签如 "Final Cut Pro,剪辑"）；没有强分隔符时按空格拆（"游戏 解说 开黑" → 3 个，与 CLI 帮助一致）。
 // 数组元素各自视为整体，不按空格拆。
-const TAG_SPLIT_RE = /[\n,，、]+/;
-const TAG_STRONG_SEP_RE = /[\n,，、#]/;
+const TAG_SPLIT_RE = /[\n,，、;；|]+/;
 
 function isShipinhaoPlatform(raw) {
   const s = String(raw || "").trim().toLowerCase();
@@ -88,8 +87,8 @@ function splitAndSanitizeTags(raw) {
       .replace(ZERO_WIDTH_RE, "")
       .replace(NBSP_RE, " ")
       .replace(/\t+/g, " ");
-    const useSpace = !Array.isArray(raw) && !TAG_STRONG_SEP_RE.test(cleaned);
-    const parts = useSpace ? cleaned.split(/\s+/) : cleaned.split(TAG_SPLIT_RE);
+    // 与上游语义一致：字符串里空格、逗号、顿号、分号、竖线、换行都是分隔符；数组元素各自保持完整
+    const parts = Array.isArray(raw) ? cleaned.split(TAG_SPLIT_RE) : cleaned.split(/[\s,，、;；|]+/);
     for (const part of parts) {
       if (!part) continue;
       const hashParts = part.split(/(?=#)/);
@@ -99,6 +98,25 @@ function splitAndSanitizeTags(raw) {
         seen.add(tag);
         out.push(tag);
       }
+    }
+  }
+  return out;
+}
+
+/**
+ * 话题类平台（抖音/快手/视频号/小红书等 `#话题` 形式）的标签：话题里不能有空格，
+ * 在通用拆分基础上再按空格拆开（"减脂,健身 教程" → 减脂/健身/教程）。B 站等普通标签平台不用。
+ * @param {unknown} raw
+ * @returns {string[]}
+ */
+function splitHashtagTags(raw) {
+  const out = [];
+  const seen = new Set();
+  for (const t of splitAndSanitizeTags(raw)) {
+    for (const part of String(t).split(/\s+/)) {
+      if (!part || seen.has(part)) continue;
+      seen.add(part);
+      out.push(part);
     }
   }
   return out;
@@ -115,8 +133,6 @@ function sanitizeTags(raw) {
   if (Array.isArray(raw)) {
     return list;
   }
-  // 单个含空格标签拼回时补尾逗号，保证再次拆分仍按强分隔符处理（无损可逆）
-  if (list.length === 1 && /\s/.test(list[0])) return `${list[0]},`;
   return list.join(",");
 }
 
@@ -377,6 +393,7 @@ function sanitizePublishCliArgs(argv) {
 }
 
 module.exports = {
+  splitHashtagTags,
   stripExcelEscapesAndCR,
   sanitizeTitle,
   sanitizeDescription,
