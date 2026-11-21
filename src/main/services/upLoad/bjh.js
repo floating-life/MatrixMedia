@@ -345,9 +345,13 @@ function normBjhTitle(s) {
   return String(s || "").replace(/\s+/g, " ").trim();
 }
 
-// 一致，或页面按字数上限截断（当前是目标标题的前缀）都算正常
-function bjhTitleOk(cur, want) {
+// 一致，或页面按字数上限截断（当前是目标标题的前缀）都算正常；
+// 但若当前内容就是/含文件名（目标标题本身不含），一律不算正常。
+function bjhTitleOk(cur, want, fileStem) {
   if (cur === want) return true;
+  const stem = normBjhTitle(fileStem);
+  if (stem && cur.includes(stem) && !want.includes(stem)) return false;
+  if (stem && want.startsWith(stem) && cur.length <= stem.length) return false;
   return cur.length >= 5 && want.startsWith(cur);
 }
 
@@ -388,21 +392,20 @@ async function fillBjhTitle(page, titleHandle, title) {
 
 // 发布前终检：百家号在视频解析完成后会异步把文件名回填/追加进标题，
 // 早先填好的标题可能被拼成「标题+文件名」。这里在点发布前重读标题，不符就重填。
-async function ensureBjhTitle(page, title) {
+async function ensureBjhTitle(page, title, fileStem) {
   const want = normBjhTitle(title);
   if (!want) return;
   for (let attempt = 1; attempt <= 3; attempt++) {
     const handle = await page.$(BJH_TITLE_SELECTOR);
     if (!handle) {
-      console.warn("[bjh] 终检未找到标题框，跳过");
-      return;
+      throw new Error("百家号标题终检找不到标题框，已停止发布（页面可能改版）");
     }
     const cur = normBjhTitle(
       await handle.evaluate(function (el) {
         return el.textContent || "";
       })
     );
-    if (bjhTitleOk(cur, want)) {
+    if (bjhTitleOk(cur, want, fileStem)) {
       if (attempt > 1) console.log("[bjh] 标题终检：重填后已一致");
       return;
     }
@@ -416,15 +419,19 @@ async function ensureBjhTitle(page, title) {
   const cur = last
     ? normBjhTitle(await last.evaluate((el) => el.textContent || ""))
     : "";
-  if (!bjhTitleOk(cur, want)) {
+  if (!bjhTitleOk(cur, want, fileStem)) {
     throw new Error(
-      `百家号标题被页面改写且无法纠正（当前="${cur}"），已停止发布，请在本页手动改标题`
+      `百家号标题被页面改写且无法纠正（当前="${cur}"），已停止发布，请检查后重发`
     );
   }
 }
 
 export default async function (page, data, window, event) {
   const wantTitle = (data.data && (data.data.title || data.data.bt1)) || "";
+  const fileStem = path.basename(
+    String(data.filePath || ""),
+    path.extname(String(data.filePath || ""))
+  );
   const isDraftMode =
     data.publishMode === "draft" || data.publishToDraft === true;
   // 使用try-catch包装所有可能出错的操作
@@ -591,8 +598,6 @@ export default async function (page, data, window, event) {
     );
     console.log("[bjh] 视频上传进度条已消失，准备点击");
 
-    // 视频解析完成后百家号可能把文件名回填进标题，点击前终检
-    await ensureBjhTitle(page, wantTitle);
 
     // 点击后解析 .cheetah-message.cheetah-message-top 的图标类型：
     //   aria-label="info-circle"  → 成功提示，直接结束
@@ -601,6 +606,8 @@ export default async function (page, data, window, event) {
     let clickSuccess = false;
     const urlBefore = readPageUrl(page);
     for (let attempt = 1; attempt <= 10; attempt++) {
+      // 视频解析完成后百家号可能把文件名回填进标题：每次点击前都终检
+      await ensureBjhTitle(page, wantTitle, fileStem);
       await page.mouse.click(cx, cy, { delay: 80 });
       console.log(
         `[bjh] 第 ${attempt} 次点击「${actionText}」at (${Math.round(
