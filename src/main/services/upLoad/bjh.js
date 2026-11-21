@@ -336,7 +336,95 @@ async function clickBjhActionButton(page, buttonText) {
   );
 }
 
+// 新版百家号标题是 contenteditable div（class 形如 FeEditorApp-xxx-contentEditable），
+// hash 中段每次构建可能变，用前缀+后缀模糊匹配。
+const BJH_TITLE_SELECTOR =
+  'div[contenteditable="true"][class*="contentEditable"], div[contenteditable="true"][class*="FeEditorApp"]';
+
+function normBjhTitle(s) {
+  return String(s || "").replace(/\s+/g, " ").trim();
+}
+
+// 一致，或页面按字数上限截断（当前是目标标题的前缀）都算正常
+function bjhTitleOk(cur, want) {
+  if (cur === want) return true;
+  return cur.length >= 5 && want.startsWith(cur);
+}
+
+// 清空标题框并输入目标标题。
+// 注意：不要用 page.evaluate + selection API，打包压缩后局部变量会被改名
+// 导致 "ReferenceError: r is not defined"。这里全部走 puppeteer 原生 API。
+async function fillBjhTitle(page, titleHandle, title) {
+  await titleHandle.focus();
+  // 三连击 = 选中当前段落（contenteditable 里等价于全选这一段）
+  await titleHandle.click({ clickCount: 3 });
+  await page.waitForTimeout(100);
+  // 兜底再来一次 Ctrl/Cmd+A 全选
+  const isMac = process.platform === "darwin";
+  await page.keyboard.down(isMac ? "Meta" : "Control");
+  await page.keyboard.press("KeyA");
+  await page.keyboard.up(isMac ? "Meta" : "Control");
+  await page.waitForTimeout(80);
+  await page.keyboard.press("Backspace");
+  await page.waitForTimeout(150);
+  // 再兜底：如果还有残留文字（个别情况下选区清不掉），直接通过 element.evaluate
+  // 把 textContent 置空（绑定到 handle，无需 selector，避免压缩问题）。
+  try {
+    const remain = await titleHandle.evaluate(function (el) {
+      return (el.textContent || "").trim();
+    });
+    if (remain) {
+      await titleHandle.evaluate(function (el) {
+        el.textContent = "";
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      await titleHandle.focus();
+    }
+  } catch (_) {
+    /* 忽略兜底失败 */
+  }
+  await page.keyboard.type(title, { delay: 50 });
+}
+
+// 发布前终检：百家号在视频解析完成后会异步把文件名回填/追加进标题，
+// 早先填好的标题可能被拼成「标题+文件名」。这里在点发布前重读标题，不符就重填。
+async function ensureBjhTitle(page, title) {
+  const want = normBjhTitle(title);
+  if (!want) return;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const handle = await page.$(BJH_TITLE_SELECTOR);
+    if (!handle) {
+      console.warn("[bjh] 终检未找到标题框，跳过");
+      return;
+    }
+    const cur = normBjhTitle(
+      await handle.evaluate(function (el) {
+        return el.textContent || "";
+      })
+    );
+    if (bjhTitleOk(cur, want)) {
+      if (attempt > 1) console.log("[bjh] 标题终检：重填后已一致");
+      return;
+    }
+    console.warn(
+      `[bjh] 标题终检不一致（第 ${attempt} 次），当前="${cur}"，重填为="${want}"`
+    );
+    await fillBjhTitle(page, handle, title);
+    await page.waitForTimeout(1500);
+  }
+  const last = await page.$(BJH_TITLE_SELECTOR);
+  const cur = last
+    ? normBjhTitle(await last.evaluate((el) => el.textContent || ""))
+    : "";
+  if (!bjhTitleOk(cur, want)) {
+    throw new Error(
+      `百家号标题被页面改写且无法纠正（当前="${cur}"），已停止发布，请在本页手动改标题`
+    );
+  }
+}
+
 export default async function (page, data, window, event) {
+  const wantTitle = (data.data && (data.data.title || data.data.bt1)) || "";
   const isDraftMode =
     data.publishMode === "draft" || data.publishToDraft === true;
   // 使用try-catch包装所有可能出错的操作
@@ -415,48 +503,11 @@ export default async function (page, data, window, event) {
     console.log("[bjh] textareas:", JSON.stringify(fieldDump.textareas));
     console.log("[bjh] contenteditable:", JSON.stringify(fieldDump.editables));
 
-    // 新版百家号标题是 contenteditable div（class 形如 FeEditorApp-xxx-contentEditable），
-    // hash 中段每次构建可能变，用前缀+后缀模糊匹配。
-    const TITLE_SELECTOR =
-      'div[contenteditable="true"][class*="contentEditable"], div[contenteditable="true"][class*="FeEditorApp"]';
-    await page.waitForSelector(TITLE_SELECTOR, { timeout: 20 * 1000 });
-    const titleHandle = await page.$(TITLE_SELECTOR);
+    await page.waitForSelector(BJH_TITLE_SELECTOR, { timeout: 20 * 1000 });
+    const titleHandle = await page.$(BJH_TITLE_SELECTOR);
     if (!titleHandle) throw new Error("未找到标题 contenteditable");
 
-    // 默认值是文件名前缀，需要先清空。
-    // 注意：不要用 page.evaluate + selection API，打包压缩后局部变量会被改名
-    // 导致 "ReferenceError: r is not defined"。这里全部走 puppeteer 原生 API。
-    await titleHandle.focus();
-    // 三连击 = 选中当前段落（contenteditable 里等价于全选这一段）
-    await titleHandle.click({ clickCount: 3 });
-    await page.waitForTimeout(100);
-    // 兜底再来一次 Ctrl/Cmd+A 全选
-    const isMac = process.platform === "darwin";
-    await page.keyboard.down(isMac ? "Meta" : "Control");
-    await page.keyboard.press("KeyA");
-    await page.keyboard.up(isMac ? "Meta" : "Control");
-    await page.waitForTimeout(80);
-    await page.keyboard.press("Backspace");
-    await page.waitForTimeout(150);
-    // 再兜底：如果还有残留文字（个别情况下选区清不掉），直接通过 element.evaluate
-    // 把 textContent 置空（绑定到 handle，无需 selector，避免压缩问题）。
-    try {
-      const remain = await titleHandle.evaluate(function (el) {
-        return (el.textContent || "").trim();
-      });
-      if (remain) {
-        await titleHandle.evaluate(function (el) {
-          el.textContent = "";
-          el.dispatchEvent(new Event("input", { bubbles: true }));
-        });
-        await titleHandle.focus();
-      }
-    } catch (_) {
-      /* 忽略兜底失败 */
-    }
-    await page.keyboard.type(data.data.title || data.data.bt1 || "", {
-      delay: 50,
-    });
+    await fillBjhTitle(page, titleHandle, wantTitle);
     console.log("[bjh] 标题已输入");
   } catch (err) {
     console.error("[bjh] 标题处理失败:", err?.message || err);
@@ -539,6 +590,9 @@ export default async function (page, data, window, event) {
       console.warn("[bjh] 进度条等待超时，强行继续:", e?.message || e)
     );
     console.log("[bjh] 视频上传进度条已消失，准备点击");
+
+    // 视频解析完成后百家号可能把文件名回填进标题，点击前终检
+    await ensureBjhTitle(page, wantTitle);
 
     // 点击后解析 .cheetah-message.cheetah-message-top 的图标类型：
     //   aria-label="info-circle"  → 成功提示，直接结束
