@@ -46,5 +46,16 @@ const svc = require("../src/main/services/publishThrottle.js");
   const takeover = src.slice(src.indexOf("只在锁内容仍是我们判定陈旧的那份时才删除"), src.indexOf("function releaseFileLock"));
   assert.ok(takeover.length > 0 && !/renameSync\(lockPath/.test(takeover), "陈旧锁抢占不得 rename lockPath");
   console.log("✓ 3 陈旧锁抢占");
+
+  // 4 源码守护：调度对账本读失败容错、启动入口不因调度异常退出、重发恢复只认本次尝试、空数组也重读
+  const sp = fs.readFileSync(path.join(__dirname, "../src/main/services/scheduledPublish.js"), "utf8");
+  assert.ok(/try \{\s*ledgerDispatchState = getScheduledTaskDispatchStateSync/.test(sp), "调度读账本须 try/catch");
+  assert.ok(sp.includes("deferredAttemptAt.get(attemptKey)"), "推迟派发的任务不应被判过期");
+  assert.ok(sp.includes("sameAttempt"), "启动恢复只认本次尝试的账本状态");
+  const idx = fs.readFileSync(path.join(__dirname, "../src/main/index.js"), "utf8");
+  assert.ok(/try \{\s*startScheduledPublishScheduler\(\);/.test(idx), "启动入口须保护调度启动");
+  const pt = fs.readFileSync(path.join(__dirname, "../src/main/services/publishThrottle.js"), "utf8");
+  assert.ok(pt.includes("if (pushRes.ok && pushRes.records.length === 0) {"), "空历史（含调用方传空数组）须重读");
+  console.log("✓ 4 调度容错守护");
   console.log("test-s11-final: 全部通过");
 })().catch((e) => { console.error(e); process.exit(1); });

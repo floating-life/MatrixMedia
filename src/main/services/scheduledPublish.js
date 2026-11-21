@@ -26,6 +26,8 @@ import {
 const MAX_TIMER_DELAY_MS = 24 * 60 * 60 * 1000;
 const REFRESH_INTERVAL_MS = 60 * 1000;
 const scheduledTimers = new Map();
+// 已尝试派发但因读失败被推迟的任务：key → 首次尝试时刻（用于宽限期判断，避免被误标过期）
+const deferredAttemptAt = new Map();
 const dispatchedKeys = new Set();
 const inFlightKeys = new Set();
 const pendingHistoryPatches = new Map();
@@ -129,6 +131,12 @@ function shouldExpireScheduledRecord(record, nowMs = Date.now()) {
   if (!isExpiredScheduledRecord(record, nowMs)) return false;
   const scheduledAt = Number(record.scheduledPublishAt);
   if (nowMs - scheduledAt <= SCHEDULED_EXPIRE_GRACE_MS) {
+    return false;
+  }
+  // 宽限期内已尝试派发、因读失败被推迟的任务，不因推迟本身被判过期
+  const attemptKey = `${record.date || ""}:${record.id}`;
+  const firstAttempt = deferredAttemptAt.get(attemptKey);
+  if (firstAttempt && firstAttempt - scheduledAt <= SCHEDULED_EXPIRE_GRACE_MS) {
     return false;
   }
   if (
@@ -500,6 +508,7 @@ async function executeScheduledRecordAsync(record, dispatchKey) {
   );
   if (!stillPending) {
     console.warn("[scheduledPublish] 任务已删除、已改状态或历史暂不可读，跳过本次派发:", record.id);
+    if (dispatchKey && !deferredAttemptAt.has(dispatchKey)) deferredAttemptAt.set(dispatchKey, Date.now());
     return { historyWritten: true, abortedBeforeUpload: true };
   }
 
@@ -655,7 +664,15 @@ export function schedulePublishRecord(record, nowMs = Date.now()) {
   const existingEntry = scheduledTimers.get(key);
 
   // 刷新时检查账本（及内存未写盘补丁）：若该任务 id 已开始/已成功，绝不再上传，只补写历史状态
-  const ledgerDispatchState = getScheduledTaskDispatchStateSync(record.id);
+  let ledgerDispatchState;
+  try {
+    ledgerDispatchState = getScheduledTaskDispatchStateSync(record.id);
+  } catch (err) {
+    // 账本暂时读不了：本轮不排这条任务（不上传、不标过期），下轮刷新再判；绝不能让异常冒到启动入口
+    console.warn("[scheduledPublish] 账本读取失败，本轮跳过任务:", record.id, (err && err.message) || err);
+    deferredAttemptAt.has(key) || deferredAttemptAt.set(key, nowMs);
+    return;
+  }
   const pendingMemPatch = pendingHistoryPatches.get(key) || null;
   if (
     ledgerDispatchState.dispatched ||
@@ -790,7 +807,10 @@ function recoverInterruptedScheduledTasks(nowMs = Date.now()) {
         return; // 账本读不了就先不动，下次启动再处理
       }
       const st = state && state.status;
-      if (st === "success" || st === "draft") {
+      // 手动重发会沿用原记录 id：只认本次尝试（派发时刻不早于本次登记时刻）的账本状态，避免把上一轮成功冒充本次
+      const attemptStart = Number(record.lastPublishAt) || 0;
+      const sameAttempt = state && state.dispatched && Number(state.dispatchedAt || 0) >= attemptStart - 60000;
+      if (sameAttempt && (st === "success" || st === "draft")) {
         updateRecord(record, {
           ...(state.resultPatch || {}),
           publishStatus: st,
@@ -816,9 +836,18 @@ export function startScheduledPublishScheduler(nowMs = Date.now()) {
   } catch (err) {
     console.warn("[scheduledPublish] 恢复中断任务失败:", (err && err.message) || err);
   }
-  refreshScheduledPublishScheduler(nowMs);
+  try {
+    refreshScheduledPublishScheduler(nowMs);
+  } catch (err) {
+    // 首轮刷新失败不得让桌面端退出，刷新循环照常建立
+    console.warn("[scheduledPublish] 首轮刷新失败:", (err && err.message) || err);
+  }
   refreshInterval = setInterval(() => {
-    refreshScheduledPublishScheduler();
+    try {
+      refreshScheduledPublishScheduler();
+    } catch (err) {
+      console.warn("[scheduledPublish] 刷新失败:", (err && err.message) || err);
+    }
   }, REFRESH_INTERVAL_MS);
 }
 
@@ -838,6 +867,7 @@ export function stopScheduledPublishScheduler() {
   dispatchedKeys.clear();
   inFlightKeys.clear();
   pendingHistoryPatches.clear();
+  deferredAttemptAt.clear();
   schedulerStarted = false;
   schedulerStartedAt = null;
 }

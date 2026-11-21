@@ -798,7 +798,8 @@ function loadActiveLedger(options = {}, nowMs = Date.now(), pushDataRecordsOpt =
   if (hasScheduledEntries && options.skipPushDataReconcile !== true) {
     let pushRes = ensurePushRecords();
     // 历史读到 0 条却有待发预留：可能是偶发读取失败（读失败也返回空），重读一次确认后再对账
-    if (pushRes.ok && pushRes.records.length === 0 && !Array.isArray(pushDataRecordsOpt)) {
+    // 调用方预读传入的空数组同样可能是读失败，统一重读一次源文件
+    if (pushRes.ok && pushRes.records.length === 0) {
       const again = readPushDataRecordsSafe(defaultChangeDataFn(options));
       if (again.ok && again.records.length > 0) {
         pushRes = again;

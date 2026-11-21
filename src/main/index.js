@@ -253,7 +253,12 @@ async function startApplication() {
 startApplication();
 
 function onAppReady() {
-  startScheduledPublishScheduler();
+  try {
+    startScheduledPublishScheduler();
+  } catch (err) {
+    // 定时调度出错不得阻止桌面端启动
+    console.error("[startup] 定时发布调度启动失败:", (err && err.message) || err);
+  }
   initWindow((win) => {
     mainWin = win;
 
