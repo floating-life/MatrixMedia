@@ -987,20 +987,22 @@ async function runBatchDirPublish(v, cfg) {
 
     let rowLedgerSettled = false;
     const settleRowLedger = (status, extra = {}) => {
-      if (rowLedgerSettled || !rowReservationId) return;
+      if (rowLedgerSettled || !rowReservationId) return Promise.resolve();
       rowLedgerSettled = true;
       const isFormalSuccess =
         status === "success" && !isDraftRow && extra.savedAsDraft !== true;
       if (isFormalSuccess) {
-        confirmThrottleReservation(rowReservationId, {
+        return confirmThrottleReservation(rowReservationId, {
           status: "success",
           ts: Date.now(),
           isScheduled: false,
           recordId,
+          platform: v.platform,
+          phone: recordItem.phone,
+          partition: v.partition,
         }).catch(() => {});
-      } else {
-        releaseThrottleReservation(rowReservationId).catch(() => {});
       }
+      return releaseThrottleReservation(rowReservationId).catch(() => {});
     };
 
     const updateRecord = (status, message) => {
@@ -1057,8 +1059,7 @@ async function runBatchDirPublish(v, cfg) {
         const msg = "CLI publish 超时（" + min + " 分钟）";
         console.error("[" + row.fileName + "] " + msg);
         updateRecord("failed", msg);
-        settleRowLedger("failed");
-        finish(false, msg);
+        settleRowLedger("failed").finally(() => finish(false, msg));
       }, CLI_PUBLISH_TIMEOUT_MS);
 
       const transport = {
@@ -1069,8 +1070,7 @@ async function runBatchDirPublish(v, cfg) {
             if (payload && payload.skipped) {
               const msg = payload.message || "用户关闭窗口，已跳过发布";
               updateRecord("skipped", msg);
-              settleRowLedger("skipped");
-              finish(true, msg);
+              settleRowLedger("skipped").finally(() => finish(true, msg));
               return;
             }
             const completion = resolvePublishCompletion({
@@ -1086,8 +1086,9 @@ async function runBatchDirPublish(v, cfg) {
             updateRecord(completion.recordStatus, completion.message);
             settleRowLedger(completion.recordStatus, {
               savedAsDraft: completion.savedAsDraft,
-            });
-            finish(completion.exitCode === 0, completion.message);
+            }).finally(() =>
+              finish(completion.exitCode === 0, completion.message)
+            );
           } else if (channel === "puppeteer-noLogin") {
             if (payload && payload.taskId != null && payload.taskId !== taskId)
               return;
@@ -1097,8 +1098,7 @@ async function runBatchDirPublish(v, cfg) {
               JSON.stringify(payload)
             );
             updateRecord("login_required", msg);
-            settleRowLedger("login_required");
-            finish(false, msg);
+            settleRowLedger("login_required").finally(() => finish(false, msg));
           }
         },
       };

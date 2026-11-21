@@ -33,6 +33,7 @@ const {
   formatUtc8DateTime,
   parseUtc8DateTimeMs,
   planPublishTimes,
+  comparePlanForGuiDrift,
 } = require("../src/shared/publishThrottle.js");
 
 const throttleService = require("../src/main/services/publishThrottle.js");
@@ -2866,6 +2867,819 @@ async function testFix13_SearchLookaheadLimitReturnsFullError() {
   }
 }
 
+/* ============================================================================
+ * S11-fix2 复审新发现 6 条阻断问题回归用例（每条按复审输入构造，修前失败、修后通过）
+ * ============================================================================ */
+
+// S11-fix2 #1: 定时任务防重复上传（派发前持久化标记到账本；写历史失败不清除标记；刷新补写历史不重复上传）
+async function testFix2_01_ScheduledTaskNoDuplicateUploadAfterPushDataEnospc() {
+  const h = await createS11FixHarness({ initialTime: "2026-11-21T10:00:00" });
+  try {
+    const phone = "13800138000";
+    // 10:00 创建 10:02:00 的定时任务
+    const created = await h.post({
+      platform: "dy",
+      phone,
+      file: h.clip1,
+      title: "防重传定时任务A",
+      publishAt: "2026-11-21 10:02:00",
+    });
+    assert.strictEqual(created.success, true);
+    assert.strictEqual(created.scheduled, true);
+    assert.ok(created.id);
+
+    h.core.startScheduledPublishScheduler(t8("2026-11-21T10:00:00"));
+
+    // 10:02:00 到点，令 pushData 的开始和完成写入均返回 ENOSPC，模拟平台返回发布成功
+    h.setNow(t8("2026-11-21T10:02:00"));
+    h.setDenyPushData(true);
+    h.core.refreshScheduledPublishScheduler(t8("2026-11-21T10:02:00"));
+    await new Promise((r) => setTimeout(r, 40));
+
+    assert.strictEqual(h.uploads.length, 1, "10:02 应执行上传 1 次");
+    const recWhileFull = h.listAllRecords().find((r) => r.id === created.id);
+    assert.strictEqual(
+      recWhileFull.publishStatus,
+      "scheduled",
+      "pushData ENOSPC 时历史仍停留在 scheduled"
+    );
+    const dispatchState = h.core.getScheduledTaskDispatchStateSync(created.id);
+    assert.strictEqual(dispatchState.dispatched, true, "账本必须持久化该任务 id 的派发标记");
+    assert.strictEqual(dispatchState.status, "success", "账本应已记录成功结果");
+    assert.strictEqual(dispatchState.historySynced, false, "写历史失败时 historySynced 应为 false");
+
+    // 10:02:30 磁盘仍满时再次刷新：仍不得重传
+    h.setNow(t8("2026-11-21T10:02:30"));
+    h.core.refreshScheduledPublishScheduler(t8("2026-11-21T10:02:30"));
+    await new Promise((r) => setTimeout(r, 30));
+    assert.strictEqual(h.uploads.length, 1, "历史仍写失败时刷新绝不得二次上传");
+
+    // 恢复 pushData 写入，10:03:00 刷新：不再上传，只补写历史为 success
+    h.setDenyPushData(false);
+    h.setNow(t8("2026-11-21T10:03:00"));
+    h.core.refreshScheduledPublishScheduler(t8("2026-11-21T10:03:00"));
+    await new Promise((r) => setTimeout(r, 40));
+
+    assert.strictEqual(h.uploads.length, 1, "恢复写盘后 10:03 刷新绝不得再次上传同一任务 ID");
+    const recAfterBackfill = h.listAllRecords().find((r) => r.id === created.id);
+    assert.strictEqual(recAfterBackfill.publishStatus, "success", "刷新应把历史状态补写为 success");
+    assert.strictEqual(recAfterBackfill.publishSuccessCount, 1);
+    assert.strictEqual(h.core.listScheduledRecords().length, 0);
+
+    // 1b. 模拟重启清空内存派发集合后刷新（账本已记成功但 pushData 仍是 scheduled）同样绝不二次上传
+    h.setNow(t8("2026-11-21T11:00:00"));
+    const created2 = await h.post({
+      platform: "ks",
+      phone,
+      file: h.clip2,
+      title: "重启后防重传任务B",
+      publishAt: "2026-11-21 11:02:00",
+    });
+    assert.strictEqual(created2.scheduled, true);
+    h.setNow(t8("2026-11-21T11:02:00"));
+    h.setDenyPushData(true);
+    h.core.refreshScheduledPublishScheduler(t8("2026-11-21T11:02:00"));
+    await new Promise((r) => setTimeout(r, 40));
+    assert.strictEqual(h.uploads.length, 2);
+
+    // 模拟进程重启（stop 清空 dispatchedKeys），恢复磁盘后重启调度器
+    h.core.stopScheduledPublishScheduler();
+    h.setDenyPushData(false);
+    h.setNow(t8("2026-11-21T11:03:00"));
+    h.core.startScheduledPublishScheduler(t8("2026-11-21T11:03:00"));
+    await new Promise((r) => setTimeout(r, 40));
+
+    assert.strictEqual(h.uploads.length, 2, "重启清空内存后按账本持久化标记仍不得二次上传");
+    const rec2 = h.listAllRecords().find((r) => r.id === created2.id);
+    assert.strictEqual(rec2.publishStatus, "success", "重启后刷新应补写历史为 success");
+    console.log("✓ Fix2 #1: 定时任务派发前持久化标记到账本，pushData ENOSPC 与重启刷新均防重传并补写历史通过");
+  } finally {
+    h.cleanup();
+  }
+}
+
+// S11-fix2 #2: GUI 错峰预览确认以 previewBaseMs（≤10 分钟）为请求时刻，差异 ≤60s 且原因不变直接通过
+async function testFix2_02_GuiStaggeredPreviewConfirmsWithoutInfiniteLoop() {
+  const h = await createS11FixHarness({
+    initialTime: "2026-11-21T10:00:00",
+    settings: {
+      platforms: {
+        bjh: { minIntervalHours: 4, dailyLimit: 3, delayFromFirstHours: 10 },
+      },
+    },
+  });
+  const messages = [];
+  const gui = loadLocalVideoPublishVm({
+    ipcInvoke: async (ch, arg) => h.handlers.get(ch)(null, arg),
+    messageCalls: messages,
+  });
+  try {
+    const phone = "13800138000";
+    const entries = [
+      {
+        key: "single:0:bjh1",
+        pt: "百家号",
+        phone,
+        partition: `persist:${phone}百家号`,
+        filePath: h.clip1,
+        textType: "local",
+        title: "百家号错峰预览一次确认",
+        isDraft: false,
+      },
+    ];
+
+    // 2a. 10:00:00 打开预览（20:00:00），2 秒后（10:00:02）点确认 → 必须一次通过，不再反复弹窗
+    const p1 = gui.state.confirmThrottlePublishPlan(entries, {});
+    await new Promise((r) => setImmediate(r));
+    assert.strictEqual(gui.state.throttlePreviewVisible, true);
+    assert.strictEqual(gui.state.throttlePreviewRows[0].plannedTimeText, "2026-11-21 20:00:00");
+
+    h.setNow(t8("2026-11-21T10:00:02"));
+    gui.state.resolveThrottlePreview("confirm");
+    const d1 = await p1;
+    assert.strictEqual(d1.proceed, true, "2 秒后点确认必须一次通过，不得死循环要求重确认");
+    assert.strictEqual(gui.state.throttlePreviewVisible, false);
+    const bjhPlan = d1.itemsByKey.get("single:0:bjh1");
+    assert.strictEqual(bjhPlan.scheduled, true);
+    assert.strictEqual(bjhPlan.publishAt, "2026-11-21 20:00:00", "应保留预览基准 10:00 算出的 20:00:00");
+    assert.ok(bjhPlan.reservationId);
+
+    // 释放刚才的预留，继续测 >10 分钟失效预览基准
+    await h.core.releaseThrottleReservation(bjhPlan.reservationId);
+
+    // 2b. 10:00:00 打开预览，拖了 11 分钟到 10:11:00 再点确认 → 超过 10 分钟拒绝 previewBaseMs，重算差异 11 分钟 > 60 秒要求重确认
+    h.setNow(t8("2026-11-21T10:00:00"));
+    const p2 = gui.state.confirmThrottlePublishPlan(entries, {});
+    await new Promise((r) => setImmediate(r));
+    assert.strictEqual(gui.state.throttlePreviewRows[0].plannedTimeText, "2026-11-21 20:00:00");
+
+    h.setNow(t8("2026-11-21T10:11:00"));
+    gui.state.resolveThrottlePreview("confirm");
+    await new Promise((r) => setTimeout(r, 20));
+    assert.strictEqual(gui.state.throttlePreviewVisible, true, "预览超过 10 分钟且计划时刻差 >60s 应要求重新确认");
+    assert.strictEqual(gui.state.throttlePreviewRows[0].plannedTimeText, "2026-11-21 20:11:00");
+
+    // 2 秒后（10:11:02）再次确认新预览 → 一次通过
+    h.setNow(t8("2026-11-21T10:11:02"));
+    gui.state.resolveThrottlePreview("confirm");
+    const d2 = await p2;
+    assert.strictEqual(d2.proceed, true);
+    assert.strictEqual(d2.itemsByKey.get("single:0:bjh1").publishAt, "2026-11-21 20:11:00");
+
+    // 2c. 纯函数边界：差异 =60s 且原因不变 → false；差异 =61s → true；时间相同但节流原因变化 → true
+    assert.strictEqual(
+      comparePlanForGuiDrift(
+        [{ isDraft: false, scheduled: true, plannedAtMs: t8("2026-11-21T20:00:00"), reason: "百家号相对首发延迟 10 小时" }],
+        [{ isDraft: false, scheduled: true, plannedAtMs: t8("2026-11-21T20:01:00"), reason: "百家号相对首发延迟 10 小时" }]
+      ),
+      false,
+      "差异恰为 60 秒且原因未变不得要求重确认"
+    );
+    assert.strictEqual(
+      comparePlanForGuiDrift(
+        [{ isDraft: false, scheduled: true, plannedAtMs: t8("2026-11-21T20:00:00"), reason: "百家号相对首发延迟 10 小时" }],
+        [{ isDraft: false, scheduled: true, plannedAtMs: t8("2026-11-21T20:01:01"), reason: "百家号相对首发延迟 10 小时" }]
+      ),
+      true,
+      "差异 61 秒 (>60s) 必须要求重确认"
+    );
+    assert.strictEqual(
+      comparePlanForGuiDrift(
+        [{ isDraft: false, scheduled: true, plannedAtMs: t8("2026-11-21T20:00:00"), reason: "百家号相对首发延迟 10 小时" }],
+        [{ isDraft: false, scheduled: true, plannedAtMs: t8("2026-11-21T20:00:00"), reason: "距上次百家号发布不足 4 小时" }]
+      ),
+      true,
+      "节流原因变化即使时刻相同也必须要求重确认"
+    );
+    console.log("✓ Fix2 #2: GUI 错峰预览按 previewBaseMs（≤10 分钟）与 >60s/原因变化比较，不再反复要求确认通过");
+  } finally {
+    gui.cleanup();
+    h.cleanup();
+  }
+}
+
+// S11-fix2 #3: 多平台部分失败逐平台处理（有效平台照常执行，失败平台单报并释预留，整体 success 表示至少提交一个）
+async function testFix2_03_MultiPlatformPartialOverflowExecutesValidPlatform() {
+  // 3a. 抖音已有超过 60 天的远期任务 → 提交 platforms:["dy","ks"] → 抖音报排期已满，快手照常立即上传且无幽灵预留
+  const h = await createS11FixHarness({ initialTime: "2026-11-21T10:00:00" });
+  try {
+    const phone = "13800138000";
+    const farDy = await h.post({
+      platform: "dy",
+      phone,
+      file: h.clip1,
+      title: "抖音超60天远期任务",
+      publishAt: "2027-02-05 10:00:00",
+      noThrottle: true,
+    });
+    assert.strictEqual(farDy.success, true);
+    assert.strictEqual(farDy.scheduled, true);
+
+    const mixed = await h.post({
+      phone,
+      file: h.clip2,
+      title: "混合请求测试",
+      platforms: ["dy", "ks"],
+    });
+    assert.strictEqual(mixed.success, true, `至少提交了一个有效平台，整体 success 应为 true，实际=${JSON.stringify(mixed)}`);
+    assert.strictEqual(mixed.status, "partial_failed");
+    assert.strictEqual(mixed.total, 2);
+    assert.strictEqual(mixed.succeeded, 1);
+    assert.strictEqual(mixed.failed, 1);
+    assert.strictEqual(mixed.results.length, 2);
+
+    const [rDy, rKs] = mixed.results;
+    assert.strictEqual(rDy.platform, "抖音");
+    assert.strictEqual(rDy.success, false);
+    assert.ok(rDy.message.includes("排期已满"), rDy.message);
+
+    assert.strictEqual(rKs.platform, "快手");
+    assert.strictEqual(rKs.success, true, "快手有效平台必须照常执行");
+    assert.ok(rKs.id, "快手应写入历史 ID");
+    assert.strictEqual(h.uploads.length, 1, "快手应真实触发 1 次立即上传");
+    assert.strictEqual(h.uploads[0].pt, "快手");
+
+    const ledger = h.core.readPublishThrottleLedger();
+    const orphanRes = ledger.entries.filter((e) => e.status === "reserved" && !e.recordId);
+    assert.strictEqual(orphanRes.length, 0, "账本不得留下无历史 ID 的快手幽灵预留");
+  } finally {
+    h.cleanup();
+  }
+
+  // 3b. 混合请求中有效平台本身上传失败 → 释放该平台预留，后续单发快手可立即上传不被误推迟 4 小时
+  const h2 = await createS11FixHarness({ initialTime: "2026-11-21T10:00:00" });
+  try {
+    const phone = "13800138000";
+    await h2.post({
+      platform: "dy",
+      phone,
+      file: h2.clip1,
+      title: "抖音超60天任务2",
+      publishAt: "2027-02-05 10:00:00",
+      noThrottle: true,
+    });
+    let failKsOnce = true;
+    h2.setUploadHandler((payload, transport, done) => {
+      h2.uploads.push(payload);
+      const ok = !failKsOnce;
+      failKsOnce = false;
+      setImmediate(() => {
+        transport.reply("puppeteerFile-done", {
+          taskId: payload.taskId,
+          status: ok,
+          message: ok ? "已发布" : "快手上传失败",
+        });
+        if (done) done();
+      });
+    });
+
+    const mixedFail = await h2.post({
+      phone,
+      file: h2.clip2,
+      title: "混合全失败",
+      platforms: ["dy", "ks"],
+    });
+    assert.strictEqual(mixedFail.success, false, "全部平台均未成功时整体 success 应为 false");
+    assert.strictEqual(mixedFail.results.length, 2);
+    assert.strictEqual(mixedFail.results[0].success, false);
+    assert.strictEqual(mixedFail.results[1].success, false);
+
+    // 紧接着单发快手应立即上传，绝不被误推迟到 14:00
+    const nextKs = await h2.post({
+      platform: "ks",
+      phone,
+      file: h2.clip3,
+      title: "紧接着单发快手",
+    });
+    assert.strictEqual(nextKs.success, true);
+    assert.ok(!nextKs.scheduled, `失败预留已释放，快手应立即发而非顺延，实际=${JSON.stringify(nextKs)}`);
+    assert.strictEqual(h2.uploads.length, 2);
+    console.log("✓ Fix2 #3: 多平台部分失败逐平台处理、有效项照常执行、失败预留立即释放且返回逐平台结果通过");
+  } finally {
+    h2.cleanup();
+  }
+}
+
+// S11-fix2 #4: 预留严格按 reservationId 确认/释放；同文件同账号共享历史 ID 时一次失败绝不抹掉另一条成功预留
+async function testFix2_04_FailureReleasesOnlyOwnReservationNotSharedRecordId() {
+  const h = await createS11FixHarness({ initialTime: "2026-11-21T10:00:00" });
+  try {
+    const phone = "13800138000";
+    const pendingUploads = [];
+    h.setUploadHandler((payload, transport, done) => {
+      h.uploads.push(payload);
+      pendingUploads.push({ payload, transport, done });
+    });
+
+    // A 先提交（保持上传中）
+    const pA = h.post({
+      platform: "dy",
+      phone,
+      file: h.clip1,
+      title: "同文件并发标题A",
+    });
+    for (let i = 0; i < 20 && pendingUploads.length < 1; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    assert.strictEqual(pendingUploads.length, 1);
+
+    // A 尚在上传时用 noThrottle:true 提交同账号同文件不同标题 B（与 A 共用同一 pushData 历史 ID）
+    const pB = h.post({
+      platform: "dy",
+      phone,
+      file: h.clip1,
+      title: "同文件并发标题B",
+      noThrottle: true,
+    });
+    for (let i = 0; i < 20 && pendingUploads.length < 2; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    assert.strictEqual(pendingUploads.length, 2);
+
+    const [uA, uB] = pendingUploads;
+    assert.strictEqual(uA.payload.recordId, uB.payload.recordId, "复现前提：两次发布共用同一 pushData 历史 ID");
+    assert.notStrictEqual(
+      uA.payload.throttleReservationId,
+      uB.payload.throttleReservationId,
+      "两次发布必须拥有各自独立的 reservationId"
+    );
+    assert.strictEqual(h.core.readPublishThrottleLedger().entries.length, 2);
+
+    // 按队列顺序先让 A 失败、再让 B 成功
+    uA.transport.reply("puppeteerFile-done", {
+      taskId: uA.payload.taskId,
+      status: false,
+      message: "模拟 A 上传失败",
+    });
+    if (uA.done) uA.done();
+    const resA = await pA;
+    assert.strictEqual(resA.success, false);
+
+    // A 失败后，账本必须仍保留 B 的预留
+    const midLedger = h.core.readPublishThrottleLedger();
+    assert.strictEqual(midLedger.entries.length, 1, "A 失败只能释放 A 自己的预留，不得删掉 B");
+    assert.strictEqual(midLedger.entries[0].id, uB.payload.throttleReservationId);
+
+    uB.transport.reply("puppeteerFile-done", {
+      taskId: uB.payload.taskId,
+      status: true,
+      message: "已发布",
+    });
+    if (uB.done) uB.done();
+    const resB = await pB;
+    assert.strictEqual(resB.success, true);
+
+    const afterLedger = h.core.readPublishThrottleLedger();
+    assert.strictEqual(afterLedger.entries.length, 1, "B 成功后账本必须保留 B 的 success 记录");
+    assert.strictEqual(afterLedger.entries[0].status, "success");
+    assert.strictEqual(afterLedger.entries[0].id, uB.payload.throttleReservationId);
+
+    // 11:00 新视频必须按抖音默认 6 小时排到 16:00:00（而非直接上传）
+    h.setNow(t8("2026-11-21T11:00:00"));
+    h.setUploadHandler((payload, transport, done) => {
+      h.uploads.push(payload);
+      setImmediate(() => {
+        transport.reply("puppeteerFile-done", { taskId: payload.taskId, status: true, message: "已发布" });
+        if (done) done();
+      });
+    });
+    const resC = await h.post({
+      platform: "dy",
+      phone,
+      file: h.clip2,
+      title: "11点新视频",
+    });
+    assert.strictEqual(resC.success, true);
+    assert.strictEqual(resC.scheduled, true, "11:00 新视频必须受 10:00 成功发布的 B 节流");
+    assert.strictEqual(resC.publishAt, "2026-11-21 16:00:00");
+    assert.strictEqual(h.uploads.length, 2, "11:00 新视频不应立即上传");
+    console.log("✓ Fix2 #4: 预留严格按 reservationId 确认/释放，A 失败不误删共享历史 ID 的 B 成功记录通过");
+  } finally {
+    h.cleanup();
+  }
+}
+
+// S11-fix2 #5: 删除远期任务时账本更新失败自动重试并告警；账本读取与 pushData 对账自动清理失效 scheduled 占位
+async function testFix2_05_DeleteTaskRetriesWarnsAndReconcilesOnRead() {
+  // 5a. 删除时仅令账本写盘失败一次 → 自动重试在第 2 次成功，无残留占位
+  const h1 = await createS11FixHarness({ initialTime: "2026-11-21T10:00:00" });
+  const realWrite = fs.writeFileSync;
+  try {
+    const phone = "13800138000";
+    const far = await h1.post({
+      platform: "dy",
+      phone,
+      file: h1.clip1,
+      title: "远期定时任务-单次写失败重试",
+      publishAt: "2027-02-05 10:00:00",
+      noThrottle: true,
+    });
+    assert.strictEqual(far.scheduled, true);
+    const rec = h1.listAllRecords().find((r) => r.id === far.id);
+
+    let failOnce = true;
+    fs.writeFileSync = function (filePath, ...rest) {
+      const p = typeof filePath === "string" ? filePath : "";
+      if (failOnce && p.includes("publish-throttle-ledger.json")) {
+        failOnce = false;
+        const err = new Error("ENOSPC: transient write failure");
+        err.code = "ENOSPC";
+        throw err;
+      }
+      return realWrite.call(this, filePath, ...rest);
+    };
+
+    const delRes = h1.core.changeData({
+      fileName: "pushData",
+      type: "delete",
+      item: { id: rec.id, date: rec.date },
+    });
+    fs.writeFileSync = realWrite;
+    assert.strictEqual(delRes.success, true);
+    assert.strictEqual(failOnce, false, "确实触发了 1 次写盘失败并重试");
+    assert.ok(!delRes.ledgerSyncFailed, "单次失败后重试成功不应报错");
+    assert.strictEqual(h1.core.readPublishThrottleLedger().entries.length, 0);
+
+    const pubNow = await h1.post({
+      platform: "dy",
+      phone,
+      file: h1.clip2,
+      title: "删后当天立即发",
+    });
+    assert.strictEqual(pubNow.success, true);
+    assert.ok(!pubNow.scheduled);
+  } finally {
+    fs.writeFileSync = realWrite;
+    h1.cleanup();
+  }
+
+  // 5b. 删除时账本写盘持续失败 → 重试后返回明确告警（不得静默）；写盘恢复后读取对账自动清理幽灵 scheduled 占位
+  const h2 = await createS11FixHarness({ initialTime: "2026-11-21T10:00:00" });
+  try {
+    const phone = "13800138000";
+    const far = await h2.post({
+      platform: "dy",
+      phone,
+      file: h2.clip1,
+      title: "远期定时任务-持续失败对账",
+      publishAt: "2027-02-05 10:00:00",
+      noThrottle: true,
+    });
+    assert.strictEqual(far.scheduled, true);
+    const rec = h2.listAllRecords().find((r) => r.id === far.id);
+
+    h2.setDenyLedger(true);
+    const delWarnRes = h2.core.changeData({
+      fileName: "pushData",
+      type: "delete",
+      item: { id: rec.id, date: rec.date },
+    });
+    assert.strictEqual(delWarnRes.success, true);
+    assert.strictEqual(delWarnRes.ledgerSyncFailed, true, "重试全部失败必须显式标记 ledgerSyncFailed");
+    assert.ok(
+      delWarnRes.warning && delWarnRes.warning.includes("节流账本同步失败"),
+      `删除失败不得静默，必须返回告警，实际=${JSON.stringify(delWarnRes)}`
+    );
+
+    // 重启调度器：待发和计时器均为 0，而原始账本文件里仍残留 2027-02-05 占位
+    h2.core.stopScheduledPublishScheduler();
+    h2.core.startScheduledPublishScheduler(t8("2026-11-21T10:00:00"));
+    assert.strictEqual(h2.core.listScheduledRecords().length, 0);
+    assert.strictEqual(h2.core.getScheduledTimersSnapshot().length, 0);
+    const rawDiskLedger = JSON.parse(
+      fs.readFileSync(h2.core.getPublishThrottleLedgerPath(), "utf8")
+    );
+    assert.strictEqual(rawDiskLedger.entries.length, 1, "复现前提：磁盘账本残留远期 scheduled 条目");
+
+    // 恢复写盘后：账本读取与 pushData 对账自动清理失效 scheduled 占位，当天与次日均可正常发布
+    h2.setDenyLedger(false);
+    const reconciledLedger = h2.core.readPublishThrottleLedger();
+    assert.strictEqual(reconciledLedger.entries.length, 0, "读取对账必须清理已删除任务的 scheduled 占位");
+
+    const pubDay1 = await h2.post({
+      platform: "dy",
+      phone,
+      file: h2.clip2,
+      title: "恢复后当天新视频",
+    });
+    assert.strictEqual(pubDay1.success, true, `当天新视频不得报排期已满，实际=${JSON.stringify(pubDay1)}`);
+    assert.ok(!pubDay1.scheduled);
+
+    h2.setNow(t8("2026-11-22T10:00:00"));
+    const pubDay2 = await h2.post({
+      platform: "dy",
+      phone,
+      file: h2.clip3,
+      title: "恢复后次日新视频",
+    });
+    assert.strictEqual(pubDay2.success, true, `次日新视频不得报排期已满，实际=${JSON.stringify(pubDay2)}`);
+    assert.ok(!pubDay2.scheduled);
+
+    // 5c. 若任务在 pushData 中已非待发状态（如 cancelled），读取账本对账同样清理该 scheduled 占位
+    const schedPath = h2.core.getPublishThrottleLedgerPath();
+    const cancelledRec = h2.addRecord({
+      scheduledTask: true,
+      publishStatus: "cancelled",
+      scheduledPublishAt: t8("2027-02-05T10:00:00"),
+      scheduledPublishAtText: "2027-02-05 10:00:00",
+      date: "2026-11-22",
+      title: "已取消定时任务",
+    });
+    const curDisk = JSON.parse(fs.readFileSync(schedPath, "utf8"));
+    curDisk.entries.push({
+      id: "tl_stale_cancelled_sched",
+      bucketKey: `抖音|persist:${phone}抖音`,
+      platform: "抖音",
+      partition: `persist:${phone}抖音`,
+      phone,
+      status: "scheduled",
+      ts: t8("2027-02-05T10:00:00"),
+      isScheduled: true,
+      recordId: String(cancelledRec.id),
+      createdAt: t8("2026-11-22T10:00:00"),
+      updatedAt: t8("2026-11-22T10:00:00"),
+    });
+    fs.writeFileSync(schedPath, JSON.stringify(curDisk, null, 2), "utf8");
+    const afterCancelledCheck = h2.core.readPublishThrottleLedger();
+    assert.ok(
+      !afterCancelledCheck.entries.some((e) => e.id === "tl_stale_cancelled_sched"),
+      "pushData 中已非 scheduled 状态的任务对应的账本 scheduled 占位必须被对账清理"
+    );
+    console.log("✓ Fix2 #5: 删除失败重试与显式告警 + 账本读取与 pushData 对账清理失效 scheduled 占位验证通过");
+  } finally {
+    h2.cleanup();
+  }
+}
+
+// S11-fix2 #6: 跨进程文件锁（同目录 .lock 独占创建、>30s 陈旧抢占、退避重试 10s 超时报错）串行化 HTTP 与 CLI
+async function testFix2_06_CrossProcessFileLockSerializesHttpAndCli() {
+  const vm = require("vm");
+  const { createRequire } = require("module");
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-s11-fix2-lock-"));
+  const clipA = path.join(tmpDir, "a.mp4");
+  const clipB = path.join(tmpDir, "b.mp4");
+  fs.writeFileSync(clipA, "video-a");
+  fs.writeFileSync(clipB, "video-b");
+
+  const ledgerPath = path.join(tmpDir, "publish-throttle-ledger.json");
+  const lockPath = path.join(tmpDir, "publish-throttle-ledger.lock");
+  const now = t8("2026-11-21T10:00:00");
+  const uploads = [];
+  let duringHttpLedgerReplace = null;
+
+  // 共享同一真实临时目录，并在 HTTP renameSync 替换账本前切入 CLI 隔离环境（复现跨进程竞态）
+  const sharedFs = new Proxy(fs, {
+    get(target, key) {
+      if (key !== "renameSync") {
+        const v = target[key];
+        return typeof v === "function" ? v.bind(target) : v;
+      }
+      return (from, to) => {
+        if (to === ledgerPath && duringHttpLedgerReplace) {
+          const run = duringHttpLedgerReplace;
+          duringHttpLedgerReplace = null;
+          run();
+        }
+        return target.renameSync(from, to);
+      };
+    },
+  });
+
+  try {
+    const built = await esbuild.build({
+      stdin: {
+        contents: [
+          `export { default as router } from "./src/main/server/routes/index.js";`,
+          `export { runCliMain } from "./src/main/cli/index.js";`,
+          `export * from "./src/main/services/publishThrottle.js";`,
+        ].join("\n"),
+        resolveDir: root,
+        sourcefile: "s11-fix2-cross-entry.js",
+      },
+      bundle: true,
+      write: false,
+      format: "cjs",
+      platform: "node",
+      packages: "external",
+      plugins: [
+        {
+          name: "s11-fix2-cross-mocks",
+          setup(b) {
+            b.onResolve({ filter: /puppeteerFile(?:\.js)?$/ }, () => ({
+              path: "upload",
+              namespace: "s11-fix2-mock",
+            }));
+            b.onResolve({ filter: /collectAlert\.js$/ }, () => ({
+              path: "alert",
+              namespace: "s11-fix2-mock",
+            }));
+            b.onLoad({ filter: /.*/, namespace: "s11-fix2-mock" }, ({ path: p }) => ({
+              contents:
+                p === "upload"
+                  ? `export function registerPublishDedupeBypass(){} export function runPuppeteerTask(...args){return globalThis.fakeUpload(...args);}`
+                  : `export function handleAccountCollectOutcome(){}`,
+              loader: "js",
+            }));
+          },
+        },
+      ],
+    });
+
+    const bundleCode = built.outputFiles[0].text;
+    const req = createRequire(path.join(root, "s11-fix2-cross-bundle.cjs"));
+    const electronStub = {
+      app: {
+        getPath: () => tmpDir,
+        getVersion: () => "0.15.0-test",
+        on() {},
+        once() {},
+        commandLine: { getSwitchValue: () => "" },
+      },
+      ipcMain: { handle() {}, on() {} },
+      BrowserWindow: function () {},
+      dialog: {},
+    };
+
+    function createIsolatedProc(label, pid) {
+      const logs = [];
+      const errors = [];
+      const proc = Object.create(process);
+      Object.defineProperty(proc, "pid", { value: pid });
+      const ctx = vm.createContext({
+        module: { exports: {} },
+        process: proc,
+        console: {
+          log: (...a) => logs.push(a.join(" ")),
+          error: (...a) => errors.push(a.join(" ")),
+          warn: (...a) => errors.push(a.join(" ")),
+        },
+        logs,
+        errors,
+        now,
+        tmpDir,
+        clipA,
+        clipB,
+        __dirname: root,
+        Buffer,
+        URL,
+        URLSearchParams,
+        setTimeout,
+        clearTimeout,
+        setImmediate,
+        clearImmediate,
+        setInterval,
+        clearInterval,
+        require(name) {
+          if (name === "fs" || name === "node:fs") return sharedFs;
+          if (name === "electron") return electronStub;
+          if (name === "puppeteer-extra") return { addExtra: () => ({ use() {}, connect() {} }) };
+          if (name === "puppeteer-extra-plugin-stealth") return () => ({});
+          if (name.startsWith("puppeteer")) return {};
+          return req(name);
+        },
+        fakeUpload(payload, transport, done) {
+          uploads.push([label, payload.data.title]);
+          transport.reply("puppeteerFile-done", {
+            taskId: payload.taskId,
+            status: true,
+            message: "已发布",
+          });
+          if (done) done();
+        },
+      });
+      ctx.global = ctx;
+      vm.runInContext(
+        `const NativeDate = Date; globalThis.Date = class extends NativeDate { constructor(...args){ super(...(args.length ? args : [now])); } static now(){ return now; } };`,
+        ctx
+      );
+      vm.runInContext(bundleCode, ctx, { timeout: 5000 });
+      return ctx;
+    }
+
+    // 6a. 两个独立运行环境（HTTP pid 7231 / CLI pid 7232）并发写同一账本，文件锁必须串行化
+    const httpCtx = createIsolatedProc("HTTP", 7231);
+    const cliCtx = createIsolatedProc("CLI", 7232);
+
+    let cliPromiseStarted = false;
+    duringHttpLedgerReplace = () => {
+      // HTTP 正在持有 .lock 替换账本期间，拉起 CLI 进程请求同一账号
+      assert.strictEqual(fs.existsSync(lockPath), true, "HTTP 替换账本时必须持有同目录 .lock 文件");
+      cliPromiseStarted = true;
+      vm.runInContext(
+        `module.exports.runCliMain(["electron","cli","publish","-p","dy","--phone","13800138000","-f",clipB,"-t","CLI视频"]).then(r=>{globalThis.cliExit=r;},e=>{globalThis.cliFailure=String(e);});`,
+        cliCtx,
+        { timeout: 5000 }
+      );
+    };
+
+    vm.runInContext(
+      `const post = module.exports.router.stack.find(r=>r.route && r.route.path==="/publish").route.stack[0].handle;
+       post(
+         { body:{ platform:"dy", phone:"13800138000", file:clipA, title:"HTTP视频" }, method:"POST", headers:{ origin:"http://localhost:30088" }, ip:"127.0.0.1", socket:{ remoteAddress:"127.0.0.1" } },
+         { status(c){ globalThis.httpCode=c; return this; }, json(r){ globalThis.httpReceipt=r; } }
+       ).catch(e=>{ globalThis.httpFailure=String(e); });`,
+      httpCtx,
+      { timeout: 5000 }
+    );
+
+    const waitDeadline = Date.now() + 4000;
+    while (
+      Date.now() < waitDeadline &&
+      (!httpCtx.httpReceipt || cliCtx.cliExit === undefined) &&
+      !httpCtx.httpFailure &&
+      !cliCtx.cliFailure
+    ) {
+      await new Promise((r) => setTimeout(r, 15));
+    }
+
+    assert.strictEqual(cliPromiseStarted, true, "确实在 HTTP 持有锁期间触发了 CLI 竞争");
+    assert.strictEqual(httpCtx.httpFailure, undefined, httpCtx.httpFailure);
+    assert.strictEqual(cliCtx.cliFailure, undefined, cliCtx.cliFailure);
+    assert.strictEqual(httpCtx.httpReceipt && httpCtx.httpReceipt.status, "success");
+    assert.strictEqual(cliCtx.cliExit, 0, JSON.stringify(cliCtx.errors));
+
+    // HTTP 拿到锁立即发，CLI 等 HTTP 放锁后读到 HTTP 的 10:00 记录 → 自动顺延到 16:00，绝不双发、绝不覆盖账本
+    assert.deepStrictEqual(
+      uploads,
+      [["HTTP", "HTTP视频"]],
+      `跨进程文件锁应阻止双发，实际上传=${JSON.stringify(uploads)}`
+    );
+    const cliReceipts = cliCtx.logs
+      .filter((s) => s.trim().startsWith("{"))
+      .map((s) => JSON.parse(s));
+    const cliLast = cliReceipts[cliReceipts.length - 1];
+    assert.strictEqual(cliLast.status, "scheduled");
+    assert.strictEqual(cliLast.publishAt, "2026-11-21 16:00:00");
+
+    const persisted = JSON.parse(fs.readFileSync(ledgerPath, "utf8"));
+    assert.strictEqual(persisted.entries.length, 2, `账本不得互相覆盖，应留 2 条记录，实际=${JSON.stringify(persisted.entries)}`);
+    assert.ok(persisted.entries.some((e) => e.status === "success"));
+    assert.ok(persisted.entries.some((e) => e.status === "scheduled"));
+    assert.strictEqual(fs.existsSync(lockPath), false, "全部完成后 .lock 文件必须清理干净");
+
+    // 6b. 陈旧锁（持有 > 30 秒）自动抢占
+    const throttleSvc = require("../src/main/services/publishThrottle.js");
+    assert.strictEqual(throttleSvc.LEDGER_LOCK_STALE_MS, 30 * 1000);
+    assert.strictEqual(throttleSvc.LEDGER_LOCK_TIMEOUT_MS, 10 * 1000);
+
+    const staleLockDir = path.join(tmpDir, "stale-lock-test");
+    fs.mkdirSync(staleLockDir, { recursive: true });
+    const staleLockFile = throttleSvc.getPublishThrottleLedgerLockPath({ userDataDir: staleLockDir });
+    fs.writeFileSync(
+      staleLockFile,
+      JSON.stringify({ pid: 99999, token: "dead-holder", acquiredAt: Date.now() - 31000 }),
+      "utf8"
+    );
+    let ranAfterStale = false;
+    await throttleSvc.withPublishThrottleLock(
+      () => {
+        ranAfterStale = true;
+      },
+      { userDataDir: staleLockDir }
+    );
+    assert.strictEqual(ranAfterStale, true, "持有超过 30 秒的陈旧 .lock 必须能被抢占");
+    assert.strictEqual(fs.existsSync(staleLockFile), false, "抢占并执行完毕后应释放 .lock");
+
+    // 6c. 活跃锁未释放时带退避重试，超时后报错且不误删活跃持有者的 .lock
+    const busyLockDir = path.join(tmpDir, "busy-lock-test");
+    fs.mkdirSync(busyLockDir, { recursive: true });
+    const busyLockFile = throttleSvc.getPublishThrottleLedgerLockPath({ userDataDir: busyLockDir });
+    const peerToken = "alive-peer-token";
+    fs.writeFileSync(
+      busyLockFile,
+      JSON.stringify({ pid: 88888, token: peerToken, acquiredAt: Date.now() }),
+      "utf8"
+    );
+    let lockErr = null;
+    const t0 = Date.now();
+    try {
+      await throttleSvc.withPublishThrottleLock(
+        () => {},
+        { userDataDir: busyLockDir, lockTimeoutMs: 120 }
+      );
+    } catch (err) {
+      lockErr = err;
+    }
+    const elapsed = Date.now() - t0;
+    assert.ok(lockErr, "锁被占用超时后必须报错");
+    assert.strictEqual(lockErr.code, "LEDGER_LOCK_TIMEOUT");
+    assert.ok(elapsed >= 100, `应带退避等待到超时，实际耗时 ${elapsed}ms`);
+    assert.strictEqual(fs.existsSync(busyLockFile), true, "超时不得删除活跃持有者的 .lock");
+    assert.strictEqual(JSON.parse(fs.readFileSync(busyLockFile, "utf8")).token, peerToken);
+
+    const planTimeoutRes = await throttleSvc.planAndReservePublishTimes(
+      { targets: [{ platform: "dy", phone: "13800138000" }] },
+      { userDataDir: busyLockDir, lockTimeoutMs: 100 }
+    );
+    assert.strictEqual(planTimeoutRes.ok, false);
+    assert.strictEqual(planTimeoutRes.code, "LEDGER_LOCK_TIMEOUT");
+
+    console.log("✓ Fix2 #6: 跨进程 .lock 独占文件锁串行化 HTTP/CLI、>30s 陈旧抢占与退避超时报错验证通过");
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
 async function main() {
   testCase1_IntervalPostponeAndBoundaries();
   testCase2_AllowedWindowRollover();
@@ -2891,6 +3705,12 @@ async function main() {
   await testFix11_ExplicitCreativeStatementPriorityAndReuseConflict();
   await testFix12_McpNoThrottleAndReceiptFields();
   await testFix13_SearchLookaheadLimitReturnsFullError();
+  await testFix2_01_ScheduledTaskNoDuplicateUploadAfterPushDataEnospc();
+  await testFix2_02_GuiStaggeredPreviewConfirmsWithoutInfiniteLoop();
+  await testFix2_03_MultiPlatformPartialOverflowExecutesValidPlatform();
+  await testFix2_04_FailureReleasesOnlyOwnReservationNotSharedRecordId();
+  await testFix2_05_DeleteTaskRetriesWarnsAndReconcilesOnRead();
+  await testFix2_06_CrossProcessFileLockSerializesHttpAndCli();
   console.log("\ntest-publish-throttle: 全部断言通过");
 }
 

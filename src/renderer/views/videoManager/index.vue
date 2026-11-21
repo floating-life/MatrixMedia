@@ -1076,7 +1076,13 @@ export default {
           },
         })
       );
-      Promise.all(promises).then(() => {
+      Promise.all(promises).then((results) => {
+        const warnings = (results || [])
+          .map((r) => r && r.warning)
+          .filter(Boolean);
+        if (warnings.length > 0 && this.$message) {
+          this.$message.warning(warnings.join("；"));
+        }
         this.dataList[dateKey].splice(idx, 1);
         if (this.dataList[dateKey].length === 0) {
           this.$delete(this.dataList, dateKey);

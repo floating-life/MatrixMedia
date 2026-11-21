@@ -391,6 +391,9 @@ function settleTaskThrottleReservation(data, channel, payload) {
             ts: Date.now(),
             isScheduled: false,
             recordId: data.recordId,
+            platform: data.pt,
+            phone: data.phone,
+            partition: data.partition,
           })
           .catch(() => {});
         return;

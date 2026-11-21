@@ -358,16 +358,31 @@ function changeDataUnsafe({ item, fileName, type } = {}) {
       list[index] = { ...list[index], ...item };
       writeDayData(filePath, list);
       if (folder.name === "pushData") {
-        try {
-          require("../services/publishThrottle.js").syncLedgerOnPushDataMutation({
-            type: "update",
-            id: list[index].id,
-            publishStatus: list[index].publishStatus,
-            publishMode: list[index].publishMode,
-            publishToDraft: list[index].publishToDraft,
-            lastPublishAt: list[index].lastPublishAt,
-          });
-        } catch (_) {}
+        const hasExplicitReservation =
+          typeof item.throttleReservationId === "string" &&
+          item.throttleReservationId.trim() !== "";
+        const isScheduledRow = list[index].scheduledTask === true;
+        // 仅同步带显式预留 id 的更新或定时任务自身状态更新；
+        // 非定时立即发布可能共享合并后的 recordId，由各执行链路按各自 reservationId 独立确认/释放，
+        // 不得按共享历史 id 误删并发任务的预留。
+        if (hasExplicitReservation || (isScheduledRow && item.publishStatus)) {
+          try {
+            require("../services/publishThrottle.js").syncLedgerOnPushDataMutation({
+              type: "update",
+              id: list[index].id,
+              reservationId: hasExplicitReservation
+                ? item.throttleReservationId.trim()
+                : isScheduledRow && list[index].throttleReservationId
+                ? list[index].throttleReservationId
+                : null,
+              scheduledTask: isScheduledRow,
+              publishStatus: list[index].publishStatus,
+              publishMode: list[index].publishMode,
+              publishToDraft: list[index].publishToDraft,
+              lastPublishAt: list[index].lastPublishAt,
+            });
+          } catch (_) {}
+        }
       }
       return { success: true, data: list };
     }
@@ -377,18 +392,41 @@ function changeDataUnsafe({ item, fileName, type } = {}) {
         return { success: false, message: "请指定日期" };
       }
       let list = readDayData(filePath);
+      const deletedRows = list.filter(obj => obj.id == item.id);
       const newList = list.filter(obj => obj.id != item.id);
       if (newList.length === list.length) {
         return { success: false, message: `未找到 id=${item.id} 的记录` };
       }
       writeDayData(filePath, newList);
+      let ledgerSync = null;
       if (folder.name === "pushData") {
+        const deletedRecord = deletedRows[0] || null;
         try {
-          require("../services/publishThrottle.js").syncLedgerOnPushDataMutation({
+          ledgerSync = require("../services/publishThrottle.js").syncLedgerOnPushDataMutation({
             type: "delete",
             id: item.id,
+            reservationId:
+              (deletedRecord && deletedRecord.throttleReservationId) || null,
+            scheduledTask: Boolean(deletedRecord && deletedRecord.scheduledTask),
           });
-        } catch (_) {}
+        } catch (err) {
+          const warnMsg = `删除记录成功，但同步节流账本失败：${
+            (err && err.message) || err
+          }`;
+          console.warn("[changeData]", warnMsg);
+          ledgerSync = { ok: false, warning: warnMsg, error: warnMsg };
+        }
+      }
+      if (ledgerSync && ledgerSync.ok === false) {
+        return {
+          success: true,
+          data: newList,
+          ledgerSyncFailed: true,
+          warning: ledgerSync.warning || ledgerSync.error || "同步节流账本失败",
+          warnings: [
+            ledgerSync.warning || ledgerSync.error || "同步节流账本失败",
+          ],
+        };
       }
       return { success: true, data: newList };
     }

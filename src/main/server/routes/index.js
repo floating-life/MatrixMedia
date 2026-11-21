@@ -120,6 +120,7 @@ router.post("/publish", async function (req, res) {
     return res.status(403).json({ success: false, message: "Forbidden" });
   }
   const acquiredReservationIds = [];
+  const ownedReservationTargets = [];
   try {
     const { parseMultiPublishRequest } = await import(
       "../../cli/parsePublishArgs.js"
@@ -261,6 +262,7 @@ router.post("/publish", async function (req, res) {
       if (planItem && planItem.reservationId) {
         acquiredReservationIds.push(planItem.reservationId);
         target.throttleReservationId = planItem.reservationId;
+        ownedReservationTargets.push(target);
       }
 
       if (planItem && planItem.scheduled) {
@@ -284,12 +286,13 @@ router.post("/publish", async function (req, res) {
       }
       result = await publishService.runSingleFilePublish(target);
       acquiredReservationIds.length = 0;
+      ownedReservationTargets.length = 0;
       if (result && result.creativeStatement == null) {
         result.creativeStatement = target.creativeStatement || "none";
       }
     } else {
-      // platforms 数组（1 个或多个平台）：先逐平台校验 publishAt 与查重，仅拦截重复的那几个平台；
-      // 未被拦截的平台再进入主进程串行排期与账本预留
+      // platforms 数组（1 个或多个平台）：先逐平台校验 publishAt 与查重，仅拦截重复或参数无效的平台；
+      // 其余有效平台照常进入主进程串行排期与账本预留，绝不在处理有效项前提前返回
       const targets = parsed.value;
       const allowedTargets = [];
       const allowedMeta = [];
@@ -322,11 +325,27 @@ router.post("/publish", async function (req, res) {
         if (t.publishAt) {
           const parsedAt = parsePublishAtUtc8(t.publishAt, nowMs);
           if (!parsedAt.ok) {
-            return res.status(400).json({
+            if (!parsed.multi) {
+              return res.status(400).json({
+                success: false,
+                status: "failed",
+                exitCode: 2,
+                code: parsedAt.code || "INVALID_PUBLISH_AT",
+                message: parsedAt.error,
+              });
+            }
+            planFailedByIndex.set(i, {
+              platform: t.platform,
+              phone: t.phone || "",
+              creativeStatement: t.creativeStatement || "none",
               success: false,
               status: "failed",
+              exitCode: 2,
+              code: parsedAt.code || "INVALID_PUBLISH_AT",
+              scheduled: false,
               message: parsedAt.error,
             });
+            continue;
           }
           explicitPublishAtMs = parsedAt.value;
           t.publishAt = parsedAt.text;
@@ -371,20 +390,39 @@ router.post("/publish", async function (req, res) {
       }
 
       if (allowedTargets.length === 0) {
-        const blockedList = targets.map((_, idx) => blockedByIndex.get(idx)).filter(Boolean);
+        const mergedFailedList = targets
+          .map((_, idx) => blockedByIndex.get(idx) || planFailedByIndex.get(idx))
+          .filter(Boolean);
+        const onlyDuplicates =
+          blockedByIndex.size > 0 && planFailedByIndex.size === 0;
+        const allParamErr =
+          planFailedByIndex.size === mergedFailedList.length &&
+          mergedFailedList.every((r) => r.exitCode === 2);
+        if (allParamErr && !onlyDuplicates) {
+          return res.status(400).json({
+            success: false,
+            status: "failed",
+            exitCode: 2,
+            total: mergedFailedList.length,
+            succeeded: 0,
+            failed: mergedFailedList.length,
+            message: mergedFailedList.map((r) => r.message).join("；"),
+            results: mergedFailedList,
+          });
+        }
         result = {
           success: false,
-          status: "duplicate",
-          exitCode: DUPLICATE_EXIT_CODE,
-          duplicate: true,
-          total: blockedList.length,
+          status: onlyDuplicates ? "duplicate" : "failed",
+          exitCode: onlyDuplicates ? DUPLICATE_EXIT_CODE : 3,
+          ...(onlyDuplicates ? { duplicate: true } : {}),
+          total: mergedFailedList.length,
           succeeded: 0,
-          failed: blockedList.length,
-          message: blockedList.map((r) => r.message).join("；"),
-          results: blockedList,
+          failed: mergedFailedList.length,
+          message: mergedFailedList.map((r) => r.message).join("；"),
+          results: mergedFailedList,
         };
       } else {
-        // 仅对未命中重复拦截的平台进行主进程串行节流排期与账本预留
+        // 仅对未命中重复拦截与参数校验的平台进行主进程串行节流排期与账本预留
         const planRes = await planAndReservePublishTimes({
           targets: allowedTargets.map((t, k) => ({
             platform: t.platform,
@@ -402,6 +440,14 @@ router.post("/publish", async function (req, res) {
         });
 
         if (!planRes.ok) {
+          if (
+            Array.isArray(planRes.reservationIds) &&
+            planRes.reservationIds.length > 0
+          ) {
+            try {
+              await releaseThrottleReservation(planRes.reservationIds);
+            } catch (_) {}
+          }
           const isParamErr =
             planRes.code === "INVALID_PUBLISH_AT" ||
             planRes.code === "EXPIRED_PUBLISH_AT";
@@ -420,27 +466,42 @@ router.post("/publish", async function (req, res) {
 
         const execTargets = [];
         const execIndices = [];
+        const failedReservationIds = [];
         for (let k = 0; k < allowedTargets.length; k++) {
           const t = allowedTargets[k];
           const meta = allowedMeta[k];
-          const planItem = planRes.items[k];
-          if (planItem && planItem.ok === false) {
+          const planItem = planRes.items && planRes.items[k];
+          if (!planItem || planItem.ok === false) {
+            if (planItem && planItem.reservationId) {
+              failedReservationIds.push(planItem.reservationId);
+            }
+            const itemExitCode =
+              planItem &&
+              (planItem.code === "INVALID_PUBLISH_AT" ||
+                planItem.code === "EXPIRED_PUBLISH_AT")
+                ? 2
+                : 3;
             planFailedByIndex.set(allowedIndices[k], {
               platform: t.platform,
               phone: t.phone || "",
               creativeStatement: t.creativeStatement || "none",
               success: false,
               status: "failed",
-              exitCode: 3,
-              message: planItem.error || "排期已满",
+              exitCode: itemExitCode,
+              code:
+                (planItem && planItem.code) ||
+                (planItem && planItem.overflow ? "SCHEDULE_FULL" : "PLAN_FAILED"),
+              scheduled: false,
+              message: (planItem && planItem.error) || "排期已满",
             });
             continue;
           }
-          if (planItem && planItem.reservationId) {
+          if (planItem.reservationId) {
             acquiredReservationIds.push(planItem.reservationId);
             t.throttleReservationId = planItem.reservationId;
+            ownedReservationTargets.push(t);
           }
-          if (planItem && planItem.scheduled) {
+          if (planItem.scheduled) {
             t.publishAt = planItem.publishAt;
             t.scheduledPublishAtMs = planItem.plannedAtMs;
             t.throttled = planItem.throttled;
@@ -463,6 +524,12 @@ router.post("/publish", async function (req, res) {
           execIndices.push(allowedIndices[k]);
         }
 
+        if (failedReservationIds.length > 0) {
+          try {
+            await releaseThrottleReservation(failedReservationIds);
+          } catch (_) {}
+        }
+
         if (
           blockedByIndex.size === 0 &&
           planFailedByIndex.size === 0
@@ -471,6 +538,7 @@ router.post("/publish", async function (req, res) {
             ? await publishService.runMultiPlatformPublish(execTargets)
             : await publishService.runSingleFilePublish(execTargets[0]);
           acquiredReservationIds.length = 0;
+          ownedReservationTargets.length = 0;
           if (!parsed.multi && result && result.creativeStatement == null) {
             result.creativeStatement = execTargets[0].creativeStatement || "none";
           }
@@ -480,6 +548,7 @@ router.post("/publish", async function (req, res) {
               ? await publishService.runMultiPlatformPublish(execTargets)
               : { results: [] };
           acquiredReservationIds.length = 0;
+          ownedReservationTargets.length = 0;
           const runResults = Array.isArray(runRes && runRes.results) ? runRes.results : [];
           const mergedResults = new Array(targets.length);
           for (const [idx, blocked] of blockedByIndex.entries()) {
@@ -519,7 +588,9 @@ router.post("/publish", async function (req, res) {
           const hasDup = blockedByIndex.size > 0;
           result = {
             ...(runRes || {}),
-            success: failed === 0,
+            // 多平台部分失败时，整体 success 表示至少提交了一个有效平台
+            success: succeeded > 0,
+            scheduled: scheduledCount === total && failed === 0,
             status: hasDup
               ? succeeded > 0
                 ? "partial_duplicate"
@@ -569,9 +640,14 @@ router.post("/publish", async function (req, res) {
 
     return res.status(httpStatus).json(response);
   } catch (error) {
-    if (acquiredReservationIds.length > 0) {
+    const unconsumedIds = ownedReservationTargets.length > 0
+      ? ownedReservationTargets
+          .map((t) => t && t.throttleReservationId)
+          .filter(Boolean)
+      : acquiredReservationIds;
+    if (unconsumedIds.length > 0) {
       try {
-        await releaseThrottleReservation(acquiredReservationIds);
+        await releaseThrottleReservation(unconsumedIds);
       } catch (_) {}
     }
     console.error("[HTTP /publish]", error);

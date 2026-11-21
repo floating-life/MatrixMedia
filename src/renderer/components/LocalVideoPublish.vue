@@ -1557,6 +1557,12 @@ export default {
       }
 
       let currentPlanItems = Array.isArray(res.items) ? res.items : [];
+      let currentPreviewBaseMs =
+        typeof res.previewBaseMs === "number" && Number.isFinite(res.previewBaseMs)
+          ? res.previewBaseMs
+          : typeof res.nowMs === "number" && Number.isFinite(res.nowMs)
+          ? res.nowMs
+          : Date.now();
       while (true) {
         const { previewRows } = buildPreviewState(currentPlanItems);
         this.throttlePreviewRows = previewRows;
@@ -1583,6 +1589,7 @@ export default {
             publishAt: options.publishAt || null,
             publishAtMs: options.publishAtMs || null,
             noThrottle: wantNoThrottle,
+            previewBaseMs: wantNoThrottle ? null : currentPreviewBaseMs,
             previewItems: wantNoThrottle
               ? null
               : currentPlanItems.map((it) => ({
@@ -1590,6 +1597,8 @@ export default {
                   scheduled: Boolean(it && it.scheduled),
                   plannedAtMs: it ? it.plannedAtMs : null,
                   publishAt: it ? it.publishAt : null,
+                  reason: it ? String(it.reason || "") : "",
+                  reasons: Array.isArray(it && it.reasons) ? it.reasons : [],
                 })),
           });
         } catch (e) {
@@ -1621,11 +1630,19 @@ export default {
           };
         }
 
-        // 主进程重算结果与预览不同：刷新预览表让用户重新确认，不得按旧预览提交
+        // 主进程重算结果与预览发生实质偏移（计划时刻差 >60s 或原因/状态变化）：刷新预览表让用户重新确认
         if (commitRes.changed === true) {
           currentPlanItems = Array.isArray(commitRes.items)
             ? commitRes.items
             : [];
+          currentPreviewBaseMs =
+            typeof commitRes.previewBaseMs === "number" &&
+            Number.isFinite(commitRes.previewBaseMs)
+              ? commitRes.previewBaseMs
+              : typeof commitRes.nowMs === "number" &&
+                Number.isFinite(commitRes.nowMs)
+              ? commitRes.nowMs
+              : Date.now();
           if (this.$message) {
             this.$message.warning(
               commitRes.message || "期间有新的发布任务，排期已更新，请重新确认"

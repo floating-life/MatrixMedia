@@ -17,15 +17,18 @@ import {
   parsePublishAtUtc8,
 } from "../../shared/publishThrottle.js";
 import {
-  confirmThrottleReservation,
-  releaseThrottleReservation,
-  settleThrottleByRecordId,
+  getScheduledTaskDispatchStateSync,
+  markScheduledTaskDispatched,
+  recordScheduledTaskOutcome,
+  markScheduledTaskHistorySynced,
 } from "./publishThrottle.js";
 
 const MAX_TIMER_DELAY_MS = 24 * 60 * 60 * 1000;
 const REFRESH_INTERVAL_MS = 60 * 1000;
 const scheduledTimers = new Map();
 const dispatchedKeys = new Set();
+const inFlightKeys = new Set();
+const pendingHistoryPatches = new Map();
 let schedulerStarted = false;
 let schedulerStartedAt = null;
 let refreshInterval = null;
@@ -229,8 +232,10 @@ export function buildTaskPayloadFromRecord(record) {
 }
 
 function updateRecord(record, patch) {
-  if (!record || !record.id || !record.date) return;
-  changeData({
+  if (!record || !record.id || !record.date) {
+    return { ok: false, res: null };
+  }
+  const res = changeData({
     fileName: "pushData",
     type: "update",
     item: {
@@ -239,6 +244,7 @@ function updateRecord(record, patch) {
       ...patch,
     },
   });
+  return { ok: Boolean(res && res.success === true), res };
 }
 
 export function listScheduledRecords() {
@@ -266,50 +272,134 @@ export function listScheduledRecords() {
   return rows;
 }
 
-function settleScheduledLedger(record, status, extra = {}) {
-  try {
-    const reservationId = record && record.throttleReservationId;
-    const isFormalSuccess =
-      status === "success" &&
-      extra.publishToDraft !== true &&
-      String(extra.publishMode || "").trim().toLowerCase() !== "draft";
-    if (reservationId) {
-      if (isFormalSuccess) {
-        confirmThrottleReservation(reservationId, {
-          status: "success",
-          ts:
-            typeof extra.ts === "number" && Number.isFinite(extra.ts)
-              ? extra.ts
-              : Date.now(),
-          isScheduled: false,
-          recordId: record && record.id,
-        }).catch(() => {});
-      } else {
-        releaseThrottleReservation(reservationId).catch(() => {});
-      }
-      return;
+function buildBackfillPatchFromLedgerState(record, state, nowMs = Date.now()) {
+  if (state && state.resultPatch && typeof state.resultPatch === "object") {
+    return { ...state.resultPatch };
+  }
+  const st = String((state && state.status) || "publishing")
+    .trim()
+    .toLowerCase();
+  const ts =
+    (state && (state.updatedAt || state.dispatchedAt)) || nowMs;
+  const isDraft =
+    Boolean(state && state.isDraft) ||
+    record.publishMode === "draft" ||
+    record.publishToDraft === true;
+  if (st === "success" || st === "published") {
+    return {
+      publishMode: "publish",
+      publishToDraft: false,
+      publishStatus: "success",
+      publishSuccessCount: 1,
+      publishFailCount: 0,
+      publishAbnormalCount: 0,
+      lastPublishMessage: "已发布（从节流账本补写历史状态）",
+      lastPublishAt: ts,
+    };
+  }
+  if (st === "draft" || st === "draft_saved") {
+    return {
+      publishMode: "draft",
+      publishToDraft: true,
+      publishStatus: "draft",
+      publishSuccessCount: 1,
+      publishFailCount: 0,
+      publishAbnormalCount: 0,
+      lastPublishMessage: "已保存草稿（从节流账本补写历史状态）",
+      lastPublishAt: ts,
+    };
+  }
+  if (st === "skipped") {
+    return {
+      publishStatus: "skipped",
+      publishSuccessCount: 0,
+      publishFailCount: 0,
+      lastPublishMessage: "用户关闭窗口，已跳过发布（从节流账本补写状态）",
+      lastPublishAt: ts,
+    };
+  }
+  if (st === "login_required") {
+    return {
+      publishStatus: "login_required",
+      publishFailCount: Number(record.publishFailCount || 0) + 1,
+      lastPublishMessage: "登录态失效，需重新扫码登录后重排（从节流账本补写状态）",
+      lastPublishAt: ts,
+    };
+  }
+  if (st === "expired") {
+    return {
+      publishStatus: "expired",
+      lastPublishMessage: "任务过期，未执行发布",
+      lastPublishAt: ts,
+    };
+  }
+  if (st === "failed" || st === "fail" || st === "abnormal") {
+    return {
+      publishStatus: st === "abnormal" ? "abnormal" : "failed",
+      publishFailCount: st === "abnormal" ? 0 : 1,
+      publishAbnormalCount: st === "abnormal" ? 1 : 0,
+      lastPublishMessage: "定时发布执行失败（从节流账本补写状态）",
+      lastPublishAt: ts,
+    };
+  }
+  return {
+    publishStatus: isDraft ? "drafting" : "publishing",
+    lastPublishMessage: isDraft
+      ? "定时任务已派发保存草稿（从节流账本补写状态）"
+      : "定时任务已派发（从节流账本补写状态）",
+    lastPublishAt: ts,
+  };
+}
+
+function tryBackfillScheduledHistory(record, key, state, nowMs = Date.now()) {
+  const patch = buildBackfillPatchFromLedgerState(record, state, nowMs);
+  const written = updateRecord(record, patch);
+  if (written.ok) {
+    if (key) {
+      dispatchedKeys.delete(key);
+      pendingHistoryPatches.delete(key);
     }
     if (record && record.id != null) {
-      settleThrottleByRecordId(record.id, status, extra).catch(() => {});
+      markScheduledTaskHistorySynced(record.id).catch(() => {});
     }
+    return true;
+  }
+  if (key) {
+    dispatchedKeys.add(key);
+    pendingHistoryPatches.set(key, patch);
+  }
+  return false;
+}
+
+async function settleScheduledLedger(record, status, extra = {}) {
+  try {
+    await recordScheduledTaskOutcome(record, status, extra);
   } catch (_) {
     /* ignore */
   }
 }
 
-function finishScheduledRecord(record, payload) {
+async function finishScheduledRecord(record, payload, dispatchKey) {
   const nowMs = Date.now();
   if (payload && payload.skipped) {
-    updateRecord(record, {
+    const patch = {
       publishStatus: "skipped",
       publishSuccessCount: 0,
       publishFailCount: 0,
       lastPublishMessage:
         (payload && payload.message) || "用户关闭窗口，已跳过发布",
       lastPublishAt: nowMs,
+    };
+    const writeRes = updateRecord(record, patch);
+    if (!writeRes.ok && dispatchKey) {
+      pendingHistoryPatches.set(dispatchKey, patch);
+    }
+    await settleScheduledLedger(record, "skipped", {
+      ts: nowMs,
+      resultPatch: patch,
+      historySynced: writeRes.ok,
     });
-    settleScheduledLedger(record, "skipped", { ts: nowMs });
-    return;
+    return writeRes.ok;
   }
   const mergedPayload = {
     ...(payload || {}),
@@ -331,7 +421,7 @@ function finishScheduledRecord(record, payload) {
   const isFailure =
     completion.recordStatus === "failed" ||
     completion.recordStatus === "login_required";
-  updateRecord(record, {
+  const patch = {
     publishMode: completion.savedAsDraft ? "draft" : record.publishMode || "publish",
     publishToDraft: completion.savedAsDraft,
     publishStatus: completion.recordStatus,
@@ -341,53 +431,114 @@ function finishScheduledRecord(record, payload) {
     ...(isPositive ? {} : { failScreenshot }),
     lastPublishMessage: completion.message,
     lastPublishAt: nowMs,
-  });
-  settleScheduledLedger(record, completion.recordStatus, {
+  };
+  const writeRes = updateRecord(record, patch);
+  if (!writeRes.ok && dispatchKey) {
+    pendingHistoryPatches.set(dispatchKey, patch);
+  }
+  await settleScheduledLedger(record, completion.recordStatus, {
     publishMode: completion.savedAsDraft ? "draft" : "publish",
     publishToDraft: completion.savedAsDraft,
     ts: nowMs,
+    resultPatch: patch,
+    historySynced: writeRes.ok,
   });
+  return writeRes.ok;
 }
 
 function executeScheduledRecord(record, dispatchKey) {
   if (!record || !record.id) {
-    if (dispatchKey) dispatchedKeys.delete(dispatchKey);
+    if (dispatchKey) {
+      inFlightKeys.delete(dispatchKey);
+      dispatchedKeys.delete(dispatchKey);
+    }
     return;
   }
-  executeScheduledRecordAsync(record)
-    .catch((e) => {
+  let historyWritten = false;
+  executeScheduledRecordAsync(record, dispatchKey)
+    .then((outcome) => {
+      historyWritten = Boolean(outcome && outcome.historyWritten === true);
+    })
+    .catch(async (e) => {
       console.error("[scheduledPublish] 执行定时发布失败:", e && e.message);
       const nowMs = Date.now();
-      updateRecord(record, {
+      const patch = {
         publishStatus: "failed",
         publishFailCount: 1,
         lastPublishMessage: (e && e.message) || "定时发布执行失败",
         lastPublishAt: nowMs,
+      };
+      const writeRes = updateRecord(record, patch);
+      historyWritten = writeRes.ok;
+      if (!writeRes.ok && dispatchKey) {
+        pendingHistoryPatches.set(dispatchKey, patch);
+      }
+      await settleScheduledLedger(record, "failed", {
+        ts: nowMs,
+        resultPatch: patch,
+        historySynced: writeRes.ok,
       });
-      settleScheduledLedger(record, "failed", { ts: nowMs });
     })
     .finally(() => {
-      if (dispatchKey) dispatchedKeys.delete(dispatchKey);
+      if (dispatchKey) {
+        inFlightKeys.delete(dispatchKey);
+        // 写历史失败时绝不清除派发标记，防止下次刷新再次上传同一任务
+        if (historyWritten) {
+          dispatchedKeys.delete(dispatchKey);
+          pendingHistoryPatches.delete(dispatchKey);
+        }
+      }
     });
 }
 
-async function executeScheduledRecordAsync(record) {
-  if (!record || !record.id) return;
+async function executeScheduledRecordAsync(record, dispatchKey) {
+  if (!record || !record.id) return { historyWritten: true };
+
+  // 派发前先把「已派发」标记持久化到账本（按任务 id）；若账本已显示已开始/已成功则不再上传，只补写历史
+  const markRes = await markScheduledTaskDispatched(record, Date.now());
+  if (!markRes || markRes.ok !== true) {
+    console.error(
+      "[scheduledPublish] 持久化定时任务派发标记失败，中止本次派发以防重复上传:",
+      markRes && markRes.error
+    );
+    return { historyWritten: true, abortedBeforeUpload: true };
+  }
+  if (markRes.alreadyDispatched) {
+    const synced = tryBackfillScheduledHistory(
+      record,
+      dispatchKey,
+      markRes.state,
+      Date.now()
+    );
+    return { historyWritten: synced };
+  }
 
   let cleanupDownload = null;
   let publishFilePath = record.filePath;
 
+  const failBeforeUpload = async (message) => {
+    const nowMs = Date.now();
+    const patch = {
+      publishStatus: "failed",
+      publishFailCount: 1,
+      lastPublishMessage: message,
+      lastPublishAt: nowMs,
+    };
+    const writeRes = updateRecord(record, patch);
+    if (!writeRes.ok && dispatchKey) {
+      pendingHistoryPatches.set(dispatchKey, patch);
+    }
+    await settleScheduledLedger(record, "failed", {
+      ts: nowMs,
+      resultPatch: patch,
+      historySynced: writeRes.ok,
+    });
+    return { historyWritten: writeRes.ok };
+  };
+
   if (record.textType !== "article") {
     if (!publishFilePath) {
-      const nowMs = Date.now();
-      updateRecord(record, {
-        publishStatus: "failed",
-        publishFailCount: 1,
-        lastPublishMessage: "本地视频文件不存在",
-        lastPublishAt: nowMs,
-      });
-      settleScheduledLedger(record, "failed", { ts: nowMs });
-      return;
+      return await failBeforeUpload("本地视频文件不存在");
     }
 
     if (isRemotePublishFile(publishFilePath)) {
@@ -396,26 +547,12 @@ async function executeScheduledRecordAsync(record) {
         publishFilePath = resolved.localPath;
         cleanupDownload = resolved.cleanup;
       } catch (e) {
-        const nowMs = Date.now();
-        updateRecord(record, {
-          publishStatus: "failed",
-          publishFailCount: 1,
-          lastPublishMessage: `下载视频失败: ${e && e.message ? e.message : e}`,
-          lastPublishAt: nowMs,
-        });
-        settleScheduledLedger(record, "failed", { ts: nowMs });
-        return;
+        return await failBeforeUpload(
+          `下载视频失败: ${e && e.message ? e.message : e}`
+        );
       }
     } else if (!fs.existsSync(publishFilePath)) {
-      const nowMs = Date.now();
-      updateRecord(record, {
-        publishStatus: "failed",
-        publishFailCount: 1,
-        lastPublishMessage: "本地视频文件不存在",
-        lastPublishAt: nowMs,
-      });
-      settleScheduledLedger(record, "failed", { ts: nowMs });
-      return;
+      return await failBeforeUpload("本地视频文件不存在");
     }
   }
 
@@ -424,15 +561,7 @@ async function executeScheduledRecordAsync(record) {
     !String(record.content || "").trim() &&
     (!record.articleFilePath || !fs.existsSync(record.articleFilePath))
   ) {
-    const nowMs = Date.now();
-    updateRecord(record, {
-      publishStatus: "failed",
-      publishFailCount: 1,
-      lastPublishMessage: "文章正文文件不存在",
-      lastPublishAt: nowMs,
-    });
-    settleScheduledLedger(record, "failed", { ts: nowMs });
-    return;
+    return await failBeforeUpload("文章正文文件不存在");
   }
 
   try {
@@ -443,63 +572,106 @@ async function executeScheduledRecordAsync(record) {
     const taskId = taskPayload.taskId;
     const isDraftTask =
       record.publishMode === "draft" || record.publishToDraft === true;
-    updateRecord(record, {
+    const startPatch = {
       publishStatus: isDraftTask ? "drafting" : "publishing",
       lastPublishMessage: isDraftTask
         ? "定时任务开始保存草稿"
         : "定时任务开始发布",
       lastPublishAt: Date.now(),
-    });
+    };
+    const startWrite = updateRecord(record, startPatch);
+    if (!startWrite.ok && dispatchKey) {
+      pendingHistoryPatches.set(dispatchKey, startPatch);
+    }
 
-    await new Promise((resolve) => {
+    const finalHistoryWritten = await new Promise((resolve) => {
       let publishSettled = false;
-      const finish = () => {
+      const finish = (written) => {
         if (publishSettled) return;
         publishSettled = true;
-        resolve();
+        resolve(Boolean(written));
       };
       const transport = {
         reply(channel, payload) {
           if (payload && payload.taskId != null && payload.taskId !== taskId)
             return;
           if (channel === "puppeteerFile-done") {
-            finishScheduledRecord(record, payload);
-            finish();
+            finishScheduledRecord(record, payload, dispatchKey)
+              .then((written) => finish(written))
+              .catch(() => finish(false));
           } else if (channel === "puppeteer-noLogin") {
             // 登录失效单独标状态：任务本身没错，补扫码后可重新排期
             const nowMs = Date.now();
-            updateRecord(record, {
+            const patch = {
               publishStatus: "login_required",
               publishFailCount: Number(record.publishFailCount || 0) + 1,
               lastPublishMessage:
                 "登录态失效，需重新扫码登录后重排（本次未发布）",
               lastPublishAt: nowMs,
-            });
-            settleScheduledLedger(record, "login_required", { ts: nowMs });
-            finish();
+            };
+            const writeRes = updateRecord(record, patch);
+            if (!writeRes.ok && dispatchKey) {
+              pendingHistoryPatches.set(dispatchKey, patch);
+            }
+            settleScheduledLedger(record, "login_required", {
+              ts: nowMs,
+              resultPatch: patch,
+              historySynced: writeRes.ok,
+            })
+              .then(() => finish(writeRes.ok))
+              .catch(() => finish(writeRes.ok));
           }
         },
       };
       runPuppeteerTask(taskPayload, transport, () => {});
     });
+    return { historyWritten: finalHistoryWritten };
   } finally {
     if (cleanupDownload) cleanupDownload();
   }
 }
 
 function dispatchScheduledRecord(record, key) {
-  if (dispatchedKeys.has(key)) return;
+  if (dispatchedKeys.has(key) || inFlightKeys.has(key)) return;
   dispatchedKeys.add(key);
+  inFlightKeys.add(key);
   executeScheduledRecord(record, key);
 }
 
 export function schedulePublishRecord(record, nowMs = Date.now()) {
   if (!record || !record.id || record.publishStatus !== "scheduled") return;
   const key = `${record.date || ""}:${record.id}`;
-  if (dispatchedKeys.has(key)) return;
+  if (inFlightKeys.has(key)) return;
+
+  const existingEntry = scheduledTimers.get(key);
+
+  // 刷新时检查账本（及内存未写盘补丁）：若该任务 id 已开始/已成功，绝不再上传，只补写历史状态
+  const ledgerDispatchState = getScheduledTaskDispatchStateSync(record.id);
+  const pendingMemPatch = pendingHistoryPatches.get(key) || null;
+  if (
+    ledgerDispatchState.dispatched ||
+    pendingMemPatch ||
+    dispatchedKeys.has(key)
+  ) {
+    if (existingEntry) {
+      clearTimeout(existingEntry.timer);
+      scheduledTimers.delete(key);
+    }
+    const state = ledgerDispatchState.dispatched
+      ? {
+          ...ledgerDispatchState,
+          resultPatch: ledgerDispatchState.resultPatch || pendingMemPatch,
+        }
+      : {
+          status: "publishing",
+          resultPatch: pendingMemPatch,
+          updatedAt: nowMs,
+        };
+    tryBackfillScheduledHistory(record, key, state, nowMs);
+    return;
+  }
 
   const targetAt = Number(record.scheduledPublishAt);
-  const existingEntry = scheduledTimers.get(key);
 
   if (targetAt <= nowMs) {
     if (shouldExpireScheduledRecord(record, nowMs)) {
@@ -507,12 +679,21 @@ export function schedulePublishRecord(record, nowMs = Date.now()) {
         clearTimeout(existingEntry.timer);
         scheduledTimers.delete(key);
       }
-      updateRecord(record, {
+      const expirePatch = {
         publishStatus: "expired",
         lastPublishMessage: "任务过期，未执行发布",
         lastPublishAt: nowMs,
-      });
-      settleScheduledLedger(record, "expired", { ts: nowMs });
+      };
+      const writeRes = updateRecord(record, expirePatch);
+      if (!writeRes.ok) {
+        dispatchedKeys.add(key);
+        pendingHistoryPatches.set(key, expirePatch);
+      }
+      settleScheduledLedger(record, "expired", {
+        ts: nowMs,
+        resultPatch: expirePatch,
+        historySynced: writeRes.ok,
+      }).catch(() => {});
       return;
     }
     // 已到点且在宽限期内或应用持续运行中：直接进入执行队列（避免刷新误取消或标 expired）
@@ -605,6 +786,8 @@ export function stopScheduledPublishScheduler() {
   scheduledTimers.forEach((entry) => clearTimeout(entry.timer));
   scheduledTimers.clear();
   dispatchedKeys.clear();
+  inFlightKeys.clear();
+  pendingHistoryPatches.clear();
   schedulerStarted = false;
   schedulerStartedAt = null;
 }

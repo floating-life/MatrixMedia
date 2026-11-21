@@ -444,6 +444,9 @@ async function runSingleFilePublishInner(
               ts: scheduledRecord.scheduledPublishAt,
               isScheduled: true,
               recordId,
+              platform: v.platform,
+              phone: recordItem.phone,
+              partition: v.partition,
             })
           : await recordThrottleEntryDirect({
               pt: v.platform,
@@ -473,6 +476,7 @@ async function runSingleFilePublishInner(
             message: (ledgerRes && ledgerRes.error) || "写入节流账本失败",
           };
         }
+        v.throttleReservationId = null;
       }
 
       notifyScheduledPublishChanged();
@@ -572,6 +576,9 @@ async function runSingleFilePublishInner(
           ts: recordItem.lastPublishAt,
           isScheduled: false,
           recordId,
+          platform: v.platform,
+          phone: recordItem.phone,
+          partition: v.partition,
         })
       : await recordThrottleEntryDirect({
           pt: v.platform,
@@ -596,26 +603,30 @@ async function runSingleFilePublishInner(
       activeReservationId = ledgerRes.id;
       taskPayload.throttleReservationId = activeReservationId;
     }
+    // 预留已由本执行任务接管，清空入参引用避免外层异常误释放
+    v.throttleReservationId = null;
   }
 
   let ledgerSettled = false;
   const settleImmediateLedger = (status, extra = {}) => {
-    if (ledgerSettled || !activeReservationId) return;
+    if (ledgerSettled || !activeReservationId) return Promise.resolve();
     ledgerSettled = true;
     const isFormalSuccess =
       status === "success" &&
       !isDraft &&
       extra.savedAsDraft !== true;
     if (isFormalSuccess) {
-      confirmThrottleReservation(activeReservationId, {
+      return confirmThrottleReservation(activeReservationId, {
         status: "success",
         ts: Date.now(),
         isScheduled: false,
         recordId,
+        platform: v.platform,
+        phone: recordItem.phone,
+        partition: v.partition,
       }).catch(() => {});
-    } else {
-      releaseThrottleReservation(activeReservationId).catch(() => {});
     }
+    return releaseThrottleReservation(activeReservationId).catch(() => {});
   };
 
   const updateRecord = (status, message) => {
@@ -667,8 +678,9 @@ async function runSingleFilePublishInner(
       const message = `发布超时（${min} 分钟），请检查网络或登录态`;
       console.error(message);
       updateRecord("failed", message);
-      settleImmediateLedger("failed");
-      finish({ exitCode: 1, status: "failed", message, id: recordId });
+      settleImmediateLedger("failed").finally(() => {
+        finish({ exitCode: 1, status: "failed", message, id: recordId });
+      });
     }, CLI_PUBLISH_TIMEOUT_MS);
 
     const transport = {
@@ -680,12 +692,13 @@ async function runSingleFilePublishInner(
           if (payload && payload.skipped) {
             const message = payload.message || "用户关闭窗口，已跳过发布";
             updateRecord("skipped", message);
-            settleImmediateLedger("skipped");
-            finish({
-              exitCode: 0,
-              status: "skipped",
-              message,
-              id: recordId,
+            settleImmediateLedger("skipped").finally(() => {
+              finish({
+                exitCode: 0,
+                status: "skipped",
+                message,
+                id: recordId,
+              });
             });
             return;
           }
@@ -702,20 +715,21 @@ async function runSingleFilePublishInner(
           updateRecord(completion.recordStatus, completion.message);
           settleImmediateLedger(completion.recordStatus, {
             savedAsDraft: completion.savedAsDraft,
-          });
-          finish({
-            exitCode: completion.exitCode,
-            status: completion.status,
-            message: completion.message,
-            id: recordId,
-            creativeStatement: finalCreativeStatement,
-            publishMode: completion.savedAsDraft ? "draft" : "publish",
-            outcome: payload && payload.outcome,
-            needsAttention: completion.fallbackDraft,
-            // 草稿保存结果校验字段（#42），供 CLI JSON 透传给 e2e/脚本消费；
-            // undefined 时 JSON.stringify 自动省略，保持老版本输出兼容
-            draftVerified: payload && payload.draftVerified,
-            draftUrlUnchanged: payload && payload.draftUrlUnchanged,
+          }).finally(() => {
+            finish({
+              exitCode: completion.exitCode,
+              status: completion.status,
+              message: completion.message,
+              id: recordId,
+              creativeStatement: finalCreativeStatement,
+              publishMode: completion.savedAsDraft ? "draft" : "publish",
+              outcome: payload && payload.outcome,
+              needsAttention: completion.fallbackDraft,
+              // 草稿保存结果校验字段（#42），供 CLI JSON 透传给 e2e/脚本消费；
+              // undefined 时 JSON.stringify 自动省略，保持老版本输出兼容
+              draftVerified: payload && payload.draftVerified,
+              draftUrlUnchanged: payload && payload.draftUrlUnchanged,
+            });
           });
         } else if (channel === "puppeteer-noLogin") {
           if (payload && payload.taskId != null && payload.taskId !== taskId) {
@@ -725,14 +739,15 @@ async function runSingleFilePublishInner(
           console.error("登录态异常或未登录:", JSON.stringify(payload));
           // 登录失效不是内容失败：单独状态 + 退出码 5，便于流水线提示"先补登录"
           updateRecord("login_required", message);
-          settleImmediateLedger("login_required");
-          finish({
-            exitCode: 5,
-            status: "login_required",
-            message,
-            id: recordId,
-            creativeStatement: finalCreativeStatement,
-            loginRequired: true,
+          settleImmediateLedger("login_required").finally(() => {
+            finish({
+              exitCode: 5,
+              status: "login_required",
+              message,
+              id: recordId,
+              creativeStatement: finalCreativeStatement,
+              loginRequired: true,
+            });
           });
         }
       },
@@ -995,8 +1010,9 @@ export async function runMultiPlatformPublish(parsedList) {
     topMessage = `已提交 ${submittedCount} 个平台立即发布，${scheduledCount} 个平台已按节流排期定时发布`;
   }
 
+  const succeededCount = scheduledCount + submittedCount;
   return {
-    success: failedCount === 0,
+    success: succeededCount > 0,
     exitCode: failedCount === 0 ? 0 : 1,
     status: topStatus,
     scheduled: allScheduledResult,
@@ -1004,7 +1020,7 @@ export async function runMultiPlatformPublish(parsedList) {
     submittedCount,
     message: topMessage,
     total: compactResults.length,
-    succeeded: scheduledCount + submittedCount,
+    succeeded: succeededCount,
     failed: failedCount,
     results: compactResults,
   };

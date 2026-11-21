@@ -22,6 +22,8 @@ const MINUTE_MS = 60 * 1000;
 const IMMEDIATE_THRESHOLD_MS = 60 * 1000;
 const MAX_PLAN_LOOKAHEAD_DAYS = 60;
 const SCHEDULED_EXPIRE_GRACE_MS = 10 * 60 * 1000;
+const PREVIEW_BASE_MAX_AGE_MS = 10 * 60 * 1000;
+const GUI_DRIFT_TIME_TOLERANCE_MS = 60 * 1000;
 
 const DEFAULT_CREATIVE_STATEMENT_VALUE = "ai_generated";
 
@@ -1006,8 +1008,22 @@ function checkExistingScheduledCreativeConflict(
   };
 }
 
+function normalizeDriftReasons(item) {
+  if (!item || typeof item !== "object") return "";
+  if (Array.isArray(item.reasons) && item.reasons.length > 0) {
+    return item.reasons
+      .map((r) => String(r || "").trim())
+      .filter(Boolean)
+      .join("；");
+  }
+  return String(item.reason || "").trim();
+}
+
 /**
- * 比较 GUI 预览排期与主进程加锁重算后的排期是否发生偏移（例如预览期间有新任务占用了名额）。
+ * 比较 GUI 预览排期与主进程加锁重算后的排期是否发生实质偏移：
+ * - 草稿态 / 定时态 / 溢出错误态变化 → 要求重新确认
+ * - 节流原因变化（当预览项携带 reason/reasons 时）→ 要求重新确认
+ * - 计划时刻差异 > 60 秒（GUI_DRIFT_TIME_TOLERANCE_MS）→ 要求重新确认
  */
 function comparePlanForGuiDrift(previewItems, freshItems) {
   if (!Array.isArray(previewItems) || !Array.isArray(freshItems)) return false;
@@ -1017,12 +1033,30 @@ function comparePlanForGuiDrift(previewItems, freshItems) {
     const fresh = freshItems[i] || {};
     if (Boolean(prev.isDraft) !== Boolean(fresh.isDraft)) return true;
     if (fresh.isDraft) continue;
+    if (Boolean(prev.ok !== false) !== Boolean(fresh.ok !== false)) return true;
     if (Boolean(prev.scheduled) !== Boolean(fresh.scheduled)) return true;
+    const prevHasReasonField =
+      Object.prototype.hasOwnProperty.call(prev, "reason") ||
+      Object.prototype.hasOwnProperty.call(prev, "reasons");
+    if (prevHasReasonField) {
+      if (normalizeDriftReasons(prev) !== normalizeDriftReasons(fresh)) {
+        return true;
+      }
+    }
     if (Boolean(fresh.scheduled)) {
-      if (
-        String(prev.publishAt || "") !== String(fresh.publishAt || "") ||
-        Number(prev.plannedAtMs || 0) !== Number(fresh.plannedAtMs || 0)
-      ) {
+      const prevMs =
+        typeof prev.plannedAtMs === "number" && Number.isFinite(prev.plannedAtMs)
+          ? prev.plannedAtMs
+          : parseUtc8DateTimeMs(prev.publishAt);
+      const freshMs =
+        typeof fresh.plannedAtMs === "number" && Number.isFinite(fresh.plannedAtMs)
+          ? fresh.plannedAtMs
+          : parseUtc8DateTimeMs(fresh.publishAt);
+      if (prevMs === null || freshMs === null) {
+        if (String(prev.publishAt || "") !== String(fresh.publishAt || "")) {
+          return true;
+        }
+      } else if (Math.abs(freshMs - prevMs) > GUI_DRIFT_TIME_TOLERANCE_MS) {
         return true;
       }
     }
@@ -1038,6 +1072,8 @@ module.exports = {
   IMMEDIATE_THRESHOLD_MS,
   MAX_PLAN_LOOKAHEAD_DAYS,
   SCHEDULED_EXPIRE_GRACE_MS,
+  PREVIEW_BASE_MAX_AGE_MS,
+  GUI_DRIFT_TIME_TOLERANCE_MS,
   DEFAULT_CREATIVE_STATEMENT_VALUE,
   THROTTLE_PLATFORMS,
   DEFAULT_ALLOWED_WINDOW,
