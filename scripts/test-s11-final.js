@@ -57,5 +57,15 @@ const svc = require("../src/main/services/publishThrottle.js");
   const pt = fs.readFileSync(path.join(__dirname, "../src/main/services/publishThrottle.js"), "utf8");
   assert.ok(pt.includes("if (pushRes.ok && pushRes.records.length === 0) {"), "空历史（含调用方传空数组）须重读");
   console.log("✓ 4 调度容错守护");
+
+  // 5 发布尝试身份：派发标记记录 publishAttemptCount，恢复时据此区分手动重发
+  const d5 = fs.mkdtempSync(path.join(os.tmpdir(), "mm-s11f5-"));
+  const o5 = { userDataDir: d5, skipPushDataReconcile: true };
+  const m5 = await svc.markScheduledTaskDispatched({ id: "t5", date: "2026-11-21", pt: "抖音", phone: "A", publishAttemptCount: 2 }, Date.now(), o5);
+  assert.strictEqual(m5.ok, true, JSON.stringify(m5));
+  const st5 = svc.getScheduledTaskDispatchStateSync("t5", o5);
+  assert.strictEqual(st5.dispatched, true);
+  assert.strictEqual(st5.attemptCount, 2, "派发状态须带尝试序号");
+  console.log("✓ 5 发布尝试身份");
   console.log("test-s11-final: 全部通过");
 })().catch((e) => { console.error(e); process.exit(1); });

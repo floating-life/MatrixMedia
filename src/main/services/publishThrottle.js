@@ -1008,7 +1008,13 @@ async function planAndReservePublishTimes(params = {}, options = {}) {
         needPushDataForReuse || needPushDataForImport || hasScheduledInRaw
           ? readPushDataRecordsSafe(changeDataFn)
           : { ok: false, records: [] };
-      const pushDataRecords = pushDataSafe.ok ? pushDataSafe.records : null;
+      let pushDataSafeEff = pushDataSafe;
+      if (pushDataSafe.ok && pushDataSafe.records.length === 0) {
+        // 历史读到 0 条可能是偶发读失败：在源头重读一次，复用检查与对账使用同一份结果
+        const again = readPushDataRecordsSafe(changeDataFn);
+        if (again.ok && again.records.length > 0) pushDataSafeEff = again;
+      }
+      const pushDataRecords = pushDataSafeEff.ok ? pushDataSafeEff.records : null;
 
       // 2b. 改标题复用同文件同时刻的定时任务：排期前命中既有待发任务则直接复用，不再节流顺延（#1）
       if (
@@ -1640,6 +1646,7 @@ function getScheduledTaskDispatchStateSync(recordId, options = {}) {
       updatedAt: Number(rec.updatedAt) || 0,
       isDraft: Boolean(rec.isDraft),
       reservationId: rec.reservationId || null,
+      attemptCount: Number(rec.attemptCount) || 0,
     };
   }
 
@@ -1740,6 +1747,8 @@ async function markScheduledTaskDispatched(record, nowMs = Date.now(), options =
         updatedAt: nowMs,
         historySynced: false,
         resultPatch: null,
+        // 发布尝试序号：手动重发沿用原 id 但会递增 publishAttemptCount，用它区分是不是同一次尝试
+        attemptCount: Number(record.publishAttemptCount) || 1,
       };
 
       // 正式视频任务的账本条目由 scheduled 转为 publishing

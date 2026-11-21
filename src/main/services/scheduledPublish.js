@@ -519,6 +519,7 @@ async function executeScheduledRecordAsync(record, dispatchKey) {
       "[scheduledPublish] 持久化定时任务派发标记失败，中止本次派发以防重复上传:",
       markRes && markRes.error
     );
+    if (dispatchKey && !deferredAttemptAt.has(dispatchKey)) deferredAttemptAt.set(dispatchKey, Date.now());
     return { historyWritten: true, abortedBeforeUpload: true };
   }
   if (markRes.alreadyDispatched) {
@@ -808,8 +809,8 @@ function recoverInterruptedScheduledTasks(nowMs = Date.now()) {
       }
       const st = state && state.status;
       // 手动重发会沿用原记录 id：只认本次尝试（派发时刻不早于本次登记时刻）的账本状态，避免把上一轮成功冒充本次
-      const attemptStart = Number(record.lastPublishAt) || 0;
-      const sameAttempt = state && state.dispatched && Number(state.dispatchedAt || 0) >= attemptStart - 60000;
+      const curAttempt = Number(record.publishAttemptCount) || 1;
+      const sameAttempt = Boolean(state && state.dispatched && Number(state.attemptCount) === curAttempt);
       if (sameAttempt && (st === "success" || st === "draft")) {
         updateRecord(record, {
           ...(state.resultPatch || {}),
