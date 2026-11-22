@@ -143,13 +143,13 @@ export const PLATFORM_COLLECTION_CONFIGS = {
     dispatchMouseDown: true,
     labelTexts: ["加入合集", "合集", "选择合集", "添加到合集", "作品合集", "所属合集"],
     entryTexts: [
-      "选择要加入到的合集",
       "请选择合集",
       "选择合集",
       "添加到合集",
       "添加至合集",
       "不加入合集",
       "暂不选择",
+      "选择要加入到的合集",
     ],
     rowContainerSelectors: [
       "[class*='edit-form-item']",
@@ -1979,10 +1979,12 @@ function collectCollectionDomOutline(args) {
     if (!visible(el)) return;
     var tag = (el.tagName || "").toLowerCase();
     if (tag === "script" || tag === "style" || tag === "svg" || tag === "img") return;
-    var role = el.getAttribute && el.getAttribute("role");
-    var t = ownText(el).slice(0, 30);
+    var t = ownText(el)
+      .replace(/(https?:|blob:|data:)\S*/gi, "[url]")
+      .replace(/\S+\.(com|cn|net)\S*/gi, "[url]")
+      .slice(0, 30);
     lines.push(
-      new Array(depth + 1).join("  ") + tag + cls(el) + (role ? "[role=" + role + "]" : "") + (t ? " \"" + t + "\"" : "")
+      new Array(depth + 1).join("  ") + tag + cls(el) + (t ? " \"" + t + "\"" : "")
     );
     var kids = el.children || [];
     for (var i = 0; i < kids.length && i < 15; i++) dump(kids[i], depth + 1, lines);
@@ -2057,9 +2059,12 @@ export async function selectPlatformCollection(
     }
     if (!config.useShadowRoot) {
       try {
-        const outline = await page.evaluate(collectCollectionDomOutline, {
-          needles: [targetName, "合集"],
-        });
+        const outline = await Promise.race([
+          page.evaluate(collectCollectionDomOutline, {
+            needles: [targetName, "合集"],
+          }),
+          new Promise((resolve) => setTimeout(() => resolve(""), 3000)),
+        ]);
         if (outline) console.log(`[collection] ${canonicalPlatform} DOM 概要:\n${outline}`);
       } catch (_) {
         // 诊断失败不影响主流程

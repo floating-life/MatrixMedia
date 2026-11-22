@@ -624,8 +624,6 @@ export default async function (page, data, window, event) {
           break;
         }
       }
-      // 视频解析完成后百家号可能把文件名回填进标题：点击前终检
-      await ensureBjhTitle(page, wantTitle, fileStem);
       // 点击前等旧提示消失，确保点击后读到的是本次点击产生的提示；仍在则本次提示不可信
       const staleToastBefore = !(await page
         .waitForSelector(".cheetah-message.cheetah-message-top", {
@@ -635,6 +633,8 @@ export default async function (page, data, window, event) {
         .then(() => true)
         .catch(() => false));
       if (staleToastBefore) console.warn("[bjh] 点击前旧提示未消失，本次点击后的失败提示不作为可重试依据");
+      // 视频解析完成后百家号可能把文件名回填进标题：紧挨点击前终检（放在等待之后，避免等待期间被回填）
+      await ensureBjhTitle(page, wantTitle, fileStem);
       bjhClickDispatched = true;
       await page.mouse.click(cx, cy, { delay: 80 });
       console.log(
@@ -694,6 +694,9 @@ export default async function (page, data, window, event) {
             : `百家号点击「发布」后出现失败提示：${msg.text || msg.type}。为防重复发布未自动重试，请先到百家号后台核对是否已发出再决定是否重发`
         );
         throw postClickErr;
+      }
+      if (staleToastBefore) {
+        throw new Error(`百家号「${actionText}」点击后读到的失败提示可能是残留提示（${msg.text || msg.type}），停止重试，请到平台核对`);
       }
       if (attempt >= maxClicks) {
         throw new Error(`百家号「${actionText}」${attempt} 次点击均出现失败提示：${msg.text || msg.type}`);
