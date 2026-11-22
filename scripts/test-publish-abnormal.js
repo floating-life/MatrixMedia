@@ -869,6 +869,183 @@ function createSignalPage(urls, full, overlay) {
       assert.strictEqual(payload.publishPageUrl, worksList);
       assert.strictEqual(payload.message, "上传成功");
     }
+
+    // 9k. S12-fix2(B5)：「末轮再读一次 URL」只对 dy/ks 发布模式生效；视频号末轮跳登录页仍判异常（恢复 54ef50e 行为）
+    {
+      const sphBefore = "https://channels.weixin.qq.com/platform/post/create";
+      const sphLogin = "https://channels.weixin.qq.com/login.html";
+      // 前 20 轮均停在发表页，第 20 轮 waitForTimeout 后第 21 次 readPageUrl 才跳到登录页
+      const sphUrls = Array(20).fill(sphBefore).concat([sphLogin]);
+      const sphPage = createSignalPage(sphUrls, "", "");
+      const event = createEvent();
+      await replyPublishOutcome({
+        page: sphPage,
+        data: { pt: "视频号", closeWindowAfterPublish: false },
+        window: null,
+        event,
+        urlBefore: sphBefore,
+        waitMs: 0,
+        successMessage: "上传成功",
+      });
+      const payload = event.calls[0].payload;
+      assert.strictEqual(
+        payload.publishAbnormal,
+        true,
+        "视频号末轮跳登录页仍应判异常（不得误判成功）"
+      );
+      assert.strictEqual(payload.needsAttention, true);
+      assert.strictEqual(payload.outcome, "publish_abnormal");
+      assert.strictEqual(payload.publishSignal, "none");
+      assert.strictEqual(payload.publishPageUrl, sphLogin);
+    }
+
+    // 9l. S12-fix2(B6)：dy/ks 的 URL 成功判定排除 about:blank、空、chrome-error、登录页、与发布编辑页同 pathname
+    for (const [pt, before] of [
+      ["抖音", "https://creator.douyin.com/creator-micro/content/post/video?enter_from=publish_page"],
+      ["快手", "https://cp.kuaishou.com/article/publish/video?tabType=1"],
+    ]) {
+      for (const badUrl of [
+        "about:blank",
+        "",
+        "   ",
+        "chrome-error://chromewebdata/",
+        "https://creator.douyin.com/passport/login?next=/manage",
+        "https://cp.kuaishou.com/login",
+        before + "&draft=1#hash",
+      ]) {
+        const page = createSignalPage([before, badUrl], "", "");
+        const verdict = await waitForPublishSignal(page, before, 2000, {
+          platform: pt,
+        });
+        assert.strictEqual(
+          verdict.ok,
+          false,
+          `${pt} 跳到 ${JSON.stringify(badUrl)} 不得判发布成功`
+        );
+        assert.strictEqual(verdict.signal, "none");
+      }
+    }
+
+    // 9m. S12-fix2(B7)：真实执行 readPageTextSignals DOM 采集——
+    //     可见 role="status" / role="alert" / aria-live / semi-toast / ant-message / ant-notification 的「发布成功」判成功；
+    //     隐藏节点（hidden / display:none / aria-hidden="true" / visibility:hidden / opacity:0）不得判成功
+    {
+      function makeDomPage(nodesSpec, url) {
+        const body = {
+          nodeType: 1,
+          tagName: "BODY",
+          isConnected: true,
+          hidden: false,
+          parentElement: null,
+          textContent: nodesSpec.map((n) => n.text).join("\n"),
+          getAttribute: () => null,
+          querySelectorAll(selector) {
+            if (selector === "*") return nodes;
+            const parts = selector.split(",").map((s) => s.trim());
+            return nodes.filter((el) =>
+              parts.some((sel) => {
+                if (sel === "[role='status']") return el.attrs.role === "status";
+                if (sel === "[role='alert']") return el.attrs.role === "alert";
+                if (sel.startsWith("[aria-live]")) {
+                  const al = el.attrs["aria-live"];
+                  return Boolean(al) && String(al).toLowerCase() !== "off";
+                }
+                if (sel === ".semi-toast") {
+                  return String(el.attrs.class || "").split(/\s+/).includes("semi-toast");
+                }
+                if (sel === ".ant-message") {
+                  return String(el.attrs.class || "").split(/\s+/).includes("ant-message");
+                }
+                if (sel === ".ant-notification") {
+                  return String(el.attrs.class || "").split(/\s+/).includes("ant-notification");
+                }
+                return false;
+              })
+            );
+          },
+        };
+        const nodes = nodesSpec.map((spec) => ({
+          nodeType: 1,
+          tagName: "DIV",
+          isConnected: true,
+          hidden: Boolean(spec.hidden),
+          parentElement: body,
+          attrs: {
+            ...(spec.attrs || {}),
+            ...(spec.hidden ? { hidden: "" } : {}),
+            ...(spec.style ? { style: spec.style } : {}),
+          },
+          textContent: spec.text || "",
+          getAttribute(k) {
+            return Object.prototype.hasOwnProperty.call(this.attrs, k)
+              ? this.attrs[k]
+              : null;
+          },
+          getBoundingClientRect() {
+            if (this.hidden || spec.zeroRect) {
+              return { left: 0, top: 0, width: 0, height: 0 };
+            }
+            return { left: 10, top: 10, width: 120, height: 32 };
+          },
+        }));
+        const doc = { body };
+        return {
+          url: () => url,
+          waitForTimeout: async () => {},
+          async evaluate(fn) {
+            const prevDoc = global.document;
+            global.document = doc;
+            try {
+              return fn();
+            } finally {
+              if (prevDoc === undefined) delete global.document;
+              else global.document = prevDoc;
+            }
+          },
+        };
+      }
+
+      for (const [pt, before] of [
+        ["抖音", "https://creator.douyin.com/creator-micro/content/post/video"],
+        ["快手", "https://cp.kuaishou.com/article/publish/video"],
+      ]) {
+        for (const visibleCase of [
+          { label: 'role="status"', attrs: { role: "status" } },
+          { label: 'role="alert"', attrs: { role: "alert" } },
+          { label: 'aria-live="polite"', attrs: { "aria-live": "polite" } },
+          { label: ".semi-toast", attrs: { class: "semi-toast" } },
+          { label: ".ant-message", attrs: { class: "ant-message" } },
+          { label: ".ant-notification", attrs: { class: "ant-notification" } },
+        ]) {
+          const p = makeDomPage([{ text: "发布成功", attrs: visibleCase.attrs }], before);
+          const v = await waitForPublishSignal(p, before, 2000, { platform: pt });
+          assert.strictEqual(
+            v.ok,
+            true,
+            `${pt} 可见 ${visibleCase.label} 的「发布成功」应判成功`
+          );
+          assert.strictEqual(v.signal, "toast:发布成功");
+        }
+
+        for (const hiddenCase of [
+          { label: "hidden semi-toast", attrs: { class: "semi-toast" }, hidden: true },
+          { label: "display:none role=status", attrs: { role: "status" }, style: "display: none;" },
+          { label: "aria-hidden role=alert", attrs: { role: "alert", "aria-hidden": "true" } },
+          { label: "visibility:hidden ant-message", attrs: { class: "ant-message" }, style: "visibility: hidden" },
+          { label: "opacity:0 ant-notification", attrs: { class: "ant-notification" }, style: "opacity: 0" },
+          { label: "aria-live=off", attrs: { "aria-live": "off" } },
+        ]) {
+          const p = makeDomPage([{ text: "发布成功", ...hiddenCase }], before);
+          const v = await waitForPublishSignal(p, before, 2000, { platform: pt });
+          assert.strictEqual(
+            v.ok,
+            false,
+            `${pt} 不可见/禁用 ${hiddenCase.label} 不得判成功`
+          );
+          assert.strictEqual(v.signal, "none");
+        }
+      }
+    }
   }
 
   console.log("test-publish-abnormal: 全部断言通过");

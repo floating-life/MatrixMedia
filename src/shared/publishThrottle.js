@@ -14,6 +14,10 @@ const {
   deriveCanonicalPartition,
   flattenPushDataRecords,
 } = require("./publishDedupe.js");
+const {
+  normalizeCollectionName,
+  collapseCollectionText,
+} = require("./collectionShared.js");
 
 const UTC8_OFFSET_MS = 8 * 3600 * 1000;
 const DAY_MS = 24 * 3600 * 1000;
@@ -997,13 +1001,7 @@ function normalizeScheduledCollectionName(value) {
       value.name != null ? value.name : value.value != null ? value.value : "";
     return normalizeScheduledCollectionName(inner);
   }
-  return String(value)
-    .replace(/_x000d_/gi, "")
-    .replace(/[\uFEFF\u200B\u200C\u200D]/g, "")
-    .replace(/\u00A0/g, " ")
-    .replace(/[\r\n\t]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+  return normalizeCollectionName(value);
 }
 
 function pickCollectionMapEntry(map, canonicalPt) {
@@ -1132,8 +1130,12 @@ function checkExistingScheduledCreativeConflict(
     : actualCollection;
 
   const creativeConflict = actualCreativeStatement !== requestedNorm;
+  // 合集冲突比较与页面匹配使用同一个归一函数 collapseCollectionText（单一来源），
+  // 确保「民 间故事」与「民间故事」视为相同。
   const collectionConflict =
-    compareCollection && actualCollection !== requestedCollectionNorm;
+    compareCollection &&
+    collapseCollectionText(actualCollection) !==
+      collapseCollectionText(requestedCollectionNorm);
   const conflict = creativeConflict || collectionConflict;
 
   const existingId = (existing && existing.id) || "";

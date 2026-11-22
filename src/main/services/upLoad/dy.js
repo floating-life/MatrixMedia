@@ -2,6 +2,10 @@ import path from "path";
 import fs from "fs";
 import { normalizeCoverForUpload } from "../coverCompat.js";
 import { resolveVideoLinkOption } from "../../../shared/videoLink.js";
+import {
+  DY_PUBLISH_BUTTON_SELECTOR,
+  DY_DRAFT_BUTTON_SELECTOR,
+} from "../../../shared/collectionShared.js";
 import { attachDyProductLink } from "./dyProductLink.js";
 import { selectPlatformCollection } from "./collection.js";
 import { resolveDyCreativeStatementLabel } from "../../../shared/creativeStatement.js";
@@ -320,16 +324,16 @@ async function selectDyCreativeStatementWithRetry(page, data, maxMs = 60000) {
 
 async function clickDyPublish(page, isDraftMode) {
   const submitSelector = isDraftMode
-    ? "#popover-tip-container+button"
-    : "#popover-tip-container";
+    ? DY_DRAFT_BUTTON_SELECTOR
+    : DY_PUBLISH_BUTTON_SELECTOR;
   const submitBtn = await page.waitForSelector(submitSelector, {
     timeout: WAIT_SELECTOR_APPEAR_MS,
   });
   await submitBtn.click({ delay: 200 });
   console.log(
     isDraftMode
-      ? "[dy] 已点击存草稿按钮 (#popover-tip-container+button)"
-      : "[dy] 已点击发布入口 (#popover-tip-container)"
+      ? `[dy] 已点击存草稿按钮 (${DY_DRAFT_BUTTON_SELECTOR})`
+      : `[dy] 已点击发布入口 (${DY_PUBLISH_BUTTON_SELECTOR})`
   );
 }
 

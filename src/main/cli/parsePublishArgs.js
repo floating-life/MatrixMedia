@@ -28,14 +28,43 @@ import {
 export { PLATFORM_ALIASES, VIDEO_PUBLISH_CANONICAL, resolvePublishPlatform };
 
 /**
+ * 解析器全部无值布尔开关的单一真源（与解析循环分支同源）：
+ * - 正文类取值参数仅在下一个 token 恰好命中此集合时才报缺值，避免把字面文案（如 `--开场--`）误判为选项，
+ *   同时拦截 `-t --draft` / `-t --allow-duplicate` / `-t --help` 等漏填吞开关场景。
+ */
+const PUBLISH_BOOLEAN_SWITCHES = Object.freeze({
+  "--help": () => ({ help: true }),
+  "-h": () => ({ help: true }),
+  "--show": (out) => {
+    out.show = true;
+  },
+  "--no-close-window": (out) => {
+    out.closeWindowAfterPublish = false;
+  },
+  "--draft": (out) => {
+    out.draft = true;
+  },
+  "--allow-duplicate": (out) => {
+    out.allowDuplicate = true;
+  },
+  "--no-throttle": (out) => {
+    out.noThrottle = true;
+  },
+  "--no-download": (out) => {
+    out.noDownload = true;
+  },
+});
+
+export const KNOWN_PUBLISH_SWITCHES = new Set(
+  Object.keys(PUBLISH_BOOLEAN_SWITCHES)
+);
+
+/**
  * 解析 `cli publish` 后的 argv（不含子命令名 publish）
  * @returns {{ ok: true, value: object } | { ok: false, error: string }}
  */
 export function parsePublishArgs(subArgv) {
   const args = Array.isArray(subArgv) ? subArgv : [];
-  if (args.includes("--help") || args.includes("-h")) {
-    return { ok: true, value: { help: true } };
-  }
 
   const out = {
     platform: null,
@@ -71,20 +100,34 @@ export function parsePublishArgs(subArgv) {
     "--sph-series-id": "剧集名称",
     "--collection": "合集名称",
   };
-  const consumeOptionValue = (flag, idx) => {
+  // 正文类取值参数（-t/--title、--description/--desc、--short-title、--tags/--bq、--bt2、--name/--book-name）：
+  // 按字面取下一个 token，仅当缺值或下一个 token 恰好是已知无值开关时报错。
+  const consumeTextValue = (flag, idx) => {
     const next = args[idx + 1];
-    if (
-      idx + 1 >= args.length ||
-      next == null ||
-      String(next).startsWith("--")
-    ) {
+    const isKnownSwitch =
+      next != null && KNOWN_PUBLISH_SWITCHES.has(String(next));
+    if (idx + 1 >= args.length || next == null || isKnownSwitch) {
       const hint = VALUE_FLAG_HINTS[flag] || "值";
       return {
         ok: false,
         error: `参数 ${flag} 缺少${hint}${
-          next != null && String(next).startsWith("--")
-            ? `（紧随其后的是选项 ${next}）`
-            : ""
+          isKnownSwitch ? `（紧随其后的是选项 ${next}）` : ""
+        }`,
+      };
+    }
+    return { ok: true, value: next };
+  };
+  // 其他取值型参数（--collection、-p、-f、--phone、--publish-at 等）：
+  // 下一个 token 缺失或以 `-` 开头（含短选项 -t、-p、-h）即报缺值。
+  const consumeStrictOptionValue = (flag, idx) => {
+    const next = args[idx + 1];
+    const startsWithDash = next != null && String(next).startsWith("-");
+    if (idx + 1 >= args.length || next == null || startsWithDash) {
+      const hint = VALUE_FLAG_HINTS[flag] || "值";
+      return {
+        ok: false,
+        error: `参数 ${flag} 缺少${hint}${
+          startsWithDash ? `（紧随其后的是选项 ${next}）` : ""
         }`,
       };
     }
@@ -93,133 +136,128 @@ export function parsePublishArgs(subArgv) {
 
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
+    if (Object.prototype.hasOwnProperty.call(PUBLISH_BOOLEAN_SWITCHES, a)) {
+      const switchRes = PUBLISH_BOOLEAN_SWITCHES[a](out);
+      if (switchRes && switchRes.help) {
+        return { ok: true, value: { help: true } };
+      }
+      continue;
+    }
     if (a === "--platform" || a === "-p") {
-      const v = consumeOptionValue(a, i);
+      const v = consumeStrictOptionValue(a, i);
       if (!v.ok) return v;
       out.platform = v.value;
       i += 1;
     } else if (a === "--file" || a === "-f") {
-      const v = consumeOptionValue(a, i);
+      const v = consumeStrictOptionValue(a, i);
       if (!v.ok) return v;
       out.file = v.value;
       i += 1;
     } else if (a === "--phone") {
-      const v = consumeOptionValue(a, i);
+      const v = consumeStrictOptionValue(a, i);
       if (!v.ok) return v;
       out.phone = v.value;
       i += 1;
     } else if (a === "--partition") {
-      const v = consumeOptionValue(a, i);
+      const v = consumeStrictOptionValue(a, i);
       if (!v.ok) return v;
       out.partition = v.value;
       i += 1;
     } else if (a === "--title" || a === "-t") {
-      const v = consumeOptionValue(a, i);
+      const v = consumeTextValue(a, i);
       if (!v.ok) return v;
       out.title = v.value;
       i += 1;
     } else if (a === "--description" || a === "--desc") {
-      const v = consumeOptionValue(a, i);
+      const v = consumeTextValue(a, i);
       if (!v.ok) return v;
       out.description = v.value || "";
       i += 1;
     } else if (a === "--short-title") {
-      const v = consumeOptionValue(a, i);
+      const v = consumeTextValue(a, i);
       if (!v.ok) return v;
       out.shortTitle = v.value || "";
       i += 1;
     } else if (a === "--name" || a === "--book-name") {
-      const v = consumeOptionValue(a, i);
+      const v = consumeTextValue(a, i);
       if (!v.ok) return v;
       out.bookName = v.value;
       i += 1;
     } else if (a === "--bt2") {
-      const v = consumeOptionValue(a, i);
+      const v = consumeTextValue(a, i);
       if (!v.ok) return v;
       out.bt2 = v.value;
       i += 1;
     } else if (a === "--tags" || a === "--bq") {
-      const v = consumeOptionValue(a, i);
+      const v = consumeTextValue(a, i);
       if (!v.ok) return v;
       out.bq = v.value || "";
       i += 1;
     } else if (a === "--publish-at") {
-      const v = consumeOptionValue(a, i);
+      const v = consumeStrictOptionValue(a, i);
       if (!v.ok) return v;
       out.publishAt = v.value;
       i += 1;
-    } else if (a === "--show") {
-      out.show = true;
-    } else if (a === "--no-close-window") {
-      out.closeWindowAfterPublish = false;
     } else if (a === "--dir") {
-      const v = consumeOptionValue(a, i);
+      const v = consumeStrictOptionValue(a, i);
       if (!v.ok) return v;
       out.dir = v.value;
       i += 1;
     } else if (a === "--config" || a === "--xlsx") {
-      const v = consumeOptionValue(a, i);
+      const v = consumeStrictOptionValue(a, i);
       if (!v.ok) return v;
       out.config = v.value;
       i += 1;
     } else if (a === "--cover") {
-      const v = consumeOptionValue(a, i);
+      const v = consumeStrictOptionValue(a, i);
       if (!v.ok) return v;
       out.cover = v.value;
       i += 1;
     } else if (a === "--creative-statement" || a === "--cs") {
-      const v = consumeOptionValue(a, i);
+      const v = consumeStrictOptionValue(a, i);
       if (!v.ok) return v;
       out.creativeStatement = v.value;
       i += 1;
     } else if (a === "--collection") {
-      const v = consumeOptionValue(a, i);
+      const v = consumeStrictOptionValue(a, i);
       if (!v.ok) return v;
       out.collection = v.value || "";
       i += 1;
     } else if (a.startsWith("--collection=")) {
       const eqVal = a.slice("--collection=".length);
-      if (eqVal.startsWith("--")) {
+      if (eqVal.startsWith("-")) {
         return {
           ok: false,
           error: `参数 --collection 值无效（${eqVal}）`,
         };
       }
       out.collection = eqVal;
-    } else if (a === "--draft") {
-      out.draft = true;
-    } else if (a === "--allow-duplicate") {
-      out.allowDuplicate = true;
-    } else if (a === "--no-throttle") {
-      out.noThrottle = true;
-    } else if (a === "--no-download") {
-      out.noDownload = true;
     } else if (a === "--sph-link-type") {
-      const v = consumeOptionValue(a, i);
+      const v = consumeStrictOptionValue(a, i);
       if (!v.ok) return v;
       out.sphLinkType = v.value;
       i += 1;
     } else if (a === "--sph-link-value") {
-      const v = consumeOptionValue(a, i);
+      const v = consumeStrictOptionValue(a, i);
       if (!v.ok) return v;
       out.sphLinkValue = v.value;
       i += 1;
     } else if (a === "--sph-product-id") {
-      const v = consumeOptionValue(a, i);
+      const v = consumeStrictOptionValue(a, i);
       if (!v.ok) return v;
       // 商品上架快捷参数：等价于 --sph-link-type product --sph-link-value <id>
       out.sphLinkType = VIDEO_LINK_TYPES.PRODUCT;
       out.sphLinkValue = v.value;
       i += 1;
     } else if (a === "--sph-drama-id") {
-      const v = consumeOptionValue(a, i);
+      const v = consumeStrictOptionValue(a, i);
       if (!v.ok) return v;
       // 小程序短剧快捷参数：等价于 --sph-link-type mini_drama --sph-link-value <短剧名称>
       out.sphLinkType = VIDEO_LINK_TYPES.MINI_DRAMA;
       out.sphLinkValue = v.value;
       i += 1;
     } else if (a === "--sph-series-id") {
-      const v = consumeOptionValue(a, i);
+      const v = consumeStrictOptionValue(a, i);
       if (!v.ok) return v;
       // 视频号剧集快捷参数：等价于 --sph-link-type sph_series --sph-link-value <剧集名称>
       out.sphLinkType = VIDEO_LINK_TYPES.SPH_SERIES;

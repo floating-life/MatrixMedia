@@ -97,18 +97,41 @@ export function isPublishEditPathname(pathname, strictPlatform) {
 }
 
 /**
+ * 严格模式下绝不算作有效跳转的非正常页面地址（空白页 / 浏览器错误页 / 内置协议页）
+ */
+const NON_NAVIGATED_URL_PATTERN =
+  /^(?:about:blank(?:[?#].*)?|chrome-error:|chrome:|edge:|devtools:|data:|javascript:)/i;
+
+/**
  * 判断点击发布后页面地址是否算作有效跳转：
- * - dy/ks 严格模式：只认 pathname 改变（忽略 query/hash），且新 pathname 不是发布编辑页本身（也不为登录页）；
+ * - dy/ks 严格模式：排除空串、about:blank、chrome-error 等非正常页及登录页（LOGIN_URL_PATTERN），
+ *   只认 http(s) 且 pathname 改变（忽略 query/hash），且新 pathname 不是发布编辑页本身；
  * - 其他平台：沿用原 normalizeUrl 对比逻辑不变。
  */
 export function hasPublishUrlNavigated(urlBefore, urlAfter, strictPlatform) {
-  if (!urlBefore || !urlAfter) return false;
+  const beforeRaw = String(urlBefore || "").trim();
+  const afterRaw = String(urlAfter || "").trim();
+  if (!beforeRaw || !afterRaw) return false;
   if (!strictPlatform) {
-    return normalizeUrl(urlAfter) !== normalizeUrl(urlBefore);
+    return normalizeUrl(afterRaw) !== normalizeUrl(beforeRaw);
   }
-  if (LOGIN_URL_PATTERN.test(urlAfter)) return false;
-  const pathBefore = extractNormalizedPathname(urlBefore);
-  const pathAfter = extractNormalizedPathname(urlAfter);
+  if (NON_NAVIGATED_URL_PATTERN.test(afterRaw)) return false;
+  if (LOGIN_URL_PATTERN.test(afterRaw)) return false;
+  let parsedAfter = null;
+  try {
+    parsedAfter = new URL(afterRaw);
+  } catch (_) {
+    parsedAfter = null;
+  }
+  if (
+    parsedAfter &&
+    parsedAfter.protocol !== "http:" &&
+    parsedAfter.protocol !== "https:"
+  ) {
+    return false;
+  }
+  const pathBefore = extractNormalizedPathname(beforeRaw);
+  const pathAfter = extractNormalizedPathname(afterRaw);
   if (!pathBefore || !pathAfter) return false;
   if (pathAfter === pathBefore) return false;
   return !isPublishEditPathname(pathAfter, strictPlatform);
@@ -226,9 +249,13 @@ export async function waitForPublishSignal(
     }
     await delay(page, 1000);
   }
-  // 轮询最后一轮等待结束后再读一次 URL，避免最后一秒跳转到作品列表页被误判异常
+  // 轮询最后一轮等待结束后再读一次 URL：仅对 dy/ks 发布模式生效（避免最后一秒跳作品列表被误判）；
+  // 其他平台（视频号等）保持 54ef50e 原行为，不因末轮跳转（如跳登录页）误判成功。
   urlAfter = readPageUrl(page);
-  if (hasPublishUrlNavigated(urlBefore, urlAfter, strictPlatform)) {
+  if (
+    strictPlatform &&
+    hasPublishUrlNavigated(urlBefore, urlAfter, strictPlatform)
+  ) {
     return {
       ok: true,
       signal: "url_changed",
@@ -339,14 +366,19 @@ async function readPageTextSignals(page) {
   try {
     const raw = await page.evaluate(() => {
       try {
-        // 弹层类节点的通用选择器：覆盖各平台 UI 库的 toast/弹窗容器
-        //（antd message/modal、element el-message/el-dialog、semi-toast 等），
-        // class/id 用包含匹配 + i 标志，避免绑死某个平台的类名
+        // 弹层类节点的通用选择器：覆盖各平台 UI 库的 toast/弹窗/状态提示容器
+        //（role="status"/role="alert"/aria-live、semi-toast、ant-message、ant-notification、
+        // element el-message/el-dialog 等），仅采集可见节点，避免隐藏模板误命中
         const OVERLAY_SELECTOR = [
+          "[role='status']",
           "[role='alert']",
           "[role='alertdialog']",
           "[role='dialog']",
           "[role='tooltip']",
+          "[aria-live]:not([aria-live='off']):not([aria-live='OFF'])",
+          ".semi-toast",
+          ".ant-message",
+          ".ant-notification",
           "[class*='toast' i]",
           "[class*='modal' i]",
           "[class*='dialog' i]",
@@ -354,12 +386,54 @@ async function readPageTextSignals(page) {
           "[class*='popover' i]",
           "[class*='message' i]",
           "[class*='notice' i]",
+          "[class*='notification' i]",
           "[class*='alert' i]",
           "[id*='toast' i]",
           "[id*='modal' i]",
           "[id*='dialog' i]",
           "[id*='message' i]",
+          "[id*='notification' i]",
         ].join(",");
+        const isOverlayVisible = (el, stopRoot) => {
+          if (!el || el.isConnected === false) return false;
+          let node = el;
+          while (node && node !== stopRoot && node.nodeType === 1) {
+            if (node.hidden === true) return false;
+            if (typeof node.getAttribute === "function") {
+              if (node.getAttribute("hidden") !== null) return false;
+              if (node.getAttribute("aria-hidden") === "true") return false;
+              const inlineStyle = String(node.getAttribute("style") || "");
+              if (
+                /(?:^|;)\s*display\s*:\s*none\b/i.test(inlineStyle) ||
+                /(?:^|;)\s*visibility\s*:\s*hidden\b/i.test(inlineStyle) ||
+                /(?:^|;)\s*opacity\s*:\s*0(?:\.0*)?\s*(?:;|$)/i.test(inlineStyle)
+              ) {
+                return false;
+              }
+            }
+            if (typeof getComputedStyle === "function") {
+              try {
+                const style = getComputedStyle(node);
+                if (
+                  style &&
+                  (style.display === "none" ||
+                    style.visibility === "hidden" ||
+                    String(style.opacity) === "0")
+                ) {
+                  return false;
+                }
+              } catch (_) {}
+            }
+            node = node.parentElement;
+          }
+          if (typeof el.getBoundingClientRect === "function") {
+            try {
+              const rect = el.getBoundingClientRect();
+              if (rect && (rect.width <= 0 || rect.height <= 0)) return false;
+            } catch (_) {}
+          }
+          return true;
+        };
         const acc = [];
         const overlays = [];
         const visit = (root) => {
@@ -377,6 +451,7 @@ async function readPageTextSignals(page) {
           }
           for (const el of hits) {
             try {
+              if (!isOverlayVisible(el, root)) continue;
               const t = String(el.textContent || "").trim();
               if (t) overlays.push(t);
             } catch (_) {

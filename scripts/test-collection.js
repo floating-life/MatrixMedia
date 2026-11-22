@@ -124,12 +124,19 @@ class FakeElement {
     const s = simple.trim();
     if (!s) return false;
     if (s === "*") return true;
-    // 分离 tag、.class、[attr="val"]、[attr*='val']
     let rest = s;
     const tagMatch = rest.match(/^([a-zA-Z][\w-]*)/);
     if (tagMatch) {
       if (this.tagName.toLowerCase() !== tagMatch[1].toLowerCase()) return false;
       rest = rest.slice(tagMatch[0].length);
+    }
+    const idMatches = [...rest.matchAll(/#([\w-]+)/g)];
+    if (idMatches.length) {
+      const ownId = String(this.getAttribute("id") || "");
+      for (const m of idMatches) {
+        if (ownId !== m[1]) return false;
+      }
+      rest = rest.replace(/#[\w-]+/g, "");
     }
     const clsMatches = [...rest.matchAll(/\.([\w-]+)/g)];
     if (clsMatches.length) {
@@ -152,31 +159,73 @@ class FakeElement {
         if (attrVal !== m[3]) return false;
       } else if (m[2] === "*") {
         if (!String(attrVal || "").includes(m[3])) return false;
+      } else if (m[2] === "^") {
+        if (!String(attrVal || "").startsWith(m[3])) return false;
+      } else if (m[2] === "$") {
+        if (!String(attrVal || "").endsWith(m[3])) return false;
       }
     }
-    return true;
+    rest = rest.replace(/\[[\w-]+(?:[*^$]?=["'][^"']*["'])?\]/g, "");
+    const pseudoMatches = [...rest.matchAll(/:(first-child|last-child)/g)];
+    for (const m of pseudoMatches) {
+      const siblings = this.parentElement ? this.parentElement.children : [];
+      if (!siblings.length) return false;
+      if (m[1] === "first-child" && siblings[0] !== this) return false;
+      if (m[1] === "last-child" && siblings[siblings.length - 1] !== this) {
+        return false;
+      }
+    }
+    rest = rest.replace(/:(first-child|last-child)/g, "");
+    return rest.trim() === "";
   }
   matches(selector) {
+    const matchCompoundChain = (el, chain) => {
+      // chain 形如 [{ sel, comb }, ...] 从左到右，最后一项 comb 为 null
+      const checkAt = (node, idx) => {
+        if (!node || !node.matchesSingle(chain[idx].sel)) return false;
+        if (idx === 0) return true;
+        const comb = chain[idx - 1].comb;
+        if (comb === ">") {
+          return checkAt(node.parentElement, idx - 1);
+        }
+        if (comb === "+") {
+          const sibs = node.parentElement ? node.parentElement.children : [];
+          const pos = sibs.indexOf(node);
+          return pos > 0 ? checkAt(sibs[pos - 1], idx - 1) : false;
+        }
+        // 默认后代组合符 " "
+        let anc = node.parentElement;
+        while (anc) {
+          if (checkAt(anc, idx - 1)) return true;
+          anc = anc.parentElement;
+        }
+        return false;
+      };
+      return checkAt(el, chain.length - 1);
+    };
     return String(selector || "")
       .split(",")
       .some((part) => {
-        const tokens = part.trim().split(/\s+/).filter(Boolean);
-        if (!tokens.length) return false;
-        if (!this.matchesSingle(tokens[tokens.length - 1])) return false;
-        let ancestor = this.parentElement;
-        for (let i = tokens.length - 2; i >= 0; i--) {
-          let matched = false;
-          while (ancestor) {
-            if (ancestor.matchesSingle(tokens[i])) {
-              matched = true;
-              ancestor = ancestor.parentElement;
-              break;
+        const trimmed = part.trim();
+        if (!trimmed) return false;
+        // 拆出选择器段与组合符（>、+、空格）
+        const normalized = trimmed.replace(/\s*([>+])\s*/g, " $1 ");
+        const rawTokens = normalized.split(/\s+/).filter(Boolean);
+        const chain = [];
+        for (let i = 0; i < rawTokens.length; i++) {
+          const tk = rawTokens[i];
+          if (tk === ">" || tk === "+") {
+            if (!chain.length) return false;
+            chain[chain.length - 1].comb = tk;
+          } else {
+            if (chain.length && !chain[chain.length - 1].comb) {
+              chain[chain.length - 1].comb = " ";
             }
-            ancestor = ancestor.parentElement;
+            chain.push({ sel: tk, comb: null });
           }
-          if (!matched) return false;
         }
-        return true;
+        if (!chain.length) return false;
+        return matchCompoundChain(this, chain);
       });
   }
   querySelectorAll(selector) {
@@ -794,11 +843,23 @@ function testCliAndHttpInputs() {
     // 其他取值型参数同样不得吞掉后续 --flag 或末尾缺值
     for (const badArgs of [
       ["-p", "dy", "--phone", "13800138000", "-f", "./v.mp4", "-t", "--draft"],
+      ["-p", "dy", "--phone", "13800138000", "-f", "./v.mp4", "-t", "--allow-duplicate"],
+      ["-p", "dy", "--phone", "13800138000", "-f", "./v.mp4", "-t", "--help"],
+      ["-p", "dy", "--phone", "13800138000", "-f", "./v.mp4", "-t", "-h"],
       ["-p", "dy", "--phone", "13800138000", "-f", "./v.mp4", "-t", "标题", "--cover", "--draft"],
       ["-p", "dy", "--phone", "13800138000", "-f", "./v.mp4", "-t", "标题", "--tags", "--draft"],
       ["-p", "dy", "--phone", "13800138000", "-f", "./v.mp4", "-t", "标题", "--cs", "--draft"],
       ["-p", "sph", "--phone", "13800138000", "-f", "./v.mp4", "-t", "标题", "--sph-product-id", "--draft"],
       ["-p", "dy", "--phone", "13800138000", "-f", "./v.mp4", "-t", "标题", "--description"],
+      // S12-fix2(C8)：严格取值型参数下一个 token 以 "-" 开头（含短选项 -t/-p/-h 与 --help）即报缺值
+      ["-p", "dy", "--phone", "13800138000", "-f", "./v.mp4", "-t", "标题", "--collection", "--help"],
+      ["-p", "dy", "--phone", "13800138000", "-f", "./v.mp4", "-t", "标题", "--collection", "-h"],
+      ["-p", "dy", "--phone", "13800138000", "-f", "./v.mp4", "-t", "标题", "--collection", "-t", "x"],
+      ["-p", "dy", "--phone", "13800138000", "-f", "./v.mp4", "-t", "标题", "--collection=-t"],
+      ["-p", "-t", "标题", "--phone", "13800138000", "-f", "./v.mp4"],
+      ["-p", "dy", "-f", "-t", "标题", "--phone", "13800138000"],
+      ["-p", "dy", "--phone", "-t", "标题", "-f", "./v.mp4"],
+      ["-p", "dy", "--phone", "13800138000", "-f", "./v.mp4", "-t", "标题", "--publish-at", "-h"],
     ]) {
       const r = parsePublish.parsePublishArgs(badArgs);
       assert.strictEqual(
@@ -807,6 +868,59 @@ function testCliAndHttpInputs() {
         `取值型参数缺值或吞 flag 必须报错: ${JSON.stringify(badArgs)}`
       );
     }
+
+    // S12-fix2(C8)：正文类参数按字面取非开关 token；HTTP 草稿请求简介「--开场--」正常解析
+    const literalDescHttp = parsePublish.parsePublishRequest({
+      platform: "dy",
+      phone: "13800138000",
+      file: "./v.mp4",
+      title: "--标题--",
+      description: "--开场--",
+      draft: true,
+    });
+    assert.strictEqual(
+      literalDescHttp.ok,
+      true,
+      `HTTP 草稿请求简介「--开场--」应正常解析，实际: ${literalDescHttp.error}`
+    );
+    assert.strictEqual(literalDescHttp.value.title, "--标题--");
+    assert.strictEqual(literalDescHttp.value.description, "--开场--");
+    assert.strictEqual(literalDescHttp.value.draft, true);
+
+    const literalDescCli = parsePublish.parsePublishArgs([
+      "-p",
+      "dy",
+      "--phone",
+      "13800138000",
+      "-f",
+      "./v.mp4",
+      "-t",
+      "--开场标题--",
+      "--description",
+      "--开场--",
+      "--draft",
+    ]);
+    assert.strictEqual(literalDescCli.ok, true, literalDescCli.error);
+    assert.strictEqual(literalDescCli.value.title, "--开场标题--");
+    assert.strictEqual(literalDescCli.value.description, "--开场--");
+    assert.strictEqual(literalDescCli.value.draft, true);
+
+    // 独立 --help / -h 仍正常返回帮助
+    assert.deepStrictEqual(parsePublish.parsePublishArgs(["--help"]), {
+      ok: true,
+      value: { help: true },
+    });
+    assert.deepStrictEqual(parsePublish.parsePublishArgs(["-p", "dy", "-h"]), {
+      ok: true,
+      value: { help: true },
+    });
+    assert.ok(
+      parsePublish.KNOWN_PUBLISH_SWITCHES.has("--draft") &&
+        parsePublish.KNOWN_PUBLISH_SWITCHES.has("--allow-duplicate") &&
+        parsePublish.KNOWN_PUBLISH_SWITCHES.has("--help") &&
+        parsePublish.KNOWN_PUBLISH_SWITCHES.has("-h"),
+      "KNOWN_PUBLISH_SWITCHES 应包含全部无值开关"
+    );
   }
   console.log("✓ 3. CLI 与 HTTP 入参解析、缺值/吞 flag 防护、覆盖优先级及帮助文案通过");
 }
@@ -1903,6 +2017,37 @@ async function testScheduledReuseCollectionConflict() {
   );
   assert.strictEqual(nonSupportRes.conflict, false, "不支持合集的平台不产生合集冲突");
 
+  // S12-fix2(D9)：排期复用比较使用与页面匹配同一个归一函数 collapseCollectionText，「民 间故事」与「民间故事」视为相同
+  const spacedSameRes = sharedThrottle.checkExistingScheduledCreativeConflict(
+    existingRec,
+    "ai_generated",
+    "民 间故事"
+  );
+  assert.strictEqual(
+    spacedSameRes.conflict,
+    false,
+    "「民 间故事」与「民间故事」去空白后等价，不应报合集冲突"
+  );
+  assert.strictEqual(spacedSameRes.collectionConflict, false);
+
+  const spacedExistingRes = sharedThrottle.checkExistingScheduledCreativeConflict(
+    { ...existingRec, publishOptions: { collection: "民  间_x000d_\n故事" } },
+    "ai_generated",
+    "民间故事"
+  );
+  assert.strictEqual(
+    spacedExistingRes.conflict,
+    false,
+    "既有任务合集含空白/转义与请求合集等价时不应报冲突"
+  );
+
+  // 单一来源校验：src/shared/collectionShared.js 导出的 collapseCollectionText 与页面匹配函数一致
+  const sharedCollection = require(path.join(root, "src/shared/collectionShared.js"));
+  assert.strictEqual(
+    sharedCollection.collapseCollectionText("民 间故事"),
+    collectionMod.normalizeCollectionMatchText("民间故事")
+  );
+
   // 端到端验证 publishThrottle IPC、publishVideo.js 与 cli/index.js 三处复用分支
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-col-sched-conflict-"));
   const mediaDir = path.join(tmpDir, "videos");
@@ -2099,6 +2244,43 @@ async function testScheduledReuseCollectionConflict() {
     assert.strictEqual(batchSummary.results[0].scheduled, false);
     assert.strictEqual(batchSummary.results[0].collection, "民间故事");
     assert.strictEqual(batchSummary.results[0].requestedCollection, "都市传说");
+
+    // 10d. S12-fix2(C8)：真实 CLI 入口 `--collection --help` 必须退 2，不得当帮助退出 0
+    const origErr2 = console.error;
+    const origLog2 = console.log;
+    const helpErrs = [];
+    console.error = (...a) => helpErrs.push(a.join(" "));
+    console.log = () => {};
+    let colHelpExit;
+    try {
+      colHelpExit = await core.runCliMain([
+        "electron",
+        "cli",
+        "publish",
+        "-p",
+        "dy",
+        "--phone",
+        phone,
+        "-f",
+        clip,
+        "-t",
+        "例子",
+        "--collection",
+        "--help",
+      ]);
+    } finally {
+      console.error = origErr2;
+      console.log = origLog2;
+    }
+    assert.strictEqual(
+      colHelpExit,
+      2,
+      `cli publish --collection --help 必须报参数错误退 2，实际=${colHelpExit}`
+    );
+    assert.ok(
+      helpErrs.some((line) => line.includes("--collection")),
+      `报错信息应指出 --collection，实际=${JSON.stringify(helpErrs)}`
+    );
   } finally {
     if (core && core.stopScheduledPublishScheduler) {
       core.stopScheduledPublishScheduler();
@@ -2195,6 +2377,508 @@ console.log(JSON.stringify({ channel: 'puppeteerFile-done', status: true, result
   console.log("✓ 11. MCP publish_video --collection 转发与 e2e collectEvidence [collection] 保留通过");
 }
 
+/* ------------------------------------------------------------------ *
+ * 12. S12-fix2(A1~A4)：safeClick 唯一出口、跨行隔离、「校园发布会」、内嵌 span 占位回读
+ * ------------------------------------------------------------------ */
+async function testS12Fix2StructuralGuards() {
+  const fastTimeouts = {
+    entryTimeoutMs: 0,
+    optionTimeoutMs: 0,
+    readbackTimeoutMs: 0,
+    pollIntervalMs: 0,
+    afterOpenDelayMs: 0,
+    afterSelectDelayMs: 0,
+  };
+  const makeDoc = () => {
+    const doc = new FakeElement("document");
+    const body = new FakeElement("body");
+    doc.body = body;
+    doc.documentElement = doc;
+    doc.append(body);
+    doc.getElementById = (id) => doc.querySelector(`[id="${id}"]`);
+    return { doc, body };
+  };
+  const makeEvalPage = (doc) => ({
+    async evaluate(fn, arg) {
+      const prevDoc = global.document;
+      const prevStyle = global.getComputedStyle;
+      const prevMouse = global.MouseEvent;
+      const prevWindow = global.window;
+      global.document = doc;
+      global.getComputedStyle = (el) => ({
+        display: el && el.hidden ? "none" : "block",
+        visibility: "visible",
+        opacity: "1",
+      });
+      global.MouseEvent = FakeMouseEvent;
+      global.window = {};
+      try {
+        const runner = new Function(
+          "document",
+          "getComputedStyle",
+          "MouseEvent",
+          "window",
+          "arg",
+          `return (${fn.toString()})(arg);`
+        );
+        return runner(doc, global.getComputedStyle, FakeMouseEvent, {}, arg);
+      } finally {
+        if (prevDoc === undefined) delete global.document;
+        else global.document = prevDoc;
+        if (prevStyle === undefined) delete global.getComputedStyle;
+        else global.getComputedStyle = prevStyle;
+        if (prevMouse === undefined) delete global.MouseEvent;
+        else global.MouseEvent = prevMouse;
+        if (prevWindow === undefined) delete global.window;
+        else global.window = prevWindow;
+      }
+    },
+    async waitForTimeout() {},
+  });
+
+  // 12a. A1 静态检验：collection.js 只有 safeClick 一个 DOM 点击/事件派发出口
+  const colSrc = fs.readFileSync(
+    path.join(root, "src/main/services/upLoad/collection.js"),
+    "utf8"
+  );
+  const directClicks = colSrc.match(/\.\s*click\s*\(/g) || [];
+  const directDispatches = colSrc.match(/\.\s*dispatchEvent\s*\(/g) || [];
+  assert.strictEqual(directClicks.length, 1, "collection.js 内只允许存在 1 处 .click()（位于 safeClick）");
+  assert.strictEqual(directDispatches.length, 3, "collection.js 内只允许 safeClick 内的 3 处 dispatchEvent(mousedown/mouseup/click)");
+
+  // 12b. A1 safeClick 拒绝 dy/ks/sph 平台提交按钮选择器及 8 层祖先链、精确提交词表与 aria-labelledby
+  {
+    const { doc, body } = makeDoc();
+    let clickedCount = 0;
+    const markClick = (el) => {
+      el.onClick = () => {
+        clickedCount += 1;
+      };
+      return el;
+    };
+
+    // dy: #popover-tip-container 及其 8 层后代、#popover-tip-container+button
+    const dyPub = markClick(new FakeElement("div", "动作", { id: "popover-tip-container" }));
+    let cur = dyPub;
+    for (let d = 1; d <= 8; d++) {
+      const child = markClick(new FakeElement("div", d === 8 ? "选择方式" : ""));
+      cur.append(child);
+      cur = child;
+    }
+    const dyDeepChild = cur;
+    const dyDraft = markClick(new FakeElement("button", "草稿入口"));
+    body.append(dyPub, dyDraft);
+
+    // ks: #setting-tours + div 下 button 与行
+    const ksTours = new FakeElement("div", "", { id: "setting-tours" });
+    const ksBar = new FakeElement("div", "");
+    const ksRow = markClick(new FakeElement("div", ""));
+    const ksBtn = markClick(new FakeElement("button", "未知文案"));
+    const ksInnerSpan = markClick(new FakeElement("span", "图标"));
+    ksBtn.append(ksInnerSpan);
+    ksRow.append(ksBtn);
+    ksBar.append(ksRow);
+    body.append(ksTours, ksBar);
+
+    // sph: .form-btns>div:first-child button 与 :last-child button（复用 sph.js 常量）
+    const sphBtns = new FakeElement("div", "", { class: "form-btns" });
+    const sphDraftWrap = new FakeElement("div", "");
+    const sphDraftBtn = markClick(new FakeElement("button", "无文案图标"));
+    const sphDraftIcon = markClick(new FakeElement("span", ""));
+    sphDraftBtn.append(sphDraftIcon);
+    sphDraftWrap.append(sphDraftBtn);
+    const sphPubWrap = new FakeElement("div", "");
+    const sphPubBtn = markClick(new FakeElement("button", "无文案图标2"));
+    sphPubWrap.append(sphPubBtn);
+    sphBtns.append(sphDraftWrap, sphPubWrap);
+    body.append(sphBtns);
+
+    // aria-labelledby 指向外部提交文案
+    const extCaption = new FakeElement("span", "保存草稿", { id: "ext-draft-cap" });
+    const labelledBtn = markClick(
+      new FakeElement("button", "", {
+        type: "button",
+        "aria-haspopup": "listbox",
+        "aria-labelledby": "ext-draft-cap",
+      })
+    );
+    body.append(labelledBtn, extCaption);
+
+    // 12 个精确提交词表 + aria-label / title / value
+    const exactWordEls = collectionMod.SUBMIT_BUTTON_EXACT_TEXTS.map((w) =>
+      markClick(new FakeElement("button", w, { type: "button" }))
+    );
+    const ariaLabelEl = markClick(
+      new FakeElement("div", "", { role: "button", "aria-label": "立即发布" })
+    );
+    const titleEl = markClick(
+      new FakeElement("div", "", { role: "button", title: "暂存离开" })
+    );
+    const valueEl = markClick(
+      new FakeElement("input", "", { type: "button", value: "确认发布" })
+    );
+    const submitTypeEl = markClick(
+      new FakeElement("button", "非提交文案", { type: "submit" })
+    );
+    const submitChild = markClick(new FakeElement("span", "请选择合集"));
+    submitTypeEl.append(submitChild);
+    body.append(...exactWordEls, ariaLabelEl, titleEl, valueEl, submitTypeEl);
+
+    const prevDoc = global.document;
+    global.document = doc;
+    try {
+      const mustReject = [
+        dyPub,
+        dyDeepChild,
+        dyDraft,
+        ksRow,
+        ksBtn,
+        ksInnerSpan,
+        sphDraftBtn,
+        sphDraftIcon,
+        sphPubBtn,
+        labelledBtn,
+        ...exactWordEls,
+        ariaLabelEl,
+        titleEl,
+        valueEl,
+        submitTypeEl,
+        submitChild,
+      ];
+      for (const el of mustReject) {
+        assert.throws(
+          () => collectionMod.safeClick(el, { root: doc }),
+          (err) => {
+            assert.strictEqual(err.deterministic, true);
+            assert.ok(
+              err.message.includes("合集操作被拒：目标疑似提交按钮"),
+              `应抛确定性拒绝文案，实际: ${err.message}`
+            );
+            return true;
+          }
+        );
+      }
+      assert.strictEqual(clickedCount, 0, "被 safeClick 拒绝的元素点击次数必须严格为 0");
+
+      // 合法控件（含「校园发布会」字样）允许通过 safeClick
+      let legitClicked = 0;
+      const legit = new FakeElement("div", "校园发布会", {
+        class: "semi-select",
+        title: "校园发布会",
+      });
+      legit.onClick = () => {
+        legitClicked += 1;
+      };
+      body.append(legit);
+      assert.strictEqual(collectionMod.safeClick(legit, { root: doc }), true);
+      assert.strictEqual(legitClicked, 1, "合法合集控件「校园发布会」应正常通过 safeClick");
+    } finally {
+      if (prevDoc === undefined) delete global.document;
+      else global.document = prevDoc;
+    }
+  }
+
+  // 12c. A1 + A2：同行 aria-labelledby 提交按钮 / submit 祖先 / 跨行（.field 与无类名）均 0 点击且抛错
+  const origLog = console.log;
+  const origError = console.error;
+  console.log = console.error = () => {};
+  try {
+    // 12c-1：同行 aria-labelledby="external-caption" 指向「发布」/「保存草稿」→ 0 点击
+    for (const [ptName, capText] of [
+      ["抖音", "发布"],
+      ["快手", "保存草稿"],
+    ]) {
+      const { doc, body } = makeDoc();
+      let actionClicks = 0;
+      const row = new FakeElement("div", "", { class: "collection-form-item" });
+      row.append(new FakeElement("label", "合集"));
+      const btn = new FakeElement("button", "", {
+        type: "button",
+        "aria-haspopup": "listbox",
+        "aria-labelledby": "external-caption",
+      });
+      btn.onClick = () => {
+        actionClicks += 1;
+      };
+      row.append(btn);
+      body.append(row, new FakeElement("span", capText, { id: "external-caption" }));
+      await assert.rejects(
+        () =>
+          collectionMod.selectPlatformCollection(
+            makeEvalPage(doc),
+            ptName,
+            { collection: "民间故事" },
+            { timeouts: fastTimeouts, captureScreenshot: async () => "" }
+          ),
+        (err) => err.deterministic === true
+      );
+      assert.strictEqual(actionClicks, 0, `${ptName} aria-labelledby="${capText}" 绝不能被点击`);
+    }
+
+    // 12c-2：review2 跨行复现：.field 只有「合集」，相邻 .field 有「同步设置」与 #popover-tip-container
+    {
+      const { doc, body } = makeDoc();
+      let pubClicks = 0;
+      const settings = new FakeElement("div", "", { class: "settings" });
+      const field1 = new FakeElement("div", "", { class: "field" });
+      field1.append(new FakeElement("span", "合集"));
+      const field2 = new FakeElement("div", "", { class: "field" });
+      field2.append(new FakeElement("span", "同步设置"));
+      const popover = new FakeElement("div", "", { id: "popover-tip-container" });
+      popover.onClick = () => {
+        pubClicks += 1;
+      };
+      const inner = new FakeElement("div", "选择方式", { "aria-haspopup": "listbox" });
+      inner.onClick = () => {
+        pubClicks += 1;
+      };
+      popover.append(new FakeElement("span", "发布"), inner);
+      field2.append(popover);
+      settings.append(field1, field2);
+      body.append(settings);
+
+      await assert.rejects(
+        () =>
+          collectionMod.selectPlatformCollection(
+            makeEvalPage(doc),
+            "抖音",
+            { collection: "民间故事" },
+            { timeouts: fastTimeouts, captureScreenshot: async () => "" }
+          ),
+        (err) => {
+          assert.strictEqual(err.code, "collection_entry_not_found");
+          assert.strictEqual(err.deterministic, true);
+          return true;
+        }
+      );
+      assert.strictEqual(pubClicks, 0, "跨行查找绝不能点到抖音发布按钮");
+    }
+
+    // 12c-3：无标准类名的跨行容器（同含另一表单标签「同步设置」）→ 0 点击
+    {
+      const { doc, body } = makeDoc();
+      let otherClicks = 0;
+      const wrapper = new FakeElement("div", "", { class: "box-group" });
+      const r1 = new FakeElement("div", "", { class: "box" });
+      r1.append(new FakeElement("span", "合集"));
+      const r2 = new FakeElement("div", "", { class: "box" });
+      r2.append(new FakeElement("span", "同步设置"));
+      const otherSel = new FakeElement("div", "请选择", { class: "semi-select" });
+      otherSel.onClick = () => {
+        otherClicks += 1;
+      };
+      r2.append(otherSel);
+      wrapper.append(r1, r2);
+      body.append(wrapper);
+
+      await assert.rejects(
+        () =>
+          collectionMod.selectPlatformCollection(
+            makeEvalPage(doc),
+            "抖音",
+            { collection: "民间故事" },
+            { timeouts: fastTimeouts, captureScreenshot: async () => "" }
+          ),
+        (err) => err.code === "collection_entry_not_found" && err.deterministic === true
+      );
+      assert.strictEqual(otherClicks, 0, "含其他表单标签的跨行控件绝不能被点击");
+    }
+
+    // 12c-4：<button type="submit"> 包裹「合集」和 .semi-select → 0 点击
+    {
+      const { doc, body } = makeDoc();
+      let submitClicks = 0;
+      const submitBtn = new FakeElement("button", "", { type: "submit" });
+      submitBtn.onClick = () => {
+        submitClicks += 1;
+      };
+      const innerSel = new FakeElement("span", "请选择合集", { class: "semi-select" });
+      innerSel.onClick = () => {
+        submitClicks += 1;
+      };
+      submitBtn.append(new FakeElement("span", "合集"), innerSel);
+      body.append(submitBtn);
+      await assert.rejects(
+        () =>
+          collectionMod.selectPlatformCollection(
+            makeEvalPage(doc),
+            "抖音",
+            { collection: "民间故事" },
+            { timeouts: fastTimeouts, captureScreenshot: async () => "" }
+          ),
+        (err) => err.deterministic === true
+      );
+      assert.strictEqual(submitClicks, 0, "submit 按钮内部节点绝不能被点击");
+    }
+
+    // 12d. A3：「校园发布会」合集名与当前已选显示值正常打开、选中和回读
+    {
+      const { doc, body } = makeDoc();
+      const row = new FakeElement("div", "", { class: "collection-form-item" });
+      row.append(new FakeElement("label", "合集"));
+      const sel = new FakeElement("div", "", {
+        class: "semi-select",
+        role: "combobox",
+        "aria-controls": "campus-list",
+      });
+      const selText = new FakeElement("span", "校园发布会", {
+        class: "semi-select-selection-text",
+      });
+      sel.append(selText);
+      row.append(sel);
+      body.append(row);
+
+      let opened = 0;
+      let picked = "";
+      sel.onClick = () => {
+        opened += 1;
+        if (doc.querySelector("#campus-list")) return;
+        const popup = new FakeElement("div", "", {
+          id: "campus-list",
+          class: "semi-select-option-list",
+          role: "listbox",
+        });
+        for (const name of ["校园发布会", "民间故事"]) {
+          const opt = new FakeElement("div", name, {
+            class: "semi-select-option",
+            role: "option",
+          });
+          opt.onClick = () => {
+            picked = name;
+            selText.textContent = name;
+            popup.remove();
+          };
+          popup.append(opt);
+        }
+        body.append(popup);
+      };
+
+      const res = await collectionMod.selectPlatformCollection(
+        makeEvalPage(doc),
+        "抖音",
+        { collection: "校园发布会" },
+        { timeouts: fastTimeouts, captureScreenshot: async () => "" }
+      );
+      assert.strictEqual(res.selected, true, "「校园发布会」必须正常选择和回读");
+      assert.strictEqual(res.displayedText, "校园发布会");
+      assert.strictEqual(opened, 1);
+      assert.strictEqual(picked, "校园发布会");
+    }
+
+    // 12e. A4：带内嵌 span 的占位文案「请选择<span>合集</span>」对目标名「合集」必须判未选失败；
+    //      真正选中「合集」后回读才通过
+    {
+      // 12e-1：点击选项后控件仍保持「请选择<span>合集</span>」→ 回读失败
+      for (const phClass of ["semi-select-selection-placeholder", "semi-select-selection-text"]) {
+        const { doc, body } = makeDoc();
+        const row = new FakeElement("div", "", { class: "collection-form-item" });
+        row.append(new FakeElement("label", "合集"));
+        const sel = new FakeElement("div", "", {
+          class: "semi-select",
+          role: "combobox",
+          "aria-controls": "album-opts",
+        });
+        const phOuter = new FakeElement("span", "请选择", { class: phClass });
+        phOuter.append(new FakeElement("span", "合集"));
+        sel.append(phOuter);
+        row.append(sel);
+        body.append(row);
+
+        sel.onClick = () => {
+          if (doc.querySelector("#album-opts")) return;
+          const popup = new FakeElement("div", "", {
+            id: "album-opts",
+            class: "semi-select-option-list",
+            role: "listbox",
+          });
+          const opt = new FakeElement("div", "合集", {
+            class: "semi-select-option",
+            role: "option",
+          });
+          opt.onClick = () => {
+            // 模拟选中未生效：占位文本「请选择<span>合集</span>」未变
+            popup.remove();
+          };
+          popup.append(opt);
+          body.append(popup);
+        };
+
+        await assert.rejects(
+          () =>
+            collectionMod.selectPlatformCollection(
+              makeEvalPage(doc),
+              "抖音",
+              { collection: "合集" },
+              { timeouts: fastTimeouts, captureScreenshot: async () => "" }
+            ),
+          (err) => {
+            assert.strictEqual(err.code, "collection_readback_mismatch");
+            assert.strictEqual(err.deterministic, true);
+            assert.ok(err.message.includes("请选择合集"));
+            return true;
+          }
+        );
+      }
+
+      // 12e-2：目标名恰为「合集」且选中后控件真实显示「合集」→ 回读通过
+      {
+        const { doc, body } = makeDoc();
+        const row = new FakeElement("div", "", { class: "collection-form-item" });
+        row.append(new FakeElement("label", "合集"));
+        const sel = new FakeElement("div", "", {
+          class: "semi-select",
+          role: "combobox",
+          "aria-controls": "album-opts-ok",
+        });
+        const phOuter = new FakeElement("span", "请选择", {
+          class: "semi-select-selection-placeholder",
+        });
+        phOuter.append(new FakeElement("span", "合集"));
+        sel.append(phOuter);
+        row.append(sel);
+        body.append(row);
+
+        sel.onClick = () => {
+          if (doc.querySelector("#album-opts-ok")) return;
+          const popup = new FakeElement("div", "", {
+            id: "album-opts-ok",
+            class: "semi-select-option-list",
+            role: "listbox",
+          });
+          const opt = new FakeElement("div", "合集", {
+            class: "semi-select-option",
+            role: "option",
+          });
+          opt.onClick = () => {
+            sel.children = [];
+            sel.append(
+              new FakeElement("span", "合集", {
+                class: "semi-select-selection-text",
+              })
+            );
+            popup.remove();
+          };
+          popup.append(opt);
+          body.append(popup);
+        };
+
+        const okRes = await collectionMod.selectPlatformCollection(
+          makeEvalPage(doc),
+          "抖音",
+          { collection: "合集" },
+          { timeouts: fastTimeouts, captureScreenshot: async () => "" }
+        );
+        assert.strictEqual(okRes.selected, true, "目标名恰为「合集」且真实选中后应回读通过");
+        assert.strictEqual(okRes.displayedText, "合集");
+      }
+    }
+  } finally {
+    console.log = origLog;
+    console.error = origError;
+  }
+  console.log("✓ 12. S12-fix2 safeClick 唯一出口、跨行隔离、「校园发布会」与内嵌 span 占位回读通过");
+}
+
 (async () => {
   testSharedCollectionResolution();
   testExcelCollectionColumn();
@@ -2206,6 +2890,7 @@ console.log(JSON.stringify({ channel: 'puppeteerFile-done', status: true, result
   await testSphLinkFallbackCollectionGate();
   await testScheduledReuseCollectionConflict();
   await testMcpCollectionAndE2eEvidence();
+  await testS12Fix2StructuralGuards();
   console.log("\ntest-collection: 全部断言通过");
 })().catch((e) => {
   console.error(e);

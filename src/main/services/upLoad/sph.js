@@ -5,11 +5,17 @@ import maybeClosePublishWindow from "./closeWindow.js";
 import { head, matchesHead, replaceAllText } from "./textReadback.js";
 import { resolveVideoLinkOption } from "../../../shared/videoLink.js";
 import {
+  SPH_DRAFT_BUTTON_SELECTOR,
+  SPH_PUBLISH_BUTTON_SELECTOR,
+} from "../../../shared/collectionShared.js";
+import {
   isCreativeStatementNone,
   resolveSphCreativeStatementLabel,
 } from "../../../shared/creativeStatement.js";
 import { attachSphVideoLink } from "./sphLink.js";
 import { selectPlatformCollection } from "./collection.js";
+
+export { SPH_DRAFT_BUTTON_SELECTOR, SPH_PUBLISH_BUTTON_SELECTOR };
 import {
   WAIT_SELECTOR_APPEAR_MS,
   WAIT_UPLOAD_PROCESSING_MS,
@@ -362,7 +368,7 @@ async function applySphCreativeStatement(page, value) {
 async function clickSphDraftButton(page) {
   // 用实时查询点击：此前的 ElementHandle.click 在影子树重渲染瞬间会拿到
   // 已分离节点，报 not clickable 直接中断发布（e2e 实测）
-  await clickSphShadow(page, ".form-btns>div:first-child button", {
+  await clickSphShadow(page, SPH_DRAFT_BUTTON_SELECTOR, {
     timeout: WAIT_SELECTOR_APPEAR_MS,
     label: "视频号保存草稿按钮",
   });
@@ -421,7 +427,7 @@ async function readVisibleSphDialogTexts(page) {
 }
 
 async function clickSphPublishButton(page) {
-  await clickSphShadow(page, ".form-btns>div:last-child button", {
+  await clickSphShadow(page, SPH_PUBLISH_BUTTON_SELECTOR, {
     timeout: WAIT_SELECTOR_APPEAR_MS,
     label: "视频号发布按钮",
   });
