@@ -23,7 +23,8 @@ import {
   PLATFORM_SUBMIT_SELECTORS,
   collapseCollectionText,
   isNonCollectionOptionText,
-  stripCollectionCountSuffix,
+  isStandaloneCollectionCountText,
+  normalizeCollectionName,
 } from "../../../shared/collectionShared.js";
 import {
   getCollectionCanonicalPlatform,
@@ -283,13 +284,12 @@ export const PLATFORM_COLLECTION_CONFIGS = {
 };
 
 /**
- * 合集控件占位/未选入口文案全集（回读时一律不得视为已选合集值）。
+ * 合集控件共享占位/未选入口文案全集（回读时一律不得视为已选合集值）。
+ * 与 9e99ec8 保持完全一致；各平台专属入口文案（如快手「选择要加入到的合集」、抖音「不选择合集」）
+ * 仅保留在各自平台配置 entryTexts 中，不污染共享表与视频号回读。
  */
 export const COLLECTION_PLACEHOLDER_TEXTS = Array.from(
   new Set([
-    ...PLATFORM_COLLECTION_CONFIGS.dy.entryTexts,
-    ...PLATFORM_COLLECTION_CONFIGS.ks.entryTexts,
-    ...PLATFORM_COLLECTION_CONFIGS.sph.entryTexts,
     "请选择合集",
     "选择合集",
     "添加到合集",
@@ -300,8 +300,6 @@ export const COLLECTION_PLACEHOLDER_TEXTS = Array.from(
     "未选择",
     "不加入合集",
     "不添加到合集",
-    "不选择合集",
-    "选择要加入到的合集",
     "暂不加入",
     "不选择",
     "无合集",
@@ -318,19 +316,35 @@ export function normalizeCollectionMatchText(text) {
   return collapseCollectionText(text);
 }
 
-/** 判断候选项名称与目标合集名是否去计数后缀及空白后完全相等（排除「不选择合集」） */
-export function isExactCollectionMatch(candidateText, targetName) {
+/**
+ * 判断候选项名称与目标合集名是否去空白后完全相等：
+ * - 不对单串标题盲目剥离「21个作品」等计数形尾缀；
+ * - 仅当传入来自 DOM 独立计数节点的 countNodeText 时，允许 candidate == target + countNodeText。
+ */
+export function isExactCollectionMatch(candidateText, targetName, options = {}) {
+  const excludeNonCollection = !(
+    options && options.excludeNonCollection === false
+  );
   if (
-    isNonCollectionOptionText(candidateText) ||
-    isNonCollectionOptionText(targetName)
+    excludeNonCollection &&
+    (isNonCollectionOptionText(candidateText) ||
+      isNonCollectionOptionText(targetName))
   ) {
     return false;
   }
-  const c = normalizeCollectionMatchText(
-    stripCollectionCountSuffix(candidateText)
-  );
+  const c = normalizeCollectionMatchText(candidateText);
   const t = normalizeCollectionMatchText(targetName);
-  return Boolean(c && t && c === t);
+  if (!c || !t) return false;
+  if (c === t) return true;
+  const countNodeText =
+    options && typeof options.countNodeText === "string"
+      ? options.countNodeText
+      : "";
+  if (countNodeText && isStandaloneCollectionCountText(countNodeText)) {
+    const cn = normalizeCollectionMatchText(countNodeText);
+    if (cn && c === t + cn) return true;
+  }
+  return false;
 }
 
 /** 判断文本是否属于合集占位/未选文案（不得视为已选合集值） */
@@ -352,10 +366,10 @@ export function isCollectionPlaceholderText(text, extraPlaceholders = []) {
 }
 
 /**
- * 严格回读校验（严禁 includes）：
- * - 任何占位/未选入口文案（含内嵌 span 拼接后的「请选择合集」「不选择合集」等全集）一律视为未选，返回 false；
- * - 允许按需去掉尾部「共\d+个作品」「\d+个作品」等计数后缀，再做去空白后的完全相等比对
- *   （目标名本身恰为「合集」时同样适用，绝不用包含匹配）。
+ * 严格回读校验（严禁 includes，不对单串标题盲目去计数后缀）：
+ * - 任何占位/未选入口文案（共享表 + 当前平台 entryTexts）一律视为未选，返回 false；
+ * - 精确比较名称节点文本去空白后等于目标名；
+ * - 若只能拿到整串，仅允许 整串==目标 或 整串==目标+DOM独立计数节点文本（且视频号不启用计数拼接）。
  */
 export function matchesCollectionReadback(
   displayedOrResult,
@@ -363,30 +377,62 @@ export function matchesCollectionReadback(
   options = {}
 ) {
   const targetNorm = normalizeCollectionMatchText(targetName);
-  if (!targetNorm || isNonCollectionOptionText(targetNorm)) return false;
+  if (!targetNorm) return false;
   const extraPlaceholders =
     options && Array.isArray(options.placeholders) ? options.placeholders : [];
-  const shouldStripCount = !(options && options.stripCountSuffix === false);
+  if (isCollectionPlaceholderText(targetNorm, extraPlaceholders)) {
+    return false;
+  }
+  const allowCountNode = !(options && options.stripCountSuffix === false);
+  const validCountNorms = [];
+  const addValidCount = (rawCnt) => {
+    if (!allowCountNode || !rawCnt) return;
+    if (!isStandaloneCollectionCountText(rawCnt)) return;
+    const cn = normalizeCollectionMatchText(rawCnt);
+    if (cn && validCountNorms.indexOf(cn) === -1) {
+      validCountNorms.push(cn);
+    }
+  };
+  if (options && typeof options.countNodeText === "string") {
+    addValidCount(options.countNodeText);
+  }
+  if (
+    displayedOrResult &&
+    typeof displayedOrResult === "object" &&
+    !Array.isArray(displayedOrResult)
+  ) {
+    if (typeof displayedOrResult.countText === "string") {
+      addValidCount(displayedOrResult.countText);
+    }
+    if (Array.isArray(displayedOrResult.countTexts)) {
+      for (let ci = 0; ci < displayedOrResult.countTexts.length; ci++) {
+        addValidCount(displayedOrResult.countTexts[ci]);
+      }
+    }
+  }
+
   const isExactNonPlaceholder = (raw) => {
     const dRaw = normalizeCollectionMatchText(raw);
     if (!dRaw) return false;
-    if (
-      isCollectionPlaceholderText(dRaw, extraPlaceholders) ||
-      isNonCollectionOptionText(dRaw)
-    ) {
+    if (isCollectionPlaceholderText(dRaw, extraPlaceholders)) {
       return false;
     }
-    const d = shouldStripCount
-      ? normalizeCollectionMatchText(stripCollectionCountSuffix(raw))
-      : dRaw;
-    if (!d) return false;
-    if (
-      isCollectionPlaceholderText(d, extraPlaceholders) ||
-      isNonCollectionOptionText(d)
-    ) {
-      return false;
+    if (dRaw === targetNorm) return true;
+    if (allowCountNode && validCountNorms.length > 0) {
+      for (let i = 0; i < validCountNorms.length; i++) {
+        const cn = validCountNorms[i];
+        if (dRaw === targetNorm + cn) return true;
+        if (
+          dRaw.length === targetNorm.length + 1 + cn.length &&
+          dRaw.indexOf(targetNorm) === 0 &&
+          dRaw.slice(targetNorm.length + 1) === cn &&
+          /^[/·•|｜\-—]$/.test(dRaw.charAt(targetNorm.length))
+        ) {
+          return true;
+        }
+      }
     }
-    return d === targetNorm;
+    return false;
   };
 
   if (Array.isArray(displayedOrResult)) {
@@ -405,7 +451,7 @@ export function matchesCollectionReadback(
   return isExactNonPlaceholder(displayedOrResult);
 }
 
-/** 整理页面候选合集名（去计数后缀、排除「不选择合集」、去重、去空、最多保留 limit 个） */
+/** 整理页面候选合集名（去重、去空、最多保留 limit 个；不剥离单串尾缀，确保视频号与 9e99ec8 一致） */
 export function formatCollectionCandidates(
   candidates,
   limit = COLLECTION_CANDIDATE_LIMIT
@@ -414,8 +460,8 @@ export function formatCollectionCandidates(
   const seen = new Set();
   const out = [];
   for (let i = 0; i < list.length; i++) {
-    const cleaned = stripCollectionCountSuffix(list[i]);
-    if (!cleaned || isNonCollectionOptionText(cleaned)) continue;
+    const cleaned = normalizeCollectionName(list[i]);
+    if (!cleaned) continue;
     const key = collapseCollectionText(cleaned);
     if (!key || seen.has(key)) continue;
     seen.add(key);
@@ -656,24 +702,65 @@ export function runCollectionDomAction(payload) {
     return false;
   };
 
+  var isInsideForm = function (node) {
+    if (!node || node.nodeType !== 1) return false;
+    if (node.form) return true;
+    if (
+      typeof node.getAttribute === "function" &&
+      String(node.getAttribute("form") || "").trim() !== ""
+    ) {
+      return true;
+    }
+    var cur = node.parentElement;
+    while (cur) {
+      if (
+        cur === docRef ||
+        (docRef && (cur === docRef.body || cur === docRef.documentElement))
+      ) {
+        break;
+      }
+      if (
+        cur.nodeType === 1 &&
+        String(cur.tagName || "").toUpperCase() === "FORM"
+      ) {
+        return true;
+      }
+      cur = cur.parentElement;
+    }
+    return false;
+  };
+
   var isExplicitSubmitControl = function (node) {
     if (!node || node.nodeType !== 1) return false;
     var tag = String(node.tagName || "").toUpperCase();
     if (tag !== "BUTTON" && tag !== "INPUT") return false;
-    var explicitType = String(
-      (typeof node.getAttribute === "function" && node.getAttribute("type")) ||
-        ""
-    )
+    var rawType =
+      typeof node.getAttribute === "function" ? node.getAttribute("type") : null;
+    var explicitType = String(rawType == null ? "" : rawType)
       .trim()
       .toLowerCase();
-    return explicitType === "submit" || explicitType === "reset";
+    if (explicitType === "submit" || explicitType === "reset") {
+      return true;
+    }
+    if (tag === "INPUT" && explicitType === "image") {
+      return true;
+    }
+    // HTML 规范：form 内未显式声明 type="button" 的 button 默认提交表单，按 submit 拒绝
+    if (
+      tag === "BUTTON" &&
+      (!explicitType || (explicitType !== "button" && explicitType !== "menu")) &&
+      isInsideForm(node)
+    ) {
+      return true;
+    }
+    return false;
   };
 
   var getSubmitRejectionReason = function (el) {
     if (!el) return "empty_target";
     var scopeRoot = resolveRootForNode(el);
     var node = el;
-    for (var depth = 0; node && depth <= 8; depth++) {
+    for (var depth = 0; node; depth++) {
       if (
         node === docRef ||
         (docRef && (node === docRef.body || node === docRef.documentElement))
@@ -681,13 +768,13 @@ export function runCollectionDomAction(payload) {
         break;
       }
       if (node.nodeType === 1) {
-        if (matchesAnySelector(node, submitSelectors)) {
+        if (depth <= 8 && matchesAnySelector(node, submitSelectors)) {
           return "submit_selector_depth_" + depth;
         }
         if (isExplicitSubmitControl(node)) {
           return "submit_control_depth_" + depth;
         }
-        if (isAccessibleNameExactSubmit(node, scopeRoot)) {
+        if (depth <= 8 && isAccessibleNameExactSubmit(node, scopeRoot)) {
           return "submit_accessible_name_depth_" + depth;
         }
       }
@@ -870,14 +957,124 @@ export function runCollectionDomAction(payload) {
       rawHtml = "";
     }
     if (!rawHtml) return "";
-    var cleaned = rawHtml
-      .replace(/<img\b([^>]*)>/gi, function (_m, attrs) {
-        var cleanedAttrs = String(attrs || "")
-          .replace(/\s+src\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "")
-          .replace(/\s+style\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "");
-        return "<img" + cleanedAttrs + ">";
-      })
-      .replace(/\s+style\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "")
+
+    var src = rawHtml
+      .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "")
+      .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, "")
+      .replace(/<!--[\s\S]*?-->/g, "");
+
+    var urlOrQueryRe =
+      /(?:https?:|blob:|data:|file:|ftp:|\/\/|\?|&#0*63;|&#x0*3f;)/i;
+    var isAllowedAttr = function (name) {
+      return (
+        name === "class" ||
+        name === "role" ||
+        name === "type" ||
+        name.indexOf("aria-") === 0
+      );
+    };
+
+    var out = "";
+    var i = 0;
+    var len = src.length;
+    while (i < len) {
+      var lt = src.indexOf("<", i);
+      if (lt === -1) {
+        out += src.slice(i);
+        break;
+      }
+      if (lt > i) {
+        out += src.slice(i, lt);
+      }
+      var pos = lt + 1;
+      if (pos >= len) break;
+
+      var isClose = false;
+      if (src.charAt(pos) === "/") {
+        isClose = true;
+        pos += 1;
+      }
+      var tagStart = pos;
+      while (pos < len && /[a-zA-Z0-9:-]/.test(src.charAt(pos))) {
+        pos += 1;
+      }
+      var tagName = src.slice(tagStart, pos).toLowerCase();
+      if (!tagName) {
+        out += "<";
+        i = lt + 1;
+        continue;
+      }
+
+      if (isClose) {
+        var closeEnd = src.indexOf(">", pos);
+        if (closeEnd === -1) break;
+        out += "</" + tagName + ">";
+        i = closeEnd + 1;
+        continue;
+      }
+
+      var keptAttrs = "";
+      while (pos < len) {
+        while (pos < len && /[\s/]/.test(src.charAt(pos))) {
+          pos += 1;
+        }
+        if (pos >= len || src.charAt(pos) === ">") {
+          break;
+        }
+        var attrStart = pos;
+        while (pos < len && !/[\s=>/]/.test(src.charAt(pos))) {
+          pos += 1;
+        }
+        var attrName = src.slice(attrStart, pos).toLowerCase();
+        if (!attrName) {
+          pos += 1;
+          continue;
+        }
+        while (pos < len && /\s/.test(src.charAt(pos))) {
+          pos += 1;
+        }
+        var hasVal = false;
+        var attrVal = "";
+        if (pos < len && src.charAt(pos) === "=") {
+          hasVal = true;
+          pos += 1;
+          while (pos < len && /\s/.test(src.charAt(pos))) {
+            pos += 1;
+          }
+          var q = pos < len ? src.charAt(pos) : "";
+          if (q === '"' || q === "'") {
+            pos += 1;
+            var valStart = pos;
+            var qEnd = src.indexOf(q, pos);
+            if (qEnd === -1) {
+              attrVal = src.slice(valStart);
+              pos = len;
+            } else {
+              attrVal = src.slice(valStart, qEnd);
+              pos = qEnd + 1;
+            }
+          } else {
+            var uStart = pos;
+            while (pos < len && !/[\s>]/.test(src.charAt(pos))) {
+              pos += 1;
+            }
+            attrVal = src.slice(uStart, pos);
+          }
+        }
+        if (hasVal && isAllowedAttr(attrName) && !urlOrQueryRe.test(attrVal)) {
+          keptAttrs +=
+            " " + attrName + '="' + attrVal.replace(/"/g, "&quot;") + '"';
+        }
+      }
+
+      if (pos < len && src.charAt(pos) === ">") {
+        pos += 1;
+      }
+      out += "<" + tagName + keptAttrs + ">";
+      i = pos;
+    }
+
+    var cleaned = out
       .replace(/[\r\n\t]+/g, " ")
       .replace(/\s{2,}/g, " ")
       .trim();
@@ -1256,7 +1453,11 @@ export function runCollectionDomAction(payload) {
           ? norm(el.getAttribute("placeholder"))
           : "";
       if (ph) return ph;
-      if (isSemanticSelect(el) && typeof el.querySelector === "function") {
+      if (
+        !isSphPlatform &&
+        isSemanticSelect(el) &&
+        typeof el.querySelector === "function"
+      ) {
         try {
           var innerInput = el.querySelector("input[placeholder]");
           if (innerInput && typeof innerInput.getAttribute === "function") {
@@ -1489,6 +1690,28 @@ export function runCollectionDomAction(payload) {
       chosenRow.setAttribute("data-mm-collection-row", token);
     }
 
+    // 打开入口前记录页面已有可见元素，供 text_leaf 仅在打开后新增的下方浮层内查找
+    if (!isSphPlatform && token) {
+      var preVisibleNodes = [];
+      try {
+        preVisibleNodes = Array.from(root.querySelectorAll("*"));
+      } catch (_) {
+        preVisibleNodes = [];
+      }
+      for (var preIdx = 0; preIdx < preVisibleNodes.length; preIdx++) {
+        var preNode = preVisibleNodes[preIdx];
+        if (
+          isVisible(preNode) &&
+          typeof preNode.setAttribute === "function"
+        ) {
+          preNode.setAttribute("data-mm-collection-pre", token);
+        }
+      }
+      if (typeof chosenTrigger.setAttribute === "function") {
+        chosenTrigger.setAttribute("data-mm-collection-pre-ready", token);
+      }
+    }
+
     var entryText = clean(getText(chosenTrigger)).slice(0, 60);
     safeClick(chosenTrigger, {
       useMouseSequence: Boolean(cfg.dispatchMouseDown),
@@ -1511,20 +1734,28 @@ export function runCollectionDomAction(payload) {
     var shouldStripCount = !isSphPlatform;
     var enableTextLeaf = !isSphPlatform;
 
-    var stripCount = function (t) {
-      var c = clean(t);
-      if (!c) return "";
-      if (!shouldStripCount) return c;
-      return c
-        .replace(
-          /(?:\s*[/·•|｜]\s*|\s+[-—]\s+|\s*)(?:[\(（]\s*(?:共\s*)?\d+\s*(?:个|条|篇|部)?\s*(?:作品|视频)\s*[\)）]|(?:共\s*)?\d+\s*(?:个|条|篇|部)?\s*(?:作品|视频))$/,
-          ""
-        )
-        .trim();
-    };
+    var MODAL_SELECTOR =
+      ".semi-modal, .ant-modal-content, .weui-desktop-dialog, [role='dialog']";
+    var standaloneCountRe =
+      /^(?:[/·•|｜\-—]\s*)?(?:[\(（]\s*(?:共\s*)?\d+\s*(?:个|条|篇|部)?\s*(?:作品|视频)\s*[\)）]|(?:共\s*)?\d+\s*(?:个|条|篇|部)?\s*(?:作品|视频))$/;
+    var standaloneSepRe = /^[/·•|｜\-—]+$/;
+    var nonContentTagRe =
+      /^(SCRIPT|STYLE|SVG|PATH|IMG|BR|HR|HEAD|META|LINK|BODY|HTML|INPUT|TEXTAREA|SELECT)$/;
+    var inlineTextTagRe =
+      /^(SPAN|B|I|EM|STRONG|SMALL|MARK|U|S|SUB|SUP|FONT|ABBR|CODE|TIME)$/;
 
+    var nonTargetTextSet = {
+      不选择合集: true,
+      不加入合集: true,
+      不添加到合集: true,
+      暂不选择: true,
+      暂不添加: true,
+      暂不加入: true,
+      不选择: true,
+      无合集: true,
+    };
     var isNonTargetOption = function (k) {
-      return !k || k === "不选择合集";
+      return !k || Boolean(nonTargetTextSet[k]);
     };
 
     var isOptionDisabled = function (el) {
@@ -1540,6 +1771,29 @@ export function runCollectionDomAction(payload) {
       return /\b(ant-select-item-option-disabled|semi-select-option-disabled|is-disabled|disabled)\b/.test(
         cls
       );
+    };
+
+    var isHiddenForText = function (el) {
+      if (!el || el.nodeType !== 1) return false;
+      if (el.hidden === true) return true;
+      if (typeof el.getAttribute === "function") {
+        if (el.getAttribute("hidden") !== null) return true;
+        if (el.getAttribute("aria-hidden") === "true") return true;
+      }
+      if (typeof getComputedStyle === "function") {
+        try {
+          var st = getComputedStyle(el);
+          if (
+            st &&
+            (st.display === "none" ||
+              st.visibility === "hidden" ||
+              String(st.opacity) === "0")
+          ) {
+            return true;
+          }
+        } catch (_) {}
+      }
+      return false;
     };
 
     var entryEl = token
@@ -1587,6 +1841,197 @@ export function runCollectionDomAction(payload) {
       return false;
     };
 
+    var isForbiddenInteractiveTag = function (el) {
+      if (!el || el.nodeType !== 1) return false;
+      var tag = String(el.tagName || "").toUpperCase();
+      if (
+        tag === "A" ||
+        tag === "BUTTON" ||
+        tag === "INPUT" ||
+        tag === "TEXTAREA" ||
+        tag === "SELECT" ||
+        tag === "NAV" ||
+        tag === "ASIDE" ||
+        tag === "HEADER"
+      ) {
+        return true;
+      }
+      if (typeof el.getAttribute === "function") {
+        var role = String(el.getAttribute("role") || "").toLowerCase();
+        if (
+          role === "link" ||
+          role === "navigation" ||
+          role === "banner" ||
+          role === "menubar"
+        ) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    var isForbiddenOptionEl = function (el) {
+      if (!el || el.nodeType !== 1) return true;
+      if (isInExcludedNavArea(el) || isInTriggerRow(el)) return true;
+      if (getSubmitRejectionReason(el)) return true;
+      var cur = el;
+      while (cur && cur !== root && cur.nodeType === 1) {
+        if (
+          cur === docRef ||
+          (docRef && (cur === docRef.body || cur === docRef.documentElement))
+        ) {
+          break;
+        }
+        if (isForbiddenInteractiveTag(cur)) return true;
+        cur = cur.parentElement;
+      }
+      return false;
+    };
+
+    var collectVisibleTextSegments = function (node, out, skipForbidden) {
+      if (!node) return;
+      if (node.nodeType === 3) {
+        var rawVal = String(node.nodeValue == null ? "" : node.nodeValue);
+        if (clean(rawVal)) {
+          out.push({
+            raw: rawVal,
+            cleaned: clean(rawVal),
+            el: node.parentElement || null,
+          });
+        }
+        return;
+      }
+      if (node.nodeType !== 1 && node.nodeType !== 11) return;
+      if (node.nodeType === 1) {
+        if (isHiddenForText(node)) return;
+        var nTag = String(node.tagName || "").toUpperCase();
+        if (
+          nTag === "SCRIPT" ||
+          nTag === "STYLE" ||
+          nTag === "SVG" ||
+          nTag === "PATH" ||
+          nTag === "IMG" ||
+          nTag === "BR" ||
+          nTag === "HR"
+        ) {
+          return;
+        }
+        if (skipForbidden && isForbiddenInteractiveTag(node)) return;
+      }
+      var kids = node.childNodes;
+      if (kids && kids.length > 0) {
+        for (var i = 0; i < kids.length; i++) {
+          collectVisibleTextSegments(kids[i], out, skipForbidden);
+        }
+        return;
+      }
+      var elKids = node.children ? Array.from(node.children) : [];
+      if (elKids.length > 0) {
+        if (typeof node._text === "string" && clean(node._text)) {
+          out.push({
+            raw: node._text,
+            cleaned: clean(node._text),
+            el: node,
+          });
+        }
+        for (var j = 0; j < elKids.length; j++) {
+          collectVisibleTextSegments(elKids[j], out, skipForbidden);
+        }
+        return;
+      }
+      var leafRaw =
+        node.textContent != null
+          ? String(node.textContent)
+          : node.innerText != null
+          ? String(node.innerText)
+          : "";
+      if (clean(leafRaw)) {
+        out.push({ raw: leafRaw, cleaned: clean(leafRaw), el: node });
+      }
+    };
+
+    var extractRowNameAndCount = function (el, skipForbidden) {
+      var segs = [];
+      collectVisibleTextSegments(el, segs, Boolean(skipForbidden));
+      if (segs.length === 0) {
+        return { fullText: "", name: "", countText: "" };
+      }
+      var joinSegs = function (arr) {
+        var s = "";
+        for (var i = 0; i < arr.length; i++) s += arr[i].raw;
+        return clean(s);
+      };
+      var fullText = joinSegs(segs);
+      if (!shouldStripCount || segs.length < 2) {
+        return { fullText: fullText, name: fullText, countText: "" };
+      }
+
+      // 只有当计数后缀在 DOM 上是独立节点（与名称不在同一文本节点）时才剥离
+      var endIdx = segs.length;
+      var countText = "";
+      var lastSeg = segs[endIdx - 1];
+      if (standaloneCountRe.test(lastSeg.cleaned)) {
+        countText = lastSeg.cleaned;
+        endIdx -= 1;
+      } else {
+        var firstEl = segs[0].el;
+        for (var splitAt = segs.length - 1; splitAt >= 1; splitAt--) {
+          var tailJoined = joinSegs(segs.slice(splitAt));
+          if (!standaloneCountRe.test(tailJoined)) continue;
+          var commonAnc = segs[splitAt].el;
+          var validContainer = false;
+          while (commonAnc && commonAnc !== el && commonAnc.nodeType === 1) {
+            var coversTail = true;
+            for (var ti = splitAt; ti < segs.length; ti++) {
+              if (
+                segs[ti].el !== commonAnc &&
+                !(
+                  typeof commonAnc.contains === "function" &&
+                  commonAnc.contains(segs[ti].el)
+                )
+              ) {
+                coversTail = false;
+                break;
+              }
+            }
+            var touchesHead =
+              firstEl === commonAnc ||
+              (typeof commonAnc.contains === "function" &&
+                firstEl &&
+                commonAnc.contains(firstEl));
+            if (coversTail && !touchesHead) {
+              var ancSegs = [];
+              collectVisibleTextSegments(commonAnc, ancSegs, Boolean(skipForbidden));
+              if (norm(joinSegs(ancSegs)) === norm(tailJoined)) {
+                validContainer = true;
+                break;
+              }
+            }
+            commonAnc = commonAnc.parentElement;
+          }
+          if (validContainer) {
+            countText = tailJoined;
+            endIdx = splitAt;
+            break;
+          }
+        }
+      }
+
+      if (
+        countText &&
+        endIdx >= 2 &&
+        standaloneSepRe.test(segs[endIdx - 1].cleaned)
+      ) {
+        endIdx -= 1;
+      }
+
+      var nameText = joinSegs(segs.slice(0, endIdx));
+      if (!nameText) {
+        return { fullText: fullText, name: fullText, countText: "" };
+      }
+      return { fullText: fullText, name: nameText, countText: countText };
+    };
+
     var isLeftSidebarPopup = function (el) {
       if (isSphPlatform || !hasEntryRect || !el) return false;
       var r = getRect(el);
@@ -1601,6 +2046,137 @@ export function runCollectionDomAction(payload) {
         return true;
       }
       return false;
+    };
+
+    var containsNestedModal = function (el) {
+      if (!el || typeof el.querySelectorAll !== "function") return false;
+      var nested = [];
+      try {
+        nested = Array.from(el.querySelectorAll(MODAL_SELECTOR));
+      } catch (_) {
+        nested = [];
+      }
+      for (var ni = 0; ni < nested.length; ni++) {
+        if (nested[ni] !== el && isVisible(nested[ni])) return true;
+      }
+      return false;
+    };
+
+    var hasPreSnapshot = Boolean(
+      !isSphPlatform &&
+        token &&
+        entryEl &&
+        typeof entryEl.getAttribute === "function" &&
+        entryEl.getAttribute("data-mm-collection-pre-ready") === token
+    );
+
+    var isPreExistingEl = function (el) {
+      return Boolean(
+        el &&
+          token &&
+          typeof el.getAttribute === "function" &&
+          el.getAttribute("data-mm-collection-pre") === token
+      );
+    };
+
+    var containsPreExistingVisible = function (el) {
+      if (!el || !token || typeof el.querySelectorAll !== "function") {
+        return false;
+      }
+      var preDesc = [];
+      try {
+        preDesc = Array.from(
+          el.querySelectorAll('[data-mm-collection-pre="' + token + '"]')
+        );
+      } catch (_) {
+        preDesc = [];
+      }
+      for (var pi3 = 0; pi3 < preDesc.length; pi3++) {
+        if (preDesc[pi3] !== el && isVisible(preDesc[pi3])) return true;
+      }
+      return false;
+    };
+
+    var findNewBelowOverlayContainer = function () {
+      if (isSphPlatform || !hasEntryRect || !hasPreSnapshot) return null;
+      var scanEls = [];
+      try {
+        scanEls = Array.from(root.querySelectorAll("*"));
+      } catch (_) {
+        scanEls = [];
+      }
+      var validItems = [];
+      for (var si = 0; si < scanEls.length; si++) {
+        var se = scanEls[si];
+        if (!isVisible(se)) continue;
+        if (isPreExistingEl(se)) continue;
+        var sTag = String(se.tagName || "").toUpperCase();
+        if (
+          sTag === "HTML" ||
+          sTag === "BODY" ||
+          sTag === "MAIN" ||
+          sTag === "FORM" ||
+          sTag === "HEAD" ||
+          sTag === "SCRIPT" ||
+          sTag === "STYLE" ||
+          sTag === "META" ||
+          sTag === "LINK" ||
+          sTag === "SVG" ||
+          sTag === "PATH" ||
+          sTag === "IMG" ||
+          sTag === "BR" ||
+          sTag === "HR"
+        ) {
+          continue;
+        }
+        if (isForbiddenOptionEl(se)) continue;
+        if (
+          entryEl &&
+          typeof se.contains === "function" &&
+          se.contains(entryEl)
+        ) {
+          continue;
+        }
+        if (
+          rowEl &&
+          typeof se.contains === "function" &&
+          se.contains(rowEl)
+        ) {
+          continue;
+        }
+        if (!isBelowTrigger(se)) continue;
+        // 拒绝包含其他对话框或包含打开前已有可见元素的外层容器，让内层真正的浮层独立参与候选
+        if (containsNestedModal(se) || containsPreExistingVisible(se)) continue;
+        var segInfo = extractRowNameAndCount(se, true);
+        if (!norm(segInfo.fullText)) continue;
+        validItems.push({ el: se, idx: si, rect: getRect(se) });
+      }
+      if (validItems.length === 0) return null;
+      var validEls = validItems.map(function (item) {
+        return item.el;
+      });
+      var topLevel = validItems.filter(function (item) {
+        var anc = item.el.parentElement;
+        while (anc && anc !== root) {
+          if (validEls.indexOf(anc) !== -1) return false;
+          anc = anc.parentElement;
+        }
+        return true;
+      });
+      if (topLevel.length === 0) return null;
+      topLevel.sort(function (a, b) {
+        var da = Math.max(0, a.rect.top - entryRect.bottom);
+        var db = Math.max(0, b.rect.top - entryRect.bottom);
+        if (Math.abs(da - db) > 8) return da - db;
+        var la = Math.abs(a.rect.left - entryRect.left);
+        var lb = Math.abs(b.rect.left - entryRect.left);
+        if (Math.abs(la - lb) > 8) return la - lb;
+        var aIsModal = matchesAnySelector(a.el, [MODAL_SELECTOR]) ? 1 : 0;
+        var bIsModal = matchesAnySelector(b.el, [MODAL_SELECTOR]) ? 1 : 0;
+        if (aIsModal !== bIsModal) return aIsModal - bIsModal;
+        return b.idx - a.idx;
+      });
+      return topLevel[0].el;
     };
 
     var popups = [];
@@ -1659,7 +2235,10 @@ export function runCollectionDomAction(payload) {
       }
     }
 
+    var newOverlay = enableTextLeaf ? findNewBelowOverlayContainer() : null;
+
     var findClosestBelowPopupEl = function () {
+      if (newOverlay) return newOverlay;
       if (hasEntryRect) {
         var belowKnown = popups.filter(function (p) {
           return isBelowTrigger(p);
@@ -1675,67 +2254,6 @@ export function runCollectionDomAction(payload) {
           });
           return belowKnown[0];
         }
-        var belowEls = [];
-        var scanEls = [];
-        try {
-          scanEls = Array.from(root.querySelectorAll("*"));
-        } catch (_) {
-          scanEls = [];
-        }
-        for (var si = 0; si < scanEls.length; si++) {
-          var se = scanEls[si];
-          if (!isVisible(se)) continue;
-          var sTag = String(se.tagName || "").toUpperCase();
-          if (
-            sTag === "HTML" ||
-            sTag === "BODY" ||
-            sTag === "MAIN" ||
-            sTag === "FORM" ||
-            sTag === "SCRIPT" ||
-            sTag === "STYLE" ||
-            sTag === "HEAD"
-          ) {
-            continue;
-          }
-          if (isInExcludedNavArea(se) || isInTriggerRow(se)) continue;
-          if (
-            entryEl &&
-            typeof se.contains === "function" &&
-            se.contains(entryEl)
-          ) {
-            continue;
-          }
-          if (
-            rowEl &&
-            typeof se.contains === "function" &&
-            se.contains(rowEl)
-          ) {
-            continue;
-          }
-          if (!isBelowTrigger(se)) continue;
-          if (!norm(getText(se))) continue;
-          belowEls.push({ el: se, idx: si, rect: getRect(se) });
-        }
-        var belowSet = belowEls.map(function (item) {
-          return item.el;
-        });
-        var topLevelBelow = belowEls.filter(function (item) {
-          var anc = item.el.parentElement;
-          while (anc && anc !== root) {
-            if (belowSet.indexOf(anc) !== -1) return false;
-            anc = anc.parentElement;
-          }
-          return true;
-        });
-        if (topLevelBelow.length > 0) {
-          topLevelBelow.sort(function (a, b) {
-            var da = Math.max(0, a.rect.top - entryRect.bottom);
-            var db = Math.max(0, b.rect.top - entryRect.bottom);
-            if (Math.abs(da - db) > 8) return da - db;
-            return b.idx - a.idx;
-          });
-          return topLevelBelow[0].el;
-        }
       }
       if (popups.length > 0) return popups[0];
       if (
@@ -1750,7 +2268,7 @@ export function runCollectionDomAction(payload) {
       return entryEl || null;
     };
 
-    if (popups.length === 0 && !enableTextLeaf) {
+    if (popups.length === 0 && !newOverlay) {
       return {
         ok: false,
         reason: "popup_not_found",
@@ -1768,7 +2286,7 @@ export function runCollectionDomAction(payload) {
     ];
     var optionTextSelectors = cfg.optionTextSelectors || [".title", ".name"];
 
-    var extractOptionName = function (opt) {
+    var extractSphOptionName = function (opt) {
       if (typeof opt.getAttribute === "function") {
         var attrLabel = clean(
           opt.getAttribute("label") || opt.getAttribute("title") || ""
@@ -1789,10 +2307,10 @@ export function runCollectionDomAction(payload) {
 
     var belowPopupCandidates = [];
     var otherPopupCandidates = [];
-    var popupBelowHasOptions = false;
     var matchedOption = null;
     var matchedPopup = null;
     var matchedName = "";
+    var matchedCountText = "";
     var matchedStrategy = "popup";
 
     for (var pIdx = 0; pIdx < popups.length; pIdx++) {
@@ -1800,18 +2318,42 @@ export function runCollectionDomAction(payload) {
       var popupIsBelow = !isSphPlatform && isBelowTrigger(popup);
       var opts = queryList(popup, optionSelectors).filter(function (el) {
         if (!isVisible(el) || el === entryEl) return false;
-        if (!isSphPlatform && isInExcludedNavArea(el)) return false;
+        if (!isSphPlatform && isForbiddenOptionEl(el)) return false;
         return true;
       });
       for (var oi = 0; oi < opts.length; oi++) {
         var opt = opts[oi];
-        var rawOptName = extractOptionName(opt);
-        var name = stripCount(rawOptName);
+        var name = "";
+        var optCountText = "";
+        var fullKey = "";
+        if (isSphPlatform) {
+          name = extractSphOptionName(opt);
+          fullKey = norm(name);
+        } else {
+          var optInfo = extractRowNameAndCount(opt, true);
+          if (norm(optInfo.fullText)) {
+            name = optInfo.name;
+            optCountText = optInfo.countText;
+            fullKey = norm(optInfo.fullText);
+          } else if (
+            !norm(getText(opt)) &&
+            typeof opt.getAttribute === "function"
+          ) {
+            name = clean(
+              opt.getAttribute("label") || opt.getAttribute("title") || ""
+            );
+            fullKey = norm(name);
+          }
+        }
         var key = norm(name);
         if (!key) continue;
-        if (!isSphPlatform && isNonTargetOption(key)) continue;
+        if (
+          !isSphPlatform &&
+          (isNonTargetOption(fullKey) || isNonTargetOption(key))
+        ) {
+          continue;
+        }
         if (popupIsBelow) {
-          popupBelowHasOptions = true;
           belowPopupCandidates.push(name);
         } else {
           otherPopupCandidates.push(name);
@@ -1824,249 +2366,314 @@ export function runCollectionDomAction(payload) {
           matchedOption = opt;
           matchedPopup = popup;
           matchedName = name;
+          matchedCountText = optCountText;
         }
       }
       if (matchedOption) break;
     }
 
     var belowCandidates = [];
-    var nonContentTagRe =
-      /^(SCRIPT|STYLE|SVG|PATH|IMG|BR|HR|HEAD|META|LINK|BODY|HTML|INPUT|TEXTAREA)$/;
 
-    var matchesTargetLeafText = function (el) {
-      if (!targetNorm || isNonTargetOption(targetNorm)) return false;
-      var raw = clean(getText(el));
-      if (!raw) return false;
-      var rawKey = norm(raw);
-      if (rawKey && !isNonTargetOption(rawKey) && rawKey === targetNorm) {
-        return true;
-      }
-      var stripped = stripCount(raw);
-      var strippedKey = norm(stripped);
-      if (
-        strippedKey &&
-        !isNonTargetOption(strippedKey) &&
-        strippedKey === targetNorm
-      ) {
-        return true;
-      }
-      return false;
-    };
-
-    var isClickableOptionNode = function (el) {
-      if (!el || el.nodeType !== 1) return false;
+    var getClickableRowStrength = function (el, overlay) {
+      // 返回 0=非候选行，1=弱启发（类名/cursor），2=强可点击行（事件处理/语义标签/角色/tabindex）
+      if (!el || el.nodeType !== 1 || el === overlay) return 0;
+      if (!isVisible(el) || isForbiddenOptionEl(el)) return 0;
       var tag = String(el.tagName || "").toUpperCase();
-      if (
-        tag === "LI" ||
-        tag === "BUTTON" ||
-        tag === "A" ||
-        tag === "LABEL"
-      ) {
-        return true;
+      if (nonContentTagRe.test(tag)) return 0;
+
+      var hasOwnHandler =
+        typeof el.onclick === "function" ||
+        typeof el.onClick === "function" ||
+        typeof el.onmousedown === "function" ||
+        typeof el.onMouseDown === "function";
+      var role =
+        typeof el.getAttribute === "function"
+          ? String(el.getAttribute("role") || "").toLowerCase()
+          : "";
+      var isOptionRole =
+        role === "option" ||
+        role === "menuitem" ||
+        role === "menuitemradio" ||
+        role === "menuitemcheckbox" ||
+        role === "radio" ||
+        role === "listitem" ||
+        role === "treeitem";
+      var hasTabIndex =
+        typeof el.getAttribute === "function" &&
+        el.getAttribute("tabindex") !== null;
+
+      if (inlineTextTagRe.test(tag)) {
+        return hasOwnHandler || isOptionRole || hasTabIndex ? 2 : 0;
       }
-      if (typeof el.onclick === "function" || typeof el.onClick === "function") {
-        return true;
-      }
+
+      if (tag === "LI" || tag === "TR" || tag === "LABEL") return 2;
+      if (hasOwnHandler || isOptionRole || hasTabIndex) return 2;
+
       if (typeof el.getAttribute === "function") {
-        var role = String(el.getAttribute("role") || "").toLowerCase();
-        if (
-          role === "option" ||
-          role === "menuitem" ||
-          role === "button" ||
-          role === "radio"
-        ) {
-          return true;
-        }
-        if (el.getAttribute("tabindex") !== null) return true;
         var cls = String(el.getAttribute("class") || "");
-        var clsTokens = cls.replace(/([a-z])([A-Z])/g, "$1-$2").toLowerCase();
-        if (/(?:^|[\s_-])(?:option|item|card)(?:$|[\s_-])/.test(clsTokens)) {
-          return true;
-        }
-      }
-      return false;
-    };
-
-    var resolveClickableTarget = function (leaf) {
-      if (!leaf) return null;
-      if (
-        typeof leaf.onclick === "function" ||
-        typeof leaf.onClick === "function"
-      ) {
-        return leaf;
-      }
-      var leafTag = String(leaf.tagName || "").toUpperCase();
-      if (leafTag === "LI" || leafTag === "BUTTON" || leafTag === "A") {
-        return leaf;
-      }
-      if (typeof leaf.getAttribute === "function") {
-        var leafRole = String(leaf.getAttribute("role") || "").toLowerCase();
-        if (
-          leafRole === "option" ||
-          leafRole === "menuitem" ||
-          leafRole === "button" ||
-          leafRole === "radio" ||
-          leaf.getAttribute("tabindex") !== null
-        ) {
-          return leaf;
-        }
-      }
-      var anc = leaf.parentElement;
-      for (var depth = 0; anc && depth < 4; depth++) {
-        if (
-          anc === root ||
-          anc === docRef ||
-          (docRef && (anc === docRef.body || anc === docRef.documentElement))
-        ) {
-          break;
-        }
-        if (
-          !isVisible(anc) ||
-          isInExcludedNavArea(anc) ||
-          isInTriggerRow(anc) ||
-          getSubmitRejectionReason(anc)
-        ) {
-          break;
-        }
-        if (!matchesTargetLeafText(anc)) break;
-        if (isClickableOptionNode(anc)) return anc;
-        anc = anc.parentElement;
-      }
-      return leaf;
-    };
-
-    var collectBelowCandidates = function (scanScope) {
-      var out = [];
-      if (!scanScope || typeof scanScope.querySelectorAll !== "function") {
-        return out;
-      }
-      var nodes = [];
-      try {
-        nodes = Array.from(scanScope.querySelectorAll("*"));
-      } catch (_) {
-        nodes = [];
-      }
-      var leafItems = [];
-      for (var ci = 0; ci < nodes.length; ci++) {
-        var n = nodes[ci];
-        if (!isVisible(n)) continue;
-        var nTag = String(n.tagName || "").toUpperCase();
-        if (nonContentTagRe.test(nTag)) continue;
-        if (isInExcludedNavArea(n) || isInTriggerRow(n)) continue;
-        if (!isBelowTrigger(n)) continue;
-        if (getSubmitRejectionReason(n)) continue;
-        var nKids = n.children ? Array.from(n.children) : [];
-        var hasTextChild = false;
-        for (var ki = 0; ki < nKids.length; ki++) {
-          var kc = nKids[ki];
-          if (!isVisible(kc)) continue;
-          var kcTag = String(kc.tagName || "").toUpperCase();
-          if (nonContentTagRe.test(kcTag)) continue;
-          if (norm(getText(kc))) {
-            hasTextChild = true;
-            break;
+        var clsParts = cls.split(/\s+/).filter(Boolean);
+        var subPartRe =
+          /(?:^|[_-])(?:title|name|text|label|desc|sub|suffix|prefix|count|meta|extra|info|icon|thumb|img|cover|avatar|badge|tag|content|body|left|right|main|inner|wrap|wrapper|list|group|container|panel|box|header|footer)(?:$|[_-])/;
+        var rowEndRe =
+          /(?:^|[_-])(?:option|item|row|card|choice|entry)(?:$|_[a-z0-9]{4,})/;
+        for (var ci2 = 0; ci2 < clsParts.length; ci2++) {
+          var tok = clsParts[ci2]
+            .replace(/([a-z])([A-Z])/g, "$1-$2")
+            .toLowerCase();
+          if (rowEndRe.test(tok) && !subPartRe.test(tok)) {
+            return 1;
           }
         }
-        if (hasTextChild) continue;
-        var strippedName = stripCount(clean(getText(n)));
-        var strippedKey = norm(strippedName);
-        if (
-          !strippedKey ||
-          strippedName.length > 60 ||
-          isNonTargetOption(strippedKey)
-        ) {
-          continue;
-        }
-        leafItems.push({
-          name: strippedName,
-          top: getRect(n).top,
-          idx: ci,
-        });
       }
-      leafItems.sort(function (a, b) {
-        if (a.top !== b.top) return a.top - b.top;
-        return a.idx - b.idx;
-      });
-      for (var li = 0; li < leafItems.length; li++) {
-        out.push(leafItems[li].name);
-      }
-      return out;
-    };
 
-    // 回退策略 text_leaf：弹层选择器未命中，或命中的弹层里没有同名项时启用
-    var matchedLeafEl = null;
-    if (!matchedOption && enableTextLeaf && hasEntryRect) {
-      var allScanEls = [];
-      try {
-        allScanEls = Array.from(root.querySelectorAll("*"));
-      } catch (_) {
-        allScanEls = [];
-      }
-      var leafMatches = [];
-      if (targetNorm && !isNonTargetOption(targetNorm)) {
-        for (var ti2 = 0; ti2 < allScanEls.length; ti2++) {
-          var candEl = allScanEls[ti2];
-          if (!isVisible(candEl)) continue;
-          var cTag = String(candEl.tagName || "").toUpperCase();
-          if (nonContentTagRe.test(cTag)) continue;
-          if (isInExcludedNavArea(candEl) || isInTriggerRow(candEl)) continue;
-          if (getSubmitRejectionReason(candEl)) continue;
-          if (!isBelowTrigger(candEl)) continue;
-          if (!matchesTargetLeafText(candEl)) continue;
-          var descNodes = [];
-          try {
-            descNodes = Array.from(candEl.querySelectorAll("*"));
-          } catch (_) {
-            descNodes = [];
-          }
-          var hasSameTextDesc = false;
-          for (var di = 0; di < descNodes.length; di++) {
-            var dn = descNodes[di];
-            if (
-              isVisible(dn) &&
-              isBelowTrigger(dn) &&
-              matchesTargetLeafText(dn)
-            ) {
-              hasSameTextDesc = true;
-              break;
+      if (typeof getComputedStyle === "function") {
+        try {
+          var st = getComputedStyle(el);
+          if (st && st.cursor === "pointer") {
+            var pSt =
+              el.parentElement && el.parentElement !== overlay
+                ? getComputedStyle(el.parentElement)
+                : null;
+            if (!pSt || pSt.cursor !== "pointer") {
+              return 1;
             }
           }
-          if (hasSameTextDesc) continue;
-          leafMatches.push(candEl);
-        }
+        } catch (_) {}
       }
-      if (leafMatches.length === 1) {
-        matchedLeafEl = leafMatches[0];
-        matchedOption = resolveClickableTarget(matchedLeafEl);
-        matchedName =
-          stripCount(clean(getText(matchedLeafEl))) ||
-          clean(getText(matchedLeafEl));
-        matchedStrategy = "text_leaf";
-        var panelAnc = matchedOption ? matchedOption.parentElement : null;
-        while (panelAnc && panelAnc !== root) {
-          if (
-            panelAnc === docRef ||
-            (docRef &&
-              (panelAnc === docRef.body ||
-                panelAnc === docRef.documentElement))
-          ) {
-            break;
-          }
-          if (isInExcludedNavArea(panelAnc) || isInTriggerRow(panelAnc)) break;
-          if (isBelowTrigger(panelAnc)) {
-            matchedPopup = panelAnc;
-          }
-          panelAnc = panelAnc.parentElement;
-        }
-      }
-    }
+      return 0;
+    };
 
-    if (!isSphPlatform && hasEntryRect && !popupBelowHasOptions) {
-      if (matchedPopup && isBelowTrigger(matchedPopup)) {
-        belowCandidates = collectBelowCandidates(matchedPopup);
+    var findOptionRowsInOverlay = function (overlay) {
+      if (!overlay || typeof overlay.querySelectorAll !== "function") return [];
+      var allDesc = [];
+      try {
+        allDesc = Array.from(overlay.querySelectorAll("*"));
+      } catch (_) {
+        allDesc = [];
       }
-      if (belowCandidates.length === 0) {
-        belowCandidates = collectBelowCandidates(root);
+
+      var rawClickable = [];
+      for (var i = 0; i < allDesc.length; i++) {
+        var d = allDesc[i];
+        var strength = getClickableRowStrength(d, overlay);
+        if (!strength) continue;
+        var info = extractRowNameAndCount(d, true);
+        if (!norm(info.fullText)) continue;
+        rawClickable.push({ el: d, strength: strength });
+      }
+
+      // 若内联元素自身挂了点击但父块级行含其他非计数同级文本（拆分文本），提升至父块级行
+      var promoted = [];
+      var pushPromoted = function (el, strength) {
+        for (var idx = 0; idx < promoted.length; idx++) {
+          if (promoted[idx].el === el) {
+            if (strength > promoted[idx].strength) {
+              promoted[idx].strength = strength;
+            }
+            return;
+          }
+        }
+        promoted.push({ el: el, strength: strength });
+      };
+      for (var pi2 = 0; pi2 < rawClickable.length; pi2++) {
+        var rcItem = rawClickable[pi2];
+        var rc = rcItem.el;
+        var rcStrength = rcItem.strength;
+        var rcTag = String(rc.tagName || "").toUpperCase();
+        if (inlineTextTagRe.test(rcTag)) {
+          var pBlk = rc.parentElement;
+          while (
+            pBlk &&
+            pBlk !== overlay &&
+            inlineTextTagRe.test(String(pBlk.tagName || "").toUpperCase())
+          ) {
+            pBlk = pBlk.parentElement;
+          }
+          if (
+            pBlk &&
+            pBlk !== overlay &&
+            !isForbiddenOptionEl(pBlk) &&
+            isVisible(pBlk)
+          ) {
+            var rcInfo = extractRowNameAndCount(rc, true);
+            var pInfo = extractRowNameAndCount(pBlk, true);
+            if (norm(pInfo.name) !== norm(rcInfo.name)) {
+              rc = pBlk;
+              rcStrength = 2;
+            }
+          }
+        }
+        pushPromoted(rc, rcStrength);
+      }
+
+      var rows = [];
+      if (promoted.length > 0) {
+        var dropSet = [];
+        for (var ai = 0; ai < promoted.length; ai++) {
+          var ancItem = promoted[ai];
+          var anc = ancItem.el;
+          var innerItems = [];
+          for (var bi = 0; bi < promoted.length; bi++) {
+            if (ai === bi) continue;
+            var descItem = promoted[bi];
+            if (
+              typeof anc.contains === "function" &&
+              anc.contains(descItem.el)
+            ) {
+              innerItems.push(descItem);
+            }
+          }
+          if (innerItems.length === 0) continue;
+          var disjointInner = innerItems.filter(function (item) {
+            return !innerItems.some(function (other) {
+              return (
+                other.el !== item.el &&
+                typeof other.el.contains === "function" &&
+                other.el.contains(item.el)
+              );
+            });
+          });
+          if (disjointInner.length >= 2) {
+            // 强可点击行不被弱启发子块拆散；同水平排布的子块也视为同一行局部片段
+            var hasStrongDesc = disjointInner.some(function (it) {
+              return it.strength >= 2;
+            });
+            var isHorizontalSplit = false;
+            if (!hasStrongDesc) {
+              var dr0 = getRect(disjointInner[0].el);
+              var dr1 = getRect(disjointInner[1].el);
+              if (
+                dr0 &&
+                dr1 &&
+                Math.abs(dr1.top - dr0.top) < 8 &&
+                (dr1.left >= dr0.right - 2 || dr0.left >= dr1.right - 2)
+              ) {
+                isHorizontalSplit = true;
+              }
+            }
+            if ((ancItem.strength >= 2 && !hasStrongDesc) || isHorizontalSplit) {
+              for (var di1 = 0; di1 < innerItems.length; di1++) {
+                if (dropSet.indexOf(innerItems[di1].el) === -1) {
+                  dropSet.push(innerItems[di1].el);
+                }
+              }
+            } else if (dropSet.indexOf(anc) === -1) {
+              dropSet.push(anc);
+            }
+          } else if (disjointInner.length === 1) {
+            var ancInfo = extractRowNameAndCount(anc, true);
+            var innerInfo = extractRowNameAndCount(disjointInner[0].el, true);
+            if (norm(ancInfo.name) === norm(innerInfo.name)) {
+              if (dropSet.indexOf(anc) === -1) dropSet.push(anc);
+            } else {
+              for (var di2 = 0; di2 < innerItems.length; di2++) {
+                if (dropSet.indexOf(innerItems[di2].el) === -1) {
+                  dropSet.push(innerItems[di2].el);
+                }
+              }
+            }
+          }
+        }
+        rows = promoted
+          .filter(function (item) {
+            return dropSet.indexOf(item.el) === -1;
+          })
+          .map(function (item) {
+            return item.el;
+          });
+      } else {
+        var cur = overlay;
+        for (var depth = 0; depth < 6; depth++) {
+          var visKids = (cur.children ? Array.from(cur.children) : []).filter(
+            function (c) {
+              return (
+                isVisible(c) &&
+                !isForbiddenOptionEl(c) &&
+                norm(extractRowNameAndCount(c, true).fullText)
+              );
+            }
+          );
+          if (visKids.length === 1) {
+            var onlyTag = String(visKids[0].tagName || "").toUpperCase();
+            if (inlineTextTagRe.test(onlyTag)) break;
+            cur = visKids[0];
+            continue;
+          }
+          if (visKids.length >= 2) {
+            var allBlock = visKids.every(function (k) {
+              return !inlineTextTagRe.test(
+                String(k.tagName || "").toUpperCase()
+              );
+            });
+            var isHorizontalCols = false;
+            if (allBlock && cur !== overlay) {
+              var r0 = getRect(visKids[0]);
+              var r1 = getRect(visKids[1]);
+              if (
+                r0 &&
+                r1 &&
+                Math.abs(r1.top - r0.top) < 8 &&
+                (r1.left >= r0.right - 2 || r0.left >= r1.right - 2)
+              ) {
+                isHorizontalCols = true;
+              }
+            }
+            if (allBlock && !isHorizontalCols) {
+              rows = visKids;
+            } else if (cur !== overlay) {
+              rows = [cur];
+            }
+          }
+          break;
+        }
+        if (rows.length === 0 && cur !== overlay && !isForbiddenOptionEl(cur)) {
+          rows = [cur];
+        }
+      }
+
+      rows.sort(function (a, b) {
+        var ra = getRect(a);
+        var rb = getRect(b);
+        if (ra && rb && ra.top !== rb.top) return ra.top - rb.top;
+        return 0;
+      });
+      return rows;
+    };
+
+    // 回退策略 text_leaf：严格仅在打开入口后新增、位于触发器下方且水平重叠的那个浮层内按选项行匹配
+    if (!matchedOption && enableTextLeaf && newOverlay) {
+      var overlayRows = findOptionRowsInOverlay(newOverlay);
+      var rowMatches = [];
+      for (var ri = 0; ri < overlayRows.length; ri++) {
+        var rEl = overlayRows[ri];
+        if (isForbiddenOptionEl(rEl)) continue;
+        var rowInfo = extractRowNameAndCount(rEl, true);
+        var rowFullKey = norm(rowInfo.fullText);
+        var rowName = rowInfo.name;
+        var rowKey = norm(rowName);
+        if (!rowKey) continue;
+        if (isNonTargetOption(rowFullKey) || isNonTargetOption(rowKey)) {
+          continue;
+        }
+        belowCandidates.push(rowName);
+        if (
+          targetNorm &&
+          !isNonTargetOption(targetNorm) &&
+          rowKey === targetNorm
+        ) {
+          rowMatches.push({
+            el: rEl,
+            name: rowName,
+            countText: rowInfo.countText,
+          });
+        }
+      }
+      if (rowMatches.length === 1) {
+        matchedOption = rowMatches[0].el;
+        matchedName = rowMatches[0].name;
+        matchedCountText = rowMatches[0].countText;
+        matchedStrategy = "text_leaf";
+        matchedPopup = newOverlay;
       }
     }
 
@@ -2087,31 +2694,29 @@ export function runCollectionDomAction(payload) {
     appendCandidates(belowCandidates);
     appendCandidates(otherPopupCandidates);
 
+    var hasOverlay = popups.length > 0 || Boolean(newOverlay);
     if (!matchedOption) {
       var failReason =
         candidates.length > 0
           ? "option_not_found"
-          : popups.length === 0
+          : !hasOverlay
           ? "popup_not_found"
           : "options_empty";
       return {
         ok: false,
         reason: failReason,
-        popupFound: popups.length > 0,
+        popupFound: hasOverlay,
         candidates: candidates.slice(0, candidateLimit),
         totalCandidates: candidates.length,
         domSnippet: getSanitizedDomSnippet(findClosestBelowPopupEl()),
       };
     }
 
-    if (
-      isOptionDisabled(matchedOption) ||
-      (matchedLeafEl && isOptionDisabled(matchedLeafEl))
-    ) {
+    if (isOptionDisabled(matchedOption)) {
       return {
         ok: false,
         reason: "option_disabled",
-        popupFound: popups.length > 0 || matchedStrategy === "text_leaf",
+        popupFound: hasOverlay,
         candidates: candidates.slice(0, candidateLimit),
         totalCandidates: candidates.length,
         domSnippet: getSanitizedDomSnippet(findClosestBelowPopupEl()),
@@ -2128,15 +2733,24 @@ export function runCollectionDomAction(payload) {
         matchedPopup.getAttribute("class")) ||
         ""
     );
-    var inModal = /dialog|modal/i.test(popupClass);
-    // 标记本次选中所在弹层，确认步骤只认这个弹层（不点全页任意弹窗的「确定」）
+    var inModal =
+      matchedStrategy === "text_leaf"
+        ? Boolean(
+            matchedPopup && matchesAnySelector(matchedPopup, [MODAL_SELECTOR])
+          )
+        : /dialog|modal/i.test(popupClass);
+    // 标记本次选中所在弹层，确认步骤只认这个弹层（text_leaf 严格只认该浮层本身）
     if (token && matchedPopup && typeof matchedPopup.setAttribute === "function") {
       matchedPopup.setAttribute("data-mm-collection-popup", token);
+      if (matchedStrategy === "text_leaf") {
+        matchedPopup.setAttribute("data-mm-collection-popup-strict", "1");
+      }
     }
 
     return {
       ok: true,
       matchedName: matchedName,
+      matchedCountText: matchedCountText,
       strategy: matchedStrategy,
       candidates: candidates.slice(0, candidateLimit),
       totalCandidates: candidates.length,
@@ -2159,9 +2773,15 @@ export function runCollectionDomAction(payload) {
     var popupMark = token
       ? root.querySelector('[data-mm-collection-popup="' + token + '"]')
       : null;
-    // 只确认「包含本次选中弹层」或「就是该弹层」的对话框；找不到就不点，交给回读判定
+    var isStrictPopup = Boolean(
+      popupMark &&
+        typeof popupMark.getAttribute === "function" &&
+        popupMark.getAttribute("data-mm-collection-popup-strict") === "1"
+    );
+    // 只确认本次被标记弹层对应的对话框（text_leaf 严格只在被标记浮层本身内找确认按钮）
     modals = popupMark
       ? modals.filter(function (m) {
+          if (isStrictPopup) return m === popupMark;
           return m === popupMark || m.contains(popupMark) || popupMark.contains(m);
         })
       : [];
@@ -2245,6 +2865,8 @@ export function clickCollectionModalConfirmInDom(payload) {
 export function readSelectedCollectionInDom(payload) {
   var cfg = (payload && payload.config) || {};
   var token = String((payload && payload.token) || "");
+  var isSphPlatform =
+    cfg.platformKey === "sph" || Boolean(cfg.useShadowRoot);
   var norm = function (t) {
     return String(t == null ? "" : t)
       .replace(/[\uFEFF\u200B\u200C\u200D]/g, "")
@@ -2262,11 +2884,28 @@ export function readSelectedCollectionInDom(payload) {
   var isHiddenForText = function (el) {
     if (!el || el.nodeType !== 1) return false;
     if (el.hidden) return true;
-    if (el.getAttribute && el.getAttribute("aria-hidden") === "true") return true;
+    if (typeof el.getAttribute === "function") {
+      if (el.getAttribute("hidden") !== null) return true;
+      if (el.getAttribute("aria-hidden") === "true") return true;
+    }
     try {
-      var view = (el.ownerDocument && el.ownerDocument.defaultView) || window;
-      var st = view.getComputedStyle(el);
-      if (st && (st.display === "none" || st.visibility === "hidden")) return true;
+      var view =
+        (el.ownerDocument && el.ownerDocument.defaultView) ||
+        (typeof window !== "undefined" ? window : null);
+      var styleFn =
+        (view && typeof view.getComputedStyle === "function"
+          ? view.getComputedStyle
+          : null) ||
+        (typeof getComputedStyle === "function" ? getComputedStyle : null);
+      var st = styleFn ? styleFn(el) : null;
+      if (
+        st &&
+        (st.display === "none" ||
+          st.visibility === "hidden" ||
+          String(st.opacity) === "0")
+      ) {
+        return true;
+      }
     } catch (_) {}
     return false;
   };
@@ -2284,6 +2923,145 @@ export function readSelectedCollectionInDom(payload) {
     var out = "";
     for (var gi = 0; gi < kids.length; gi++) out += getText(kids[gi]);
     return out;
+  };
+
+  var standaloneCountRe =
+    /^(?:[/·•|｜\-—]\s*)?(?:[\(（]\s*(?:共\s*)?\d+\s*(?:个|条|篇|部)?\s*(?:作品|视频)\s*[\)）]|(?:共\s*)?\d+\s*(?:个|条|篇|部)?\s*(?:作品|视频))$/;
+  var standaloneSepRe = /^[/·•|｜\-—]+$/;
+
+  var collectVisibleSegments = function (node, out) {
+    if (!node) return;
+    if (node.nodeType === 3) {
+      var rawVal = String(node.nodeValue == null ? "" : node.nodeValue);
+      if (clean(rawVal)) {
+        out.push({
+          raw: rawVal,
+          cleaned: clean(rawVal),
+          el: node.parentElement || null,
+        });
+      }
+      return;
+    }
+    if (node.nodeType !== 1 && node.nodeType !== 11) return;
+    if (node.nodeType === 1) {
+      if (isHiddenForText(node)) return;
+      var nTag = String(node.tagName || "").toUpperCase();
+      if (
+        nTag === "SCRIPT" ||
+        nTag === "STYLE" ||
+        nTag === "SVG" ||
+        nTag === "PATH" ||
+        nTag === "IMG" ||
+        nTag === "BR" ||
+        nTag === "HR"
+      ) {
+        return;
+      }
+    }
+    var kids = node.childNodes;
+    if (kids && kids.length > 0) {
+      for (var i = 0; i < kids.length; i++) {
+        collectVisibleSegments(kids[i], out);
+      }
+      return;
+    }
+    var elKids = node.children ? Array.from(node.children) : [];
+    if (elKids.length > 0) {
+      if (typeof node._text === "string" && clean(node._text)) {
+        out.push({ raw: node._text, cleaned: clean(node._text), el: node });
+      }
+      for (var j = 0; j < elKids.length; j++) {
+        collectVisibleSegments(elKids[j], out);
+      }
+      return;
+    }
+    var leafRaw =
+      node.textContent != null
+        ? String(node.textContent)
+        : node.innerText != null
+        ? String(node.innerText)
+        : "";
+    if (clean(leafRaw)) {
+      out.push({ raw: leafRaw, cleaned: clean(leafRaw), el: node });
+    }
+  };
+
+  var extractReadbackNameAndCount = function (el) {
+    var segs = [];
+    collectVisibleSegments(el, segs);
+    if (segs.length === 0) {
+      return { fullText: "", name: "", countText: "" };
+    }
+    var joinSegs = function (arr) {
+      var s = "";
+      for (var i = 0; i < arr.length; i++) s += arr[i].raw;
+      return clean(s);
+    };
+    var fullText = joinSegs(segs);
+    if (isSphPlatform || segs.length < 2) {
+      return { fullText: fullText, name: fullText, countText: "" };
+    }
+    var endIdx = segs.length;
+    var countText = "";
+    var lastSeg = segs[endIdx - 1];
+    if (standaloneCountRe.test(lastSeg.cleaned)) {
+      countText = lastSeg.cleaned;
+      endIdx -= 1;
+    } else {
+      var firstEl = segs[0].el;
+      for (var splitAt = segs.length - 1; splitAt >= 1; splitAt--) {
+        var tailJoined = joinSegs(segs.slice(splitAt));
+        if (!standaloneCountRe.test(tailJoined)) continue;
+        var commonAnc = segs[splitAt].el;
+        var validContainer = false;
+        while (commonAnc && commonAnc !== el && commonAnc.nodeType === 1) {
+          var coversTail = true;
+          for (var ti = splitAt; ti < segs.length; ti++) {
+            if (
+              segs[ti].el !== commonAnc &&
+              !(
+                typeof commonAnc.contains === "function" &&
+                commonAnc.contains(segs[ti].el)
+              )
+            ) {
+              coversTail = false;
+              break;
+            }
+          }
+          var touchesHead =
+            firstEl === commonAnc ||
+            (typeof commonAnc.contains === "function" &&
+              firstEl &&
+              commonAnc.contains(firstEl));
+          if (coversTail && !touchesHead) {
+            var ancSegs = [];
+            collectVisibleSegments(commonAnc, ancSegs);
+            if (norm(joinSegs(ancSegs)) === norm(tailJoined)) {
+              validContainer = true;
+              break;
+            }
+          }
+          commonAnc = commonAnc.parentElement;
+        }
+        if (validContainer) {
+          countText = tailJoined;
+          endIdx = splitAt;
+          break;
+        }
+      }
+    }
+    if (
+      countText &&
+      endIdx >= 2 &&
+      standaloneSepRe.test(segs[endIdx - 1].cleaned)
+    ) {
+      endIdx -= 1;
+    }
+    var nameText = joinSegs(segs.slice(0, endIdx));
+    if (!nameText) {
+      return { fullText: fullText, name: fullText, countText: "" };
+    }
+    return { fullText: fullText, name: nameText, countText: countText };
   };
 
   var root = document;
@@ -2374,8 +3152,6 @@ export function readSelectedCollectionInDom(payload) {
       "未选择",
       "不加入合集",
       "不添加到合集",
-      "不选择合集",
-      "选择要加入到的合集",
       "暂不加入",
       "不选择",
       "无合集",
@@ -2459,17 +3235,39 @@ export function readSelectedCollectionInDom(payload) {
 
   var readScope = entryEl || rowEl;
   if (readScope && isVisible(readScope) && !isInsidePopup(readScope)) {
-    // 1. 先检查控件完整拼接后的 textContent（含带内嵌 span 的「请选择<span>合集</span>」）：
+    // 1. 先检查控件完整拼接后的可见文本（含带内嵌 span 的「请选择<span>合集</span>」）：
     //    若整体属于占位/入口文案全集，直接判为未选，绝不拆解内层 span 误认成目标名。
     var entryFullText =
       entryEl && isVisible(entryEl) && !isInsidePopup(entryEl)
         ? clean(getText(entryEl))
         : "";
+    var entryReadInfo =
+      !isSphPlatform &&
+      entryEl &&
+      isVisible(entryEl) &&
+      !isInsidePopup(entryEl)
+        ? extractReadbackNameAndCount(entryEl)
+        : null;
     if (entryFullText && isPlaceholderText(entryFullText)) {
       return {
         ok: true,
         displayedText: entryFullText,
         selectedTexts: [],
+        countText: "",
+        isPlaceholder: true,
+        readbackSource: "entry_placeholder",
+      };
+    }
+    if (
+      entryReadInfo &&
+      entryReadInfo.name &&
+      isPlaceholderText(entryReadInfo.name)
+    ) {
+      return {
+        ok: true,
+        displayedText: entryReadInfo.fullText || entryFullText,
+        selectedTexts: [],
+        countText: "",
         isPlaceholder: true,
         readbackSource: "entry_placeholder",
       };
@@ -2478,6 +3276,7 @@ export function readSelectedCollectionInDom(payload) {
     var readbackSelectors = cfg.readbackSelectors || [];
     var selectedTexts = [];
     var selectedSeen = {};
+    var countTexts = [];
     var firstDisplayText = "";
     var firstReadbackSource = "";
 
@@ -2495,6 +3294,16 @@ export function readSelectedCollectionInDom(payload) {
         selectedTexts.push(c);
       }
     };
+    var pushCountText = function (cnt) {
+      var c = clean(cnt);
+      if (c && countTexts.indexOf(c) === -1) {
+        countTexts.push(c);
+      }
+    };
+
+    if (entryReadInfo && entryReadInfo.countText) {
+      pushCountText(entryReadInfo.countText);
+    }
 
     // 2. 按平台 readbackSelectors 收集可见且非占位节点（含祖先链检查）的完整文本
     for (var ri = 0; ri < readbackSelectors.length; ri++) {
@@ -2521,16 +3330,53 @@ export function readSelectedCollectionInDom(payload) {
         ) {
           continue;
         }
-        var txt = clean(getText(n));
-        if (txt) {
-          pushCandidate(txt, readbackSelectors[ri]);
+        if (isSphPlatform) {
+          var sphTxt = clean(getText(n));
+          if (sphTxt) {
+            pushCandidate(sphTxt, readbackSelectors[ri]);
+          }
+        } else {
+          var nInfo = extractReadbackNameAndCount(n);
+          if (!nInfo.name) continue;
+          // 防止拆分标题前半段（如 <span class="title">民间故事</span><span>续集</span>）经 .title 单独放行
+          if (entryReadInfo && norm(entryReadInfo.name)) {
+            if (norm(nInfo.name) !== norm(entryReadInfo.name)) {
+              continue;
+            }
+          } else if (
+            !entryEl &&
+            n.parentElement &&
+            n.parentElement !== rowEl &&
+            !isFormLabelNode(n.parentElement) &&
+            !(
+              rowLabelEl &&
+              typeof n.parentElement.contains === "function" &&
+              n.parentElement.contains(rowLabelEl)
+            )
+          ) {
+            var parentInfo = extractReadbackNameAndCount(n.parentElement);
+            if (
+              parentInfo.name &&
+              norm(parentInfo.name) !== norm(nInfo.name)
+            ) {
+              continue;
+            }
+          }
+          if (nInfo.countText) pushCountText(nInfo.countText);
+          pushCandidate(nInfo.name, readbackSelectors[ri]);
         }
       }
     }
 
     // 3. 控件完整文本（已排除占位文案，不再扫描任意内层叶 span）
     if (entryFullText && !isInsidePlaceholderNode(entryEl, readScope)) {
-      pushCandidate(entryFullText, "entry");
+      if (isSphPlatform) {
+        pushCandidate(entryFullText, "entry");
+      } else if (entryReadInfo && entryReadInfo.name) {
+        pushCandidate(entryReadInfo.name, "entry");
+      } else {
+        pushCandidate(entryFullText, "entry");
+      }
     }
 
     if (firstDisplayText || selectedTexts.length > 0) {
@@ -2538,6 +3384,8 @@ export function readSelectedCollectionInDom(payload) {
         ok: true,
         displayedText: selectedTexts[0] || firstDisplayText,
         selectedTexts: selectedTexts,
+        countText: countTexts[0] || "",
+        countTexts: countTexts,
         isPlaceholder:
           selectedTexts.length === 0 && isPlaceholderText(firstDisplayText),
         readbackSource: firstReadbackSource || (entryEl ? "entry" : "row"),
@@ -2550,6 +3398,7 @@ export function readSelectedCollectionInDom(payload) {
     reason: "readback_target_missing",
     displayedText: "",
     selectedTexts: [],
+    countText: "",
     isPlaceholder: false,
   };
 }
@@ -2566,18 +3415,23 @@ export function cleanupCollectionMarkersInDom(payload) {
     root = host && host.shadowRoot ? host.shadowRoot : null;
     if (!root) return;
   }
+  var markerAttrs = [
+    "data-mm-collection-entry",
+    "data-mm-collection-row",
+    "data-mm-collection-popup",
+    "data-mm-collection-pre",
+    "data-mm-collection-pre-ready",
+  ];
   try {
-    var entries = root.querySelectorAll(
-      '[data-mm-collection-entry="' + token + '"]'
-    );
-    for (var i = 0; i < entries.length; i++) {
-      entries[i].removeAttribute("data-mm-collection-entry");
-    }
-    var rows = root.querySelectorAll(
-      '[data-mm-collection-row="' + token + '"]'
-    );
-    for (var j = 0; j < rows.length; j++) {
-      rows[j].removeAttribute("data-mm-collection-row");
+    for (var mi = 0; mi < markerAttrs.length; mi++) {
+      var attr = markerAttrs[mi];
+      var marked = root.querySelectorAll("[" + attr + '="' + token + '"]');
+      for (var i = 0; i < marked.length; i++) {
+        marked[i].removeAttribute(attr);
+        if (attr === "data-mm-collection-popup") {
+          marked[i].removeAttribute("data-mm-collection-popup-strict");
+        }
+      }
     }
   } catch (_) {}
 }
@@ -2915,12 +3769,16 @@ export async function selectPlatformCollection(
         (readbackResult && readbackResult.displayedText) || ""
       ).trim();
       const stripCountSuffix = config.platformKey !== "sph";
+      const countNodeText = stripCountSuffix
+        ? String((pickResult && pickResult.matchedCountText) || "")
+        : "";
       if (
         readbackResult &&
         readbackResult.ok &&
         matchesCollectionReadback(readbackResult, targetName, {
           placeholders: config.entryTexts,
           stripCountSuffix,
+          countNodeText,
         })
       ) {
         const matchedDisplay =
@@ -2929,6 +3787,8 @@ export async function selectPlatformCollection(
               matchesCollectionReadback(t, targetName, {
                 placeholders: config.entryTexts,
                 stripCountSuffix,
+                countNodeText:
+                  (readbackResult && readbackResult.countText) || countNodeText,
               })
             )) ||
           lastDisplayed;

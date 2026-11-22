@@ -91,6 +91,14 @@ class FakeElement {
     }
     this.isConnected = false;
   }
+  get childNodes() {
+    const out = [];
+    if (this._text) {
+      out.push({ nodeType: 3, nodeValue: this._text, parentElement: this });
+    }
+    for (const c of this.children) out.push(c);
+    return out;
+  }
   get textContent() {
     return this._text + this.children.map((c) => c.textContent).join("");
   }
@@ -260,8 +268,14 @@ class FakeElement {
     return null;
   }
   click() {
-    this.events.push("click");
-    if (this.onClick) this.onClick();
+    const chain = [];
+    for (let cur = this; cur; cur = cur.parentElement) {
+      chain.push(cur);
+    }
+    for (const node of chain) {
+      node.events.push("click");
+      if (node.onClick) node.onClick();
+    }
   }
   dispatchEvent(ev) {
     this.events.push(ev && ev.type ? ev.type : "event");
@@ -2904,42 +2918,57 @@ async function testS12Cal1Calibration() {
     afterSelectDelayMs: 0,
   };
 
-  // 13a. 计数后缀归一化与「不选择合集」禁选纯函数
+  // 13a. 独立计数节点判定、精确匹配与「不选择合集/不加入合集」清空项纯函数
   assert.strictEqual(
-    sharedCollection.stripCollectionCountSuffix("民间故事 共21个作品"),
-    "民间故事"
-  );
-  assert.strictEqual(
-    sharedCollection.stripCollectionCountSuffix("钟馗说案 / 共10个作品"),
-    "钟馗说案"
-  );
-  assert.strictEqual(
-    sharedCollection.stripCollectionCountSuffix("民间故事21个作品"),
-    "民间故事"
-  );
-  assert.strictEqual(
-    sharedCollection.stripCollectionCountSuffix("民间故事（共21个作品）"),
-    "民间故事"
-  );
-  assert.strictEqual(
-    sharedCollection.stripCollectionCountSuffix("共21个作品"),
-    ""
-  );
-  assert.strictEqual(
-    sharedCollection.stripCollectionCountSuffix("民间故事续集"),
-    "民间故事续集"
-  );
-  assert.strictEqual(
-    sharedCollection.stripCollectionCountSuffix("民间故事2"),
-    "民间故事2"
-  );
-
-  assert.strictEqual(
-    collectionMod.isExactCollectionMatch("民间故事 共21个作品", "民间故事"),
+    sharedCollection.isStandaloneCollectionCountText("共21个作品"),
     true
   );
   assert.strictEqual(
-    collectionMod.isExactCollectionMatch("民间故事续集 共21个作品", "民间故事"),
+    sharedCollection.isStandaloneCollectionCountText("/ 共10个作品"),
+    true
+  );
+  assert.strictEqual(
+    sharedCollection.isStandaloneCollectionCountText("（共21个作品）"),
+    true
+  );
+  assert.strictEqual(
+    sharedCollection.isStandaloneCollectionCountText("民间故事21个作品"),
+    false,
+    "含标题主干的单文本不得判为独立计数节点"
+  );
+  assert.strictEqual(
+    sharedCollection.isStandaloneCollectionCountText("民间故事续集"),
+    false
+  );
+  assert.strictEqual(
+    sharedCollection.isNonCollectionOptionText("不选择合集"),
+    true
+  );
+  assert.strictEqual(
+    sharedCollection.isNonCollectionOptionText("不加入合集"),
+    true
+  );
+
+  // 单串不得盲目剥离「21个作品」；只有提供 DOM 独立计数节点文本时才允许目标+计数拼接通过
+  assert.strictEqual(
+    collectionMod.isExactCollectionMatch("民间故事21个作品", "民间故事"),
+    false,
+    "单文本节点含「21个作品」不得剥离后误匹配"
+  );
+  assert.strictEqual(
+    collectionMod.isExactCollectionMatch("民间故事 共21个作品", "民间故事"),
+    false
+  );
+  assert.strictEqual(
+    collectionMod.isExactCollectionMatch("民间故事 共21个作品", "民间故事", {
+      countNodeText: "共21个作品",
+    }),
+    true
+  );
+  assert.strictEqual(
+    collectionMod.isExactCollectionMatch("民间故事续集 共21个作品", "民间故事", {
+      countNodeText: "共21个作品",
+    }),
     false
   );
   assert.strictEqual(
@@ -2949,33 +2978,45 @@ async function testS12Cal1Calibration() {
   );
 
   assert.strictEqual(
-    collectionMod.matchesCollectionReadback("民间故事 共21个作品", "民间故事"),
-    true,
-    "抖音回读带计数后缀应归一化后精确通过"
+    collectionMod.matchesCollectionReadback("民间故事21个作品", "民间故事"),
+    false,
+    "无独立计数节点时，回读单串「民间故事21个作品」不得放行"
   );
   assert.strictEqual(
-    collectionMod.matchesCollectionReadback("民间故事续集 共21个作品", "民间故事"),
+    collectionMod.matchesCollectionReadback("民间故事 共21个作品", "民间故事", {
+      countNodeText: "共21个作品",
+    }),
+    true,
+    "回读整串等于 目标+独立计数节点文本 时应通过"
+  );
+  assert.strictEqual(
+    collectionMod.matchesCollectionReadback("民间故事续集 共21个作品", "民间故事", {
+      countNodeText: "共21个作品",
+    }),
     false,
     "带计数后缀但主名不同绝不能用包含误过"
   );
   assert.strictEqual(
-    collectionMod.matchesCollectionReadback("不选择合集", "不选择合集"),
+    collectionMod.matchesCollectionReadback("不选择合集", "不选择合集", {
+      placeholders: collectionMod.PLATFORM_COLLECTION_CONFIGS.dy.entryTexts,
+    }),
     false
   );
   assert.strictEqual(
-    collectionMod.matchesCollectionReadback("选择要加入到的合集", "合集"),
+    collectionMod.matchesCollectionReadback("选择要加入到的合集", "合集", {
+      placeholders: collectionMod.PLATFORM_COLLECTION_CONFIGS.ks.entryTexts,
+    }),
     false
   );
 
   assert.deepStrictEqual(
     collectionMod.formatCollectionCandidates([
-      "不选择合集",
-      "民间故事 共21个作品",
-      "钟馗说案 / 共10个作品",
-      "共5个作品",
-      "民间故事 21个作品",
+      "民间故事",
+      "钟馗说案",
+      "民间故事21个作品",
+      "民间 故事",
     ]),
-    ["民间故事", "钟馗说案"]
+    ["民间故事", "钟馗说案", "民间故事21个作品"]
   );
 
   // 配置检查：快手 labelTexts 首位「加入合集」，entryTexts 含「选择要加入到的合集」
@@ -3180,8 +3221,9 @@ async function testS12Cal1Calibration() {
       });
 
       if (extraPopupHtmlPad > 0) {
-        const pad = new FakeElement("div", "", {
-          "data-pad": "x".repeat(extraPopupHtmlPad),
+        const pad = new FakeElement("span", "x".repeat(extraPopupHtmlPad), {
+          class: "pad-note",
+          "data-pad": "https://pad.example.com/?sig=should_be_stripped",
         });
         pad.rect = { left: 420, top: 430, width: 10, height: 10 };
         panel.append(pad);
@@ -3238,14 +3280,14 @@ async function testS12Cal1Calibration() {
       }
     }
 
-    // 13c. 抖音真机场景（单文本节点「民间故事 共21个作品」）
+    // 13c. 抖音真机场景（单文本节点精确匹配；名称本身含「共21个作品」不剥离）
     {
       logs.length = 0;
       const ctx = buildDouyinCalibratedPage({
         items: [
           { title: "不选择合集", isNone: true },
-          { title: "民间故事", countText: "共21个作品" },
-          { title: "钟馗说案", countText: "共10个作品" },
+          { title: "民间故事" },
+          { title: "钟馗说案" },
         ],
         splitNodes: false,
         readbackWithCount: false,
@@ -3469,6 +3511,798 @@ async function testS12Cal1Calibration() {
   console.log("✓ 13. S12-cal1 抖音 text_leaf/计数后缀/排除导航/DOM 片段与快手「加入合集」单测通过");
 }
 
+/* ------------------------------------------------------------------ *
+ * 14. S12-cal1-fix：评审 7 项回归防护（text_leaf 范围/safeClick/无关弹窗/拆分文本/独立计数节点/视频号对齐/全量脱敏）
+ * ------------------------------------------------------------------ */
+async function testS12Cal1FixReviewGuards() {
+  const fastTimeouts = {
+    entryTimeoutMs: 0,
+    optionTimeoutMs: 0,
+    readbackTimeoutMs: 0,
+    pollIntervalMs: 0,
+    afterOpenDelayMs: 0,
+    afterSelectDelayMs: 0,
+  };
+  const makeDoc = () => {
+    const doc = new FakeElement("document");
+    const body = new FakeElement("body");
+    doc.body = body;
+    doc.documentElement = doc;
+    doc.append(body);
+    doc.getElementById = (id) => doc.querySelector(`[id="${id}"]`);
+    return { doc, body };
+  };
+  const makeEvalPage = (doc) => ({
+    async evaluate(fn, arg) {
+      const prevDoc = global.document;
+      const prevStyle = global.getComputedStyle;
+      const prevMouse = global.MouseEvent;
+      const prevWindow = global.window;
+      global.document = doc;
+      global.getComputedStyle = (el) => ({
+        display: el && el.hidden ? "none" : "block",
+        visibility: "visible",
+        opacity: "1",
+      });
+      global.MouseEvent = FakeMouseEvent;
+      global.window = {};
+      try {
+        const runner = new Function(
+          "document",
+          "getComputedStyle",
+          "MouseEvent",
+          "window",
+          "arg",
+          `return (${fn.toString()})(arg);`
+        );
+        return runner(doc, global.getComputedStyle, FakeMouseEvent, {}, arg);
+      } finally {
+        if (prevDoc === undefined) delete global.document;
+        else global.document = prevDoc;
+        if (prevStyle === undefined) delete global.getComputedStyle;
+        else global.getComputedStyle = prevStyle;
+        if (prevMouse === undefined) delete global.MouseEvent;
+        else global.MouseEvent = prevMouse;
+        if (prevWindow === undefined) delete global.window;
+        else global.window = prevWindow;
+      }
+    },
+    async waitForTimeout() {},
+  });
+
+  const buildDyTriggerRow = (body) => {
+    const row = new FakeElement("div", "", { class: "setting-item" });
+    row.rect = { left: 240, top: 200, width: 520, height: 40 };
+    const label = new FakeElement("div", "添加合集", { class: "item-label" });
+    label.rect = { left: 240, top: 206, width: 80, height: 24 };
+    const colSelect = new FakeElement("div", "", {
+      class: "semi-select",
+      role: "combobox",
+    });
+    colSelect.rect = { left: 420, top: 202, width: 240, height: 34 };
+    const colDisplay = new FakeElement("span", "请选择合集", {
+      class: "semi-select-selection-text",
+    });
+    colDisplay.rect = { left: 432, top: 208, width: 160, height: 20 };
+    colSelect.append(colDisplay);
+    row.append(label, colSelect);
+    body.append(row);
+    return { row, colSelect, colDisplay };
+  };
+
+  const origLog = console.log;
+  const origError = console.error;
+  const logs = [];
+  console.log = (...a) => logs.push(a.join(" "));
+  console.error = (...a) => logs.push(a.join(" "));
+
+  try {
+    // 14a. 评审项 1 & 2：text_leaf 仅限新增下方浮层、拒绝 a 链接与无 type 表单按钮；safeClick 拒绝 form 内无 type button 及其后代
+    {
+      // 14a-1: safeClick 直接单测 form 内无显式 type button 及其祖先链
+      const { doc, body } = makeDoc();
+      let clickHits = 0;
+      const form = new FakeElement("form", "", { id: "pub-form" });
+      const implicitBtn = new FakeElement("button", "内容管理");
+      implicitBtn.onClick = () => {
+        clickHits += 1;
+      };
+      const implicitSpan = new FakeElement("span", "民间故事");
+      implicitSpan.onClick = () => {
+        clickHits += 1;
+      };
+      const implicitBtnWithChild = new FakeElement("button", "");
+      implicitBtnWithChild.onClick = () => {
+        clickHits += 1;
+      };
+      implicitBtnWithChild.append(implicitSpan);
+      const emptyTypeBtn = new FakeElement("button", "民间故事", { type: "" });
+      emptyTypeBtn.onClick = () => {
+        clickHits += 1;
+      };
+      const explicitNonSubmitBtn = new FakeElement("button", "民间故事", {
+        type: "button",
+      });
+      let safeHits = 0;
+      explicitNonSubmitBtn.onClick = () => {
+        safeHits += 1;
+      };
+      form.append(implicitBtn, implicitBtnWithChild, emptyTypeBtn, explicitNonSubmitBtn);
+
+      const formAttrBtn = new FakeElement("button", "民间故事", { form: "pub-form" });
+      formAttrBtn.onClick = () => {
+        clickHits += 1;
+      };
+      const outsideBtn = new FakeElement("button", "普通按钮");
+      outsideBtn.onClick = () => {
+        safeHits += 1;
+      };
+      body.append(form, formAttrBtn, outsideBtn);
+
+      const prevDoc = global.document;
+      global.document = doc;
+      try {
+        for (const bad of [implicitBtn, implicitBtnWithChild, implicitSpan, emptyTypeBtn, formAttrBtn]) {
+          assert.throws(
+            () => collectionMod.safeClick(bad, { root: doc }),
+            (err) => err.code === "collection_click_rejected" && err.deterministic === true,
+            "form 内无显式 type 的 button 及其后代必须被 safeClick 拒绝"
+          );
+        }
+        assert.strictEqual(clickHits, 0);
+        assert.strictEqual(collectionMod.safeClick(explicitNonSubmitBtn, { root: doc }), true);
+        assert.strictEqual(collectionMod.safeClick(outsideBtn, { root: doc }), true);
+        assert.strictEqual(safeHits, 2);
+      } finally {
+        if (prevDoc === undefined) delete global.document;
+        else global.document = prevDoc;
+      }
+
+      // 14a-2: 打开入口后未出现新浮层，页面下方原有链接/表单无 type 按钮/同名卡片绝不能被误点
+      {
+        const { doc: doc2, body: body2 } = makeDoc();
+        const { colSelect } = buildDyTriggerRow(body2);
+        let navLinkClicks = 0;
+        let formBtnClicks = 0;
+        let cardClicks = 0;
+
+        const navLink = new FakeElement("a", "内容管理", {
+          href: "https://creator.douyin.com/manage",
+        });
+        navLink.rect = { left: 420, top: 250, width: 120, height: 30 };
+        navLink.onClick = () => {
+          navLinkClicks += 1;
+        };
+
+        const form2 = new FakeElement("form", "");
+        form2.rect = { left: 420, top: 290, width: 200, height: 40 };
+        const formBtn = new FakeElement("button", "民间故事");
+        formBtn.rect = { left: 420, top: 290, width: 120, height: 32 };
+        formBtn.onClick = () => {
+          formBtnClicks += 1;
+        };
+        form2.append(formBtn);
+
+        const existingCard = new FakeElement("div", "民间故事", { class: "existing-card" });
+        existingCard.rect = { left: 420, top: 340, width: 120, height: 32 };
+        existingCard.onClick = () => {
+          cardClicks += 1;
+        };
+
+        body2.append(navLink, form2, existingCard);
+        // 触发器点击后不渲染任何新浮层
+        colSelect.onClick = () => {};
+
+        await assert.rejects(
+          () =>
+            collectionMod.selectPlatformCollection(
+              makeEvalPage(doc2),
+              "抖音",
+              { collection: "内容管理" },
+              { timeouts: fastTimeouts, captureScreenshot: async () => "" }
+            ),
+          (err) => {
+            assert.strictEqual(err.code, "collection_option_not_found");
+            assert.strictEqual(err.details.reason, "popup_not_found");
+            assert.deepStrictEqual(err.details.candidates, []);
+            return true;
+          }
+        );
+        await assert.rejects(
+          () =>
+            collectionMod.selectPlatformCollection(
+              makeEvalPage(doc2),
+              "抖音",
+              { collection: "民间故事" },
+              { timeouts: fastTimeouts, captureScreenshot: async () => "" }
+            ),
+          (err) => {
+            assert.strictEqual(err.code, "collection_option_not_found");
+            assert.strictEqual(err.details.reason, "popup_not_found");
+            return true;
+          }
+        );
+        assert.strictEqual(navLinkClicks, 0, "不得误点页面原有 <a> 链接");
+        assert.strictEqual(formBtnClicks, 0, "不得误点表单无 type <button>");
+        assert.strictEqual(cardClicks, 0, "找不到新浮层不得回退整页点击已有元素");
+      }
+
+      // 14a-3: 即使在新增浮层内部，a 链接、任何 button、input/submit、nav/aside/header 也一律不作为候选或点击目标
+      {
+        const { doc: doc3, body: body3 } = makeDoc();
+        const { colSelect } = buildDyTriggerRow(body3);
+        let forbiddenHits = 0;
+
+        colSelect.onClick = () => {
+          if (doc3.querySelector(".new-custom-panel")) return;
+          const panel = new FakeElement("div", "", { class: "new-custom-panel" });
+          panel.rect = { left: 420, top: 240, width: 280, height: 220 };
+
+          const linkEl = new FakeElement("a", "民间故事", { href: "/manage" });
+          linkEl.rect = { left: 420, top: 244, width: 120, height: 30 };
+          linkEl.onClick = () => {
+            forbiddenHits += 1;
+          };
+          const btnNoType = new FakeElement("button", "民间故事");
+          btnNoType.rect = { left: 420, top: 278, width: 120, height: 30 };
+          btnNoType.onClick = () => {
+            forbiddenHits += 1;
+          };
+          const btnWithType = new FakeElement("button", "民间故事", { type: "button" });
+          btnWithType.rect = { left: 420, top: 312, width: 120, height: 30 };
+          btnWithType.onClick = () => {
+            forbiddenHits += 1;
+          };
+          const inputEl = new FakeElement("input", "", { type: "submit", value: "民间故事" });
+          inputEl.rect = { left: 420, top: 346, width: 120, height: 30 };
+          inputEl.onClick = () => {
+            forbiddenHits += 1;
+          };
+          const validRow = new FakeElement("div", "钟馗说案", { class: "custom-mix-row" });
+          validRow.rect = { left: 420, top: 380, width: 240, height: 32 };
+          panel.append(linkEl, btnNoType, btnWithType, inputEl, validRow);
+          body3.append(panel);
+        };
+
+        await assert.rejects(
+          () =>
+            collectionMod.selectPlatformCollection(
+              makeEvalPage(doc3),
+              "抖音",
+              { collection: "民间故事" },
+              { timeouts: fastTimeouts, captureScreenshot: async () => "" }
+            ),
+          (err) => {
+            assert.strictEqual(err.code, "collection_option_not_found");
+            assert.deepStrictEqual(err.details.candidates, ["钟馗说案"]);
+            return true;
+          }
+        );
+        assert.strictEqual(forbiddenHits, 0, "新增浮层内的 a/button/input 不得被命中或点击");
+      }
+    }
+
+    // 14b. 评审项 3：外层容器含无关对话框时，text_leaf 仅标记合集浮层本身，绝不点无关对话框「确定」
+    for (const hostPreExisting of [true, false]) {
+      const { doc, body } = makeDoc();
+      const { colSelect, colDisplay } = buildDyTriggerRow(body);
+      let unrelatedConfirmClicks = 0;
+
+      const makeUnrelatedDialog = () => {
+        const dlg = new FakeElement("div", "", {
+          class: "semi-modal unrelated-dialog",
+          role: "dialog",
+        });
+        dlg.rect = { left: 420, top: 420, width: 280, height: 120 };
+        const tip = new FakeElement("div", "是否离开当前页面？");
+        const okBtn = new FakeElement("button", "确定", { type: "button" });
+        okBtn.rect = { left: 520, top: 480, width: 64, height: 32 };
+        okBtn.onClick = () => {
+          unrelatedConfirmClicks += 1;
+        };
+        dlg.append(tip, okBtn);
+        return dlg;
+      };
+
+      const makeMixPanel = () => {
+        const panel = new FakeElement("div", "", { class: "custom-mix-panel" });
+        panel.rect = { left: 420, top: 240, width: 280, height: 140 };
+        const optRow = new FakeElement("div", "", { class: "custom-mix-row" });
+        optRow.rect = { left: 420, top: 244, width: 280, height: 40 };
+        optRow.append(
+          new FakeElement("span", "民间故事"),
+          new FakeElement("span", "共21个作品")
+        );
+        optRow.onClick = () => {
+          colDisplay.textContent = "民间故事";
+          panel.remove();
+        };
+        panel.append(optRow);
+        return panel;
+      };
+
+      let outerHost = null;
+      if (hostPreExisting) {
+        outerHost = new FakeElement("div", "", { class: "modal-portal-layer" });
+        outerHost.rect = { left: 400, top: 238, width: 320, height: 320 };
+        outerHost.append(makeUnrelatedDialog());
+        body.append(outerHost);
+      }
+
+      colSelect.onClick = () => {
+        if (doc.querySelector(".custom-mix-panel")) return;
+        if (hostPreExisting) {
+          outerHost.append(makeMixPanel());
+        } else {
+          outerHost = new FakeElement("div", "", { class: "modal-portal-layer" });
+          outerHost.rect = { left: 400, top: 238, width: 320, height: 320 };
+          outerHost.append(makeMixPanel(), makeUnrelatedDialog());
+          body.append(outerHost);
+        }
+      };
+
+      const res = await collectionMod.selectPlatformCollection(
+        makeEvalPage(doc),
+        "抖音",
+        { collection: "民间故事" },
+        { timeouts: fastTimeouts, captureScreenshot: async () => "" }
+      );
+      assert.strictEqual(res.selected, true);
+      assert.strictEqual(
+        unrelatedConfirmClicks,
+        0,
+        `外层容器(pre=${hostPreExisting})含无关对话框时绝不能点其「确定」`
+      );
+    }
+
+    // 14c. 评审项 4：「民间故事续集」拆成两个节点时不误选，且回读含 .title 前半段不放行
+    {
+      // 14c-1: text_leaf 自定义浮层拆分「民间故事」+「续集」→ 不误选，0 点击
+      const { doc, body } = makeDoc();
+      const { colSelect } = buildDyTriggerRow(body);
+      let rowClicks = 0;
+
+      colSelect.onClick = () => {
+        if (doc.querySelector(".split-title-panel")) return;
+        const panel = new FakeElement("div", "", { class: "split-title-panel" });
+        panel.rect = { left: 420, top: 240, width: 280, height: 120 };
+        const optRow = new FakeElement("div", "", { class: "custom-mix-row" });
+        optRow.rect = { left: 420, top: 244, width: 280, height: 40 };
+        const p1 = new FakeElement("span", "民间故事", { class: "title" });
+        p1.rect = { left: 430, top: 254, width: 64, height: 20 };
+        const p2 = new FakeElement("span", "续集", { class: "suffix" });
+        p2.rect = { left: 494, top: 254, width: 32, height: 20 };
+        optRow.append(p1, p2);
+        optRow.onClick = () => {
+          rowClicks += 1;
+        };
+        panel.append(optRow);
+        body.append(panel);
+      };
+
+      await assert.rejects(
+        () =>
+          collectionMod.selectPlatformCollection(
+            makeEvalPage(doc),
+            "抖音",
+            { collection: "民间故事" },
+            { timeouts: fastTimeouts, captureScreenshot: async () => "" }
+          ),
+        (err) => {
+          assert.strictEqual(err.code, "collection_option_not_found");
+          assert.deepStrictEqual(err.details.candidates, ["民间故事续集"]);
+          return true;
+        }
+      );
+      assert.strictEqual(rowClicks, 0, "拆分节点「民间故事」+「续集」不得误点");
+
+      // 14c-1b: 块级拆分（含 option-title / option-extra 子类名）同样按整行判定，绝不把子块拆成独立行
+      const { doc: docBlk, body: bodyBlk } = makeDoc();
+      const { colSelect: selBlk } = buildDyTriggerRow(bodyBlk);
+      let blkClicks = 0;
+      selBlk.onClick = () => {
+        if (docBlk.querySelector(".blk-split-panel")) return;
+        const panel = new FakeElement("div", "", { class: "blk-split-panel" });
+        panel.rect = { left: 420, top: 240, width: 280, height: 120 };
+        const optRow = new FakeElement("div", "", { class: "option-row" });
+        optRow.rect = { left: 420, top: 244, width: 280, height: 40 };
+        const d1 = new FakeElement("div", "民间故事", { class: "option-title" });
+        d1.rect = { left: 430, top: 254, width: 64, height: 20 };
+        const d2 = new FakeElement("div", "续集", { class: "option-extra" });
+        d2.rect = { left: 494, top: 254, width: 32, height: 20 };
+        optRow.append(d1, d2);
+        optRow.onClick = () => {
+          blkClicks += 1;
+        };
+        panel.append(optRow);
+        bodyBlk.append(panel);
+      };
+      await assert.rejects(
+        () =>
+          collectionMod.selectPlatformCollection(
+            makeEvalPage(docBlk),
+            "抖音",
+            { collection: "民间故事" },
+            { timeouts: fastTimeouts, captureScreenshot: async () => "" }
+          ),
+        (err) => {
+          assert.strictEqual(err.code, "collection_option_not_found");
+          assert.deepStrictEqual(err.details.candidates, ["民间故事续集"]);
+          return true;
+        }
+      );
+      assert.strictEqual(blkClicks, 0, "块级拆分 option-title/option-extra 不得误点");
+
+      // 14c-2: 标准弹层回读中控件显示 <span class="title">民间故事</span><span>续集</span> → 回读必须拒放行
+      const { doc: docRb, body: bodyRb } = makeDoc();
+      const { colSelect: selRb } = buildDyTriggerRow(bodyRb);
+      selRb.onClick = () => {
+        if (docRb.querySelector(".semi-select-option-list")) return;
+        const popup = new FakeElement("div", "", {
+          class: "semi-select-option-list",
+          role: "listbox",
+        });
+        popup.rect = { left: 420, top: 240, width: 240, height: 100 };
+        const opt = new FakeElement("div", "民间故事", {
+          class: "semi-select-option",
+          role: "option",
+        });
+        opt.rect = { left: 420, top: 244, width: 240, height: 36 };
+        opt.onClick = () => {
+          // 模拟控件实际回显为拆分节点「民间故事续集」，其中 .title 只含前半段
+          selRb.children = [];
+          selRb.append(
+            new FakeElement("span", "民间故事", { class: "title" }),
+            new FakeElement("span", "续集")
+          );
+          popup.remove();
+        };
+        popup.append(opt);
+        bodyRb.append(popup);
+      };
+
+      await assert.rejects(
+        () =>
+          collectionMod.selectPlatformCollection(
+            makeEvalPage(docRb),
+            "抖音",
+            { collection: "民间故事" },
+            { timeouts: fastTimeouts, captureScreenshot: async () => "" }
+          ),
+        (err) => {
+          assert.strictEqual(err.code, "collection_readback_mismatch");
+          assert.ok(err.message.includes("民间故事续集"));
+          return true;
+        }
+      );
+    }
+
+    // 14d. 评审项 4：「不选择」+「合集」与「不加入」+「合集」拆分整行判定，目标为「合集」绝不命中
+    for (const mode of ["text_leaf", "popup"]) {
+      const { doc, body } = makeDoc();
+      const { colSelect } = buildDyTriggerRow(body);
+      let clearHits = 0;
+
+      colSelect.onClick = () => {
+        if (doc.querySelector(".clear-split-panel")) return;
+        const panel = new FakeElement("div", "", {
+          class:
+            mode === "popup"
+              ? "semi-select-option-list clear-split-panel"
+              : "clear-split-panel",
+          ...(mode === "popup" ? { role: "listbox" } : {}),
+        });
+        panel.rect = { left: 420, top: 240, width: 260, height: 140 };
+        for (const [idx, pair] of [
+          ["不选择", "合集"],
+          ["不加入", "合集"],
+        ].entries()) {
+          const rowEl = new FakeElement("div", "", {
+            class: mode === "popup" ? "semi-select-option" : "custom-mix-row",
+            ...(mode === "popup" ? { role: "option" } : {}),
+          });
+          rowEl.rect = { left: 420, top: 244 + idx * 42, width: 260, height: 36 };
+          const s1 = new FakeElement("span", pair[0]);
+          const s2 = new FakeElement("span", pair[1]);
+          rowEl.append(s1, s2);
+          rowEl.onClick = () => {
+            clearHits += 1;
+          };
+          panel.append(rowEl);
+        }
+        body.append(panel);
+      };
+
+      await assert.rejects(
+        () =>
+          collectionMod.selectPlatformCollection(
+            makeEvalPage(doc),
+            "抖音",
+            { collection: "合集" },
+            { timeouts: fastTimeouts, captureScreenshot: async () => "" }
+          ),
+        (err) => err.code === "collection_option_not_found"
+      );
+      assert.strictEqual(clearHits, 0, `${mode}: 拆分清空项「不选择/不加入」+「合集」绝不能被命中`);
+    }
+
+    // 14e. 评审项 5：「民间故事21个作品」与「民间故事」共存时必须选「民间故事」（单节点不剥离，独立计数节点才剥离）
+    {
+      // 14e-1: 标准弹层，长标题「民间故事21个作品」排在前
+      const { doc, body } = makeDoc();
+      const { colSelect, colDisplay } = buildDyTriggerRow(body);
+      const pickedTitles = [];
+
+      colSelect.onClick = () => {
+        if (doc.querySelector(".semi-select-option-list")) return;
+        const popup = new FakeElement("div", "", {
+          class: "semi-select-option-list",
+          role: "listbox",
+        });
+        popup.rect = { left: 420, top: 240, width: 260, height: 120 };
+        for (const [idx, title] of ["民间故事21个作品", "民间故事"].entries()) {
+          const opt = new FakeElement("div", "", {
+            class: "semi-select-option",
+            role: "option",
+          });
+          opt.rect = { left: 420, top: 244 + idx * 42, width: 260, height: 36 };
+          opt.append(new FakeElement("span", title, { class: "title" }));
+          opt.onClick = () => {
+            pickedTitles.push(title);
+            colDisplay.textContent = title;
+            popup.remove();
+          };
+          popup.append(opt);
+        }
+        body.append(popup);
+      };
+
+      const res = await collectionMod.selectPlatformCollection(
+        makeEvalPage(doc),
+        "抖音",
+        { collection: "民间故事" },
+        { timeouts: fastTimeouts, captureScreenshot: async () => "" }
+      );
+      assert.strictEqual(res.selected, true);
+      assert.deepStrictEqual(pickedTitles, ["民间故事"]);
+      assert.strictEqual(res.displayedText, "民间故事");
+
+      // 14e-2: text_leaf 自定义浮层，长标题「民间故事21个作品」+独立计数节点「共3个作品」排在前，
+      //        真实「民间故事」+独立计数节点「共21个作品」排在后；回读分别测独立节点与整串
+      for (const readbackMode of ["split", "flat"]) {
+        const { doc: d2, body: b2 } = makeDoc();
+        const { colSelect: sel2, colDisplay: disp2 } = buildDyTriggerRow(b2);
+        const picked2 = [];
+
+        sel2.onClick = () => {
+          if (d2.querySelector(".coexist-panel")) return;
+          const panel = new FakeElement("div", "", { class: "coexist-panel" });
+          panel.rect = { left: 420, top: 240, width: 280, height: 140 };
+          const entries = [
+            { title: "民间故事21个作品", count: "共3个作品" },
+            { title: "民间故事", count: "共21个作品" },
+          ];
+          entries.forEach((item, idx) => {
+            const r = new FakeElement("div", "", { class: "custom-mix-row" });
+            r.rect = { left: 420, top: 244 + idx * 44, width: 280, height: 40 };
+            r.append(
+              new FakeElement("span", item.title, { class: "mix-name" }),
+              new FakeElement("span", item.count, { class: "mix-count" })
+            );
+            r.onClick = () => {
+              picked2.push(item.title);
+              if (readbackMode === "split") {
+                disp2.textContent = "";
+                disp2.append(
+                  new FakeElement("span", item.title, { class: "name" }),
+                  new FakeElement("span", item.count, { class: "count" })
+                );
+              } else {
+                disp2.textContent = `${item.title} ${item.count}`;
+              }
+              panel.remove();
+            };
+            panel.append(r);
+          });
+          b2.append(panel);
+        };
+
+        const r2 = await collectionMod.selectPlatformCollection(
+          makeEvalPage(d2),
+          "抖音",
+          { collection: "民间故事" },
+          { timeouts: fastTimeouts, captureScreenshot: async () => "" }
+        );
+        assert.strictEqual(r2.selected, true);
+        assert.deepStrictEqual(
+          picked2,
+          ["民间故事"],
+          `text_leaf(${readbackMode})必须选「民间故事」而非「民间故事21个作品」`
+        );
+        assert.deepStrictEqual(r2.candidates, ["民间故事21个作品", "民间故事"]);
+      }
+    }
+
+    // 14f. 评审项 6：视频号零行为变化（共享占位表不含快手占位文案；视频号候选不剥离计数尾缀；同名合集与 9e99ec8 一致）
+    {
+      assert.strictEqual(
+        collectionMod.COLLECTION_PLACEHOLDER_TEXTS.includes("选择要加入到的合集"),
+        false,
+        "快手占位文案「选择要加入到的合集」不得进入共享占位表"
+      );
+      assert.strictEqual(
+        collectionMod.COLLECTION_PLACEHOLDER_TEXTS.includes("不选择合集"),
+        false,
+        "抖音专属入口文案「不选择合集」不得进入共享占位表"
+      );
+
+      // 14f-1: 视频号存在名为「选择要加入到的合集」的真实合集 → 选中且回读通过（与 9e99ec8 一致）
+      const sphSameAsKsPh = buildFakeCollectionPage("sph", "success", {
+        candidates: ["选择要加入到的合集", "民间故事"],
+      });
+      const sphRes = await collectionMod.selectPlatformCollection(
+        sphSameAsKsPh.page,
+        "视频号",
+        { collection: "选择要加入到的合集" },
+        { timeouts: fastTimeouts, captureScreenshot: async () => "" }
+      );
+      assert.strictEqual(sphRes.selected, true, "视频号同名合集「选择要加入到的合集」应与 9e99ec8 一致通过");
+      assert.strictEqual(sphRes.displayedText, "选择要加入到的合集");
+
+      // 14f-2: 视频号候选诊断保留原始计数形尾缀，不剥离
+      const sphCountCand = buildFakeCollectionPage("sph", "missing_option", {
+        candidates: ["民间故事 共21个作品", "钟馗说案21个作品"],
+      });
+      await assert.rejects(
+        () =>
+          collectionMod.selectPlatformCollection(
+            sphCountCand.page,
+            "视频号",
+            { collection: "民间故事" },
+            { timeouts: fastTimeouts, captureScreenshot: async () => "" }
+          ),
+        (err) => {
+          assert.strictEqual(err.code, "collection_option_not_found");
+          assert.deepStrictEqual(
+            err.details.candidates,
+            ["民间故事 共21个作品", "钟馗说案21个作品"],
+            "视频号候选诊断不得剥离计数形尾缀"
+          );
+          return true;
+        }
+      );
+
+      // 14f-3: 快手仍将「选择要加入到的合集」识别为占位文案（回读不得通过）
+      const ksPhStay = buildFakeCollectionPage("ks", "readback_mismatch", {
+        candidates: ["选择要加入到的合集", "民间故事"],
+        wrongReadback: "选择要加入到的合集",
+      });
+      await assert.rejects(
+        () =>
+          collectionMod.selectPlatformCollection(
+            ksPhStay.page,
+            "快手",
+            { collection: "选择要加入到的合集" },
+            { timeouts: fastTimeouts, captureScreenshot: async () => "" }
+          ),
+        (err) => err.code === "collection_readback_mismatch"
+      );
+    }
+
+    // 14g. 评审项 7：DOM 片段脱敏（删除所有 URL/查询参数属性，仅保留 tag/class/role/aria-*/type 与文本）
+    {
+      logs.length = 0;
+      const { doc, body } = makeDoc();
+      const { colSelect } = buildDyTriggerRow(body);
+
+      colSelect.onClick = () => {
+        if (doc.querySelector(".sanitize-panel")) return;
+        const panel = new FakeElement("div", "", {
+          class: "sanitize-panel",
+          role: "listbox",
+          style: "background:url(https://cdn.example.com/bg.png?sig=STYLE_SECRET)",
+          "data-endpoint": "https://api.example.com/list?token=DATA_SECRET",
+          "data-tricky": "a>b",
+        });
+        panel.rect = { left: 420, top: 240, width: 280, height: 180 };
+
+        const img = new FakeElement("img", "", {
+          src: "https://cdn.example.com/cover.jpg?sig=SRC_SECRET",
+          srcset:
+            "https://cdn.example.com/c1.jpg?sig=SRCSET_SECRET1 1x, https://cdn.example.com/c2.jpg?sig=SRCSET_SECRET2 2x",
+          alt: "thumb",
+        });
+        const link = new FakeElement("a", "管理入口", {
+          href: "https://creator.douyin.com/manage?ticket=HREF_SECRET",
+          class: "manage-link",
+          role: "link",
+          "aria-label": "https://leak.example.com/?sig=ARIA_SECRET",
+          "aria-describedby": "safe-desc",
+        });
+        const video = new FakeElement("video", "", {
+          poster: "https://cdn.example.com/poster.jpg?sig=POSTER_SECRET",
+          src: "blob:https://creator.douyin.com/BLOB_SECRET",
+        });
+        const dataUriImg = new FakeElement("img", "", {
+          src: "data:image/png;base64,DATAURI_SECRET",
+        });
+        const row = new FakeElement("div", "", {
+          class: "custom-mix-row",
+          role: "option",
+          "aria-selected": "false",
+        });
+        row.rect = { left: 420, top: 248, width: 260, height: 36 };
+        row.append(
+          new FakeElement("span", "其他合集"),
+          new FakeElement("button", "按钮", { type: "button", class: "keep-btn" })
+        );
+        panel.append(img, link, video, dataUriImg, row);
+        body.append(panel);
+      };
+
+      await assert.rejects(
+        () =>
+          collectionMod.selectPlatformCollection(
+            makeEvalPage(doc),
+            "抖音",
+            { collection: "民间故事" },
+            { timeouts: fastTimeouts, captureScreenshot: async () => "" }
+          ),
+        (err) => {
+          assert.strictEqual(err.code, "collection_option_not_found");
+          const snippet = String(err.details.domSnippet || "");
+          assert.ok(snippet.includes('class="sanitize-panel"'), "应保留 class");
+          assert.ok(snippet.includes('role="listbox"'), "应保留 role");
+          assert.ok(snippet.includes('aria-selected="false"'), "应保留安全 aria-*");
+          assert.ok(snippet.includes('aria-describedby="safe-desc"'), "应保留安全 aria-*");
+          assert.ok(snippet.includes('type="button"'), "应保留 type");
+          assert.ok(snippet.includes("其他合集"), "应保留文本");
+          for (const leaked of [
+            "STYLE_SECRET",
+            "DATA_SECRET",
+            "SRC_SECRET",
+            "SRCSET_SECRET1",
+            "SRCSET_SECRET2",
+            "HREF_SECRET",
+            "ARIA_SECRET",
+            "POSTER_SECRET",
+            "BLOB_SECRET",
+            "DATAURI_SECRET",
+            "src=",
+            "srcset=",
+            "href=",
+            "poster=",
+            "style=",
+            "data-endpoint=",
+            "data-tricky=",
+            "http://",
+            "https://",
+            "blob:",
+            "data:",
+            "?",
+          ]) {
+            assert.strictEqual(
+              snippet.includes(leaked),
+              false,
+              `DOM 片段脱敏后绝不能包含「${leaked}」，实际=${snippet}`
+            );
+          }
+          return true;
+        }
+      );
+      const domLog = logs.find((l) => l.includes("[collection] 抖音 DOM 片段:"));
+      assert.ok(domLog, "失败日志应输出脱敏 DOM 片段");
+      assert.strictEqual(domLog.includes("SRCSET_SECRET1"), false);
+      assert.strictEqual(domLog.includes("HREF_SECRET"), false);
+    }
+  } finally {
+    console.log = origLog;
+    console.error = origError;
+  }
+
+  console.log("✓ 14. S12-cal1-fix 评审 7 项回归防护全部通过");
+}
+
 (async () => {
   testSharedCollectionResolution();
   testExcelCollectionColumn();
@@ -3482,6 +4316,7 @@ async function testS12Cal1Calibration() {
   await testMcpCollectionAndE2eEvidence();
   await testS12Fix2StructuralGuards();
   await testS12Cal1Calibration();
+  await testS12Cal1FixReviewGuards();
   console.log("\ntest-collection: 全部断言通过");
 })().catch((e) => {
   console.error(e);
