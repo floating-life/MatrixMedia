@@ -674,7 +674,8 @@ async function testCliAndPuppeteerEntryDedupe() {
       ]);
       assert.strictEqual(codeSample, 6, `真实按日期分组结构下 CLI 应拦截并返回 6，实际=${codeSample}`);
 
-      // 4c. S10-fix #6b：CLI 使用 `-t '--allow-duplicate'` 不得吞掉标题值
+      // 4c. S12-fix1 起改为严格：取值型参数后紧跟 -- 选项一律报参数错误（退出码 2），
+      // 避免 `-t --draft` 这类漏填把开关吞成值、草稿变正式发布（取代 S10-fix #6b 的字面标题约定）
       const codeOptionLikeTitle = await cliMod.runCliMain([
         "node",
         ".",
@@ -691,8 +692,8 @@ async function testCliAndPuppeteerEntryDedupe() {
       ]);
       assert.strictEqual(
         codeOptionLikeTitle,
-        0,
-        `-t '--allow-duplicate' 应按字面标题发布返回 0（不得报缺少标题退 2），实际=${codeOptionLikeTitle}`
+        2,
+        `-t '--allow-duplicate' 应报参数错误退 2，实际=${codeOptionLikeTitle}`
       );
       const parsedOptTitle = cliMod.parsePublishArgs([
         "-p",
@@ -704,13 +705,7 @@ async function testCliAndPuppeteerEntryDedupe() {
         "-t",
         "--allow-duplicate",
       ]);
-      assert.strictEqual(parsedOptTitle.ok, true);
-      assert.strictEqual(parsedOptTitle.value.title, "--allow-duplicate");
-      assert.strictEqual(
-        parsedOptTitle.value.allowDuplicate,
-        false,
-        "作为 -t 值的 --allow-duplicate 不得开启 allowDuplicate 开关"
-      );
+      assert.strictEqual(parsedOptTitle.ok, false);
 
       // 带 --allow-duplicate 放行
       const code2 = await cliMod.runCliMain([
