@@ -293,13 +293,13 @@ function createSignalPage(urls, full, overlay) {
     assert.strictEqual(event.calls[0].payload.publishAbnormal, true);
   }
 
-  // 5. 读不到地址时不误报异常
+  // 5. 非 dy/ks 平台读不到地址时不误报异常（dy/ks 收紧判据见 9i）
   {
     const page = { url: () => "", waitForTimeout: async () => {} };
     const event = createEvent();
     await replyPublishOutcome({
       page,
-      data: { pt: "快手", closeWindowAfterPublish: false },
+      data: { pt: "视频号", closeWindowAfterPublish: false },
       window: null,
       event,
       urlBefore: "https://x.com/publish",
@@ -607,11 +607,12 @@ function createSignalPage(urls, full, overlay) {
       assert.strictEqual(completion.exitCode, 4);
     }
 
-    // 9b. 抖音 / 快手页面含「发布成功」（即使同时含「上传成功」且地址未变）→ 成功
+    // 9b. 抖音 / 快手弹层（overlay）含「发布成功」（即使正文同时含「上传成功」且地址未变）→ 成功
     for (const pt of ["抖音", "快手"]) {
-      const page = createTextPage(
+      const page = createSignalPage(
         ["https://creator.example.com/publish", "https://creator.example.com/publish"],
-        "视频上传成功 发布成功"
+        "视频上传成功 发布成功",
+        "发布成功"
       );
       const event = createEvent();
       await replyPublishOutcome({
@@ -625,7 +626,7 @@ function createSignalPage(urls, full, overlay) {
       });
       const payload = event.calls[0].payload;
       assert.strictEqual(payload.status, true);
-      assert.strictEqual(payload.publishAbnormal, undefined, `${pt} 出现「发布成功」应判成功`);
+      assert.strictEqual(payload.publishAbnormal, undefined, `${pt} 弹层出现「发布成功」应判成功`);
       assert.strictEqual(payload.publishSignal, "toast:发布成功");
       assert.strictEqual(payload.message, "上传成功");
     }
@@ -688,6 +689,185 @@ function createSignalPage(urls, full, overlay) {
       });
       assert.strictEqual(excluded.ok, false, "显式排除「上传成功」时不应判成功");
       assert.strictEqual(excluded.signal, "none");
+    }
+
+    // 9f. S12-fix1(4a)：dy/ks 发布模式仅 query 或 hash 变化不得算跳转成功
+    for (const [pt, before, after] of [
+      [
+        "抖音",
+        "https://creator.douyin.com/creator-micro/content/post/video?enter_from=publish_page",
+        "https://creator.douyin.com/creator-micro/content/post/video?enter_from=publish_page&draft=1#top",
+      ],
+      [
+        "快手",
+        "https://cp.kuaishou.com/article/publish/video?tabType=1",
+        "https://cp.kuaishou.com/article/publish/video?tabType=2#editor",
+      ],
+    ]) {
+      const page = createSignalPage([before, after], "上传成功", "");
+      const event = createEvent();
+      await replyPublishOutcome({
+        page,
+        data: { pt, closeWindowAfterPublish: false },
+        window: null,
+        event,
+        urlBefore: before,
+        waitMs: 0,
+        successMessage: "上传成功",
+      });
+      const payload = event.calls[0].payload;
+      assert.strictEqual(
+        payload.publishAbnormal,
+        true,
+        `${pt} 仅 query/hash 变化不得判成功`
+      );
+      assert.strictEqual(payload.needsAttention, true);
+      assert.strictEqual(payload.publishSignal, "none");
+    }
+
+    // 9g. S12-fix1(4a)：dy/ks 新 pathname 仍为发布编辑页本身不得判成功；跳到作品列表才判成功
+    for (const [pt, before, stillEdit, worksList] of [
+      [
+        "抖音",
+        "https://creator.douyin.com/creator-micro/content/upload",
+        "https://creator.douyin.com/creator-micro/content/post/video?enter_from=publish_page",
+        "https://creator.douyin.com/creator-micro/content/manage",
+      ],
+      [
+        "快手",
+        "https://cp.kuaishou.com/article/publish/video",
+        "https://cp.kuaishou.com/article/publish/video/edit",
+        "https://cp.kuaishou.com/article/manage/video",
+      ],
+    ]) {
+      const editPage = createSignalPage([before, stillEdit], "", "");
+      const evEdit = createEvent();
+      await replyPublishOutcome({
+        page: editPage,
+        data: { pt, closeWindowAfterPublish: false },
+        window: null,
+        event: evEdit,
+        urlBefore: before,
+        waitMs: 0,
+      });
+      assert.strictEqual(
+        evEdit.calls[0].payload.publishAbnormal,
+        true,
+        `${pt} 仍停留在发布编辑页(${stillEdit})不得判成功`
+      );
+      assert.strictEqual(evEdit.calls[0].payload.needsAttention, true);
+
+      const listPage = createSignalPage([before, worksList], "", "");
+      const evList = createEvent();
+      await replyPublishOutcome({
+        page: listPage,
+        data: { pt, closeWindowAfterPublish: false },
+        window: null,
+        event: evList,
+        urlBefore: before,
+        waitMs: 0,
+      });
+      assert.strictEqual(
+        evList.calls[0].payload.publishAbnormal,
+        undefined,
+        `${pt} 跳到作品列表(${worksList})应判成功`
+      );
+      assert.strictEqual(evList.calls[0].payload.publishSignal, "url_changed");
+    }
+
+    // 9h. S12-fix1(4b)：dy/ks「发布成功」仅出现在整页正文（overlay 为空）不得判成功
+    for (const pt of ["抖音", "快手"]) {
+      const bodyOnlyPage = createSignalPage(
+        ["https://creator.example.com/publish", "https://creator.example.com/publish"],
+        "提示：点击按钮后显示发布成功即表示发布完成",
+        ""
+      );
+      const event = createEvent();
+      await replyPublishOutcome({
+        page: bodyOnlyPage,
+        data: { pt, closeWindowAfterPublish: false },
+        window: null,
+        event,
+        urlBefore: "https://creator.example.com/publish",
+        waitMs: 0,
+      });
+      const payload = event.calls[0].payload;
+      assert.strictEqual(
+        payload.publishAbnormal,
+        true,
+        `${pt} 整页正文含「发布成功」而弹层为空不得判成功`
+      );
+      assert.strictEqual(payload.needsAttention, true);
+      assert.strictEqual(payload.publishSignal, "none");
+    }
+
+    // 9i. S12-fix1(4c)：dy/ks 读不到 URL 且无信号 → 不判成功，走 needs_attention（退出码 4）
+    for (const pt of ["抖音", "快手"]) {
+      const emptyUrlPage = {
+        url: () => "",
+        waitForTimeout: async () => {},
+        evaluate: async () => ({ full: "", overlay: "" }),
+      };
+      const event = createEvent();
+      await replyPublishOutcome({
+        page: emptyUrlPage,
+        data: { pt, closeWindowAfterPublish: false },
+        window: null,
+        event,
+        urlBefore: "https://creator.example.com/publish",
+        waitMs: 0,
+        successMessage: "上传成功",
+      });
+      const payload = event.calls[0].payload;
+      assert.strictEqual(
+        payload.publishAbnormal,
+        true,
+        `${pt} 读不到 URL 且无信号不得判成功`
+      );
+      assert.strictEqual(payload.needsAttention, true);
+      assert.strictEqual(payload.outcome, "publish_abnormal");
+      assert.strictEqual(payload.message, PUBLISH_UNCONFIRMED_MESSAGE);
+      const completion = resolvePublishCompletion(payload);
+      assert.strictEqual(completion.exitCode, 4);
+      assert.strictEqual(completion.recordStatus, "abnormal");
+    }
+
+    // 9j. S12-fix1(4d)：轮询最后一轮等待结束后页面才跳到作品列表 → 末尾补读 URL 判成功
+    for (const [pt, before, worksList] of [
+      [
+        "抖音",
+        "https://creator.douyin.com/creator-micro/content/post/video?enter_from=publish_page",
+        "https://creator.douyin.com/creator-micro/content/manage",
+      ],
+      [
+        "快手",
+        "https://cp.kuaishou.com/article/publish/video?tabType=1",
+        "https://cp.kuaishou.com/article/manage/video",
+      ],
+    ]) {
+      // PUBLISH_VERDICT_TIMEOUT_MS=20000 → maxRounds=20，前 20 轮均在编辑页，
+      // 第 20 轮 await delay(1000) 结束后第 21 次 readPageUrl 才跳到作品列表
+      const urls = Array(20).fill(before).concat([worksList]);
+      const lateRedirectPage = createSignalPage(urls, "上传成功", "");
+      const event = createEvent();
+      await replyPublishOutcome({
+        page: lateRedirectPage,
+        data: { pt, closeWindowAfterPublish: false },
+        window: null,
+        event,
+        urlBefore: before,
+        waitMs: 0,
+        successMessage: "上传成功",
+      });
+      const payload = event.calls[0].payload;
+      assert.strictEqual(
+        payload.publishAbnormal,
+        undefined,
+        `${pt} 最后一轮等待结束后跳到作品列表应判成功`
+      );
+      assert.strictEqual(payload.publishSignal, "url_changed");
+      assert.strictEqual(payload.publishPageUrl, worksList);
+      assert.strictEqual(payload.message, "上传成功");
     }
   }
 

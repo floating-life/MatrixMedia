@@ -65,46 +65,127 @@ export function parsePublishArgs(subArgv) {
     publishOptions: {},
   };
 
+  const VALUE_FLAG_HINTS = {
+    "--sph-product-id": "商品编号",
+    "--sph-drama-id": "短剧名称",
+    "--sph-series-id": "剧集名称",
+    "--collection": "合集名称",
+  };
+  const consumeOptionValue = (flag, idx) => {
+    const next = args[idx + 1];
+    if (
+      idx + 1 >= args.length ||
+      next == null ||
+      String(next).startsWith("--")
+    ) {
+      const hint = VALUE_FLAG_HINTS[flag] || "值";
+      return {
+        ok: false,
+        error: `参数 ${flag} 缺少${hint}${
+          next != null && String(next).startsWith("--")
+            ? `（紧随其后的是选项 ${next}）`
+            : ""
+        }`,
+      };
+    }
+    return { ok: true, value: next };
+  };
+
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === "--platform" || a === "-p") {
-      out.platform = args[++i];
+      const v = consumeOptionValue(a, i);
+      if (!v.ok) return v;
+      out.platform = v.value;
+      i += 1;
     } else if (a === "--file" || a === "-f") {
-      out.file = args[++i];
+      const v = consumeOptionValue(a, i);
+      if (!v.ok) return v;
+      out.file = v.value;
+      i += 1;
     } else if (a === "--phone") {
-      out.phone = args[++i];
+      const v = consumeOptionValue(a, i);
+      if (!v.ok) return v;
+      out.phone = v.value;
+      i += 1;
     } else if (a === "--partition") {
-      out.partition = args[++i];
+      const v = consumeOptionValue(a, i);
+      if (!v.ok) return v;
+      out.partition = v.value;
+      i += 1;
     } else if (a === "--title" || a === "-t") {
-      out.title = args[++i];
+      const v = consumeOptionValue(a, i);
+      if (!v.ok) return v;
+      out.title = v.value;
+      i += 1;
     } else if (a === "--description" || a === "--desc") {
-      out.description = args[++i] || "";
+      const v = consumeOptionValue(a, i);
+      if (!v.ok) return v;
+      out.description = v.value || "";
+      i += 1;
     } else if (a === "--short-title") {
-      out.shortTitle = args[++i] || "";
+      const v = consumeOptionValue(a, i);
+      if (!v.ok) return v;
+      out.shortTitle = v.value || "";
+      i += 1;
     } else if (a === "--name" || a === "--book-name") {
-      out.bookName = args[++i];
+      const v = consumeOptionValue(a, i);
+      if (!v.ok) return v;
+      out.bookName = v.value;
+      i += 1;
     } else if (a === "--bt2") {
-      out.bt2 = args[++i];
+      const v = consumeOptionValue(a, i);
+      if (!v.ok) return v;
+      out.bt2 = v.value;
+      i += 1;
     } else if (a === "--tags" || a === "--bq") {
-      out.bq = args[++i] || "";
+      const v = consumeOptionValue(a, i);
+      if (!v.ok) return v;
+      out.bq = v.value || "";
+      i += 1;
     } else if (a === "--publish-at") {
-      out.publishAt = args[++i];
+      const v = consumeOptionValue(a, i);
+      if (!v.ok) return v;
+      out.publishAt = v.value;
+      i += 1;
     } else if (a === "--show") {
       out.show = true;
     } else if (a === "--no-close-window") {
       out.closeWindowAfterPublish = false;
     } else if (a === "--dir") {
-      out.dir = args[++i];
+      const v = consumeOptionValue(a, i);
+      if (!v.ok) return v;
+      out.dir = v.value;
+      i += 1;
     } else if (a === "--config" || a === "--xlsx") {
-      out.config = args[++i];
+      const v = consumeOptionValue(a, i);
+      if (!v.ok) return v;
+      out.config = v.value;
+      i += 1;
     } else if (a === "--cover") {
-      out.cover = args[++i];
+      const v = consumeOptionValue(a, i);
+      if (!v.ok) return v;
+      out.cover = v.value;
+      i += 1;
     } else if (a === "--creative-statement" || a === "--cs") {
-      out.creativeStatement = args[++i];
+      const v = consumeOptionValue(a, i);
+      if (!v.ok) return v;
+      out.creativeStatement = v.value;
+      i += 1;
     } else if (a === "--collection") {
-      out.collection = args[++i] || "";
+      const v = consumeOptionValue(a, i);
+      if (!v.ok) return v;
+      out.collection = v.value || "";
+      i += 1;
     } else if (a.startsWith("--collection=")) {
-      out.collection = a.slice("--collection=".length);
+      const eqVal = a.slice("--collection=".length);
+      if (eqVal.startsWith("--")) {
+        return {
+          ok: false,
+          error: `参数 --collection 值无效（${eqVal}）`,
+        };
+      }
+      out.collection = eqVal;
     } else if (a === "--draft") {
       out.draft = true;
     } else if (a === "--allow-duplicate") {
@@ -114,21 +195,36 @@ export function parsePublishArgs(subArgv) {
     } else if (a === "--no-download") {
       out.noDownload = true;
     } else if (a === "--sph-link-type") {
-      out.sphLinkType = args[++i];
+      const v = consumeOptionValue(a, i);
+      if (!v.ok) return v;
+      out.sphLinkType = v.value;
+      i += 1;
     } else if (a === "--sph-link-value") {
-      out.sphLinkValue = args[++i];
+      const v = consumeOptionValue(a, i);
+      if (!v.ok) return v;
+      out.sphLinkValue = v.value;
+      i += 1;
     } else if (a === "--sph-product-id") {
+      const v = consumeOptionValue(a, i);
+      if (!v.ok) return v;
       // 商品上架快捷参数：等价于 --sph-link-type product --sph-link-value <id>
       out.sphLinkType = VIDEO_LINK_TYPES.PRODUCT;
-      out.sphLinkValue = args[++i];
+      out.sphLinkValue = v.value;
+      i += 1;
     } else if (a === "--sph-drama-id") {
+      const v = consumeOptionValue(a, i);
+      if (!v.ok) return v;
       // 小程序短剧快捷参数：等价于 --sph-link-type mini_drama --sph-link-value <短剧名称>
       out.sphLinkType = VIDEO_LINK_TYPES.MINI_DRAMA;
-      out.sphLinkValue = args[++i];
+      out.sphLinkValue = v.value;
+      i += 1;
     } else if (a === "--sph-series-id") {
+      const v = consumeOptionValue(a, i);
+      if (!v.ok) return v;
       // 视频号剧集快捷参数：等价于 --sph-link-type sph_series --sph-link-value <剧集名称>
       out.sphLinkType = VIDEO_LINK_TYPES.SPH_SERIES;
-      out.sphLinkValue = args[++i];
+      out.sphLinkValue = v.value;
+      i += 1;
     }
   }
 

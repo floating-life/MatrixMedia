@@ -740,7 +740,14 @@ async function runBatchDirPublish(v, cfg) {
         if (rowReservationId) {
           await releaseThrottleReservation(rowReservationId);
         }
-        const conflictInfo = checkExistingScheduledCreativeConflict(existing, cs);
+        const requestedRowCollection =
+          (resolvedRowCol && resolvedRowCol.enabled && resolvedRowCol.name) ||
+          "";
+        const conflictInfo = checkExistingScheduledCreativeConflict(
+          existing,
+          cs,
+          requestedRowCollection
+        );
         const existingPublishAt =
           existing.scheduledPublishAtText ||
           formatUtc8DateTime(existing.scheduledPublishAt) ||
@@ -756,6 +763,8 @@ async function runBatchDirPublish(v, cfg) {
               creativeStatement: conflictInfo.actualCreativeStatement,
               requestedCreativeStatement:
                 conflictInfo.requestedCreativeStatement,
+              collection: conflictInfo.actualCollection,
+              requestedCollection: conflictInfo.requestedCollection,
               status: "needs_attention",
               needsAttention: true,
               duplicate: true,
@@ -773,6 +782,9 @@ async function runBatchDirPublish(v, cfg) {
               platform: v.platform,
               phone: v.phone || "",
               creativeStatement: conflictInfo.actualCreativeStatement,
+              ...(conflictInfo.actualCollection
+                ? { collection: conflictInfo.actualCollection }
+                : {}),
               status: "scheduled",
               scheduled: true,
               duplicate: true,
@@ -1430,6 +1442,12 @@ export async function runCliMain(argv = process.argv) {
             creativeStatement: finalCs,
             ...(result.requestedCreativeStatement !== undefined
               ? { requestedCreativeStatement: result.requestedCreativeStatement }
+              : {}),
+            ...(result.collection !== undefined
+              ? { collection: result.collection }
+              : {}),
+            ...(result.requestedCollection !== undefined
+              ? { requestedCollection: result.requestedCollection }
               : {}),
             message: result.message,
           })

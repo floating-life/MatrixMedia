@@ -104,10 +104,10 @@ function parseAppVersion(lines) {
   return "";
 }
 
-/** 提取平台自动化诊断行（[publish]/[dy]/[sph]...），用于校准 #42 的信号文案 */
+/** 提取平台自动化诊断行（[publish]/[collection]/[dy]/[sph]...），用于校准 #42 的信号文案 */
 function collectEvidence(lines) {
   return lines.filter((l) =>
-    /\[(publish|dy|sph|blbl|bjh|tt|ks|xhs)\]/.test(l)
+    /\[(publish|collection|dy|sph|blbl|bjh|tt|ks|xhs)\]/.test(l)
   );
 }
 

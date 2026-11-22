@@ -27,6 +27,30 @@ import { capturePublishFailureScreenshot } from "./failureScreenshot.js";
 
 export const COLLECTION_CANDIDATE_LIMIT = 10;
 
+/**
+ * 禁止作为合集入口点击的表单提交/动作按钮文案常量（安全红线）：
+ * 候选入口本身及其祖先/后代按钮含这些文案的一律排除，绝不允许误点发布/存草稿/取消等按钮。
+ */
+export const FORBIDDEN_ENTRY_ACTION_TEXTS = [
+  "发布",
+  "立即发布",
+  "确认发布",
+  "定时发布",
+  "发表",
+  "立即发表",
+  "存草稿",
+  "保存草稿",
+  "暂存离开",
+  "暂存草稿",
+  "保存",
+  "提交",
+  "取消",
+  "取消发布",
+  "离开",
+  "放弃",
+  "删除",
+];
+
 export const COLLECTION_DEFAULT_TIMEOUTS = {
   entryTimeoutMs: 5000,
   optionTimeoutMs: 5000,
@@ -68,7 +92,7 @@ export const PLATFORM_COLLECTION_CONFIGS = {
       "[class*='mix']",
       "[class*='form-item']",
       "[class*='setting-item']",
-      "[class*='content-']",
+      "[class*='form-field']",
     ],
     triggerSelectors: [
       ".semi-select",
@@ -237,6 +261,30 @@ export const PLATFORM_COLLECTION_CONFIGS = {
   },
 };
 
+/**
+ * 合集控件占位/未选入口文案全集（回读时一律不得视为已选合集值）。
+ */
+export const COLLECTION_PLACEHOLDER_TEXTS = Array.from(
+  new Set([
+    ...PLATFORM_COLLECTION_CONFIGS.dy.entryTexts,
+    ...PLATFORM_COLLECTION_CONFIGS.ks.entryTexts,
+    ...PLATFORM_COLLECTION_CONFIGS.sph.entryTexts,
+    "请选择合集",
+    "选择合集",
+    "添加到合集",
+    "添加合集",
+    "添加至合集",
+    "暂不添加",
+    "暂不选择",
+    "未选择",
+    "不加入合集",
+    "不添加到合集",
+    "暂不加入",
+    "不选择",
+    "无合集",
+  ])
+);
+
 export function getPlatformCollectionConfig(platform) {
   const key = getCollectionPlatformKey(platform);
   return key ? PLATFORM_COLLECTION_CONFIGS[key] || null : null;
@@ -254,14 +302,62 @@ export function isExactCollectionMatch(candidateText, targetName) {
   return Boolean(c && t && c === t);
 }
 
+/** 判断文本是否属于合集占位/未选文案（不得视为已选合集值） */
+export function isCollectionPlaceholderText(text, extraPlaceholders = []) {
+  const d = normalizeCollectionMatchText(text);
+  if (!d) return true;
+  const set = new Set(
+    COLLECTION_PLACEHOLDER_TEXTS.map((p) => normalizeCollectionMatchText(p)).filter(
+      Boolean
+    )
+  );
+  if (Array.isArray(extraPlaceholders)) {
+    for (let i = 0; i < extraPlaceholders.length; i++) {
+      const np = normalizeCollectionMatchText(extraPlaceholders[i]);
+      if (np) set.add(np);
+    }
+  }
+  return set.has(d);
+}
+
 /**
- * 回读校验：控件上显示的已选文本包含目标合集名（去空白后比对）才算成功。
- * 例如控件显示「民间故事」或「已选：民间故事」均通过；「请选择合集」「都市传说」「」均不通过。
+ * 严格回读校验（严禁 includes）：
+ * - 任何占位/未选入口文案（如「请选择合集」「选择合集」「添加到合集」「暂不添加」「未选择」「不加入合集」等）
+ *   一律视为未选，返回 false；
+ * - 支持传入字符串、已选标签文本数组、或 readSelectedCollectionInDom 返回对象；
+ * - 必须去空白后与目标合集名完全相等，或控件内某已选标签节点文本去空白后恰等于目标合集名。
  */
-export function matchesCollectionReadback(displayedText, targetName) {
-  const d = normalizeCollectionMatchText(displayedText);
-  const t = normalizeCollectionMatchText(targetName);
-  return Boolean(d && t && d.includes(t));
+export function matchesCollectionReadback(
+  displayedOrResult,
+  targetName,
+  options = {}
+) {
+  const targetNorm = normalizeCollectionMatchText(targetName);
+  if (!targetNorm) return false;
+  const extraPlaceholders =
+    options && Array.isArray(options.placeholders) ? options.placeholders : [];
+  const isExactNonPlaceholder = (raw) => {
+    const d = normalizeCollectionMatchText(raw);
+    if (!d) return false;
+    if (isCollectionPlaceholderText(d, extraPlaceholders)) return false;
+    return d === targetNorm;
+  };
+
+  if (Array.isArray(displayedOrResult)) {
+    return displayedOrResult.some(isExactNonPlaceholder);
+  }
+  if (displayedOrResult && typeof displayedOrResult === "object") {
+    if (
+      Array.isArray(displayedOrResult.selectedTexts) &&
+      displayedOrResult.selectedTexts.length > 0 &&
+      displayedOrResult.selectedTexts.some(isExactNonPlaceholder)
+    ) {
+      return true;
+    }
+    if (displayedOrResult.isPlaceholder === true) return false;
+    return isExactNonPlaceholder(displayedOrResult.displayedText);
+  }
+  return isExactNonPlaceholder(displayedOrResult);
 }
 
 /** 整理页面候选合集名（去重、去空、最多保留 limit 个） */
@@ -311,9 +407,11 @@ function waitMs(page, ms) {
 
 /**
  * 浏览器端：查找合集入口控件并点击展开。
- * 策略顺序：
- *   1. label_row：找到可见的合集表单标签（如「添加到合集」「合集」），在同行/近邻容器找交互控件；
- *   2. entry_text：直接按控件占位符/按钮可见文本（如「请选择合集」「选择合集」）定位。
+ * 安全红线：
+ *   1. 候选入口一律排除 FORBIDDEN_ENTRY_ACTION_TEXTS（「发布」「存草稿」「暂存离开」「保存草稿」「发表」「取消」等）
+ *      及其祖先/后代含这些文案的按钮与 submit/reset 控件；
+ *   2. 入口必须与「合集」表单标签处在同一表单行容器内，绝不越界到整页/表单级容器；
+ *   3. 入口缺失或 disabled 直接返回失败，不做任何宽松兜底点击。
  */
 export function openCollectionEntryInDom(payload) {
   var cfg = (payload && payload.config) || {};
@@ -389,15 +487,141 @@ export function openCollectionEntryInDom(payload) {
       if (node.disabled === true) return true;
       if (
         typeof node.getAttribute === "function" &&
-        node.getAttribute("aria-disabled") === "true"
+        (node.getAttribute("disabled") !== null ||
+          node.getAttribute("aria-disabled") === "true")
       ) {
         return true;
       }
       var cls = String((node.getAttribute && node.getAttribute("class")) || "");
-      if (/\b(ant-select-disabled|semi-select-disabled|is-disabled)\b/.test(cls)) {
+      if (
+        /\b(ant-select-disabled|semi-select-disabled|is-disabled|disabled|weui-desktop-btn_disabled)\b/.test(
+          cls
+        )
+      ) {
         return true;
       }
       node = node.parentElement;
+    }
+    return false;
+  };
+
+  var forbiddenTexts = (
+    (payload && Array.isArray(payload.forbiddenActionTexts)
+      ? payload.forbiddenActionTexts
+      : null) || [
+      "发布",
+      "立即发布",
+      "确认发布",
+      "定时发布",
+      "发表",
+      "立即发表",
+      "存草稿",
+      "保存草稿",
+      "暂存离开",
+      "暂存草稿",
+      "保存",
+      "提交",
+      "取消",
+      "取消发布",
+      "离开",
+      "放弃",
+      "删除",
+    ]
+  )
+    .map(norm)
+    .filter(Boolean);
+
+  var isForbiddenText = function (raw) {
+    var t = norm(raw);
+    if (!t) return false;
+    for (var i = 0; i < forbiddenTexts.length; i++) {
+      if (t === forbiddenTexts[i] || t.indexOf(forbiddenTexts[i]) !== -1) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  var nodeHasForbiddenText = function (node) {
+    if (!node) return false;
+    var txt = node.innerText != null ? node.innerText : node.textContent;
+    if (isForbiddenText(txt)) return true;
+    if (typeof node.getAttribute === "function") {
+      if (isForbiddenText(node.getAttribute("aria-label"))) return true;
+      if (isForbiddenText(node.getAttribute("title"))) return true;
+      if (isForbiddenText(node.getAttribute("value"))) return true;
+    }
+    if (node.value != null && isForbiddenText(node.value)) return true;
+    return false;
+  };
+
+  var isButtonLike = function (node) {
+    if (!node || node.nodeType !== 1) return false;
+    var tag = String(node.tagName || "").toUpperCase();
+    if (tag === "BUTTON" || tag === "A") return true;
+    if (tag === "INPUT") {
+      var inputType = String(
+        (node.getAttribute && node.getAttribute("type")) || node.type || ""
+      ).toLowerCase();
+      if (
+        inputType === "submit" ||
+        inputType === "button" ||
+        inputType === "reset"
+      ) {
+        return true;
+      }
+    }
+    var role = String(
+      (node.getAttribute && node.getAttribute("role")) || ""
+    ).toLowerCase();
+    if (role === "button") return true;
+    var cls = String((node.getAttribute && node.getAttribute("class")) || "");
+    if (/(?:^|[\s_-])(?:btn|button)(?:$|[\s_-])/i.test(cls)) return true;
+    return false;
+  };
+
+  var isForbiddenEntryCandidate = function (el) {
+    if (!el) return true;
+    var tag = String(el.tagName || "").toUpperCase();
+    var typeAttr = String(
+      (el.getAttribute && el.getAttribute("type")) || el.type || ""
+    ).toLowerCase();
+    if (
+      (tag === "BUTTON" || tag === "INPUT") &&
+      (typeAttr === "submit" || typeAttr === "reset")
+    ) {
+      return true;
+    }
+    if (nodeHasForbiddenText(el)) return true;
+    // 排除祖先中存在含提交/动作文案的按钮
+    var anc = el.parentElement;
+    while (anc && anc !== root && anc.nodeType === 1) {
+      if (isButtonLike(anc) && nodeHasForbiddenText(anc)) return true;
+      anc = anc.parentElement;
+    }
+    // 排除后代中存在含提交/动作文案的元素或 submit/reset 按钮
+    if (typeof el.querySelectorAll === "function") {
+      var desc = [];
+      try {
+        desc = Array.from(el.querySelectorAll("*"));
+      } catch (_) {
+        desc = [];
+      }
+      for (var di = 0; di < desc.length; di++) {
+        var dTag = String(desc[di].tagName || "").toUpperCase();
+        var dType = String(
+          (desc[di].getAttribute && desc[di].getAttribute("type")) ||
+            desc[di].type ||
+            ""
+        ).toLowerCase();
+        if (
+          (dTag === "BUTTON" || dTag === "INPUT") &&
+          (dType === "submit" || dType === "reset")
+        ) {
+          return true;
+        }
+        if (nodeHasForbiddenText(desc[di])) return true;
+      }
     }
     return false;
   };
@@ -408,7 +632,11 @@ export function openCollectionEntryInDom(payload) {
         el.scrollIntoView({ block: "center", inline: "center" });
       } catch (_) {}
     }
-    if (useMouseSequence && typeof el.dispatchEvent === "function" && typeof MouseEvent === "function") {
+    if (
+      useMouseSequence &&
+      typeof el.dispatchEvent === "function" &&
+      typeof MouseEvent === "function"
+    ) {
       var rect =
         typeof el.getBoundingClientRect === "function"
           ? el.getBoundingClientRect()
@@ -450,6 +678,13 @@ export function openCollectionEntryInDom(payload) {
 
   var labelTexts = (cfg.labelTexts || []).map(norm).filter(Boolean);
   var entryTexts = (cfg.entryTexts || []).map(norm).filter(Boolean);
+  var rowContainerSelectors = cfg.rowContainerSelectors || [
+    "[class*='collection']",
+    "[class*='album']",
+    "[class*='form-item']",
+    "[class*='setting-item']",
+    "[class*='form-field']",
+  ];
   var triggerSelectors = cfg.triggerSelectors || [
     ".semi-select",
     ".ant-select-selector",
@@ -458,6 +693,10 @@ export function openCollectionEntryInDom(payload) {
     "button",
     "[role='button']",
   ];
+  var semanticSelectSelectors = triggerSelectors.filter(function (sel) {
+    var s = String(sel || "").trim().toLowerCase();
+    return s !== "button" && s !== "[role='button']" && s !== '[role="button"]';
+  });
 
   var allEls = [];
   try {
@@ -485,7 +724,118 @@ export function openCollectionEntryInDom(payload) {
     return false;
   };
 
-  // 策略 1：按表单行标签定位同行交互控件
+  var isSemanticSelect = function (el) {
+    if (!el || typeof el.matches !== "function") return false;
+    var tag = String(el.tagName || "").toUpperCase();
+    if (tag === "SELECT") return true;
+    for (var i = 0; i < semanticSelectSelectors.length; i++) {
+      try {
+        if (el.matches(semanticSelectSelectors[i])) return true;
+      } catch (_) {}
+    }
+    return false;
+  };
+
+  var isLabelWrapper = function (node, lbNormText) {
+    if (!node || node.nodeType !== 1) return false;
+    var cls = String((node.getAttribute && node.getAttribute("class")) || "");
+    if (/(?:^|[\s_-])label(?:$|[\s_-])/i.test(cls)) return true;
+    var nodeText = norm(
+      node.innerText != null ? node.innerText : node.textContent
+    ).replace(/[:：*＊]+$/g, "");
+    return Boolean(nodeText && nodeText === lbNormText);
+  };
+
+  var matchesRowContainerSelector = function (node) {
+    if (!node || typeof node.matches !== "function") return false;
+    for (var i = 0; i < rowContainerSelectors.length; i++) {
+      try {
+        if (node.matches(rowContainerSelectors[i])) return true;
+      } catch (_) {}
+    }
+    return false;
+  };
+
+  var isWholeFormOrMultiRowContainer = function (node, lb, lbNormText) {
+    if (
+      !node ||
+      node === root ||
+      node === document ||
+      node === document.body ||
+      node === document.documentElement
+    ) {
+      return true;
+    }
+    var tag = String(node.tagName || "").toUpperCase();
+    if (tag === "FORM" || tag === "MAIN" || tag === "BODY" || tag === "HTML") {
+      return true;
+    }
+    var txtLen = norm(
+      node.innerText != null ? node.innerText : node.textContent
+    ).length;
+    if (txtLen > 240) return true;
+    if (typeof node.querySelectorAll === "function") {
+      var btns = [];
+      try {
+        btns = Array.from(
+          node.querySelectorAll(
+            "button, [role='button'], input[type='submit'], input[type='button']"
+          )
+        );
+      } catch (_) {
+        btns = [];
+      }
+      for (var bi = 0; bi < btns.length; bi++) {
+        if (isVisible(btns[bi]) && isForbiddenEntryCandidate(btns[bi])) {
+          return true;
+        }
+      }
+      var otherLabels = [];
+      try {
+        otherLabels = Array.from(node.querySelectorAll("label"));
+      } catch (_) {
+        otherLabels = [];
+      }
+      for (var oli = 0; oli < otherLabels.length; oli++) {
+        var ol = otherLabels[oli];
+        if (!isVisible(ol) || ol === lb) continue;
+        if (typeof lb.contains === "function" && lb.contains(ol)) continue;
+        if (typeof ol.contains === "function" && ol.contains(lb)) continue;
+        var olText = norm(
+          ol.innerText != null ? ol.innerText : ol.textContent
+        ).replace(/[:：*＊]+$/g, "");
+        if (olText && olText !== lbNormText) return true;
+      }
+      var nestedRows = queryList(node, [
+        ".form-item",
+        "[class*='form-item']",
+        "[class*='setting-item']",
+        "[class*='form-field']",
+      ]).filter(function (r) {
+        return (
+          r !== node &&
+          isVisible(r) &&
+          !isLabelWrapper(r, lbNormText) &&
+          !isSemanticSelect(r)
+        );
+      });
+      // 仅统计互不包含的独立表单行，避免把行内子节点（如 ant-form-item-control）算成多行
+      var disjointRows = nestedRows.filter(function (r) {
+        return !nestedRows.some(function (other) {
+          return (
+            other !== r &&
+            typeof other.contains === "function" &&
+            other.contains(r)
+          );
+        });
+      });
+      if (disjointRows.length >= 2) return true;
+    }
+    return false;
+  };
+
+  // 严格策略：只认与「合集」表单标签处于同一表单行容器内的合集入口控件，
+  // 排除所有提交/动作类按钮；不做任何跨行/全页宽松兜底点击。
   var labelNodes = allEls.filter(function (el) {
     var t = norm(el.innerText != null ? el.innerText : el.textContent);
     if (!matchLabelText(t)) return false;
@@ -507,84 +857,84 @@ export function openCollectionEntryInDom(payload) {
   var chosenRow = null;
   var strategy = "";
   var matchedLabel = "";
+  var disabledCandidate = null;
+  var disabledLabel = "";
 
   for (var li = 0; li < labelNodes.length && !chosenTrigger; li++) {
     var lb = labelNodes[li];
     var lbText = clean(lb.innerText != null ? lb.innerText : lb.textContent);
+    var lbNormText = norm(lbText).replace(/[:：*＊]+$/g, "");
     var container = lb.parentElement;
-    for (var depth = 0; container && container !== root && container !== document.body && depth < 6; depth++) {
-      var containerLen = norm(
-        container.innerText != null ? container.innerText : container.textContent
-      ).length;
-      if (containerLen > 600) break;
-      var triggers = queryList(container, triggerSelectors).filter(function (el) {
+    for (var depth = 0; container && depth < 5; depth++) {
+      if (
+        container === root ||
+        container === document ||
+        container === document.body ||
+        container === document.documentElement
+      ) {
+        break;
+      }
+      var containerIsLabelWrap = isLabelWrapper(container, lbNormText);
+      if (containerIsLabelWrap) {
+        container = container.parentElement;
+        continue;
+      }
+      if (isWholeFormOrMultiRowContainer(container, lb, lbNormText)) {
+        break;
+      }
+      var rowCandidates = queryList(container, triggerSelectors).filter(function (
+        el
+      ) {
+        if (!isVisible(el)) return false;
+        if (el === lb) return false;
+        if (typeof el.contains === "function" && el.contains(lb)) return false;
+        if (isForbiddenEntryCandidate(el)) return false;
+        if (isSemanticSelect(el)) return true;
+        var txt = norm(el.innerText != null ? el.innerText : el.textContent);
+        var ph = norm(
+          typeof el.getAttribute === "function"
+            ? el.getAttribute("placeholder")
+            : ""
+        );
         return (
-          isVisible(el) &&
-          !isDisabled(el) &&
-          el !== lb &&
-          (typeof el.contains !== "function" || !el.contains(lb))
+          matchEntryText(txt) ||
+          matchEntryText(ph) ||
+          txt.indexOf("合集") !== -1
         );
       });
-      if (triggers.length > 0) {
-        // 优先选带合集占位文案或语义下拉的触发器
-        var preferred =
-          triggers.find(function (el) {
-            var txt = norm(el.innerText != null ? el.innerText : el.textContent);
-            var ph = norm(
-              typeof el.getAttribute === "function" ? el.getAttribute("placeholder") : ""
-            );
-            return matchEntryText(txt) || matchEntryText(ph);
-          }) || triggers[0];
-        chosenTrigger = preferred;
-        chosenRow = container;
-        strategy = "label_row";
-        matchedLabel = lbText;
+      if (rowCandidates.length > 0) {
+        var enabledTriggers = rowCandidates.filter(function (el) {
+          return !isDisabled(el);
+        });
+        if (enabledTriggers.length > 0) {
+          var preferred =
+            enabledTriggers.find(function (el) {
+              var txt = norm(
+                el.innerText != null ? el.innerText : el.textContent
+              );
+              var ph = norm(
+                typeof el.getAttribute === "function"
+                  ? el.getAttribute("placeholder")
+                  : ""
+              );
+              return matchEntryText(txt) || matchEntryText(ph);
+            }) || enabledTriggers[0];
+          chosenTrigger = preferred;
+          chosenRow = container;
+          strategy = "label_row";
+          matchedLabel = lbText;
+          break;
+        }
+        if (!disabledCandidate) {
+          disabledCandidate = rowCandidates[0];
+          disabledLabel = lbText;
+        }
+        break;
+      }
+      if (matchesRowContainerSelector(container)) {
         break;
       }
       container = container.parentElement;
-    }
-  }
-
-  // 策略 2：直接按控件可见文案/placeholder 定位
-  if (!chosenTrigger) {
-    var directTriggers = queryList(root, triggerSelectors).filter(function (el) {
-      if (!isVisible(el) || isDisabled(el)) return false;
-      var txt = norm(el.innerText != null ? el.innerText : el.textContent);
-      var ph = norm(
-        typeof el.getAttribute === "function" ? el.getAttribute("placeholder") : ""
-      );
-      return matchEntryText(txt) || matchEntryText(ph);
-    });
-    if (directTriggers.length > 0) {
-      chosenTrigger = directTriggers[0];
-      chosenRow = chosenTrigger.parentElement || chosenTrigger;
-      strategy = "entry_trigger";
-    }
-  }
-
-  // 策略 3：任意可见叶节点文本命中入口文案（兼容无标准 role/class 的自定义组件）
-  if (!chosenTrigger) {
-    var textLeaves = allEls.filter(function (el) {
-      if (isDisabled(el)) return false;
-      var txt = norm(el.innerText != null ? el.innerText : el.textContent);
-      if (!matchEntryText(txt)) return false;
-      var kids = el.children ? Array.from(el.children) : [];
-      for (var k = 0; k < kids.length; k++) {
-        if (
-          isVisible(kids[k]) &&
-          matchEntryText(
-            norm(kids[k].innerText != null ? kids[k].innerText : kids[k].textContent)
-          )
-        ) {
-          return false;
-        }
-      }
-      return true;
-    });
-    if (textLeaves.length > 0) {
-      chosenTrigger = textLeaves[0];
-      chosenRow = chosenTrigger.parentElement || chosenTrigger;
-      strategy = "entry_text_leaf";
     }
   }
 
@@ -617,13 +967,21 @@ export function openCollectionEntryInDom(payload) {
     }
     return {
       ok: false,
-      reason: "entry_not_found",
+      reason: disabledCandidate ? "entry_disabled" : "entry_not_found",
       diagnostics: {
         useShadowRoot: Boolean(cfg.useShadowRoot),
         shadowHost: cfg.shadowHostSelector || "",
         shadowFound: shadowFound,
         triedLabels: cfg.labelTexts || [],
         triedEntries: cfg.entryTexts || [],
+        matchedLabel: disabledLabel,
+        disabledEntryText: disabledCandidate
+          ? clean(
+              disabledCandidate.innerText != null
+                ? disabledCandidate.innerText
+                : disabledCandidate.textContent
+            ).slice(0, 60)
+          : "",
         nearbyKeywords: nearbyKeywords,
         formLabels: formLabels,
       },
@@ -974,7 +1332,8 @@ export function clickCollectionModalConfirmInDom(payload) {
 }
 
 /**
- * 浏览器端：回读合集控件当前显示的已选文本（排除仍展开的弹层/下拉节点）。
+ * 浏览器端：回读合集控件当前显示的已选文本（排除仍展开的弹层/下拉节点与表单标签，
+ * 并显式过滤占位/未选文案，避免把「请选择合集」或行标签「合集」误判为已选合集）。
  */
 export function readSelectedCollectionInDom(payload) {
   var cfg = (payload && payload.config) || {};
@@ -997,6 +1356,8 @@ export function readSelectedCollectionInDom(payload) {
         ok: false,
         reason: "shadow_root_not_found",
         displayedText: "",
+        selectedTexts: [],
+        isPlaceholder: false,
       };
     }
   }
@@ -1047,6 +1408,50 @@ export function readSelectedCollectionInDom(payload) {
     }
   };
 
+  var isPlaceholderNode = function (el) {
+    if (!el || typeof el.getAttribute !== "function") return false;
+    var cls = String(el.getAttribute("class") || "");
+    return /(?:^|[\s_-])placeholder(?:$|[\s_-])/i.test(cls);
+  };
+
+  var placeholderList = (
+    (payload && Array.isArray(payload.placeholders)
+      ? payload.placeholders
+      : null) || [
+      "请选择合集",
+      "选择合集",
+      "添加到合集",
+      "添加合集",
+      "添加至合集",
+      "暂不添加",
+      "暂不选择",
+      "未选择",
+      "不加入合集",
+      "不添加到合集",
+      "暂不加入",
+      "不选择",
+      "无合集",
+    ]
+  ).concat(Array.isArray(cfg.entryTexts) ? cfg.entryTexts : []);
+  var placeholderSet = {};
+  for (var phIdx = 0; phIdx < placeholderList.length; phIdx++) {
+    var phNorm = norm(placeholderList[phIdx]);
+    if (phNorm) placeholderSet[phNorm] = true;
+  }
+  var isPlaceholderText = function (txt) {
+    var n = norm(txt);
+    return !n || Boolean(placeholderSet[n]);
+  };
+
+  var labelTexts = (cfg.labelTexts || []).map(norm).filter(Boolean);
+  var isFormLabelNode = function (el) {
+    if (!el || el.nodeType !== 1) return false;
+    if (String(el.tagName || "").toUpperCase() === "LABEL") return true;
+    var cls = String((el.getAttribute && el.getAttribute("class")) || "");
+    if (/(?:^|[\s_-])label(?:$|[\s_-])/i.test(cls)) return true;
+    return false;
+  };
+
   var entryEl = token
     ? root.querySelector('[data-mm-collection-entry="' + token + '"]')
     : null;
@@ -1054,66 +1459,160 @@ export function readSelectedCollectionInDom(payload) {
     ? root.querySelector('[data-mm-collection-row="' + token + '"]')
     : null;
 
-  // 若组件重渲染导致临时标记丢失，按行标签重新定位只读容器（不点击）
+  // 若组件重渲染导致临时标记丢失，按行标签重新定位只读控件（不点击，且绝不把行标签当成已选值）
+  var rowLabelEl = null;
   if (!entryEl && !rowEl) {
-    var labelTexts = (cfg.labelTexts || []).map(norm).filter(Boolean);
     var allEls = [];
     try {
       allEls = Array.from(root.querySelectorAll("*")).filter(isVisible);
     } catch (_) {
       allEls = [];
     }
-    var lb = allEls.find(function (el) {
+    rowLabelEl = allEls.find(function (el) {
       var t = norm(el.innerText != null ? el.innerText : el.textContent).replace(
         /[:：*＊]+$/g,
         ""
       );
       return labelTexts.indexOf(t) !== -1;
     });
-    if (lb && lb.parentElement) {
-      rowEl = lb.parentElement;
+    if (rowLabelEl && rowLabelEl.parentElement) {
+      rowEl = rowLabelEl.parentElement;
+    }
+  }
+
+  // 若 entryEl 丢失但 rowEl 存在，优先在 rowEl 中重定位交互控件（排除 label）
+  if (!entryEl && rowEl && typeof rowEl.querySelectorAll === "function") {
+    var triggerSelectors = cfg.triggerSelectors || [
+      ".semi-select",
+      ".ant-select-selector",
+      ".ant-select",
+      ".post-album-display",
+      "[role='combobox']",
+    ];
+    for (var ti = 0; ti < triggerSelectors.length && !entryEl; ti++) {
+      var foundTriggers = [];
+      try {
+        foundTriggers = Array.from(rowEl.querySelectorAll(triggerSelectors[ti]));
+      } catch (_) {
+        foundTriggers = [];
+      }
+      for (var tj = 0; tj < foundTriggers.length; tj++) {
+        var cand = foundTriggers[tj];
+        if (!isVisible(cand) || isInsidePopup(cand) || isFormLabelNode(cand)) {
+          continue;
+        }
+        if (
+          rowLabelEl &&
+          (cand === rowLabelEl ||
+            (typeof cand.contains === "function" && cand.contains(rowLabelEl)))
+        ) {
+          continue;
+        }
+        entryEl = cand;
+        break;
+      }
     }
   }
 
   var readbackSelectors = cfg.readbackSelectors || [];
-  var scopes = [entryEl, rowEl].filter(Boolean);
-  for (var si = 0; si < scopes.length; si++) {
-    var scope = scopes[si];
+  var selectedTexts = [];
+  var selectedSeen = {};
+  var firstDisplayText = "";
+  var firstReadbackSource = "";
+
+  var pushCandidate = function (txt, source) {
+    var c = clean(txt);
+    if (!c) return;
+    if (!firstDisplayText) {
+      firstDisplayText = c;
+      firstReadbackSource = source;
+    }
+    if (isPlaceholderText(c)) return;
+    var k = norm(c);
+    if (k && !selectedSeen[k]) {
+      selectedSeen[k] = true;
+      selectedTexts.push(c);
+    }
+  };
+
+  var readScope = entryEl || rowEl;
+  if (readScope && isVisible(readScope) && !isInsidePopup(readScope)) {
+    // 1. 按平台 readbackSelectors 收集控件内已选标签/回读节点文本
     for (var ri = 0; ri < readbackSelectors.length; ri++) {
       var nodes = [];
       try {
-        nodes = Array.from(scope.querySelectorAll(readbackSelectors[ri]));
+        nodes = Array.from(readScope.querySelectorAll(readbackSelectors[ri]));
       } catch (_) {
         nodes = [];
       }
       for (var ni = 0; ni < nodes.length; ni++) {
         var n = nodes[ni];
-        if (!isVisible(n) || isInsidePopup(n)) continue;
+        if (!isVisible(n) || isInsidePopup(n) || isPlaceholderNode(n)) continue;
+        if (!entryEl && isFormLabelNode(n)) continue;
+        if (
+          rowLabelEl &&
+          (n === rowLabelEl ||
+            (typeof n.contains === "function" && n.contains(rowLabelEl)))
+        ) {
+          continue;
+        }
         var txt = clean(n.innerText != null ? n.innerText : n.textContent);
         if (txt) {
-          return {
-            ok: true,
-            displayedText: txt,
-            readbackSource: readbackSelectors[ri],
-          };
+          pushCandidate(txt, readbackSelectors[ri]);
         }
       }
     }
+
+    // 2. 若定位到了明确入口控件 entryEl，同时收集其内部可见叶节点标签文本（不含占位节点）与控件自身文本
+    if (entryEl && isVisible(entryEl) && !isInsidePopup(entryEl)) {
+      if (typeof entryEl.querySelectorAll === "function") {
+        var leaves = [];
+        try {
+          leaves = Array.from(entryEl.querySelectorAll("*"));
+        } catch (_) {
+          leaves = [];
+        }
+        for (var li = 0; li < leaves.length; li++) {
+          var leaf = leaves[li];
+          if (!isVisible(leaf) || isInsidePopup(leaf) || isPlaceholderNode(leaf)) {
+            continue;
+          }
+          if (leaf.children && leaf.children.length > 0) continue;
+          var leafTxt = clean(
+            leaf.innerText != null ? leaf.innerText : leaf.textContent
+          );
+          if (leafTxt) {
+            pushCandidate(leafTxt, "entry_tag");
+          }
+        }
+      }
+      var entryText = clean(
+        entryEl.innerText != null ? entryEl.innerText : entryEl.textContent
+      );
+      if (entryText) {
+        pushCandidate(entryText, "entry");
+      }
+    }
+
+    if (firstDisplayText || selectedTexts.length > 0) {
+      return {
+        ok: true,
+        displayedText: selectedTexts[0] || firstDisplayText,
+        selectedTexts: selectedTexts,
+        isPlaceholder:
+          selectedTexts.length === 0 && isPlaceholderText(firstDisplayText),
+        readbackSource: firstReadbackSource || (entryEl ? "entry" : "row"),
+      };
+    }
   }
 
-  if (entryEl && isVisible(entryEl) && !isInsidePopup(entryEl)) {
-    var entryText = clean(
-      entryEl.innerText != null ? entryEl.innerText : entryEl.textContent
-    );
-    return { ok: true, displayedText: entryText, readbackSource: "entry" };
-  }
-  if (rowEl && isVisible(rowEl) && !isInsidePopup(rowEl)) {
-    var rowText = clean(
-      rowEl.innerText != null ? rowEl.innerText : rowEl.textContent
-    );
-    return { ok: true, displayedText: rowText, readbackSource: "row" };
-  }
-  return { ok: false, reason: "readback_target_missing", displayedText: "" };
+  return {
+    ok: false,
+    reason: "readback_target_missing",
+    displayedText: "",
+    selectedTexts: [],
+    isPlaceholder: false,
+  };
 }
 
 export function cleanupCollectionMarkersInDom(payload) {
@@ -1266,6 +1765,7 @@ export async function selectPlatformCollection(
       openResult = await page.evaluate(openCollectionEntryInDom, {
         config,
         token,
+        forbiddenActionTexts: FORBIDDEN_ENTRY_ACTION_TEXTS,
       });
     } catch (evalErr) {
       openResult = {
@@ -1284,18 +1784,28 @@ export async function selectPlatformCollection(
     const entrySummary = formatEntryLookupSummary(
       openResult && openResult.diagnostics
     );
+    const isEntryDisabled =
+      openResult && openResult.reason === "entry_disabled";
     const reasonText =
       openResult && openResult.reason === "shadow_root_not_found"
         ? "未穿透 wujie 影子树（shadowRoot 不存在）"
+        : isEntryDisabled
+        ? "合集选择入口处于禁用状态（disabled）"
         : openResult && openResult.error
         ? `页面脚本异常：${openResult.error}`
         : "页面未找到合集选择入口";
     const msg = `${canonicalPlatform}选择合集「${targetName}」失败：${reasonText}；入口查找：${entrySummary}；页面候选合集（最多${COLLECTION_CANDIDATE_LIMIT}个）：（未打开入口，无候选）`;
-    await failWithScreenshot("collection_entry_not_found", msg, {
-      targetName,
-      entryLookup: (openResult && openResult.diagnostics) || null,
-      candidates: [],
-    });
+    await failWithScreenshot(
+      isEntryDisabled
+        ? "collection_entry_disabled"
+        : "collection_entry_not_found",
+      msg,
+      {
+        targetName,
+        entryLookup: (openResult && openResult.diagnostics) || null,
+        candidates: [],
+      }
+    );
   }
 
   const entryInfoText = `策略=${openResult.strategy}${
@@ -1384,7 +1894,7 @@ export async function selectPlatformCollection(
 
     await waitMs(page, timeouts.afterSelectDelayMs);
 
-    // ---------- 第 3 步：回读校验（控件上显示的已选文本必须包含目标合集名） ----------
+    // ---------- 第 3 步：严格回读校验（去空白后完全等于目标名或控件内已选标签恰为目标名，排除占位文案） ----------
     let readbackResult = null;
     let lastDisplayed = "";
     const readbackDeadline =
@@ -1394,12 +1904,15 @@ export async function selectPlatformCollection(
         readbackResult = await page.evaluate(readSelectedCollectionInDom, {
           config,
           token,
+          placeholders: COLLECTION_PLACEHOLDER_TEXTS,
         });
       } catch (evalErr) {
         readbackResult = {
           ok: false,
           reason: "evaluate_error",
           displayedText: "",
+          selectedTexts: [],
+          isPlaceholder: false,
         };
       }
       lastDisplayed = String(
@@ -1408,16 +1921,26 @@ export async function selectPlatformCollection(
       if (
         readbackResult &&
         readbackResult.ok &&
-        matchesCollectionReadback(lastDisplayed, targetName)
+        matchesCollectionReadback(readbackResult, targetName, {
+          placeholders: config.entryTexts,
+        })
       ) {
+        const matchedDisplay =
+          (Array.isArray(readbackResult.selectedTexts) &&
+            readbackResult.selectedTexts.find((t) =>
+              matchesCollectionReadback(t, targetName, {
+                placeholders: config.entryTexts,
+              })
+            )) ||
+          lastDisplayed;
         console.log(
-          `[collection] ${canonicalPlatform} 回读校验通过：控件显示=「${lastDisplayed}」，目标=「${targetName}」（来源=${readbackResult.readbackSource || "entry"}）`
+          `[collection] ${canonicalPlatform} 回读校验通过：控件显示=「${matchedDisplay}」，目标=「${targetName}」（来源=${readbackResult.readbackSource || "entry"}）`
         );
         return {
           skipped: false,
           selected: true,
           name: targetName,
-          displayedText: lastDisplayed,
+          displayedText: matchedDisplay,
           candidates: candidateNames,
         };
       }
@@ -1428,7 +1951,7 @@ export async function selectPlatformCollection(
 
     const msg = `${canonicalPlatform}选择合集「${targetName}」失败：回读不符，控件显示=「${
       lastDisplayed || "（空）"
-    }」不含目标合集名；入口查找：已打开（${entryInfoText}）；页面候选合集（最多${COLLECTION_CANDIDATE_LIMIT}个）：${candidateSummary}`;
+    }」与目标合集名不匹配；入口查找：已打开（${entryInfoText}）；页面候选合集（最多${COLLECTION_CANDIDATE_LIMIT}个）：${candidateSummary}`;
     await failWithScreenshot("collection_readback_mismatch", msg, {
       targetName,
       displayedText: lastDisplayed,

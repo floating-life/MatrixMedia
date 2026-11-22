@@ -2295,7 +2295,8 @@ function registerPublishThrottleIpc(ipcMain, deps = {}) {
             const conflictInfo =
               sharedThrottle.checkExistingScheduledCreativeConflict(
                 existing,
-                scheduledRecord.creativeStatement
+                scheduledRecord.creativeStatement,
+                scheduledRecord
               );
             const existingPublishAt =
               existing.scheduledPublishAtText ||
@@ -2312,6 +2313,8 @@ function registerPublishThrottleIpc(ipcMain, deps = {}) {
                 creativeStatement: conflictInfo.actualCreativeStatement,
                 requestedCreativeStatement:
                   conflictInfo.requestedCreativeStatement,
+                collection: conflictInfo.actualCollection,
+                requestedCollection: conflictInfo.requestedCollection,
                 message: conflictInfo.message,
               };
             }
@@ -2321,6 +2324,9 @@ function registerPublishThrottleIpc(ipcMain, deps = {}) {
               id: existing.id || null,
               publishAt: existingPublishAt,
               creativeStatement: conflictInfo.actualCreativeStatement,
+              ...(conflictInfo.actualCollection
+                ? { collection: conflictInfo.actualCollection }
+                : {}),
               message: conflictInfo.message,
             };
           }

@@ -451,6 +451,11 @@ async function fallbackLinkFailureToDraft(page, data, window, event, error) {
   try {
     // 链接在表单前半段填写；失败时仍需等待视频处理完成后才能可靠保存草稿。
     await waitSphUploadProcessing(page);
+    // 转存草稿前必须先完成合集选择 + 回读；合集失败则中止，不点保存草稿。
+    await selectPlatformCollection(page, "视频号", data.publishOptions, {
+      data,
+      window,
+    });
     await clickSphDraftButton(page);
     event.reply("puppeteerFile-done", {
       ...data,
@@ -465,6 +470,10 @@ async function fallbackLinkFailureToDraft(page, data, window, event, error) {
     maybeClosePublishWindow({ ...data, closeWindowAfterPublish: true }, window);
     return true;
   } catch (draftError) {
+    if (draftError && draftError.isCollectionError) {
+      draftError.message = `视频号链接添加失败（${detail}），转存草稿前选择合集失败：${draftError.message}`;
+      throw draftError;
+    }
     const draftDetail =
       (draftError && draftError.message) || String(draftError || "未知错误");
     throw new Error(

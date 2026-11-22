@@ -93,6 +93,11 @@ export const publishVideoTool: Tool = {
         description:
           "Optional absolute path to a custom cover image. Effective for Douyin (dy), Kuaishou (ks) and Shipinhao (sph) single-file publish; 3:4 portrait ratio recommended (1080x1440 fits all three; Douyin auto-generates the horizontal cover from the portrait one; Shipinhao accepts jpg/png only).",
       },
+      collection: {
+        type: "string",
+        description:
+          "Optional collection / album name to attach the video to (effective for Douyin/dy, Kuaishou/ks and Shipinhao/sph; exact match after stripping whitespace; leave empty to skip; ignored on other platforms). Forwards --collection to CLI.",
+      },
       sphProductId: {
         type: "string",
         description:
@@ -154,6 +159,8 @@ export async function handlePublishVideo(
   const creativeStatement =
     args.creativeStatement == null ? "" : String(args.creativeStatement).trim();
   const cover = args.cover == null ? "" : String(args.cover).trim();
+  const collection =
+    args.collection == null ? "" : String(args.collection).trim();
   const sphProductId =
     args.sphProductId == null ? "" : String(args.sphProductId).trim();
   const sphDramaId =
@@ -240,6 +247,7 @@ export async function handlePublishVideo(
     ...(noDownload ? ["--no-download"] : []),
     ...(creativeStatement ? ["--creative-statement", creativeStatement] : []),
     ...(cover ? ["--cover", cover] : []),
+    ...(collection ? ["--collection", collection] : []),
     ...sphLinkArgs,
   ];
 
@@ -324,6 +332,12 @@ export async function handlePublishVideo(
           : {}),
         ...(lastJson.requestedCreativeStatement !== undefined
           ? { requestedCreativeStatement: lastJson.requestedCreativeStatement }
+          : {}),
+        ...(lastJson.collection !== undefined
+          ? { collection: lastJson.collection }
+          : {}),
+        ...(lastJson.requestedCollection !== undefined
+          ? { requestedCollection: lastJson.requestedCollection }
           : {}),
         message:
           (lastJson.message as string) ??

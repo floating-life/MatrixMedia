@@ -43,6 +43,78 @@ export const PLATFORM_EXCLUDED_SUCCESS_TOASTS = {
 };
 
 /**
+ * 抖音/快手发布编辑页 pathname 匹配：
+ * 严格发布判定下，URL 跳转后若仍落在发布编辑页本身（或登录页），不算发布成功。
+ */
+const PUBLISH_EDIT_PATHNAME_PATTERNS = {
+  抖音: [
+    /^\/creator-micro\/content\/(?:upload|publish|post(?:\/|$))/i,
+    /^\/(?:publish|upload|post|edit)(?:\/(?:video|image|edit|create))?$/i,
+  ],
+  快手: [
+    /^\/article\/publish(?:\/|$)/i,
+    /^\/(?:publish|upload|post|edit)(?:\/(?:video|image|edit|create))?$/i,
+  ],
+};
+
+/** 识别是否属于收紧发布判定的平台（抖音 / 快手），其他平台返回空串 */
+export function resolveStrictPublishPlatform(platform) {
+  const pt = String(platform || "").trim();
+  if (!pt) return "";
+  const lower = pt.toLowerCase();
+  if (pt.includes("抖音") || lower === "dy" || lower === "douyin") {
+    return "抖音";
+  }
+  if (pt.includes("快手") || lower === "ks" || lower === "kuaishou") {
+    return "快手";
+  }
+  return "";
+}
+
+/** 提取归一化后的 URL pathname（忽略 query/hash 与末尾斜杠） */
+export function extractNormalizedPathname(url) {
+  const raw = String(url || "").trim();
+  if (!raw) return "";
+  try {
+    const parsed = new URL(raw);
+    return parsed.pathname.replace(/\/+$/, "") || "/";
+  } catch (_) {
+    const noHash = raw.split("#")[0];
+    const noQuery = noHash.split("?")[0];
+    return noQuery.replace(/\/+$/, "") || "/";
+  }
+}
+
+/** 判断 pathname 是否仍属于指定平台的发布编辑页 */
+export function isPublishEditPathname(pathname, strictPlatform) {
+  const p = String(pathname || "").trim();
+  if (!p) return true;
+  const patterns = PUBLISH_EDIT_PATHNAME_PATTERNS[strictPlatform] || [];
+  for (let i = 0; i < patterns.length; i++) {
+    if (patterns[i].test(p)) return true;
+  }
+  return false;
+}
+
+/**
+ * 判断点击发布后页面地址是否算作有效跳转：
+ * - dy/ks 严格模式：只认 pathname 改变（忽略 query/hash），且新 pathname 不是发布编辑页本身（也不为登录页）；
+ * - 其他平台：沿用原 normalizeUrl 对比逻辑不变。
+ */
+export function hasPublishUrlNavigated(urlBefore, urlAfter, strictPlatform) {
+  if (!urlBefore || !urlAfter) return false;
+  if (!strictPlatform) {
+    return normalizeUrl(urlAfter) !== normalizeUrl(urlBefore);
+  }
+  if (LOGIN_URL_PATTERN.test(urlAfter)) return false;
+  const pathBefore = extractNormalizedPathname(urlBefore);
+  const pathAfter = extractNormalizedPathname(urlAfter);
+  if (!pathBefore || !pathAfter) return false;
+  if (pathAfter === pathBefore) return false;
+  return !isPublishEditPathname(pathAfter, strictPlatform);
+}
+
+/**
  * 计算发布模式应排除的成功提示词列表：
  * - 若调用方显式传入 excludeSuccessToasts 数组，直接使用该数组；
  * - 否则按平台（抖音 / 快手）应用默认排除表；其他平台返回空数组。
@@ -53,14 +125,9 @@ export function resolveExcludedSuccessToasts(platform, excludeSuccessToasts) {
       .map((kw) => String(kw || "").trim())
       .filter(Boolean);
   }
-  const pt = String(platform || "").trim();
-  if (!pt) return [];
-  const lower = pt.toLowerCase();
-  if (pt.includes("抖音") || lower === "dy" || lower === "douyin") {
-    return PLATFORM_EXCLUDED_SUCCESS_TOASTS["抖音"].slice();
-  }
-  if (pt.includes("快手") || lower === "ks" || lower === "kuaishou") {
-    return PLATFORM_EXCLUDED_SUCCESS_TOASTS["快手"].slice();
+  const strictPt = resolveStrictPublishPlatform(platform);
+  if (strictPt && PLATFORM_EXCLUDED_SUCCESS_TOASTS[strictPt]) {
+    return PLATFORM_EXCLUDED_SUCCESS_TOASTS[strictPt].slice();
   }
   return [];
 }
@@ -104,6 +171,9 @@ export async function waitForPublishSignal(
   timeoutMs,
   options = {}
 ) {
+  const strictPlatform = resolveStrictPublishPlatform(
+    options && options.platform
+  );
   const excludedToasts = resolveExcludedSuccessToasts(
     options && options.platform,
     options && options.excludeSuccessToasts
@@ -119,11 +189,7 @@ export async function waitForPublishSignal(
   let blockHint = "";
   for (let round = 0; round < maxRounds; round++) {
     urlAfter = readPageUrl(page);
-    if (
-      urlBefore &&
-      urlAfter &&
-      normalizeUrl(urlAfter) !== normalizeUrl(urlBefore)
-    ) {
+    if (hasPublishUrlNavigated(urlBefore, urlAfter, strictPlatform)) {
       return {
         ok: true,
         signal: "url_changed",
@@ -133,10 +199,12 @@ export async function waitForPublishSignal(
       };
     }
     const signals = await readPageTextSignals(page);
-    const text = signals.full;
-    if (text) {
+    // dy/ks 发布模式只在弹层/toast 文本（overlay）里识别成功提示，避免整页正文误判；
+    // 其他平台维持原整页扫描行为不变。
+    const toastText = strictPlatform ? signals.overlay : signals.full;
+    if (toastText) {
       for (const kw of allowedToasts) {
-        if (text.includes(kw)) {
+        if (toastText.includes(kw)) {
           return {
             ok: true,
             signal: `toast:${kw}`,
@@ -146,22 +214,33 @@ export async function waitForPublishSignal(
           };
         }
       }
-      // 阻断提示只在弹层文本里找：整页正文里的常驻静态文案（字数上限等）
-      // 不算数——平台 toast 一般只存活几秒，取首次命中的上下文
-      if (!blockHint && signals.overlay) {
-        blockHint = matchPatternWithContext(
-          BLOCKING_TIP_PATTERNS,
-          signals.overlay,
-          12
-        );
-      }
+    }
+    // 阻断提示只在弹层文本里找：整页正文里的常驻静态文案（字数上限等）
+    // 不算数——平台 toast 一般只存活几秒，取首次命中的上下文
+    if (!blockHint && signals.overlay) {
+      blockHint = matchPatternWithContext(
+        BLOCKING_TIP_PATTERNS,
+        signals.overlay,
+        12
+      );
     }
     await delay(page, 1000);
+  }
+  // 轮询最后一轮等待结束后再读一次 URL，避免最后一秒跳转到作品列表页被误判异常
+  urlAfter = readPageUrl(page);
+  if (hasPublishUrlNavigated(urlBefore, urlAfter, strictPlatform)) {
+    return {
+      ok: true,
+      signal: "url_changed",
+      urlAfter,
+      blockHint: "",
+      excludedToasts,
+    };
   }
   return {
     ok: false,
     signal: "none",
-    urlAfter: readPageUrl(page),
+    urlAfter,
     blockHint,
     excludedToasts,
   };
@@ -570,9 +649,11 @@ export async function replyPublishOutcome({
       excludeSuccessToasts,
     }
   );
+  const strictPlatform = resolveStrictPublishPlatform(data && data.pt);
   const urlAfter = verdict.urlAfter;
-  // 读不到地址（窗口已关/页面销毁）时 abnormal 为 false，不误报异常
-  const abnormal = !verdict.ok && !!verdict.urlAfter;
+  // dy/ks 发布模式：读不到 URL 且无信号时不能判成功，走 publish_abnormal / needs_attention；
+  // 其他平台保持原行为（读不到地址时不误报异常）。
+  const abnormal = !verdict.ok && (strictPlatform ? true : !!verdict.urlAfter);
   const excludedList = Array.isArray(verdict.excludedToasts)
     ? verdict.excludedToasts
     : [];

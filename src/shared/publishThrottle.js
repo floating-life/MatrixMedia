@@ -978,14 +978,135 @@ function parseLocalPublishAt(value, nowMs = Date.now()) {
   return parsePublishAtUtc8(value, nowMs);
 }
 
+const COLLECTION_PLATFORM_KEYS = {
+  抖音: ["抖音", "dy", "douyin"],
+  快手: ["快手", "ks", "kuaishou"],
+  视频号: ["视频号", "sph"],
+};
+
+function resolveCollectionPlatformForThrottle(platform) {
+  const canonical = resolveCanonicalPlatform(platform);
+  return canonical && COLLECTION_PLATFORM_KEYS[canonical] ? canonical : "";
+}
+
+function normalizeScheduledCollectionName(value) {
+  if (value == null) return "";
+  if (typeof value === "object") {
+    if (value.enabled === false) return "";
+    const inner =
+      value.name != null ? value.name : value.value != null ? value.value : "";
+    return normalizeScheduledCollectionName(inner);
+  }
+  return String(value)
+    .replace(/_x000d_/gi, "")
+    .replace(/[\uFEFF\u200B\u200C\u200D]/g, "")
+    .replace(/\u00A0/g, " ")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function pickCollectionMapEntry(map, canonicalPt) {
+  if (!map || typeof map !== "object" || Array.isArray(map)) {
+    return { found: false, value: undefined };
+  }
+  const keys = COLLECTION_PLATFORM_KEYS[canonicalPt] || [];
+  const lowerSet = new Set(keys.map((k) => k.toLowerCase()));
+  for (let i = 0; i < keys.length; i++) {
+    if (
+      Object.prototype.hasOwnProperty.call(map, keys[i]) &&
+      map[keys[i]] !== undefined &&
+      map[keys[i]] !== null
+    ) {
+      return { found: true, value: map[keys[i]] };
+    }
+  }
+  for (const mk of Object.keys(map)) {
+    if (
+      lowerSet.has(mk.toLowerCase()) &&
+      map[mk] !== undefined &&
+      map[mk] !== null
+    ) {
+      return { found: true, value: map[mk] };
+    }
+  }
+  return { found: false, value: undefined };
+}
+
+/** 提取定时任务记录或请求配置在对应平台上实际生效的合集名（不支持平台返回空串） */
+function extractScheduledCollectionForPlatform(recordOrValue, platformHint) {
+  const pt = resolveCollectionPlatformForThrottle(
+    platformHint ||
+      (recordOrValue &&
+        typeof recordOrValue === "object" &&
+        (recordOrValue.pt || recordOrValue.platform))
+  );
+  if (!pt) return "";
+  if (recordOrValue == null) return "";
+  if (typeof recordOrValue === "string") {
+    return normalizeScheduledCollectionName(recordOrValue);
+  }
+  if (typeof recordOrValue !== "object") return "";
+  if (
+    (Object.prototype.hasOwnProperty.call(recordOrValue, "enabled") ||
+      Object.prototype.hasOwnProperty.call(recordOrValue, "name") ||
+      Object.prototype.hasOwnProperty.call(recordOrValue, "value")) &&
+    !Object.prototype.hasOwnProperty.call(recordOrValue, "publishOptions") &&
+    !Object.prototype.hasOwnProperty.call(recordOrValue, "collection")
+  ) {
+    return normalizeScheduledCollectionName(recordOrValue);
+  }
+  const opts =
+    recordOrValue.publishOptions &&
+    typeof recordOrValue.publishOptions === "object"
+      ? recordOrValue.publishOptions
+      : recordOrValue;
+  if (opts.platformOptions && typeof opts.platformOptions === "object") {
+    const pHit = pickCollectionMapEntry(opts.platformOptions, pt);
+    if (
+      pHit.found &&
+      pHit.value &&
+      typeof pHit.value === "object" &&
+      Object.prototype.hasOwnProperty.call(pHit.value, "collection") &&
+      pHit.value.collection !== undefined &&
+      pHit.value.collection !== null
+    ) {
+      return normalizeScheduledCollectionName(pHit.value.collection);
+    }
+  }
+  if (opts.collections && typeof opts.collections === "object") {
+    const mHit = pickCollectionMapEntry(opts.collections, pt);
+    if (mHit.found) {
+      return normalizeScheduledCollectionName(mHit.value);
+    }
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(opts, "collection") &&
+    opts.collection !== undefined &&
+    opts.collection !== null
+  ) {
+    return normalizeScheduledCollectionName(opts.collection);
+  }
+  if (
+    recordOrValue !== opts &&
+    Object.prototype.hasOwnProperty.call(recordOrValue, "collection") &&
+    recordOrValue.collection !== undefined &&
+    recordOrValue.collection !== null
+  ) {
+    return normalizeScheduledCollectionName(recordOrValue.collection);
+  }
+  return "";
+}
+
 /**
- * 校验复用既有定时任务时的创作声明冲突：
- * - 回执必须反映既有任务的实际声明（与上传参数一致）
- * - 若请求声明与既有任务不同，标记 conflict: true，交由调用方返回 needs_attention 不静默吞掉
+ * 校验复用既有定时任务时的参数冲突（创作声明 + 合集）：
+ * - 回执必须反映既有任务的实际声明与合集（与上传参数一致）
+ * - 若请求声明或合集与既有任务不同，标记 conflict: true，交由调用方返回 needs_attention 不静默复用原任务
  */
 function checkExistingScheduledCreativeConflict(
   existing,
-  requestedCreativeStatement
+  requestedCreativeStatement,
+  requestedCollection = undefined
 ) {
   const actualCreativeStatement = normalizeDefaultCreativeStatement(
     existing && existing.creativeStatement,
@@ -995,16 +1116,53 @@ function checkExistingScheduledCreativeConflict(
     requestedCreativeStatement,
     "none"
   );
-  const conflict = actualCreativeStatement !== requestedNorm;
+  const platformHint =
+    (existing && (existing.pt || existing.platform)) ||
+    (requestedCollection &&
+      typeof requestedCollection === "object" &&
+      (requestedCollection.pt || requestedCollection.platform)) ||
+    "";
+  const actualCollection = extractScheduledCollectionForPlatform(
+    existing,
+    platformHint
+  );
+  const compareCollection = requestedCollection !== undefined;
+  const requestedCollectionNorm = compareCollection
+    ? extractScheduledCollectionForPlatform(requestedCollection, platformHint)
+    : actualCollection;
+
+  const creativeConflict = actualCreativeStatement !== requestedNorm;
+  const collectionConflict =
+    compareCollection && actualCollection !== requestedCollectionNorm;
+  const conflict = creativeConflict || collectionConflict;
+
+  const existingId = (existing && existing.id) || "";
+  let message = "同一视频在该时间点的定时任务已存在，未重复创建";
+  if (creativeConflict && collectionConflict) {
+    message = `同一视频在该时间点的定时任务已存在（id=${existingId}），但既有任务创作声明为「${actualCreativeStatement}」、合集为「${
+      actualCollection || "无"
+    }」，与本次请求创作声明「${requestedNorm}」、合集「${
+      requestedCollectionNorm || "无"
+    }」不一致，未覆盖原任务，请核对后处理`;
+  } else if (creativeConflict) {
+    message = `同一视频在该时间点的定时任务已存在（id=${existingId}），但既有任务创作声明为「${actualCreativeStatement}」，与本次请求声明「${requestedNorm}」不一致，未覆盖原任务，请核对后处理`;
+  } else if (collectionConflict) {
+    message = `同一视频在该时间点的定时任务已存在（id=${existingId}），但既有任务合集为「${
+      actualCollection || "无"
+    }」，与本次请求合集「${
+      requestedCollectionNorm || "无"
+    }」不一致，未覆盖原任务，请核对后处理`;
+  }
+
   return {
     conflict,
+    creativeConflict,
+    collectionConflict,
     actualCreativeStatement,
     requestedCreativeStatement: requestedNorm,
-    message: conflict
-      ? `同一视频在该时间点的定时任务已存在（id=${
-          (existing && existing.id) || ""
-        }），但既有任务创作声明为「${actualCreativeStatement}」，与本次请求声明「${requestedNorm}」不一致，未覆盖原任务，请核对后处理`
-      : "同一视频在该时间点的定时任务已存在，未重复创建",
+    actualCollection,
+    requestedCollection: requestedCollectionNorm,
+    message,
   };
 }
 
@@ -1100,6 +1258,7 @@ module.exports = {
   extractThrottleRecordEvent,
   buildAccountBucketKey,
   planPublishTimes,
+  extractScheduledCollectionForPlatform,
   checkExistingScheduledCreativeConflict,
   comparePlanForGuiDrift,
 };

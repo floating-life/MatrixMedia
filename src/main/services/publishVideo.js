@@ -372,9 +372,13 @@ async function runSingleFilePublishInner(
             await releaseThrottleReservation(activeReservationId);
           } catch (_) {}
         }
+        const requestedCollection =
+          resolveCollectionOption(v.platform, effectivePublishOptions).name ||
+          "";
         const conflictInfo = checkExistingScheduledCreativeConflict(
           existing,
-          finalCreativeStatement
+          finalCreativeStatement,
+          requestedCollection
         );
         const existingPublishAt =
           existing.scheduledPublishAtText ||
@@ -382,7 +386,7 @@ async function runSingleFilePublishInner(
           scheduledRecord.scheduledPublishAtText;
         if (conflictInfo.conflict) {
           console.warn(
-            `[publish] 定时任务已存在（id=${existing.id}）但创作声明冲突: stored=${conflictInfo.actualCreativeStatement}, requested=${conflictInfo.requestedCreativeStatement}`
+            `[publish] 定时任务已存在（id=${existing.id}）但参数冲突: creative(stored=${conflictInfo.actualCreativeStatement}, requested=${conflictInfo.requestedCreativeStatement}), collection(stored=${conflictInfo.actualCollection || "无"}, requested=${conflictInfo.requestedCollection || "无"})`
           );
           return {
             exitCode: 4,
@@ -395,6 +399,8 @@ async function runSingleFilePublishInner(
             plannedAtMs: existing.scheduledPublishAt,
             creativeStatement: conflictInfo.actualCreativeStatement,
             requestedCreativeStatement: conflictInfo.requestedCreativeStatement,
+            collection: conflictInfo.actualCollection,
+            requestedCollection: conflictInfo.requestedCollection,
             throttled: false,
             throttleReason: "",
             reason: "",
@@ -414,6 +420,9 @@ async function runSingleFilePublishInner(
           publishAt: existingPublishAt,
           plannedAtMs: existing.scheduledPublishAt,
           creativeStatement: conflictInfo.actualCreativeStatement,
+          ...(conflictInfo.actualCollection
+            ? { collection: conflictInfo.actualCollection }
+            : {}),
           throttled: false,
           throttleReason: "",
           reason: "",
@@ -845,6 +854,12 @@ export async function runMultiPlatformPublish(parsedList) {
       ...(result.requestedCreativeStatement !== undefined
         ? { requestedCreativeStatement: result.requestedCreativeStatement }
         : {}),
+      ...(result.collection !== undefined
+        ? { collection: result.collection }
+        : {}),
+      ...(result.requestedCollection !== undefined
+        ? { requestedCollection: result.requestedCollection }
+        : {}),
       total: 1,
       succeeded: result.exitCode === 0 ? 1 : 0,
       failed: result.exitCode === 0 ? 0 : 1,
@@ -869,6 +884,12 @@ export async function runMultiPlatformPublish(parsedList) {
           ...(result.duplicate ? { duplicate: true } : {}),
           ...(result.requestedCreativeStatement !== undefined
             ? { requestedCreativeStatement: result.requestedCreativeStatement }
+            : {}),
+          ...(result.collection !== undefined
+            ? { collection: result.collection }
+            : {}),
+          ...(result.requestedCollection !== undefined
+            ? { requestedCollection: result.requestedCollection }
             : {}),
         },
       ],
@@ -982,6 +1003,12 @@ export async function runMultiPlatformPublish(parsedList) {
         ...(result.duplicate ? { duplicate: true } : {}),
         ...(result.requestedCreativeStatement !== undefined
           ? { requestedCreativeStatement: result.requestedCreativeStatement }
+          : {}),
+        ...(result.collection !== undefined
+          ? { collection: result.collection }
+          : {}),
+        ...(result.requestedCollection !== undefined
+          ? { requestedCollection: result.requestedCollection }
           : {}),
       };
       if (

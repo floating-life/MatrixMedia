@@ -18,8 +18,10 @@
 
 const assert = require("assert");
 const fs = require("fs");
+const Module = require("module");
 const os = require("os");
 const path = require("path");
+const { pathToFileURL } = require("url");
 const vm = require("vm");
 const xlsx = require("xlsx");
 const { build, buildSync } = require("esbuild");
@@ -344,8 +346,16 @@ function buildFakeCollectionPage(platformKey, mode = "success", extra = {}) {
           state.optionClicked = title;
           state.optionEvents = opt.events.slice();
           if (mode === "success") {
-            displaySpan.textContent =
-              platformKey === "sph" ? `已选：${title}` : title;
+            if (platformKey === "sph") {
+              // 视频号控件外层可含「已选：」前缀，但已选标签子节点 .album-name 文本恰为目标名
+              trigger.children = [];
+              trigger.append(
+                new FakeElement("span", "已选：", { class: "prefix" }),
+                new FakeElement("span", title, { class: "album-name" })
+              );
+            } else {
+              displaySpan.textContent = title;
+            }
           } else if (mode === "readback_mismatch") {
             displaySpan.textContent = extra.wrongReadback || "都市传说";
           }
@@ -728,7 +738,77 @@ function testCliAndHttpInputs() {
   const help = parsePublish.publishHelpText();
   assert.ok(help.includes("--collection"), "CLI 帮助应包含 --collection");
   assert.ok(help.includes("合集"), "CLI 帮助应说明合集功能");
-  console.log("✓ 3. CLI 与 HTTP 入参解析、覆盖优先级及帮助文案通过");
+
+  // S12-fix1(3)：取值型参数缺值或下一个 token 以 -- 开头时报参数错误，绝不吞掉后面的 flag
+  {
+    const swallowed = parsePublish.parsePublishArgs([
+      "-p",
+      "dy",
+      "--phone",
+      "13800138000",
+      "-f",
+      "./v.mp4",
+      "-t",
+      "标题",
+      "--collection",
+      "--draft",
+    ]);
+    assert.strictEqual(
+      swallowed.ok,
+      false,
+      "--collection --draft 必须报参数错误，不得把 --draft 吞成合集名"
+    );
+    assert.ok(swallowed.error.includes("--collection"));
+
+    const trailingMissing = parsePublish.parsePublishArgs([
+      "-p",
+      "dy",
+      "--phone",
+      "13800138000",
+      "-f",
+      "./v.mp4",
+      "-t",
+      "标题",
+      "--collection",
+    ]);
+    assert.strictEqual(trailingMissing.ok, false, "末尾缺值 --collection 必须报错");
+
+    const okWithDraft = parsePublish.parsePublishArgs([
+      "-p",
+      "dy",
+      "--phone",
+      "13800138000",
+      "-f",
+      "./v.mp4",
+      "-t",
+      "标题",
+      "--collection",
+      "民间故事",
+      "--draft",
+    ]);
+    assert.strictEqual(okWithDraft.ok, true, okWithDraft.error);
+    assert.strictEqual(okWithDraft.value.draft, true);
+    assert.strictEqual(okWithDraft.value.collection, "民间故事");
+    assert.strictEqual(okWithDraft.value.publishOptions.collection, "民间故事");
+
+    // 其他取值型参数同样不得吞掉后续 --flag 或末尾缺值
+    for (const badArgs of [
+      ["-p", "dy", "--phone", "13800138000", "-f", "./v.mp4", "-t", "--draft"],
+      ["-p", "dy", "--phone", "13800138000", "-f", "./v.mp4", "-t", "标题", "--cover", "--draft"],
+      ["-p", "dy", "--phone", "13800138000", "-f", "./v.mp4", "-t", "标题", "--tags", "--draft"],
+      ["-p", "dy", "--phone", "13800138000", "-f", "./v.mp4", "-t", "标题", "--cs", "--draft"],
+      ["-p", "sph", "--phone", "13800138000", "-f", "./v.mp4", "-t", "标题", "--sph-product-id", "--draft"],
+      ["-p", "dy", "--phone", "13800138000", "-f", "./v.mp4", "-t", "标题", "--description"],
+    ]) {
+      const r = parsePublish.parsePublishArgs(badArgs);
+      assert.strictEqual(
+        r.ok,
+        false,
+        `取值型参数缺值或吞 flag 必须报错: ${JSON.stringify(badArgs)}`
+      );
+    }
+  }
+  console.log("✓ 3. CLI 与 HTTP 入参解析、缺值/吞 flag 防护、覆盖优先级及帮助文案通过");
 }
 
 /* ------------------------------------------------------------------ *
@@ -874,10 +954,56 @@ function testMatchingHelpers() {
     true
   );
   assert.strictEqual(
-    collectionMod.matchesCollectionReadback("已选：民 间 故 事", "民间故事"),
+    collectionMod.matchesCollectionReadback("  民 间 故 事  ", "民间故事"),
     true,
-    "控件显示含目标合集名（去空白）应通过回读"
+    "去空白后完全相等应通过回读"
   );
+  assert.strictEqual(
+    collectionMod.matchesCollectionReadback("已选：民 间 故 事", "民间故事"),
+    false,
+    "平铺字符串含前缀不得用 includes 放行"
+  );
+  assert.strictEqual(
+    collectionMod.matchesCollectionReadback("民间故事番外", "民间故事"),
+    false,
+    "子串/前缀包含不得算回读通过"
+  );
+  assert.strictEqual(
+    collectionMod.matchesCollectionReadback(
+      { displayedText: "已选：民 间 故 事", selectedTexts: ["民 间 故 事"] },
+      "民间故事"
+    ),
+    true,
+    "控件内已选标签节点文本去空白后恰等于目标名应通过回读"
+  );
+  // S12-fix1(2)：占位文案全集不得视为已选值；目标名为「合集」、显示「请选择合集」必须失败
+  assert.strictEqual(
+    collectionMod.matchesCollectionReadback("请选择合集", "合集"),
+    false,
+    "目标名为「合集」、显示「请选择合集」必须失败"
+  );
+  for (const ph of [
+    "请选择合集",
+    "选择合集",
+    "添加到合集",
+    "添加合集",
+    "暂不添加",
+    "未选择",
+    "不加入合集",
+    "不添加到合集",
+    "暂不选择",
+  ]) {
+    assert.strictEqual(
+      collectionMod.matchesCollectionReadback(ph, "合集"),
+      false,
+      `占位文案「${ph}」不得匹配「合集」`
+    );
+    assert.strictEqual(
+      collectionMod.matchesCollectionReadback(ph, ph),
+      false,
+      `占位文案「${ph}」本身亦不得视为已选值`
+    );
+  }
   assert.strictEqual(
     collectionMod.matchesCollectionReadback("请选择合集", "民间故事"),
     false
@@ -1120,6 +1246,258 @@ async function testFakePageFlows() {
       );
       assert.strictEqual(shots, 1);
     }
+
+    // 7f. S12-fix1(1) 安全红线：假 DOM 只有发布/存草稿/暂存离开/保存草稿/发表/取消按钮、无合集入口
+    //     （含：无合集标签 / 有合集标签但同行无入口 / 同行里混入发布按钮 / 入口 disabled / 非合集行有同名占位符）
+    //     → 所有提交类按钮点击次数均为 0 且抛确定性错误
+    {
+      const makeEvalPage = (doc) => ({
+        async evaluate(fn, arg) {
+          const prevDoc = global.document;
+          const prevStyle = global.getComputedStyle;
+          const prevMouse = global.MouseEvent;
+          const prevWindow = global.window;
+          global.document = doc;
+          global.getComputedStyle = (el) => ({
+            display: el && el.hidden ? "none" : "block",
+            visibility: "visible",
+            opacity: "1",
+          });
+          global.MouseEvent = FakeMouseEvent;
+          global.window = {};
+          try {
+            const runner = new Function(
+              "document",
+              "getComputedStyle",
+              "MouseEvent",
+              "window",
+              "arg",
+              `return (${fn.toString()})(arg);`
+            );
+            return runner(doc, global.getComputedStyle, FakeMouseEvent, {}, arg);
+          } finally {
+            if (prevDoc === undefined) delete global.document;
+            else global.document = prevDoc;
+            if (prevStyle === undefined) delete global.getComputedStyle;
+            else global.getComputedStyle = prevStyle;
+            if (prevMouse === undefined) delete global.MouseEvent;
+            else global.MouseEvent = prevMouse;
+            if (prevWindow === undefined) delete global.window;
+            else global.window = prevWindow;
+          }
+        },
+        async waitForTimeout() {},
+      });
+
+      const makeDocWithRoot = () => {
+        const doc = new FakeElement("document");
+        const body = new FakeElement("body");
+        doc.body = body;
+        doc.append(body);
+        doc.getElementById = (id) => doc.querySelector(`[id="${id}"]`);
+        return { doc, body };
+      };
+
+      // 7f-1：只有提交类按钮、完全无合集入口
+      {
+        const { doc, body } = makeDocWithRoot();
+        const form = new FakeElement("div", "", { class: "publish-form" });
+        const actionLabels = ["发布", "存草稿", "暂存离开", "保存草稿", "发表", "取消"];
+        let actionClicks = 0;
+        for (const text of actionLabels) {
+          const btn = new FakeElement("button", text);
+          btn.onClick = () => {
+            actionClicks += 1;
+          };
+          form.append(btn);
+        }
+        body.append(form);
+        await assert.rejects(
+          () =>
+            collectionMod.selectPlatformCollection(
+              makeEvalPage(doc),
+              "抖音",
+              { collection: "民间故事" },
+              { timeouts: fastTimeouts, captureScreenshot: async () => "/tmp/s1.png" }
+            ),
+          (err) => {
+            assert.strictEqual(err.code, "collection_entry_not_found");
+            assert.strictEqual(err.deterministic, true);
+            return true;
+          }
+        );
+        assert.strictEqual(actionClicks, 0, "无合集入口时提交类按钮点击次数必须为 0");
+      }
+
+      // 7f-2：存在「合集」标签但该表单行内无合集入口，外层紧邻「发布」「存草稿」按钮
+      {
+        const { doc, body } = makeDocWithRoot();
+        const form = new FakeElement("div", "", { class: "publish-form" });
+        const emptyRow = new FakeElement("div", "", { class: "form-item" });
+        emptyRow.append(new FakeElement("label", "合集"));
+        const footer = new FakeElement("div", "", { class: "form-actions" });
+        let publishClicks = 0;
+        const pubBtn = new FakeElement("button", "");
+        pubBtn.append(new FakeElement("span", "发布"));
+        pubBtn.onClick = () => {
+          publishClicks += 1;
+        };
+        const draftBtn = new FakeElement("button", "存草稿");
+        draftBtn.onClick = () => {
+          publishClicks += 1;
+        };
+        footer.append(pubBtn, draftBtn);
+        form.append(emptyRow, footer);
+        body.append(form);
+        await assert.rejects(
+          () =>
+            collectionMod.selectPlatformCollection(
+              makeEvalPage(doc),
+              "抖音",
+              { collection: "民间故事" },
+              { timeouts: fastTimeouts, captureScreenshot: async () => "/tmp/s2.png" }
+            ),
+          (err) => {
+            assert.strictEqual(err.code, "collection_entry_not_found");
+            assert.strictEqual(err.deterministic, true);
+            return true;
+          }
+        );
+        assert.strictEqual(publishClicks, 0, "合集行缺入口时绝不能越界点击发布/存草稿按钮");
+      }
+
+      // 7f-3：同一容器里紧挨「合集」标签放着带嵌套 span 的发布/暂存离开按钮
+      {
+        const { doc, body } = makeDocWithRoot();
+        const row = new FakeElement("div", "", { class: "setting-item" });
+        row.append(new FakeElement("label", "合集"));
+        let btnClicks = 0;
+        const pubBtn = new FakeElement("button", "");
+        pubBtn.append(new FakeElement("span", "发布"));
+        pubBtn.onClick = () => {
+          btnClicks += 1;
+        };
+        const leaveBtn = new FakeElement("div", "", { role: "button" });
+        leaveBtn.append(new FakeElement("span", "暂存离开"));
+        leaveBtn.onClick = () => {
+          btnClicks += 1;
+        };
+        row.append(pubBtn, leaveBtn);
+        body.append(row);
+        await assert.rejects(
+          () =>
+            collectionMod.selectPlatformCollection(
+              makeEvalPage(doc),
+              "抖音",
+              { collection: "民间故事" },
+              { timeouts: fastTimeouts, captureScreenshot: async () => "/tmp/s3.png" }
+            ),
+          (err) => {
+            assert.strictEqual(err.code, "collection_entry_not_found");
+            assert.strictEqual(err.deterministic, true);
+            return true;
+          }
+        );
+        assert.strictEqual(btnClicks, 0, "含提交文案及其后代的按钮一律不得被点击");
+      }
+
+      // 7f-4：合集入口存在但处于 disabled，外层有发布按钮 → 两者点击均为 0 且抛确定性错误
+      {
+        const { doc, body } = makeDocWithRoot();
+        const form = new FakeElement("div", "", { class: "publish-form" });
+        const row = new FakeElement("div", "", { class: "setting-item" });
+        row.append(new FakeElement("label", "添加到合集"));
+        let disabledClicks = 0;
+        const disabledSel = new FakeElement("div", "请选择合集", {
+          class: "semi-select semi-select-disabled",
+          role: "combobox",
+          "aria-disabled": "true",
+        });
+        disabledSel.onClick = () => {
+          disabledClicks += 1;
+        };
+        row.append(disabledSel);
+        let pubClicks = 0;
+        const pubBtn = new FakeElement("button", "发布");
+        pubBtn.onClick = () => {
+          pubClicks += 1;
+        };
+        form.append(row, pubBtn);
+        body.append(form);
+        await assert.rejects(
+          () =>
+            collectionMod.selectPlatformCollection(
+              makeEvalPage(doc),
+              "抖音",
+              { collection: "民间故事" },
+              { timeouts: fastTimeouts, captureScreenshot: async () => "/tmp/s4.png" }
+            ),
+          (err) => {
+            assert.strictEqual(err.code, "collection_entry_disabled");
+            assert.strictEqual(err.deterministic, true);
+            assert.ok(err.message.includes("disabled"));
+            return true;
+          }
+        );
+        assert.strictEqual(disabledClicks, 0, "disabled 入口不得被点击");
+        assert.strictEqual(pubClicks, 0, "disabled 时绝不兜底点击发布按钮");
+      }
+
+      // 7f-5：非「合集」表单行里出现「未选择」「请选择合集」等文案 → 不在同一合集行内，不得点击
+      {
+        const { doc, body } = makeDocWithRoot();
+        const otherRow = new FakeElement("div", "", { class: "setting-item" });
+        otherRow.append(new FakeElement("label", "拍摄地点"));
+        let otherClicks = 0;
+        const otherSel = new FakeElement("div", "请选择合集", {
+          class: "semi-select",
+          role: "combobox",
+        });
+        otherSel.onClick = () => {
+          otherClicks += 1;
+        };
+        otherRow.append(otherSel);
+        body.append(otherRow);
+        await assert.rejects(
+          () =>
+            collectionMod.selectPlatformCollection(
+              makeEvalPage(doc),
+              "抖音",
+              { collection: "民间故事" },
+              { timeouts: fastTimeouts, captureScreenshot: async () => "/tmp/s5.png" }
+            ),
+          (err) => {
+            assert.strictEqual(err.code, "collection_entry_not_found");
+            assert.strictEqual(err.deterministic, true);
+            return true;
+          }
+        );
+        assert.strictEqual(otherClicks, 0, "未与「合集」标签同行的控件不得被点击");
+      }
+    }
+
+    // 7g. S12-fix1(2) 端到端回读：目标名为「合集」、点击后控件仍显示「请选择合集」→ 回读失败
+    {
+      const placeholderStay = buildFakeCollectionPage("ks", "readback_mismatch", {
+        candidates: ["合集", "都市传说"],
+        wrongReadback: "请选择合集",
+      });
+      await assert.rejects(
+        () =>
+          collectionMod.selectPlatformCollection(
+            placeholderStay.page,
+            "快手",
+            { collection: "合集" },
+            { timeouts: fastTimeouts, captureScreenshot: async () => "/tmp/s-ph.png" }
+          ),
+        (err) => {
+          assert.strictEqual(err.code, "collection_readback_mismatch");
+          assert.strictEqual(err.deterministic, true);
+          assert.ok(err.message.includes("请选择合集"));
+          return true;
+        }
+      );
+    }
   } finally {
     console.log = origLog;
     console.error = origError;
@@ -1319,6 +1697,504 @@ async function testHandlerCollectionFailureGates() {
   console.log("✓ 8. dy.js / ks.js / sph.js 合集失败门禁（中止发布 + 完整诊断 + 截图）通过");
 }
 
+/* ------------------------------------------------------------------ *
+ * 9. S12-fix1(5)：sph.js 挂车/挂剧失败转存草稿前先选合集 + 回读；失败中止且不点存草稿
+ * ------------------------------------------------------------------ */
+async function testSphLinkFallbackCollectionGate() {
+  async function buildSphWithStubs(colMode) {
+    const outFile = path.join(outDir, `sph-link-fallback-${colMode}.cjs`);
+    const stubLink = `
+      export async function attachSphVideoLink() {
+        throw new Error("模拟商品ID未找到");
+      }
+    `;
+    const stubCol =
+      colMode === "fail"
+        ? `
+      export async function selectPlatformCollection(page, platform, publishOptions) {
+        globalThis.__SPH_FALLBACK_ORDER__.push("collection");
+        const err = new Error("视频号选择合集「民间故事」失败：页面未找到合集选择入口");
+        err.code = "collection_entry_not_found";
+        err.deterministic = true;
+        err.isCollectionError = true;
+        err.failScreenshot = "/tmp/sph-fallback-col-fail.png";
+        throw err;
+      }
+    `
+        : `
+      export async function selectPlatformCollection(page, platform, publishOptions) {
+        globalThis.__SPH_FALLBACK_ORDER__.push("collection");
+        return { skipped: false, selected: true, name: publishOptions.collection, displayedText: publishOptions.collection };
+      }
+    `;
+    const stubMap = new Map([
+      ["./sphLink.js", stubLink],
+      ["./collection.js", stubCol],
+      [
+        "./uploadTimeouts.js",
+        "export const WAIT_SELECTOR_APPEAR_MS=1; export const WAIT_UPLOAD_PROCESSING_MS=1; export async function pollPageUntil(){return true;}",
+      ],
+      [
+        "./failureScreenshot.js",
+        "export async function capturePublishFailureScreenshot(){return '/tmp/fallback-shot.png';}",
+      ],
+      ["./closeWindow.js", "export default function maybeClosePublishWindow(){}"],
+      ["../coverCompat.js", "export async function normalizeCoverForUpload(p){return p;}"],
+    ]);
+    await build({
+      entryPoints: [path.join(root, "src/main/services/upLoad/sph.js")],
+      bundle: true,
+      platform: "node",
+      format: "cjs",
+      outfile: outFile,
+      external: ["electron"],
+      plugins: [
+        {
+          name: "sph-fallback-stubs",
+          setup(b) {
+            b.onResolve({ filter: /.*/ }, (args) =>
+              stubMap.has(args.path) ? { path: args.path, namespace: "stub" } : null
+            );
+            b.onLoad({ filter: /.*/, namespace: "stub" }, (args) => ({
+              contents: stubMap.get(args.path),
+              loader: "js",
+            }));
+          },
+        },
+      ],
+    });
+    delete require.cache[outFile];
+    return require(outFile).default;
+  }
+
+  const origLog = console.log;
+  const origWarn = console.warn;
+  const origError = console.error;
+  console.log = console.warn = console.error = () => {};
+  try {
+    const runCase = async (colMode) => {
+      const handler = await buildSphWithStubs(colMode);
+      const order = [];
+      globalThis.__SPH_FALLBACK_ORDER__ = order;
+      let draftClicked = false;
+      const replies = [];
+      const page = {
+        async waitForSelector() {
+          return {
+            async uploadFile() {},
+            async evaluate() {},
+          };
+        },
+        keyboard: {
+          async down() {},
+          async up() {},
+          async press() {},
+          async type() {},
+        },
+        async waitForTimeout() {},
+        async evaluate(_fn, arg) {
+          if (arg && typeof arg === "object" && typeof arg.sel === "string") {
+            if (arg.sel.includes(".form-btns>div:first-child")) {
+              draftClicked = true;
+              order.push("draft");
+              return true;
+            }
+            if ("isValue" in arg) return "测试标题";
+            return true;
+          }
+          return true;
+        },
+        url: () => "https://channels.weixin.qq.com/platform/post/create",
+      };
+      const event = {
+        reply(ch, payload) {
+          assert.strictEqual(ch, "puppeteerFile-done");
+          replies.push(payload);
+        },
+      };
+      await handler(
+        page,
+        {
+          pt: "视频号",
+          filePath: "demo.mp4",
+          data: { title: "测试标题", description: "", tags: [], creativeStatement: "none" },
+          publishOptions: {
+            link: { enabled: true, type: "product", value: "10000591263144" },
+            collection: "民间故事",
+          },
+        },
+        null,
+        event
+      );
+      delete globalThis.__SPH_FALLBACK_ORDER__;
+      return { order, draftClicked, replies };
+    };
+
+    // 9a. 挂车失败 + 合集失败 → 中止，绝不点保存草稿
+    const failRes = await runCase("fail");
+    assert.strictEqual(failRes.draftClicked, false, "合集失败时绝不能点击保存草稿");
+    assert.deepStrictEqual(failRes.order, ["collection"]);
+    assert.strictEqual(failRes.replies.length, 1);
+    assert.strictEqual(failRes.replies[0].status, false);
+    assert.strictEqual(failRes.replies[0].outcome, "collection_failed");
+    assert.strictEqual(failRes.replies[0].failScreenshot, "/tmp/sph-fallback-col-fail.png");
+    assert.ok(failRes.replies[0].message.includes("选择合集失败"));
+
+    // 9b. 挂车失败 + 合集成功 → 先选合集再点保存草稿
+    const okRes = await runCase("ok");
+    assert.strictEqual(okRes.draftClicked, true, "合集成功后才点击保存草稿");
+    assert.deepStrictEqual(okRes.order, ["collection", "draft"]);
+    assert.strictEqual(okRes.replies.length, 1);
+    assert.strictEqual(okRes.replies[0].status, true);
+    assert.strictEqual(okRes.replies[0].outcome, "draft_saved");
+    assert.strictEqual(okRes.replies[0].failureStage, "video_link");
+  } finally {
+    console.log = origLog;
+    console.warn = origWarn;
+    console.error = origError;
+  }
+  console.log("✓ 9. sph.js 挂车失败转存草稿分支：先选合集+回读，失败中止不点草稿 通过");
+}
+
+/* ------------------------------------------------------------------ *
+ * 10. S12-fix1(6)：定时复用排期比较 collection（publishThrottle / publishVideo / cli/index）
+ * ------------------------------------------------------------------ */
+async function testScheduledReuseCollectionConflict() {
+  const sharedThrottle = require(path.join(root, "src/shared/publishThrottle.js"));
+  const existingRec = {
+    id: "sched-1",
+    pt: "抖音",
+    creativeStatement: "ai_generated",
+    publishOptions: { collection: "民间故事" },
+  };
+
+  // 纯函数校验
+  const sameRes = sharedThrottle.checkExistingScheduledCreativeConflict(
+    existingRec,
+    "ai_generated",
+    "民间故事"
+  );
+  assert.strictEqual(sameRes.conflict, false, "声明与合集一致允许复用");
+
+  const diffColRes = sharedThrottle.checkExistingScheduledCreativeConflict(
+    existingRec,
+    "ai_generated",
+    "都市传说"
+  );
+  assert.strictEqual(diffColRes.conflict, true, "合集不同必须判冲突");
+  assert.strictEqual(diffColRes.collectionConflict, true);
+  assert.strictEqual(diffColRes.actualCollection, "民间故事");
+  assert.strictEqual(diffColRes.requestedCollection, "都市传说");
+  assert.ok(diffColRes.message.includes("民间故事"));
+  assert.ok(diffColRes.message.includes("都市传说"));
+
+  const emptyColRes = sharedThrottle.checkExistingScheduledCreativeConflict(
+    existingRec,
+    "ai_generated",
+    ""
+  );
+  assert.strictEqual(emptyColRes.conflict, true, "既有有合集、新请求无合集必须判冲突");
+  assert.strictEqual(emptyColRes.requestedCollection, "");
+
+  const nonSupportRes = sharedThrottle.checkExistingScheduledCreativeConflict(
+    { id: "b-1", pt: "哔哩哔哩", creativeStatement: "none", publishOptions: {} },
+    "none",
+    "民间故事"
+  );
+  assert.strictEqual(nonSupportRes.conflict, false, "不支持合集的平台不产生合集冲突");
+
+  // 端到端验证 publishThrottle IPC、publishVideo.js 与 cli/index.js 三处复用分支
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-col-sched-conflict-"));
+  const mediaDir = path.join(tmpDir, "videos");
+  fs.mkdirSync(mediaDir, { recursive: true });
+  const clip = path.join(mediaDir, "ep01.mp4");
+  fs.writeFileSync(clip, "fake-video");
+
+  const coreBundle = path.join(outDir, "s12-sched-core.cjs");
+  const entryJs = path.join(outDir, "s12-sched-entry.js");
+  fs.writeFileSync(
+    entryJs,
+    `
+      export { changeData } from ${JSON.stringify(path.join(root, "src/main/server/utils.js"))};
+      export { createScheduledRecord, notifyScheduledPublishChanged, stopScheduledPublishScheduler } from ${JSON.stringify(path.join(root, "src/main/services/scheduledPublish.js"))};
+      export { findExistingScheduled } from ${JSON.stringify(path.join(root, "src/main/services/scheduledDedupe.js"))};
+      export { registerPublishThrottleIpc, savePublishThrottleSettings } from ${JSON.stringify(path.join(root, "src/main/services/publishThrottle.js"))};
+      export { runSingleFilePublish } from ${JSON.stringify(path.join(root, "src/main/services/publishVideo.js"))};
+      export { runCliMain } from ${JSON.stringify(path.join(root, "src/main/cli/index.js"))};
+    `,
+    "utf8"
+  );
+  await build({
+    entryPoints: [entryJs],
+    outfile: coreBundle,
+    bundle: true,
+    platform: "node",
+    format: "cjs",
+    external: ["electron", "xlsx", "axios", "puppeteer-core", "puppeteer-extra", "puppeteer-extra-plugin-stealth", "puppeteer-in-electron"],
+  });
+
+  const origLoad = Module._load;
+  const handlers = new Map();
+  let core;
+  try {
+    Module._load = function (request) {
+      if (request === "electron") {
+        return {
+          app: {
+            getPath: () => tmpDir,
+            getVersion: () => "0.15.0-test",
+            on: () => {},
+            once: () => {},
+            commandLine: { getSwitchValue: () => "" },
+          },
+          ipcMain: {
+            handle: (ch, fn) => handlers.set(ch, fn),
+            on: () => {},
+          },
+          BrowserWindow: function () {},
+          dialog: {},
+        };
+      }
+      if (request === "puppeteer-extra") {
+        return { addExtra: () => ({ use: () => {}, connect: () => {} }) };
+      }
+      if (request === "puppeteer-extra-plugin-stealth") return () => ({});
+      if (request.startsWith("puppeteer")) return { use: () => {}, connect: () => {} };
+      return origLoad.apply(this, arguments);
+    };
+    delete require.cache[coreBundle];
+    core = require(coreBundle);
+    core.savePublishThrottleSettings({ enabled: false });
+    core.registerPublishThrottleIpc(
+      { handle: (ch, fn) => handlers.set(ch, fn) },
+      {
+        changeData: core.changeData,
+        createScheduledRecord: core.createScheduledRecord,
+        notifyScheduledPublishChanged: core.notifyScheduledPublishChanged,
+        findExistingScheduled: core.findExistingScheduled,
+      }
+    );
+
+    const publishAt = "2099-11-21 13:00:00";
+    const phone = "13800138000";
+
+    // 10a. publishVideo.js: 创建带合集「民间故事」的定时任务，再次提交不同合集 → needs_attention (exitCode 4)
+    const created = await core.runSingleFilePublish({
+      platform: "抖音",
+      phone,
+      partition: "persist:13800138000抖音",
+      file: clip,
+      title: "初版任务",
+      publishAt,
+      creativeStatement: "ai_generated",
+      collection: "民间故事",
+      publishOptions: { collection: "民间故事" },
+    });
+    assert.strictEqual(created.exitCode, 0);
+    assert.strictEqual(created.scheduled, true);
+
+    const conflictSingle = await core.runSingleFilePublish({
+      platform: "抖音",
+      phone,
+      partition: "persist:13800138000抖音",
+      file: clip,
+      title: "改合集冲突",
+      publishAt,
+      creativeStatement: "ai_generated",
+      collection: "都市传说",
+      publishOptions: { collection: "都市传说" },
+    });
+    assert.strictEqual(conflictSingle.exitCode, 4, "publishVideo 复用排期合集不同必须返回 exitCode=4");
+    assert.strictEqual(conflictSingle.status, "needs_attention");
+    assert.strictEqual(conflictSingle.needsAttention, true);
+    assert.strictEqual(conflictSingle.scheduled, false);
+    assert.strictEqual(conflictSingle.duplicate, true);
+    assert.strictEqual(conflictSingle.collection, "民间故事");
+    assert.strictEqual(conflictSingle.requestedCollection, "都市传说");
+
+    const reuseSame = await core.runSingleFilePublish({
+      platform: "抖音",
+      phone,
+      partition: "persist:13800138000抖音",
+      file: clip,
+      title: "同合集复用",
+      publishAt,
+      creativeStatement: "ai_generated",
+      collection: "民间故事",
+      publishOptions: { collection: "民间故事" },
+    });
+    assert.strictEqual(reuseSame.exitCode, 0, "声明与合集均一致允许复用");
+    assert.strictEqual(reuseSame.scheduled, true);
+    assert.strictEqual(reuseSame.duplicate, true);
+
+    // 10b. publishThrottle.js IPC (publish-throttle:create-scheduled)：合集不同返回 needs_attention，不复用旧任务
+    const createScheduledIpc = handlers.get("publish-throttle:create-scheduled");
+    const ipcConflict = await createScheduledIpc(null, {
+      item: {
+        pt: "抖音",
+        phone,
+        partition: "persist:13800138000抖音",
+        filePath: clip,
+        textType: "local",
+        textOtherName: "ep01",
+        selectedFile: "ep01.mp4",
+        title: "GUI改合集",
+        creativeStatement: "ai_generated",
+        publishOptions: { collection: "都市传说" },
+      },
+      publishAtText: publishAt,
+    });
+    assert.strictEqual(ipcConflict.ok, false, "publish-throttle:create-scheduled 合集冲突必须返回 ok:false");
+    assert.strictEqual(ipcConflict.status, "needs_attention");
+    assert.strictEqual(ipcConflict.needsAttention, true);
+    assert.strictEqual(ipcConflict.duplicate, true);
+    assert.strictEqual(ipcConflict.collection, "民间故事");
+    assert.strictEqual(ipcConflict.requestedCollection, "都市传说");
+
+    // 10c. cli/index.js 批量 --dir 定时复用分支：xlsx 合集列不同 → needs_attention，不复用
+    const xlsxPath = path.join(mediaDir, "batch.xlsx");
+    const wb = xlsx.utils.book_new();
+    const ws = xlsx.utils.json_to_sheet([
+      { 文件名: "ep01.mp4", 标题: "批量改合集", 简介: "", 标签: "", 创作声明: "ai_generated", 合集: "都市传说" },
+    ]);
+    xlsx.utils.book_append_sheet(wb, ws, "Sheet1");
+    xlsx.writeFile(wb, xlsxPath);
+
+    const outLines = [];
+    const origLog = console.log;
+    const origErr = console.error;
+    console.log = (...a) => outLines.push(a.join(" "));
+    console.error = () => {};
+    let batchExit;
+    try {
+      batchExit = await core.runCliMain([
+        "electron",
+        "cli",
+        "publish",
+        "-p",
+        "dy",
+        "--phone",
+        phone,
+        "--dir",
+        mediaDir,
+        "--config",
+        xlsxPath,
+        "--publish-at",
+        publishAt,
+        "--no-throttle",
+        "--allow-duplicate",
+      ]);
+    } finally {
+      console.log = origLog;
+      console.error = origErr;
+    }
+    const batchSummary = outLines
+      .filter((s) => s.trim().startsWith("{"))
+      .map((s) => JSON.parse(s))
+      .find((o) => o.summary === true);
+    assert.ok(batchSummary, "应输出批量摘要");
+    assert.notStrictEqual(batchExit, 0, "批量复用存在合集冲突时不应退出码 0");
+    assert.strictEqual(batchSummary.results[0].status, "needs_attention");
+    assert.strictEqual(batchSummary.results[0].needsAttention, true);
+    assert.strictEqual(batchSummary.results[0].scheduled, false);
+    assert.strictEqual(batchSummary.results[0].collection, "民间故事");
+    assert.strictEqual(batchSummary.results[0].requestedCollection, "都市传说");
+  } finally {
+    if (core && core.stopScheduledPublishScheduler) {
+      core.stopScheduledPublishScheduler();
+    }
+    Module._load = origLoad;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+  console.log("✓ 10. publishThrottle / publishVideo / cli/index 定时复用合集冲突返回 needs_attention 通过");
+}
+
+/* ------------------------------------------------------------------ *
+ * 11. S12-fix1(7 & 8)：MCP publish_video 转发 --collection + e2e collectEvidence 保留 [collection]
+ * ------------------------------------------------------------------ */
+async function testMcpCollectionAndE2eEvidence() {
+  // 11a. MCP publish_video schema + --collection 转发 + exitCode 4 合集冲突字段透传
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-col-mcp-"));
+  const pubBundle = path.join(tmpDir, "publish.mjs");
+  const argsLog = path.join(tmpDir, "args.json");
+  const fakeBin = path.join(tmpDir, "fake-matrixmedia");
+  const origBin = process.env.MATRIXMEDIA_BIN;
+  try {
+    await build({
+      entryPoints: [path.join(root, "mcp/src/tools/publish.ts")],
+      outfile: pubBundle,
+      bundle: true,
+      platform: "node",
+      format: "esm",
+      external: ["@modelcontextprotocol/sdk"],
+    });
+    const { publishVideoTool, handlePublishVideo } = await import(
+      pathToFileURL(pubBundle).href
+    );
+    assert.strictEqual(
+      publishVideoTool.inputSchema.properties.collection.type,
+      "string",
+      "MCP publish_video schema 必须声明 string collection"
+    );
+
+    fs.writeFileSync(
+      fakeBin,
+      `#!/usr/bin/env node
+const fs = require('fs');
+fs.writeFileSync(${JSON.stringify(argsLog)}, JSON.stringify(process.argv.slice(2)));
+console.log(JSON.stringify({ channel: 'puppeteerFile-done', status: true, resultStatus: 'success', publishMode: 'publish', message: '上传成功' }));
+`,
+      "utf8"
+    );
+    fs.chmodSync(fakeBin, 0o755);
+    process.env.MATRIXMEDIA_BIN = fakeBin;
+
+    await handlePublishVideo({
+      platform: "dy",
+      phone: "13800138000",
+      file: "/tmp/v.mp4",
+      title: "带合集发布",
+      collection: "民间故事",
+    });
+    const argvWithCol = JSON.parse(fs.readFileSync(argsLog, "utf8"));
+    const colIdx = argvWithCol.indexOf("--collection");
+    assert.ok(colIdx >= 0, `MCP 必须转发 --collection，实际 argv=${JSON.stringify(argvWithCol)}`);
+    assert.strictEqual(argvWithCol[colIdx + 1], "民间故事");
+
+    await handlePublishVideo({
+      platform: "dy",
+      phone: "13800138000",
+      file: "/tmp/v.mp4",
+      title: "不带合集发布",
+    });
+    const argvNoCol = JSON.parse(fs.readFileSync(argsLog, "utf8"));
+    assert.strictEqual(
+      argvNoCol.includes("--collection"),
+      false,
+      "未传 collection 时不得透传 --collection"
+    );
+  } finally {
+    if (origBin === undefined) delete process.env.MATRIXMEDIA_BIN;
+    else process.env.MATRIXMEDIA_BIN = origBin;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+
+  // 11b. e2e/lib/cli.js collectEvidence 保留 [collection] 诊断行
+  const { collectEvidence } = require(path.join(root, "e2e/lib/cli.js"));
+  const filtered = collectEvidence([
+    "无关启动日志",
+    "[collection] 抖音 开始选择合集：「民间故事」",
+    "[collection] 视频号 回读校验通过：控件显示=「民间故事」",
+    "[publish] 抖音 发布判定 signal=url_changed → 成功",
+    "plain line",
+  ]);
+  assert.strictEqual(filtered.length, 3);
+  assert.ok(filtered[0].includes("[collection] 抖音"));
+  assert.ok(filtered[1].includes("[collection] 视频号"));
+  assert.ok(filtered[2].includes("[publish] 抖音"));
+  console.log("✓ 11. MCP publish_video --collection 转发与 e2e collectEvidence [collection] 保留通过");
+}
+
 (async () => {
   testSharedCollectionResolution();
   testExcelCollectionColumn();
@@ -1327,6 +2203,9 @@ async function testHandlerCollectionFailureGates() {
   testMatchingHelpers();
   await testFakePageFlows();
   await testHandlerCollectionFailureGates();
+  await testSphLinkFallbackCollectionGate();
+  await testScheduledReuseCollectionConflict();
+  await testMcpCollectionAndE2eEvidence();
   console.log("\ntest-collection: 全部断言通过");
 })().catch((e) => {
   console.error(e);
