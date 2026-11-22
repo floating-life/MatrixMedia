@@ -1811,7 +1811,11 @@ export function readSelectedCollectionInDom(payload) {
     }
     var pushCandidate = function (txt, source) {
       var c = clean(txt);
-      if (c && stripRe) c = clean(c.replace(stripRe, ""));
+      // option-title 节点就是合集真名，不剥（真名可能本身以「共N个作品」结尾）；
+      // 只对整条控件文本（标题+计数拼在一起）剥掉结尾计数
+      if (c && stripRe && String(source || "").indexOf("option-title") === -1) {
+        c = clean(c.replace(stripRe, ""));
+      }
       if (!c) return;
       if (!firstDisplayText) {
         firstDisplayText = c;
