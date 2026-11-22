@@ -122,7 +122,7 @@ function makeHarness(platform, options = {}) {
     },
     url() {
       return submitCount && !options.urlUnchanged
-        ? "https://creator.example.test/success"
+        ? (platform === "快手" ? "https://cp.example.test/article/manage/video" : "https://creator.example.test/creator-micro/content/manage")
         : "https://creator.example.test/publish";
     },
   };

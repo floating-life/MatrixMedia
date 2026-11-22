@@ -222,7 +222,7 @@ function tmpDir(name) {
   const okCalls = [];
   await replyPublishOutcome({
     page: {
-      url: () => "https://example.com/success",
+      url: () => "https://cp.kuaishou.com/article/manage/video",
       waitForTimeout: async () => {},
       screenshot: async () => PNG_1PX,
     },

@@ -109,14 +109,18 @@ function createSignalPage(urls, full, overlay) {
 
   // 2. 地址已跳到成功页 → 正常成功
   {
-    const page = createPage(["https://x.com/publish", "https://x.com/success"]);
+    // S12：抖音成功落地页白名单为作品管理页
+    const page = createPage([
+      "https://creator.douyin.com/creator-micro/content/post/video",
+      "https://creator.douyin.com/creator-micro/content/manage",
+    ]);
     const event = createEvent();
     await replyPublishOutcome({
       page,
       data: { pt: "抖音", closeWindowAfterPublish: false },
       window: null,
       event,
-      urlBefore: "https://x.com/publish",
+      urlBefore: "https://creator.douyin.com/creator-micro/content/post/video",
       waitMs: 0,
       successMessage: "上传成功",
     });
@@ -450,7 +454,7 @@ function createSignalPage(urls, full, overlay) {
   // 5c. 有校验提示但地址已跳成功页：仍判成功，不携带 blockHint（提示不参与成功判定）
   {
     const page = createSignalPage(
-      ["https://x.com/publish", "https://x.com/success"],
+      ["https://cp.kuaishou.com/article/publish/video", "https://cp.kuaishou.com/article/manage/video"],
       "最多只能添加4个话题 发布成功",
       "最多只能添加4个话题"
     );
@@ -460,7 +464,7 @@ function createSignalPage(urls, full, overlay) {
       data: { pt: "快手", closeWindowAfterPublish: false },
       window: null,
       event,
-      urlBefore: "https://x.com/publish",
+      urlBefore: "https://cp.kuaishou.com/article/publish/video",
       waitMs: 0,
       successMessage: "上传成功",
     });
@@ -632,18 +636,19 @@ function createSignalPage(urls, full, overlay) {
     }
 
     // 9c. 抖音 / 快手点击发布后 URL 跳离发布编辑页 → 成功
+    const S12_REAL_URLS = {
+      抖音: ["https://creator.douyin.com/creator-micro/content/post/video", "https://creator.douyin.com/creator-micro/content/manage"],
+      快手: ["https://cp.kuaishou.com/article/publish/video", "https://cp.kuaishou.com/article/manage/video"],
+    };
     for (const pt of ["抖音", "快手"]) {
-      const page = createTextPage(
-        ["https://creator.example.com/publish", "https://creator.example.com/manage"],
-        "上传成功"
-      );
+      const page = createTextPage(S12_REAL_URLS[pt], "上传成功");
       const event = createEvent();
       await replyPublishOutcome({
         page,
         data: { pt, closeWindowAfterPublish: false },
         window: null,
         event,
-        urlBefore: "https://creator.example.com/publish",
+        urlBefore: S12_REAL_URLS[pt][0],
         waitMs: 0,
         successMessage: "上传成功",
       });
@@ -897,6 +902,28 @@ function createSignalPage(urls, full, overlay) {
       assert.strictEqual(payload.outcome, "publish_abnormal");
       assert.strictEqual(payload.publishSignal, "none");
       assert.strictEqual(payload.publishPageUrl, sphLogin);
+    }
+
+    // 9s. S12 Claude 收尾：抖音/快手只认作品管理页；扫码登录入口、首页等跳转 → 异常
+    for (const [pt, before, after] of [
+      ["抖音", "https://creator.douyin.com/creator-micro/content/post/video", "https://creator.douyin.com/"],
+      ["抖音", "https://creator.douyin.com/creator-micro/content/post/video", "https://www.douyin.com/qrcode/login"],
+      ["快手", "https://cp.kuaishou.com/article/publish/video", "https://cp.kuaishou.com/login#qrcode"],
+      ["快手", "https://cp.kuaishou.com/article/publish/video", "https://passport.kuaishou.com/pc/account/login"],
+    ]) {
+      const page = createTextPage([before, after], "");
+      const event = createEvent();
+      await replyPublishOutcome({ page, data: { pt, closeWindowAfterPublish: false }, window: null, event, urlBefore: before, waitMs: 0, successMessage: "上传成功" });
+      assert.strictEqual(event.calls[0].payload.publishAbnormal, true, `${pt} 跳到 ${after} 不得判成功`);
+    }
+    {
+      const { containsAffirmativeToastForTest } = require(outcomeBundle);
+      if (typeof containsAffirmativeToastForTest === "function") {
+        assert.strictEqual(containsAffirmativeToastForTest("视频未发布成功", "发布成功"), false);
+        assert.strictEqual(containsAffirmativeToastForTest("没有发布成功", "发布成功"), false);
+        assert.strictEqual(containsAffirmativeToastForTest("发布成功", "发布成功"), true);
+        assert.strictEqual(containsAffirmativeToastForTest("未发布成功；重试后发布成功", "发布成功"), true);
+      }
     }
 
     // 9l. S12-fix2(B6)：dy/ks 的 URL 成功判定排除 about:blank、空、chrome-error、登录页、与发布编辑页同 pathname

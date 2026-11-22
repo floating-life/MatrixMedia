@@ -134,7 +134,33 @@ export function hasPublishUrlNavigated(urlBefore, urlAfter, strictPlatform) {
   const pathAfter = extractNormalizedPathname(afterRaw);
   if (!pathBefore || !pathAfter) return false;
   if (pathAfter === pathBefore) return false;
-  return !isPublishEditPathname(pathAfter, strictPlatform);
+  if (isPublishEditPathname(pathAfter, strictPlatform)) return false;
+  // 白名单：抖音/快手发布成功只会跳到作品管理页；其他跳转（扫码登录入口、首页等）一律不算成功，
+  // 交给 needs_attention 人工核对（宁可多一次核对，也不假成功）
+  const okPattern = STRICT_SUCCESS_PATH_PATTERNS[strictPlatform];
+  return okPattern ? okPattern.test(pathAfter) : false;
+}
+
+/** 抖音/快手发布成功后的落地页 pathname（作品管理页） */
+const STRICT_SUCCESS_PATH_PATTERNS = {
+  抖音: /\/content\/manage(?:\/|$)/,
+  快手: /\/article\/manage(?:\/|$)/,
+};
+
+/** 成功提示前带否定词（未发布成功 / 没有发布成功 / 不…）时不算成功 */
+export function containsAffirmativeToastForTest(text, kw) {
+  return containsAffirmativeToast(text, kw);
+}
+
+function containsAffirmativeToast(text, kw) {
+  let from = 0;
+  for (;;) {
+    const idx = text.indexOf(kw, from);
+    if (idx === -1) return false;
+    const before = text.slice(Math.max(0, idx - 2), idx);
+    if (!/[未没不]|没有/.test(before)) return true;
+    from = idx + kw.length;
+  }
 }
 
 /**
@@ -227,7 +253,11 @@ export async function waitForPublishSignal(
     const toastText = strictPlatform ? signals.overlay : signals.full;
     if (toastText) {
       for (const kw of allowedToasts) {
-        if (toastText.includes(kw)) {
+        if (
+          strictPlatform
+            ? containsAffirmativeToast(toastText, kw)
+            : toastText.includes(kw)
+        ) {
           return {
             ok: true,
             signal: `toast:${kw}`,
@@ -252,6 +282,16 @@ export async function waitForPublishSignal(
   // 轮询最后一轮等待结束后再读一次 URL：仅对 dy/ks 发布模式生效（避免最后一秒跳作品列表被误判）；
   // 其他平台（视频号等）保持 54ef50e 原行为，不因末轮跳转（如跳登录页）误判成功。
   urlAfter = readPageUrl(page);
+  if (strictPlatform && !hasPublishUrlNavigated(urlBefore, urlAfter, strictPlatform)) {
+    // 末轮再读一次弹层：最后一秒才出现的「发布成功」不漏报
+    const lastSignals = await readPageTextSignals(page);
+    const lastText = (lastSignals && lastSignals.overlay) || "";
+    for (const kw of allowedToasts) {
+      if (lastText && containsAffirmativeToast(lastText, kw)) {
+        return { ok: true, signal: `toast:${kw}`, urlAfter, blockHint: "", excludedToasts };
+      }
+    }
+  }
   if (
     strictPlatform &&
     hasPublishUrlNavigated(urlBefore, urlAfter, strictPlatform)
@@ -452,7 +492,10 @@ async function readPageTextSignals(page) {
           for (const el of hits) {
             try {
               if (!isOverlayVisible(el, root)) continue;
-              const t = String(el.textContent || "").trim();
+              // innerText 只含渲染出来的文字（不含容器里隐藏的子节点）；无 innerText 时回退 textContent
+              const t = String(
+                (typeof el.innerText === "string" ? el.innerText : el.textContent) || ""
+              ).trim();
               if (t) overlays.push(t);
             } catch (_) {
               /* 单个弹层读取失败不阻断 */

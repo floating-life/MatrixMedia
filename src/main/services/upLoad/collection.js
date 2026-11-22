@@ -1436,6 +1436,10 @@ export function runCollectionDomAction(payload) {
         ""
     );
     var inModal = /dialog|modal/i.test(popupClass);
+    // 标记本次选中所在弹层，确认步骤只认这个弹层（不点全页任意弹窗的「确定」）
+    if (token && matchedPopup && typeof matchedPopup.setAttribute === "function") {
+      matchedPopup.setAttribute("data-mm-collection-popup", token);
+    }
 
     return {
       ok: true,
@@ -1458,8 +1462,17 @@ export function runCollectionDomAction(payload) {
         ".semi-modal, .ant-modal-content, .weui-desktop-dialog, [role='dialog']"
       )
     ).filter(isVisible);
-    if (!modals.length) return { ok: true, confirmed: false };
-    var modal = modals[modals.length - 1];
+    var popupMark = token
+      ? root.querySelector('[data-mm-collection-popup="' + token + '"]')
+      : null;
+    // 只确认「包含本次选中弹层」或「就是该弹层」的对话框；找不到就不点，交给回读判定
+    modals = popupMark
+      ? modals.filter(function (m) {
+          return m === popupMark || m.contains(popupMark) || popupMark.contains(m);
+        })
+      : [];
+    if (modals.length !== 1) return { ok: true, confirmed: false };
+    var modal = modals[0];
     var btns = Array.from(
       modal.querySelectorAll("button, .weui-desktop-btn, [role='button']")
     ).filter(isVisible);
@@ -1550,11 +1563,33 @@ export function readSelectedCollectionInDom(payload) {
       .replace(/\s+/g, " ")
       .trim();
   };
+  // 回读只取「看得见」的文字：跳过 display:none / visibility:hidden / hidden / aria-hidden 的子树，
+  // 防止隐藏图标标题等拼进占位文案后被误读成已选合集名
+  var isHiddenForText = function (el) {
+    if (!el || el.nodeType !== 1) return false;
+    if (el.hidden) return true;
+    if (el.getAttribute && el.getAttribute("aria-hidden") === "true") return true;
+    try {
+      var view = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+      var st = view.getComputedStyle(el);
+      if (st && (st.display === "none" || st.visibility === "hidden")) return true;
+    } catch (_) {}
+    return false;
+  };
   var getText = function (node) {
     if (!node) return "";
-    if (node.textContent != null) return String(node.textContent);
-    if (node.innerText != null) return String(node.innerText);
-    return "";
+    if (node.nodeType === 3) return String(node.nodeValue || "");
+    if (node.nodeType !== 1 && node.nodeType !== 11) {
+      return node.textContent != null ? String(node.textContent) : "";
+    }
+    if (isHiddenForText(node)) return "";
+    var kids = node.childNodes;
+    if (!kids || !kids.length) {
+      return node.textContent != null ? String(node.textContent) : "";
+    }
+    var out = "";
+    for (var gi = 0; gi < kids.length; gi++) out += getText(kids[gi]);
+    return out;
   };
 
   var root = document;
@@ -2109,6 +2144,7 @@ export async function selectPlatformCollection(
         confirmed = await page.evaluate(runCollectionDomAction, {
           action: "confirm_modal",
           config,
+          token,
           submitSelectors: ALL_PLATFORM_SUBMIT_SELECTORS,
           submitTexts: SUBMIT_BUTTON_EXACT_TEXTS,
           rejectedMessage: COLLECTION_CLICK_REJECTED_MESSAGE,

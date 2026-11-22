@@ -59,6 +59,29 @@ export const KNOWN_PUBLISH_SWITCHES = new Set(
   Object.keys(PUBLISH_BOOLEAN_SWITCHES)
 );
 
+/** 解析器认识的全部取值型参数（与下方 if 分支一一对应） */
+export const KNOWN_PUBLISH_VALUE_FLAGS = new Set([
+  "--platform", "-p", "--file", "-f", "--phone", "--partition",
+  "--title", "-t", "--description", "--desc", "--short-title",
+  "--name", "--book-name", "--bt2", "--tags", "--bq", "--publish-at",
+  "--dir", "--config", "--xlsx", "--cover", "--creative-statement", "--cs",
+  "--collection", "--sph-link-type", "--sph-link-value",
+  "--sph-product-id", "--sph-drama-id", "--sph-series-id",
+]);
+
+/**
+ * 下一个 token 是否是「解析器认识的选项」：开关、取值型参数或其 --x=值 形式、--help/-h。
+ * 只有这种情况才视为缺值；其他以 - 开头的字面值（如简介「--开场--」、文件「-开场.mp4」）照常取值。
+ */
+export function isKnownPublishOptionToken(token) {
+  const t = String(token == null ? "" : token);
+  if (!t.startsWith("-")) return false;
+  if (t === "--help" || t === "-h") return true;
+  if (KNOWN_PUBLISH_SWITCHES.has(t) || KNOWN_PUBLISH_VALUE_FLAGS.has(t)) return true;
+  const eq = t.indexOf("=");
+  return eq > 0 && KNOWN_PUBLISH_VALUE_FLAGS.has(t.slice(0, eq));
+}
+
 /**
  * 解析 `cli publish` 后的 argv（不含子命令名 publish）
  * @returns {{ ok: true, value: object } | { ok: false, error: string }}
@@ -104,8 +127,7 @@ export function parsePublishArgs(subArgv) {
   // 按字面取下一个 token，仅当缺值或下一个 token 恰好是已知无值开关时报错。
   const consumeTextValue = (flag, idx) => {
     const next = args[idx + 1];
-    const isKnownSwitch =
-      next != null && KNOWN_PUBLISH_SWITCHES.has(String(next));
+    const isKnownSwitch = next != null && isKnownPublishOptionToken(next);
     if (idx + 1 >= args.length || next == null || isKnownSwitch) {
       const hint = VALUE_FLAG_HINTS[flag] || "值";
       return {
@@ -121,7 +143,7 @@ export function parsePublishArgs(subArgv) {
   // 下一个 token 缺失或以 `-` 开头（含短选项 -t、-p、-h）即报缺值。
   const consumeStrictOptionValue = (flag, idx) => {
     const next = args[idx + 1];
-    const startsWithDash = next != null && String(next).startsWith("-");
+    const startsWithDash = next != null && isKnownPublishOptionToken(next);
     if (idx + 1 >= args.length || next == null || startsWithDash) {
       const hint = VALUE_FLAG_HINTS[flag] || "值";
       return {
