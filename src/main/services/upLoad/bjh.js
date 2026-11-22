@@ -626,6 +626,12 @@ export default async function (page, data, window, event) {
       console.warn(`[bjh] 等待提示期间标题变为「${titleNow}」，重新纠正`);
       await ensureBjhTitle(page, wantTitle, fileStem);
       staleToastBefore = !(await waitToastHidden());
+      // 最后一次等待后只读复核：仍被改写就在点击前中止（未点击，可安全重试）
+      const h2 = await page.$(BJH_TITLE_SELECTOR).catch(() => null);
+      const t2 = h2 ? normBjhTitle(await h2.evaluate((el) => el.textContent || "").catch(() => "")) : "";
+      if (!bjhTitleOk(t2, normBjhTitle(wantTitle), fileStem)) {
+        throw new Error(`百家号标题点击前再次被页面改写（当前="${t2}"），已停止${isDraftMode ? "存草稿" : "发布"}，请检查后重发`);
+      }
     }
     if (staleToastBefore) console.warn("[bjh] 点击前旧提示未消失，点击后读到的提示可能是残留");
 
@@ -670,7 +676,7 @@ export default async function (page, data, window, event) {
         );
       throw new Error(
         preValidation
-          ? `百家号点击「${actionText}」后被平台校验拦下：${msg.text}（未自动重试，请处理后手动重发）`
+          ? `百家号点击「${actionText}」后出现校验提示：${msg.text}。未自动重试；请先到百家号后台核对是否已${isDraftMode ? "存成草稿" : "发出"}，确认没有再处理后手动重发`
           : `百家号点击「${actionText}」后出现失败提示：${msg.text || msg.type}。为防重复${isDraftMode ? "存草稿" : "发布"}未自动重试，请先到百家号后台核对是否已${isDraftMode ? "存成" : "发出"}再决定是否重发`
       );
     }

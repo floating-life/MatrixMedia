@@ -326,7 +326,7 @@ function buildFakeCollectionPage(platformKey, mode = "success", extra = {}) {
         ? "ant-select-selector"
         : platformKey === "sph"
         ? "post-album-display"
-        : "semi-select";
+        : "semi-select select-collection-nkL6sA";
     const trigger = new FakeElement("div", "", {
       class: triggerClass,
       role: "combobox",
@@ -353,13 +353,13 @@ function buildFakeCollectionPage(platformKey, mode = "success", extra = {}) {
           ? "ant-select-dropdown mm-test-popup"
           : platformKey === "sph"
           ? "common-option-list-wrap mm-test-popup"
-          : "semi-select-option-list mm-test-popup";
+          : "mix-dropdown semi-select-option-list mm-test-popup";
       const optClass =
         platformKey === "ks"
           ? "ant-select-item-option"
           : platformKey === "sph"
           ? "option-item"
-          : "semi-select-option";
+          : "semi-select-option collection-option";
       const popup = new FakeElement("div", "", {
         class: popupClass,
         role: "listbox",
@@ -1523,7 +1523,7 @@ async function testFakePageFlows() {
         row.append(new FakeElement("label", "添加到合集"));
         let disabledClicks = 0;
         const disabledSel = new FakeElement("div", "请选择合集", {
-          class: "semi-select semi-select-disabled",
+          class: "semi-select select-collection-x semi-select-disabled",
           role: "combobox",
           "aria-disabled": "true",
         });
@@ -2717,7 +2717,7 @@ async function testS12Fix2StructuralGuards() {
       const row = new FakeElement("div", "", { class: "collection-form-item" });
       row.append(new FakeElement("label", "合集"));
       const sel = new FakeElement("div", "", {
-        class: "semi-select",
+        class: "semi-select select-collection-x",
         role: "combobox",
         "aria-controls": "campus-list",
       });
@@ -2735,12 +2735,12 @@ async function testS12Fix2StructuralGuards() {
         if (doc.querySelector("#campus-list")) return;
         const popup = new FakeElement("div", "", {
           id: "campus-list",
-          class: "semi-select-option-list",
+          class: "mix-dropdown semi-select-option-list",
           role: "listbox",
         });
         for (const name of ["校园发布会", "民间故事"]) {
           const opt = new FakeElement("div", name, {
-            class: "semi-select-option",
+            class: "semi-select-option collection-option",
             role: "option",
           });
           opt.onClick = () => {
@@ -2765,6 +2765,57 @@ async function testS12Fix2StructuralGuards() {
       assert.strictEqual(picked, "校园发布会");
     }
 
+    // 12f. 2026-11-22 抖音真机结构：左侧导航 li、行内「类型」select 在前、首项「不选择合集」、
+    //      选项名在 option-title、旁有「共N个作品」→ 只能打开 select-collection 并选中「民间故事」
+    {
+      const { doc, body } = makeDoc();
+      const nav = new FakeElement("ul", "", { role: "menu" });
+      for (const n of ["首页", "内容管理", "民间故事"]) nav.append(new FakeElement("li", n, { role: "menuitem" }));
+      body.append(nav);
+      const row = new FakeElement("div", "", { class: "content-obt4oA" });
+      row.append(new FakeElement("span", "添加合集", { class: "title-content-oaqcSp" }));
+      let typeOpened = 0;
+      const typeSel = new FakeElement("div", "", { class: "semi-select select-mix-type-G9iqb2", role: "combobox" });
+      typeSel.append(new FakeElement("span", "请选择合集类型", { class: "semi-select-selection-text" }));
+      typeSel.onClick = () => { typeOpened += 1; };
+      const sel = new FakeElement("div", "", { class: "semi-select select-collection-nkL6sA", role: "combobox" });
+      const selText = new FakeElement("span", "请选择合集", { class: "semi-select-selection-text" });
+      sel.append(selText);
+      row.append(typeSel, sel);
+      body.append(row);
+      let picked = "";
+      sel.onClick = () => {
+        if (doc.querySelector(".mix-dropdown")) return;
+        const pop = new FakeElement("div", "", { class: "semi-popover-content" });
+        const dd = new FakeElement("div", "", { class: "mix-dropdown" });
+        const list = new FakeElement("div", "", { class: "semi-select-option-list" });
+        const none = new FakeElement("div", "", { class: "semi-select-option" });
+        none.append(new FakeElement("div", "不选择合集", { class: "semi-select-option-text" }));
+        none.onClick = () => { picked = "不选择合集"; };
+        list.append(none);
+        for (const [name, cnt] of [["民间故事", "共21个作品"], ["钟馗说案", "共10个作品"]]) {
+          const opt = new FakeElement("div", "", { class: "semi-select-option collection-option" });
+          opt.append(new FakeElement("span", name, { class: "option-title-WKxxu3" }));
+          opt.append(new FakeElement("span", cnt, { class: "option-extra-text-i_ch3r" }));
+          opt.onClick = () => { picked = name; selText.textContent = name; pop.remove(); };
+          list.append(opt);
+        }
+        dd.append(list);
+        pop.append(dd);
+        body.append(pop);
+      };
+      const res = await collectionMod.selectPlatformCollection(
+        makeEvalPage(doc),
+        "抖音",
+        { collection: "民间故事" },
+        { timeouts: fastTimeouts, captureScreenshot: async () => "" }
+      );
+      assert.strictEqual(res.selected, true, "真机结构下必须选中「民间故事」");
+      assert.strictEqual(picked, "民间故事");
+      assert.strictEqual(typeOpened, 0, "不得打开合集类型控件");
+      assert.strictEqual(res.displayedText, "民间故事");
+    }
+
     // 12e. A4：带内嵌 span 的占位文案「请选择<span>合集</span>」对目标名「合集」必须判未选失败；
     //      真正选中「合集」后回读才通过
     {
@@ -2774,7 +2825,7 @@ async function testS12Fix2StructuralGuards() {
         const row = new FakeElement("div", "", { class: "collection-form-item" });
         row.append(new FakeElement("label", "合集"));
         const sel = new FakeElement("div", "", {
-          class: "semi-select",
+          class: "semi-select select-collection-x",
           role: "combobox",
           "aria-controls": "album-opts",
         });
@@ -2788,11 +2839,11 @@ async function testS12Fix2StructuralGuards() {
           if (doc.querySelector("#album-opts")) return;
           const popup = new FakeElement("div", "", {
             id: "album-opts",
-            class: "semi-select-option-list",
+            class: "mix-dropdown semi-select-option-list",
             role: "listbox",
           });
           const opt = new FakeElement("div", "合集", {
-            class: "semi-select-option",
+            class: "semi-select-option collection-option",
             role: "option",
           });
           opt.onClick = () => {
@@ -2826,7 +2877,7 @@ async function testS12Fix2StructuralGuards() {
         const row = new FakeElement("div", "", { class: "collection-form-item" });
         row.append(new FakeElement("label", "合集"));
         const sel = new FakeElement("div", "", {
-          class: "semi-select",
+          class: "semi-select select-collection-x",
           role: "combobox",
           "aria-controls": "album-opts-ok",
         });
@@ -2842,11 +2893,11 @@ async function testS12Fix2StructuralGuards() {
           if (doc.querySelector("#album-opts-ok")) return;
           const popup = new FakeElement("div", "", {
             id: "album-opts-ok",
-            class: "semi-select-option-list",
+            class: "mix-dropdown semi-select-option-list",
             role: "listbox",
           });
           const opt = new FakeElement("div", "合集", {
-            class: "semi-select-option",
+            class: "semi-select-option collection-option",
             role: "option",
           });
           opt.onClick = () => {

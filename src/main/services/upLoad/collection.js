@@ -79,7 +79,7 @@ export const PLATFORM_COLLECTION_CONFIGS = {
     useShadowRoot: false,
     shadowHostSelector: "",
     dispatchMouseDown: false,
-    labelTexts: ["添加到合集", "作品合集", "合集"],
+    labelTexts: ["添加合集", "添加到合集", "作品合集", "合集"],
     entryTexts: [
       "请选择合集",
       "选择合集",
@@ -98,22 +98,15 @@ export const PLATFORM_COLLECTION_CONFIGS = {
       "[class*='setting-row']",
       "[class*='field']",
     ],
-    triggerSelectors: [
-      ".semi-select",
-      "[role='combobox']",
-      "[aria-haspopup='listbox']",
-      "button",
-      "[role='button']",
-    ],
+    // 2026-11-22 真机：「添加合集」行内有两个 semi-select（类型 .select-mix-type-* 与合集 .select-collection-*），
+    // 打开与回读兜底都只认合集那个，避免认成类型控件。
+    triggerSelectors: ["[class*='select-collection']"],
     // 2026-11-22 真机 DOM：.semi-popover-content > .mix-dropdown > .semi-select-option-list >
     // .semi-select-option.collection-option，名称在 span.option-title-*，旁边 option-extra-text「共N个作品」。
     // 去掉 role=menu / li 等泛选择器：会把左侧导航（首页/内容管理…）当成选项弹层。
-    popupSelectors: [
-      ".mix-dropdown",
-      ".semi-select-option-list",
-      ".semi-portal .semi-popover-content",
-    ],
-    optionSelectors: [".semi-select-option"],
+    popupSelectors: [".mix-dropdown"],
+    // 只认真实合集项；首项「不选择合集」不是 collection-option，不参与匹配
+    optionSelectors: [".semi-select-option.collection-option"],
     optionTextSelectors: [
       "[class*='option-title']",
       ".semi-select-option-text",
@@ -122,11 +115,8 @@ export const PLATFORM_COLLECTION_CONFIGS = {
       ".name",
     ],
     readbackSelectors: [
-      ".semi-select-selection-text",
-      ".semi-select-selection",
-      ".semi-tag-content",
-      ".title",
-      ".name",
+      "[class*='select-collection'] .semi-select-selection-text",
+      "[class*='select-collection'] .semi-select-selection",
     ],
     confirmButtonLabels: ["确定", "确认", "完成"],
   },
@@ -2000,7 +1990,7 @@ function collectCollectionDomOutline(args) {
           .replace(/\S*[A-Za-z0-9-]+\.[A-Za-z]{2,}\S*/g, "[url]")
           .replace(/(https?:|blob:|data:)\S*/gi, "[url]")
           .replace(/\d{5,}/g, "[n]")
-          .replace(/\S+@\S+/g, "[at]")
+          .replace(/\S*@\S+/g, "[at]")
           .slice(0, 30)
       : raw
         ? "[t:" + raw.length + "]"
@@ -2127,15 +2117,12 @@ export async function selectPlatformCollection(
         }, config.openDropdownSelector);
       if (await stillOpen()) {
         console.log(`[collection] ${canonicalPlatform} 发现未收起的下拉，先收起`);
+        // 只让「焦点在 Ant 下拉控件内」的那个控件失焦（Ant Select 失焦即收起）；不向页面发 Escape，免得关掉别的弹窗
         await page.evaluate(function () {
           var a = document.activeElement;
-          if (a && a !== document.body && typeof a.blur === "function") a.blur();
+          if (a && a !== document.body && a.closest && a.closest(".ant-select") && typeof a.blur === "function") a.blur();
         });
-        await page.waitForTimeout(300);
-        if (await stillOpen()) {
-          await page.keyboard.press("Escape");
-          await page.waitForTimeout(300);
-        }
+        await page.waitForTimeout(400);
         if (await stillOpen()) {
           console.warn(`[collection] ${canonicalPlatform} 残留下拉仍未收起，继续尝试打开合集入口`);
         }
@@ -2249,8 +2236,8 @@ export async function selectPlatformCollection(
       if (pickResult && pickResult.ok) break;
       if (
         pickResult &&
-        (pickResult.reason === "option_not_found" ||
-          pickResult.reason === "option_disabled")
+        // option_not_found 不提前结束：选项可能分批渲染，轮询到超时再判失败
+        pickResult.reason === "option_disabled"
       ) {
         break;
       }
