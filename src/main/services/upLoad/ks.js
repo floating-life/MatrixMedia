@@ -259,22 +259,40 @@ async function uploadKsCustomCover(page, coverPath) {
     return false;
   });
   if (!confirmed) throw new Error("快手封面弹窗内未找到「确认」按钮");
-  await page.waitForTimeout(3500);
 
-  // 校验：封面槽位 img src 相对设置前变化（原为 blob: 视频帧图）；快手 CDN 域名为强信号
-  const after = await page.evaluate(() => {
-    const img = document.querySelector('[class*="_default-cover"] img');
-    return img ? img.src : "";
-  });
-  const changed = !!after && after !== slotSrcBefore;
-  if (!changed) {
+  // 校验（2026-11-22 真机：自定义封面应用后，槽位 img 仍是视频帧 blob，不再变化；
+  // 平台会弹「封面应用成功」）。成功判据：弹窗已关闭 且（出现「封面应用成功」或槽位图片变化）。
+  // 提示约 3 秒消失，所以点确认后立刻轮询，不再先固定等待。
+  let toastOk = false;
+  let state = { src: "", modalOpen: true, toast: "" };
+  const deadline = Date.now() + 10000;
+  while (Date.now() < deadline) {
+    state = await page.evaluate(() => {
+      const img = document.querySelector('[class*="_default-cover"] img');
+      const modal = Array.from(document.querySelectorAll(".ant-modal")).some((m) => {
+        const r = m.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      });
+      const msgs = Array.from(
+        document.querySelectorAll(".ant-message, .ant-message-notice, [class*='toast']")
+      )
+        .map((el) => el.innerText || el.textContent || "")
+        .join(" ");
+      return { src: img ? img.src : "", modalOpen: modal, toast: msgs.slice(0, 120) };
+    });
+    if (/封面应用成功/.test(state.toast)) toastOk = true;
+    const srcChanged = !!state.src && state.src !== slotSrcBefore;
+    if (!state.modalOpen && (toastOk || srcChanged)) break;
+    await page.waitForTimeout(300);
+  }
+  const srcChanged = !!state.src && state.src !== slotSrcBefore;
+  if (state.modalOpen || !(toastOk || srcChanged)) {
     throw new Error(
-      `快手封面设置后槽位图片未变化（src=${(after || "").slice(0, 120)}）`
+      `快手封面设置未确认成功（弹窗仍开=${state.modalOpen}，成功提示=${toastOk}，槽位图片变化=${srcChanged}，提示文本=${JSON.stringify(state.toast)}）`
     );
   }
-  const cdn = /ssrcdn|kwaicdn|kwcdn|kscdn|yximgs/.test(after);
   console.log(
-    `[ks] 自定义封面已设置并校验通过（src变化=true, CDN=${cdn}）: ${after.slice(0, 120)}`
+    `[ks] 自定义封面已设置并校验通过（成功提示=${toastOk}, 槽位图片变化=${srcChanged}）`
   );
 }
 
