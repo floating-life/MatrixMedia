@@ -391,6 +391,10 @@ async function fillBjhTitle(page, titleHandle, title) {
   await page.keyboard.type(title, { delay: 50 });
 }
 
+function isDraftModeForRetry(data) {
+  return data.publishMode === "draft" || data.publishToDraft === true;
+}
+
 // 发布前终检：百家号在视频解析完成后会异步把文件名回填/追加进标题，
 // 早先填好的标题可能被拼成「标题+文件名」。这里在点发布前重读标题，不符就重填。
 async function ensureBjhTitle(page, title, fileStem) {
@@ -428,6 +432,8 @@ async function ensureBjhTitle(page, title, fileStem) {
 }
 
 export default async function (page, data, window, event) {
+  // 发布模式下一旦派发过点击，后续任何异常都无法排除已发出 → 外层不得整体重试（宁漏勿重）
+  let bjhClickDispatched = false;
   const wantTitle = (data.data && (data.data.title || data.data.bt1)) || "";
   const fileStem = path.basename(
     String(data.filePath || ""),
@@ -620,6 +626,16 @@ export default async function (page, data, window, event) {
       }
       // 视频解析完成后百家号可能把文件名回填进标题：点击前终检
       await ensureBjhTitle(page, wantTitle, fileStem);
+      // 点击前等旧提示消失，确保点击后读到的是本次点击产生的提示；仍在则本次提示不可信
+      const staleToastBefore = !(await page
+        .waitForSelector(".cheetah-message.cheetah-message-top", {
+          hidden: true,
+          timeout: 8000,
+        })
+        .then(() => true)
+        .catch(() => false));
+      if (staleToastBefore) console.warn("[bjh] 点击前旧提示未消失，本次点击后的失败提示不作为可重试依据");
+      bjhClickDispatched = true;
       await page.mouse.click(cx, cy, { delay: 80 });
       console.log(
         `[bjh] 第 ${attempt}/${maxClicks} 次点击「${actionText}」at (${Math.round(
@@ -667,15 +683,17 @@ export default async function (page, data, window, event) {
       if (!isDraftMode) {
         // 「请添加/请上传/请填写/请选择…」「…不能为空」属于发布前校验，可确认未发出，允许外层整体重试；
         // 其余失败提示无法排除已发出，标记 noRetry，防止外层重开窗口再发一次。
-        const preValidation = /^(请|未)(添加|上传|填写|选择|设置|输入|完成)|不能为空|不能少于|不能超过/.test(
-          msg.text || ""
-        );
+        const preValidation =
+          !staleToastBefore &&
+          /^(请|未)先?(添加|上传|填写|选择|设置|输入|完成)|不能为空|不能少于|不能超过/.test(
+            msg.text || ""
+          );
         const postClickErr = new Error(
           preValidation
             ? `百家号点击「发布」后被平台校验拦下：${msg.text}`
             : `百家号点击「发布」后出现失败提示：${msg.text || msg.type}。为防重复发布未自动重试，请先到百家号后台核对是否已发出再决定是否重发`
         );
-        postClickErr._mmBjhNoRetry = !preValidation;
+        postClickErr._mmBjhRetryOk = preValidation;
         throw postClickErr;
       }
       if (attempt >= maxClicks) {
@@ -720,7 +738,10 @@ export default async function (page, data, window, event) {
       event,
       message: failMessage,
       closeWindow: false,
-      extraPayload: err && err._mmBjhNoRetry ? { noRetry: true } : {},
+      extraPayload:
+        !isDraftModeForRetry(data) && bjhClickDispatched && !(err && err._mmBjhRetryOk)
+          ? { noRetry: true }
+          : {},
     });
     console.error("点击提交按钮失败:", err);
   }
