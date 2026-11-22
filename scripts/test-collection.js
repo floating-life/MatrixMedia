@@ -2863,6 +2863,44 @@ async function testS12Fix2StructuralGuards() {
       );
     }
 
+    // 12h. 评审复现：真名「民间故事共3个作品」在 option-title，计数在 selection-text 同级 → 仍须判不符
+    {
+      const { doc, body } = makeDoc();
+      const row = new FakeElement("div", "", { class: "content-obt4oA" });
+      row.append(new FakeElement("span", "添加合集", { class: "title-content-oaqcSp" }));
+      const sel = new FakeElement("div", "", { class: "semi-select select-collection-nkL6sA" });
+      const selection = new FakeElement("div", "", { class: "semi-select-selection" });
+      const selText = new FakeElement("span", "请选择合集", { class: "semi-select-selection-text" });
+      selection.append(selText);
+      sel.append(selection);
+      row.append(sel);
+      body.append(row);
+      sel.onClick = () => {
+        if (doc.querySelector(".mix-dropdown")) return;
+        const dd = new FakeElement("div", "", { class: "mix-dropdown" });
+        const opt = new FakeElement("div", "", { class: "semi-select-option collection-option" });
+        opt.append(new FakeElement("span", "民间故事", { class: "option-title-a" }));
+        opt.onClick = () => {
+          selText.textContent = "";
+          selText.append(new FakeElement("span", "民间故事共3个作品", { class: "option-title-a" }));
+          selection.append(new FakeElement("span", "共8个作品", { class: "option-extra-text-b" }));
+          dd.remove();
+        };
+        dd.append(opt);
+        body.append(dd);
+      };
+      await assert.rejects(
+        () =>
+          collectionMod.selectPlatformCollection(
+            makeEvalPage(doc),
+            "抖音",
+            { collection: "民间故事" },
+            { timeouts: fastTimeouts, captureScreenshot: async () => "" }
+          ),
+        (err) => err.code === "collection_readback_mismatch"
+      );
+    }
+
     // 12e. A4：带内嵌 span 的占位文案「请选择<span>合集</span>」对目标名「合集」必须判未选失败；
     //      真正选中「合集」后回读才通过
     {

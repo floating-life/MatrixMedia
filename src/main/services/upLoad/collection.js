@@ -1823,11 +1823,17 @@ export function readSelectedCollectionInDom(payload) {
       }
       if (isPlaceholderText(c)) return;
       var k = norm(c);
+      if (String(source || "").indexOf("option-title") !== -1) {
+        if (k && titleTexts.indexOf(c) === -1) titleTexts.push(c);
+      }
       if (k && !selectedSeen[k]) {
         selectedSeen[k] = true;
         selectedTexts.push(c);
       }
     };
+    // 读到 option-title（合集真名节点）时只认它，不再用剥后缀后的整条文本兜底，
+    // 避免真名本身以「共N个作品」结尾时被截成近似名误放行
+    var titleTexts = [];
 
     // 2. 按平台 readbackSelectors 收集可见且非占位节点（含祖先链检查）的完整文本
     for (var ri = 0; ri < readbackSelectors.length; ri++) {
@@ -1864,6 +1870,10 @@ export function readSelectedCollectionInDom(payload) {
     // 3. 控件完整文本（已排除占位文案，不再扫描任意内层叶 span）
     if (entryFullText && !isInsidePlaceholderNode(entryEl, readScope)) {
       pushCandidate(entryFullText, "entry");
+    }
+
+    if (titleTexts.length > 0) {
+      selectedTexts = titleTexts.slice();
     }
 
     if (firstDisplayText || selectedTexts.length > 0) {
