@@ -101,6 +101,8 @@ export const PLATFORM_COLLECTION_CONFIGS = {
     // 2026-11-22 真机：「添加合集」行内有两个 semi-select（类型 .select-mix-type-* 与合集 .select-collection-*），
     // 打开与回读兜底都只认合集那个，避免认成类型控件。
     triggerSelectors: ["[class*='select-collection']"],
+    // 2026-11-22 真机第 3 轮：类型控件选中后显示「合集」，若不认作控件会被当成另一表单标签触发跨行保护
+    interactiveSelectors: [".semi-select"],
     // 2026-11-22 真机 DOM：.semi-popover-content > .mix-dropdown > .semi-select-option-list >
     // .semi-select-option.collection-option，名称在 span.option-title-*，旁边 option-extra-text「共N个作品」。
     // 去掉 role=menu / li 等泛选择器：会把左侧导航（首页/内容管理…）当成选项弹层。
@@ -883,7 +885,17 @@ export function runCollectionDomAction(payload) {
         }
         if (el.getAttribute("aria-haspopup")) return true;
       }
-      return isSemanticSelect(el);
+      if (isSemanticSelect(el)) return true;
+      // 仅用于「是否交互控件」判定、不作为可点入口的选择器（如抖音行内的合集类型 .semi-select）
+      var extraSel = cfg.interactiveSelectors || [];
+      if (typeof el.matches === "function") {
+        for (var xi = 0; xi < extraSel.length; xi++) {
+          try {
+            if (el.matches(extraSel[xi])) return true;
+          } catch (_) {}
+        }
+      }
+      return false;
     };
 
     var isLabelClassNode = function (node) {

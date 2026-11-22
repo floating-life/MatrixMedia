@@ -2773,15 +2773,24 @@ async function testS12Fix2StructuralGuards() {
       for (const n of ["首页", "内容管理", "民间故事"]) nav.append(new FakeElement("li", n, { role: "menuitem" }));
       body.append(nav);
       const row = new FakeElement("div", "", { class: "content-obt4oA" });
-      row.append(new FakeElement("span", "添加合集", { class: "title-content-oaqcSp" }));
+      const titleWrap = new FakeElement("div", "", { class: "title-dS7kae" });
+      titleWrap.append(new FakeElement("span", "添加合集", { class: "title-content-oaqcSp" }));
+      const head = new FakeElement("div", "");
+      head.append(titleWrap);
+      row.append(head);
       let typeOpened = 0;
-      const typeSel = new FakeElement("div", "", { class: "semi-select select-mix-type-G9iqb2", role: "combobox" });
-      typeSel.append(new FakeElement("span", "请选择合集类型", { class: "semi-select-selection-text" }));
+      // 真机第 3 轮：类型控件已选中，显示「合集」；两个 semi-select 均不假设有 role
+      const typeSel = new FakeElement("div", "", { class: "semi-select select-mix-type-G9iqb2" });
+      typeSel.append(new FakeElement("span", "合集", { class: "semi-select-selection-text" }));
       typeSel.onClick = () => { typeOpened += 1; };
-      const sel = new FakeElement("div", "", { class: "semi-select select-collection-nkL6sA", role: "combobox" });
+      const sel = new FakeElement("div", "", { class: "semi-select select-collection-nkL6sA" });
       const selText = new FakeElement("span", "请选择合集", { class: "semi-select-selection-text" });
       sel.append(selText);
-      row.append(typeSel, sel);
+      const ctl = new FakeElement("div", "", { class: "content-child-V0CB7w" });
+      const area = new FakeElement("div", "", { class: "sel-area-uXj3oO" });
+      area.append(typeSel, sel);
+      ctl.append(area);
+      row.append(ctl);
       body.append(row);
       let picked = "";
       sel.onClick = () => {
