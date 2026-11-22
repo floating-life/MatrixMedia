@@ -690,10 +690,9 @@ export default async function (page, data, window, event) {
           );
         const postClickErr = new Error(
           preValidation
-            ? `百家号点击「发布」后被平台校验拦下：${msg.text}`
+            ? `百家号点击「发布」后被平台校验拦下：${msg.text}（未自动重试，请处理后手动重发）`
             : `百家号点击「发布」后出现失败提示：${msg.text || msg.type}。为防重复发布未自动重试，请先到百家号后台核对是否已发出再决定是否重发`
         );
-        postClickErr._mmBjhRetryOk = preValidation;
         throw postClickErr;
       }
       if (attempt >= maxClicks) {
@@ -739,7 +738,9 @@ export default async function (page, data, window, event) {
       message: failMessage,
       closeWindow: false,
       extraPayload:
-        !isDraftModeForRetry(data) && bjhClickDispatched && !(err && err._mmBjhRetryOk)
+        // 发布模式一旦派发过点击，任何失败（含「请添加横版封面」等校验提示）都不整体重试：
+        // 提示可能是残留/误读，无法证明未发出。宁可报失败让用户手动补发，也不重复发布。
+        !isDraftModeForRetry(data) && bjhClickDispatched
           ? { noRetry: true }
           : {},
     });

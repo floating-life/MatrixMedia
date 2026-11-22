@@ -141,8 +141,9 @@ export const PLATFORM_COLLECTION_CONFIGS = {
     useShadowRoot: false,
     shadowHostSelector: "",
     dispatchMouseDown: true,
-    labelTexts: ["合集", "选择合集", "添加到合集", "作品合集", "所属合集"],
+    labelTexts: ["加入合集", "合集", "选择合集", "添加到合集", "作品合集", "所属合集"],
     entryTexts: [
+      "选择要加入到的合集",
       "请选择合集",
       "选择合集",
       "添加到合集",
@@ -1933,6 +1934,86 @@ function formatCandidateListSummary(candidates) {
  *   先截图（复用 failureScreenshot），打 `[collection] <平台> …` 日志，
  *   再抛带 `deterministic=true`、`isCollectionError=true` 的错误中止发布。
  */
+
+/**
+ * 失败诊断：输出合集相关区域的结构概要（仅 tag、class 与直属文本，不含任何属性值/URL），
+ * 用于按真机 DOM 校准 PLATFORM_COLLECTION_CONFIGS。浏览器端函数自包含。
+ */
+function collectCollectionDomOutline(args) {
+  var needles = (args && args.needles) || [];
+  var out = [];
+  var budget = 3500;
+  function visible(el) {
+    try {
+      var cs = window.getComputedStyle(el);
+      if (cs.display === "none" || cs.visibility === "hidden") return false;
+      var r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    } catch (e) {
+      return false;
+    }
+  }
+  function ownText(el) {
+    var t = "";
+    for (var i = 0; i < el.childNodes.length; i++) {
+      var n = el.childNodes[i];
+      if (n.nodeType === 3) t += n.nodeValue;
+    }
+    return t.replace(/\s+/g, " ").trim();
+  }
+  function cls(el) {
+    var c = typeof el.className === "string" ? el.className : "";
+    return c
+      .split(/\s+/)
+      .filter(function (x) {
+        return x && !/[\/:?=]/.test(x);
+      })
+      .slice(0, 3)
+      .map(function (x) {
+        return "." + x;
+      })
+      .join("");
+  }
+  function dump(el, depth, lines) {
+    if (depth > 7 || lines.length > 80) return;
+    if (!visible(el)) return;
+    var tag = (el.tagName || "").toLowerCase();
+    if (tag === "script" || tag === "style" || tag === "svg" || tag === "img") return;
+    var role = el.getAttribute && el.getAttribute("role");
+    var t = ownText(el).slice(0, 30);
+    lines.push(
+      new Array(depth + 1).join("  ") + tag + cls(el) + (role ? "[role=" + role + "]" : "") + (t ? " \"" + t + "\"" : "")
+    );
+    var kids = el.children || [];
+    for (var i = 0; i < kids.length && i < 15; i++) dump(kids[i], depth + 1, lines);
+  }
+  var all = document.querySelectorAll("body *");
+  var roots = [];
+  for (var i = 0; i < all.length && roots.length < 4; i++) {
+    var el = all[i];
+    var t = ownText(el);
+    if (!t || !visible(el)) continue;
+    var hit = false;
+    for (var k = 0; k < needles.length; k++) {
+      if (needles[k] && t.indexOf(needles[k]) >= 0) hit = true;
+    }
+    if (!hit) continue;
+    if (el.closest && el.closest("nav,aside,header")) continue;
+    var root = el;
+    for (var up = 0; up < 4 && root.parentElement && root.parentElement !== document.body; up++) root = root.parentElement;
+    var dup = false;
+    for (var j = 0; j < roots.length; j++) if (roots[j] === root || roots[j].contains(root)) dup = true;
+    if (!dup) roots.push(root);
+  }
+  for (var r = 0; r < roots.length; r++) {
+    var lines = [];
+    dump(roots[r], 0, lines);
+    out.push("#" + (r + 1) + "\n" + lines.join("\n"));
+  }
+  var text = out.join("\n");
+  return text.length > budget ? text.slice(0, budget) + "…(截断)" : text;
+}
+
 export async function selectPlatformCollection(
   page,
   platform,
@@ -1973,6 +2054,16 @@ export async function selectPlatformCollection(
       );
     } catch (_) {
       shot = "";
+    }
+    if (!config.useShadowRoot) {
+      try {
+        const outline = await page.evaluate(collectCollectionDomOutline, {
+          needles: [targetName, "合集"],
+        });
+        if (outline) console.log(`[collection] ${canonicalPlatform} DOM 概要:\n${outline}`);
+      } catch (_) {
+        // 诊断失败不影响主流程
+      }
     }
     console.error(
       `[collection] ${canonicalPlatform} 失败(${code}): ${message}${
