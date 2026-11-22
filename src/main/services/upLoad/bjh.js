@@ -665,9 +665,18 @@ export default async function (page, data, window, event) {
       }
 
       if (!isDraftMode) {
-        throw new Error(
-          `百家号点击「发布」后出现失败提示：${msg.text || msg.type}。为防重复发布未自动重试，请先到百家号后台核对是否已发出再决定是否重发`
+        // 「请添加/请上传/请填写/请选择…」「…不能为空」属于发布前校验，可确认未发出，允许外层整体重试；
+        // 其余失败提示无法排除已发出，标记 noRetry，防止外层重开窗口再发一次。
+        const preValidation = /^(请|未)(添加|上传|填写|选择|设置|输入|完成)|不能为空|不能少于|不能超过/.test(
+          msg.text || ""
         );
+        const postClickErr = new Error(
+          preValidation
+            ? `百家号点击「发布」后被平台校验拦下：${msg.text}`
+            : `百家号点击「发布」后出现失败提示：${msg.text || msg.type}。为防重复发布未自动重试，请先到百家号后台核对是否已发出再决定是否重发`
+        );
+        postClickErr._mmBjhNoRetry = !preValidation;
+        throw postClickErr;
       }
       if (attempt >= maxClicks) {
         throw new Error(`百家号「${actionText}」${attempt} 次点击均出现失败提示：${msg.text || msg.type}`);
@@ -711,6 +720,7 @@ export default async function (page, data, window, event) {
       event,
       message: failMessage,
       closeWindow: false,
+      extraPayload: err && err._mmBjhNoRetry ? { noRetry: true } : {},
     });
     console.error("点击提交按钮失败:", err);
   }

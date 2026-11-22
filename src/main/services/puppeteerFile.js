@@ -1182,7 +1182,11 @@ async function doUpload(data, transport, queueDone, runtimeTask) {
           if (finished) return;
           console.log(`尝试${currentAttempt}执行平台逻辑失败:`, err);
           const failurePayload = err && err._mmUploadFailurePayload;
-          if (currentAttempt >= maxRetries) {
+          // noRetry：平台已点过提交且无法排除已发出（如百家号点击发布后出现未知失败提示），
+          // 重开窗口重传可能重复发布，直接按最终失败处理。
+          const noRetry = !!(failurePayload && failurePayload.noRetry === true);
+          if (noRetry) console.log(`尝试${currentAttempt}失败标记 noRetry，不再重试`);
+          if (noRetry || currentAttempt >= maxRetries) {
             await replyFailureWithShot({
               ...data,
               ...failurePayload,
