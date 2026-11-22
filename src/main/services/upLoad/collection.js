@@ -22,7 +22,8 @@ import {
   ALL_PLATFORM_SUBMIT_SELECTORS,
   PLATFORM_SUBMIT_SELECTORS,
   collapseCollectionText,
-  normalizeCollectionName,
+  isNonCollectionOptionText,
+  stripCollectionCountSuffix,
 } from "../../../shared/collectionShared.js";
 import {
   getCollectionCanonicalPlatform,
@@ -79,12 +80,13 @@ export const PLATFORM_COLLECTION_CONFIGS = {
     useShadowRoot: false,
     shadowHostSelector: "",
     dispatchMouseDown: false,
-    labelTexts: ["添加到合集", "作品合集", "合集"],
+    labelTexts: ["添加到合集", "添加合集", "作品合集", "合集"],
     entryTexts: [
       "请选择合集",
       "选择合集",
       "添加到合集",
       "添加合集",
+      "不选择合集",
       "不加入合集",
       "不添加到合集",
     ],
@@ -141,8 +143,16 @@ export const PLATFORM_COLLECTION_CONFIGS = {
     useShadowRoot: false,
     shadowHostSelector: "",
     dispatchMouseDown: true,
-    labelTexts: ["合集", "选择合集", "添加到合集", "作品合集", "所属合集"],
+    labelTexts: [
+      "加入合集",
+      "合集",
+      "选择合集",
+      "添加到合集",
+      "作品合集",
+      "所属合集",
+    ],
     entryTexts: [
+      "选择要加入到的合集",
       "请选择合集",
       "选择合集",
       "添加到合集",
@@ -290,6 +300,8 @@ export const COLLECTION_PLACEHOLDER_TEXTS = Array.from(
     "未选择",
     "不加入合集",
     "不添加到合集",
+    "不选择合集",
+    "选择要加入到的合集",
     "暂不加入",
     "不选择",
     "无合集",
@@ -306,9 +318,17 @@ export function normalizeCollectionMatchText(text) {
   return collapseCollectionText(text);
 }
 
-/** 判断候选项名称与目标合集名是否去空白后完全相等 */
+/** 判断候选项名称与目标合集名是否去计数后缀及空白后完全相等（排除「不选择合集」） */
 export function isExactCollectionMatch(candidateText, targetName) {
-  const c = normalizeCollectionMatchText(candidateText);
+  if (
+    isNonCollectionOptionText(candidateText) ||
+    isNonCollectionOptionText(targetName)
+  ) {
+    return false;
+  }
+  const c = normalizeCollectionMatchText(
+    stripCollectionCountSuffix(candidateText)
+  );
   const t = normalizeCollectionMatchText(targetName);
   return Boolean(c && t && c === t);
 }
@@ -333,8 +353,9 @@ export function isCollectionPlaceholderText(text, extraPlaceholders = []) {
 
 /**
  * 严格回读校验（严禁 includes）：
- * - 任何占位/未选入口文案（含内嵌 span 拼接后的「请选择合集」等全集）一律视为未选，返回 false；
- * - 否则必须去空白后与目标合集名完全相等（目标名本身恰为「合集」时同样适用）。
+ * - 任何占位/未选入口文案（含内嵌 span 拼接后的「请选择合集」「不选择合集」等全集）一律视为未选，返回 false；
+ * - 允许按需去掉尾部「共\d+个作品」「\d+个作品」等计数后缀，再做去空白后的完全相等比对
+ *   （目标名本身恰为「合集」时同样适用，绝不用包含匹配）。
  */
 export function matchesCollectionReadback(
   displayedOrResult,
@@ -342,13 +363,29 @@ export function matchesCollectionReadback(
   options = {}
 ) {
   const targetNorm = normalizeCollectionMatchText(targetName);
-  if (!targetNorm) return false;
+  if (!targetNorm || isNonCollectionOptionText(targetNorm)) return false;
   const extraPlaceholders =
     options && Array.isArray(options.placeholders) ? options.placeholders : [];
+  const shouldStripCount = !(options && options.stripCountSuffix === false);
   const isExactNonPlaceholder = (raw) => {
-    const d = normalizeCollectionMatchText(raw);
+    const dRaw = normalizeCollectionMatchText(raw);
+    if (!dRaw) return false;
+    if (
+      isCollectionPlaceholderText(dRaw, extraPlaceholders) ||
+      isNonCollectionOptionText(dRaw)
+    ) {
+      return false;
+    }
+    const d = shouldStripCount
+      ? normalizeCollectionMatchText(stripCollectionCountSuffix(raw))
+      : dRaw;
     if (!d) return false;
-    if (isCollectionPlaceholderText(d, extraPlaceholders)) return false;
+    if (
+      isCollectionPlaceholderText(d, extraPlaceholders) ||
+      isNonCollectionOptionText(d)
+    ) {
+      return false;
+    }
     return d === targetNorm;
   };
 
@@ -368,7 +405,7 @@ export function matchesCollectionReadback(
   return isExactNonPlaceholder(displayedOrResult);
 }
 
-/** 整理页面候选合集名（去重、去空、最多保留 limit 个） */
+/** 整理页面候选合集名（去计数后缀、排除「不选择合集」、去重、去空、最多保留 limit 个） */
 export function formatCollectionCandidates(
   candidates,
   limit = COLLECTION_CANDIDATE_LIMIT
@@ -377,8 +414,8 @@ export function formatCollectionCandidates(
   const seen = new Set();
   const out = [];
   for (let i = 0; i < list.length; i++) {
-    const cleaned = normalizeCollectionName(list[i]);
-    if (!cleaned) continue;
+    const cleaned = stripCollectionCountSuffix(list[i]);
+    if (!cleaned || isNonCollectionOptionText(cleaned)) continue;
     const key = collapseCollectionText(cleaned);
     if (!key || seen.has(key)) continue;
     seen.add(key);
@@ -760,6 +797,96 @@ export function runCollectionDomAction(payload) {
     return out;
   };
 
+  var isSphPlatform =
+    cfg.platformKey === "sph" || Boolean(cfg.useShadowRoot);
+
+  var getRect = function (el) {
+    if (!el || typeof el.getBoundingClientRect !== "function") return null;
+    var r = null;
+    try {
+      r = el.getBoundingClientRect();
+    } catch (_) {
+      r = null;
+    }
+    if (!r) return null;
+    var left = Number(r.left || 0);
+    var top = Number(r.top || 0);
+    var width = Number(r.width || 0);
+    var height = Number(r.height || 0);
+    var right = r.right != null ? Number(r.right) : left + width;
+    var bottom = r.bottom != null ? Number(r.bottom) : top + height;
+    return {
+      left: left,
+      top: top,
+      width: width,
+      height: height,
+      right: right,
+      bottom: bottom,
+    };
+  };
+
+  var isInExcludedNavArea = function (el) {
+    var node = el;
+    while (node && node !== root && node.nodeType === 1) {
+      var tag = String(node.tagName || "").toUpperCase();
+      if (tag === "NAV" || tag === "ASIDE" || tag === "HEADER") {
+        return true;
+      }
+      if (typeof node.getAttribute === "function") {
+        var role = String(node.getAttribute("role") || "").toLowerCase();
+        if (
+          role === "navigation" ||
+          role === "banner" ||
+          role === "menubar"
+        ) {
+          return true;
+        }
+        var cls = String(node.getAttribute("class") || "");
+        var idStr = String(node.getAttribute("id") || "");
+        var clsTokens = (cls + " " + idStr)
+          .replace(/([a-z])([A-Z])/g, "$1-$2")
+          .toLowerCase();
+        if (
+          /(?:^|[\s_-])(?:semi-navigation|ant-layout-sider|ant-layout-header|ant-menu|sidebar|side-bar|sider|left-menu|side-menu|nav-menu|main-menu|left-nav|side-nav|top-nav|nav-bar|navbar|navigation|nav|app-header|page-header|site-header|layout-header)(?:$|[\s_-])/.test(
+            clsTokens
+          )
+        ) {
+          return true;
+        }
+      }
+      node = node.parentElement;
+    }
+    return false;
+  };
+
+  var getSanitizedDomSnippet = function (el) {
+    if (!el) return "";
+    var rawHtml = "";
+    try {
+      if (typeof el.outerHTML === "string") {
+        rawHtml = el.outerHTML;
+      }
+    } catch (_) {
+      rawHtml = "";
+    }
+    if (!rawHtml) return "";
+    var cleaned = rawHtml
+      .replace(/<img\b([^>]*)>/gi, function (_m, attrs) {
+        var cleanedAttrs = String(attrs || "")
+          .replace(/\s+src\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "")
+          .replace(/\s+style\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "");
+        return "<img" + cleanedAttrs + ">";
+      })
+      .replace(/\s+style\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "")
+      .replace(/[\r\n\t]+/g, " ")
+      .replace(/\s{2,}/g, " ")
+      .trim();
+    if (cleaned.length > 3000) {
+      return cleaned.slice(0, 3000);
+    }
+    return cleaned;
+  };
+
   /* -------------------- action: open_entry -------------------- */
   if (action === "open_entry") {
     var isDisabled = function (el) {
@@ -1110,6 +1237,7 @@ export function runCollectionDomAction(payload) {
 
     var labelNodes = allEls.filter(function (el) {
       if (isInsidePopup(el) || isLabelInsideInteractive(el)) return false;
+      if (!isSphPlatform && isInExcludedNavArea(el)) return false;
       var t = norm(getText(el));
       if (!matchLabelText(t)) return false;
       var kids = el.children ? Array.from(el.children) : [];
@@ -1120,6 +1248,24 @@ export function runCollectionDomAction(payload) {
       }
       return true;
     });
+
+    var getControlPlaceholder = function (el) {
+      if (!el) return "";
+      var ph =
+        typeof el.getAttribute === "function"
+          ? norm(el.getAttribute("placeholder"))
+          : "";
+      if (ph) return ph;
+      if (isSemanticSelect(el) && typeof el.querySelector === "function") {
+        try {
+          var innerInput = el.querySelector("input[placeholder]");
+          if (innerInput && typeof innerInput.getAttribute === "function") {
+            return norm(innerInput.getAttribute("placeholder"));
+          }
+        } catch (_) {}
+      }
+      return "";
+    };
 
     var chosenTrigger = null;
     var chosenRow = null;
@@ -1162,11 +1308,7 @@ export function runCollectionDomAction(payload) {
             if (getSubmitRejectionReason(el)) return false;
             if (isSemanticSelect(el)) return true;
             var txt = norm(getText(el));
-            var ph = norm(
-              typeof el.getAttribute === "function"
-                ? el.getAttribute("placeholder")
-                : ""
-            );
+            var ph = getControlPlaceholder(el);
             return (
               matchEntryText(txt) ||
               matchEntryText(ph) ||
@@ -1183,11 +1325,7 @@ export function runCollectionDomAction(payload) {
             var preferred =
               enabledTriggers.find(function (el) {
                 var txt = norm(getText(el));
-                var ph = norm(
-                  typeof el.getAttribute === "function"
-                    ? el.getAttribute("placeholder")
-                    : ""
-                );
+                var ph = getControlPlaceholder(el);
                 return matchEntryText(txt) || matchEntryText(ph);
               }) ||
               enabledTriggers.find(isSemanticSelect) ||
@@ -1240,6 +1378,90 @@ export function runCollectionDomAction(payload) {
           formLabels.push(tClean);
         }
       }
+      var findEntryFailureDomEl = function () {
+        if (disabledCandidate) {
+          var dp = disabledCandidate.parentElement;
+          if (
+            dp &&
+            dp !== root &&
+            dp !== docRef &&
+            (!docRef || (dp !== docRef.body && dp !== docRef.documentElement))
+          ) {
+            return dp;
+          }
+          return disabledCandidate;
+        }
+        if (labelNodes.length > 0) {
+          var flb = labelNodes[0];
+          var cur = flb.parentElement;
+          for (var d = 0; cur && d < 3; d++) {
+            if (
+              cur === root ||
+              cur === docRef ||
+              (docRef &&
+                (cur === docRef.body || cur === docRef.documentElement))
+            ) {
+              break;
+            }
+            if (matchesExplicitRowContainer(cur)) return cur;
+            cur = cur.parentElement;
+          }
+          if (
+            flb.parentElement &&
+            flb.parentElement !== root &&
+            flb.parentElement !== docRef &&
+            (!docRef ||
+              (flb.parentElement !== docRef.body &&
+                flb.parentElement !== docRef.documentElement))
+          ) {
+            return flb.parentElement;
+          }
+          return flb;
+        }
+        for (var ki = 0; ki < allEls.length; ki++) {
+          var kn = allEls[ki];
+          if (isInExcludedNavArea(kn)) continue;
+          var kt = norm(getText(kn));
+          if (!kt || kt.length > 40 || kt.indexOf("合集") === -1) continue;
+          var kKids = kn.children ? Array.from(kn.children) : [];
+          var hasSameChild = kKids.some(function (c) {
+            return isVisible(c) && norm(getText(c)).indexOf("合集") !== -1;
+          });
+          if (hasSameChild) continue;
+          var kRow = kn.parentElement;
+          for (var kd = 0; kRow && kd < 3; kd++) {
+            if (
+              kRow === root ||
+              kRow === docRef ||
+              (docRef &&
+                (kRow === docRef.body || kRow === docRef.documentElement))
+            ) {
+              break;
+            }
+            if (matchesExplicitRowContainer(kRow)) return kRow;
+            if (norm(getText(kRow)).length > 240) break;
+            kRow = kRow.parentElement;
+          }
+          if (
+            kn.parentElement &&
+            kn.parentElement !== root &&
+            kn.parentElement !== docRef &&
+            (!docRef ||
+              (kn.parentElement !== docRef.body &&
+                kn.parentElement !== docRef.documentElement))
+          ) {
+            return kn.parentElement;
+          }
+          return kn;
+        }
+        var firstFormRow = queryList(root, rowContainerSelectors).find(
+          function (el) {
+            return isVisible(el) && !isInExcludedNavArea(el);
+          }
+        );
+        return firstFormRow || null;
+      };
+      var entryDomSnippet = getSanitizedDomSnippet(findEntryFailureDomEl());
       return {
         ok: false,
         reason: disabledCandidate ? "entry_disabled" : "entry_not_found",
@@ -1255,6 +1477,7 @@ export function runCollectionDomAction(payload) {
             : "",
           nearbyKeywords: nearbyKeywords,
           formLabels: formLabels,
+          domSnippet: entryDomSnippet,
         },
       };
     }
@@ -1285,6 +1508,24 @@ export function runCollectionDomAction(payload) {
     var targetName = String((payload && payload.targetName) || "");
     var candidateLimit = Number((payload && payload.candidateLimit) || 10);
     var targetNorm = norm(targetName);
+    var shouldStripCount = !isSphPlatform;
+    var enableTextLeaf = !isSphPlatform;
+
+    var stripCount = function (t) {
+      var c = clean(t);
+      if (!c) return "";
+      if (!shouldStripCount) return c;
+      return c
+        .replace(
+          /(?:\s*[/·•|｜]\s*|\s+[-—]\s+|\s*)(?:[\(（]\s*(?:共\s*)?\d+\s*(?:个|条|篇|部)?\s*(?:作品|视频)\s*[\)）]|(?:共\s*)?\d+\s*(?:个|条|篇|部)?\s*(?:作品|视频))$/,
+          ""
+        )
+        .trim();
+    };
+
+    var isNonTargetOption = function (k) {
+      return !k || k === "不选择合集";
+    };
 
     var isOptionDisabled = function (el) {
       if (!el) return true;
@@ -1304,6 +1545,63 @@ export function runCollectionDomAction(payload) {
     var entryEl = token
       ? root.querySelector('[data-mm-collection-entry="' + token + '"]')
       : null;
+    var rowEl = token
+      ? root.querySelector('[data-mm-collection-row="' + token + '"]')
+      : null;
+    var entryRect = entryEl ? getRect(entryEl) : null;
+    var hasEntryRect = Boolean(
+      entryRect && entryRect.width > 0 && entryRect.height > 0
+    );
+
+    var isBelowTrigger = function (el) {
+      if (!hasEntryRect || !el) return false;
+      var r = getRect(el);
+      if (!r || r.width <= 0 || r.height <= 0) return false;
+      return (
+        r.top >= entryRect.bottom - 4 &&
+        r.left < entryRect.right &&
+        r.right > entryRect.left
+      );
+    };
+
+    var isInTriggerRow = function (el) {
+      if (!el) return false;
+      if (
+        entryEl &&
+        (el === entryEl ||
+          (typeof entryEl.contains === "function" && entryEl.contains(el)))
+      ) {
+        return true;
+      }
+      if (
+        rowEl &&
+        rowEl !== root &&
+        rowEl !== docRef &&
+        (!docRef ||
+          (rowEl !== docRef.body && rowEl !== docRef.documentElement)) &&
+        (el === rowEl ||
+          (typeof rowEl.contains === "function" && rowEl.contains(el)))
+      ) {
+        return true;
+      }
+      return false;
+    };
+
+    var isLeftSidebarPopup = function (el) {
+      if (isSphPlatform || !hasEntryRect || !el) return false;
+      var r = getRect(el);
+      if (!r || r.width <= 0 || r.height <= 0) return false;
+      var role =
+        typeof el.getAttribute === "function"
+          ? String(el.getAttribute("role") || "").toLowerCase()
+          : "";
+      var cls = String((el.getAttribute && el.getAttribute("class")) || "");
+      if (/dialog|modal/i.test(cls) || role === "dialog") return false;
+      if (r.right <= entryRect.left) {
+        return true;
+      }
+      return false;
+    };
 
     var popups = [];
     if (entryEl && typeof entryEl.getAttribute === "function") {
@@ -1324,7 +1622,12 @@ export function runCollectionDomAction(payload) {
             }
             if (p) linked = p;
           }
-          if (linked && isVisible(linked) && popups.indexOf(linked) === -1) {
+          if (
+            linked &&
+            isVisible(linked) &&
+            (isSphPlatform || !isInExcludedNavArea(linked)) &&
+            popups.indexOf(linked) === -1
+          ) {
             popups.push(linked);
           }
         }
@@ -1332,20 +1635,128 @@ export function runCollectionDomAction(payload) {
     }
 
     var foundPopups = queryList(root, cfg.popupSelectors || []).filter(
-      isVisible
+      function (p) {
+        if (!isVisible(p)) return false;
+        if (!isSphPlatform) {
+          if (isInExcludedNavArea(p) || isLeftSidebarPopup(p)) return false;
+        }
+        return true;
+      }
     );
+    if (!isSphPlatform && hasEntryRect) {
+      for (var pbi = foundPopups.length - 1; pbi >= 0; pbi--) {
+        if (
+          isBelowTrigger(foundPopups[pbi]) &&
+          popups.indexOf(foundPopups[pbi]) === -1
+        ) {
+          popups.push(foundPopups[pbi]);
+        }
+      }
+    }
     for (var pi = foundPopups.length - 1; pi >= 0; pi--) {
       if (popups.indexOf(foundPopups[pi]) === -1) {
         popups.push(foundPopups[pi]);
       }
     }
 
-    if (popups.length === 0) {
+    var findClosestBelowPopupEl = function () {
+      if (hasEntryRect) {
+        var belowKnown = popups.filter(function (p) {
+          return isBelowTrigger(p);
+        });
+        if (belowKnown.length > 0) {
+          belowKnown.sort(function (a, b) {
+            var ra = getRect(a);
+            var rb = getRect(b);
+            return (
+              Math.abs(ra.top - entryRect.bottom) -
+              Math.abs(rb.top - entryRect.bottom)
+            );
+          });
+          return belowKnown[0];
+        }
+        var belowEls = [];
+        var scanEls = [];
+        try {
+          scanEls = Array.from(root.querySelectorAll("*"));
+        } catch (_) {
+          scanEls = [];
+        }
+        for (var si = 0; si < scanEls.length; si++) {
+          var se = scanEls[si];
+          if (!isVisible(se)) continue;
+          var sTag = String(se.tagName || "").toUpperCase();
+          if (
+            sTag === "HTML" ||
+            sTag === "BODY" ||
+            sTag === "MAIN" ||
+            sTag === "FORM" ||
+            sTag === "SCRIPT" ||
+            sTag === "STYLE" ||
+            sTag === "HEAD"
+          ) {
+            continue;
+          }
+          if (isInExcludedNavArea(se) || isInTriggerRow(se)) continue;
+          if (
+            entryEl &&
+            typeof se.contains === "function" &&
+            se.contains(entryEl)
+          ) {
+            continue;
+          }
+          if (
+            rowEl &&
+            typeof se.contains === "function" &&
+            se.contains(rowEl)
+          ) {
+            continue;
+          }
+          if (!isBelowTrigger(se)) continue;
+          if (!norm(getText(se))) continue;
+          belowEls.push({ el: se, idx: si, rect: getRect(se) });
+        }
+        var belowSet = belowEls.map(function (item) {
+          return item.el;
+        });
+        var topLevelBelow = belowEls.filter(function (item) {
+          var anc = item.el.parentElement;
+          while (anc && anc !== root) {
+            if (belowSet.indexOf(anc) !== -1) return false;
+            anc = anc.parentElement;
+          }
+          return true;
+        });
+        if (topLevelBelow.length > 0) {
+          topLevelBelow.sort(function (a, b) {
+            var da = Math.max(0, a.rect.top - entryRect.bottom);
+            var db = Math.max(0, b.rect.top - entryRect.bottom);
+            if (Math.abs(da - db) > 8) return da - db;
+            return b.idx - a.idx;
+          });
+          return topLevelBelow[0].el;
+        }
+      }
+      if (popups.length > 0) return popups[0];
+      if (
+        rowEl &&
+        rowEl !== root &&
+        rowEl !== docRef &&
+        (!docRef ||
+          (rowEl !== docRef.body && rowEl !== docRef.documentElement))
+      ) {
+        return rowEl;
+      }
+      return entryEl || null;
+    };
+
+    if (popups.length === 0 && !enableTextLeaf) {
       return {
         ok: false,
         reason: "popup_not_found",
         popupFound: false,
         candidates: [],
+        domSnippet: getSanitizedDomSnippet(findClosestBelowPopupEl()),
       };
     }
 
@@ -1376,27 +1787,40 @@ export function runCollectionDomAction(payload) {
       return clean(getText(opt));
     };
 
-    var candidates = [];
-    var seenCand = {};
+    var belowPopupCandidates = [];
+    var otherPopupCandidates = [];
+    var popupBelowHasOptions = false;
     var matchedOption = null;
     var matchedPopup = null;
     var matchedName = "";
+    var matchedStrategy = "popup";
 
     for (var pIdx = 0; pIdx < popups.length; pIdx++) {
       var popup = popups[pIdx];
+      var popupIsBelow = !isSphPlatform && isBelowTrigger(popup);
       var opts = queryList(popup, optionSelectors).filter(function (el) {
-        return isVisible(el) && el !== entryEl;
+        if (!isVisible(el) || el === entryEl) return false;
+        if (!isSphPlatform && isInExcludedNavArea(el)) return false;
+        return true;
       });
       for (var oi = 0; oi < opts.length; oi++) {
         var opt = opts[oi];
-        var name = extractOptionName(opt);
+        var rawOptName = extractOptionName(opt);
+        var name = stripCount(rawOptName);
         var key = norm(name);
         if (!key) continue;
-        if (!seenCand[key]) {
-          seenCand[key] = true;
-          candidates.push(name);
+        if (!isSphPlatform && isNonTargetOption(key)) continue;
+        if (popupIsBelow) {
+          popupBelowHasOptions = true;
+          belowPopupCandidates.push(name);
+        } else {
+          otherPopupCandidates.push(name);
         }
-        if (!matchedOption && key === targetNorm) {
+        if (
+          !matchedOption &&
+          (isSphPlatform || !isNonTargetOption(targetNorm)) &&
+          key === targetNorm
+        ) {
           matchedOption = opt;
           matchedPopup = popup;
           matchedName = name;
@@ -1405,23 +1829,292 @@ export function runCollectionDomAction(payload) {
       if (matchedOption) break;
     }
 
+    var belowCandidates = [];
+    var nonContentTagRe =
+      /^(SCRIPT|STYLE|SVG|PATH|IMG|BR|HR|HEAD|META|LINK|BODY|HTML|INPUT|TEXTAREA)$/;
+
+    var matchesTargetLeafText = function (el) {
+      if (!targetNorm || isNonTargetOption(targetNorm)) return false;
+      var raw = clean(getText(el));
+      if (!raw) return false;
+      var rawKey = norm(raw);
+      if (rawKey && !isNonTargetOption(rawKey) && rawKey === targetNorm) {
+        return true;
+      }
+      var stripped = stripCount(raw);
+      var strippedKey = norm(stripped);
+      if (
+        strippedKey &&
+        !isNonTargetOption(strippedKey) &&
+        strippedKey === targetNorm
+      ) {
+        return true;
+      }
+      return false;
+    };
+
+    var isClickableOptionNode = function (el) {
+      if (!el || el.nodeType !== 1) return false;
+      var tag = String(el.tagName || "").toUpperCase();
+      if (
+        tag === "LI" ||
+        tag === "BUTTON" ||
+        tag === "A" ||
+        tag === "LABEL"
+      ) {
+        return true;
+      }
+      if (typeof el.onclick === "function" || typeof el.onClick === "function") {
+        return true;
+      }
+      if (typeof el.getAttribute === "function") {
+        var role = String(el.getAttribute("role") || "").toLowerCase();
+        if (
+          role === "option" ||
+          role === "menuitem" ||
+          role === "button" ||
+          role === "radio"
+        ) {
+          return true;
+        }
+        if (el.getAttribute("tabindex") !== null) return true;
+        var cls = String(el.getAttribute("class") || "");
+        var clsTokens = cls.replace(/([a-z])([A-Z])/g, "$1-$2").toLowerCase();
+        if (/(?:^|[\s_-])(?:option|item|card)(?:$|[\s_-])/.test(clsTokens)) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    var resolveClickableTarget = function (leaf) {
+      if (!leaf) return null;
+      if (
+        typeof leaf.onclick === "function" ||
+        typeof leaf.onClick === "function"
+      ) {
+        return leaf;
+      }
+      var leafTag = String(leaf.tagName || "").toUpperCase();
+      if (leafTag === "LI" || leafTag === "BUTTON" || leafTag === "A") {
+        return leaf;
+      }
+      if (typeof leaf.getAttribute === "function") {
+        var leafRole = String(leaf.getAttribute("role") || "").toLowerCase();
+        if (
+          leafRole === "option" ||
+          leafRole === "menuitem" ||
+          leafRole === "button" ||
+          leafRole === "radio" ||
+          leaf.getAttribute("tabindex") !== null
+        ) {
+          return leaf;
+        }
+      }
+      var anc = leaf.parentElement;
+      for (var depth = 0; anc && depth < 4; depth++) {
+        if (
+          anc === root ||
+          anc === docRef ||
+          (docRef && (anc === docRef.body || anc === docRef.documentElement))
+        ) {
+          break;
+        }
+        if (
+          !isVisible(anc) ||
+          isInExcludedNavArea(anc) ||
+          isInTriggerRow(anc) ||
+          getSubmitRejectionReason(anc)
+        ) {
+          break;
+        }
+        if (!matchesTargetLeafText(anc)) break;
+        if (isClickableOptionNode(anc)) return anc;
+        anc = anc.parentElement;
+      }
+      return leaf;
+    };
+
+    var collectBelowCandidates = function (scanScope) {
+      var out = [];
+      if (!scanScope || typeof scanScope.querySelectorAll !== "function") {
+        return out;
+      }
+      var nodes = [];
+      try {
+        nodes = Array.from(scanScope.querySelectorAll("*"));
+      } catch (_) {
+        nodes = [];
+      }
+      var leafItems = [];
+      for (var ci = 0; ci < nodes.length; ci++) {
+        var n = nodes[ci];
+        if (!isVisible(n)) continue;
+        var nTag = String(n.tagName || "").toUpperCase();
+        if (nonContentTagRe.test(nTag)) continue;
+        if (isInExcludedNavArea(n) || isInTriggerRow(n)) continue;
+        if (!isBelowTrigger(n)) continue;
+        if (getSubmitRejectionReason(n)) continue;
+        var nKids = n.children ? Array.from(n.children) : [];
+        var hasTextChild = false;
+        for (var ki = 0; ki < nKids.length; ki++) {
+          var kc = nKids[ki];
+          if (!isVisible(kc)) continue;
+          var kcTag = String(kc.tagName || "").toUpperCase();
+          if (nonContentTagRe.test(kcTag)) continue;
+          if (norm(getText(kc))) {
+            hasTextChild = true;
+            break;
+          }
+        }
+        if (hasTextChild) continue;
+        var strippedName = stripCount(clean(getText(n)));
+        var strippedKey = norm(strippedName);
+        if (
+          !strippedKey ||
+          strippedName.length > 60 ||
+          isNonTargetOption(strippedKey)
+        ) {
+          continue;
+        }
+        leafItems.push({
+          name: strippedName,
+          top: getRect(n).top,
+          idx: ci,
+        });
+      }
+      leafItems.sort(function (a, b) {
+        if (a.top !== b.top) return a.top - b.top;
+        return a.idx - b.idx;
+      });
+      for (var li = 0; li < leafItems.length; li++) {
+        out.push(leafItems[li].name);
+      }
+      return out;
+    };
+
+    // 回退策略 text_leaf：弹层选择器未命中，或命中的弹层里没有同名项时启用
+    var matchedLeafEl = null;
+    if (!matchedOption && enableTextLeaf && hasEntryRect) {
+      var allScanEls = [];
+      try {
+        allScanEls = Array.from(root.querySelectorAll("*"));
+      } catch (_) {
+        allScanEls = [];
+      }
+      var leafMatches = [];
+      if (targetNorm && !isNonTargetOption(targetNorm)) {
+        for (var ti2 = 0; ti2 < allScanEls.length; ti2++) {
+          var candEl = allScanEls[ti2];
+          if (!isVisible(candEl)) continue;
+          var cTag = String(candEl.tagName || "").toUpperCase();
+          if (nonContentTagRe.test(cTag)) continue;
+          if (isInExcludedNavArea(candEl) || isInTriggerRow(candEl)) continue;
+          if (getSubmitRejectionReason(candEl)) continue;
+          if (!isBelowTrigger(candEl)) continue;
+          if (!matchesTargetLeafText(candEl)) continue;
+          var descNodes = [];
+          try {
+            descNodes = Array.from(candEl.querySelectorAll("*"));
+          } catch (_) {
+            descNodes = [];
+          }
+          var hasSameTextDesc = false;
+          for (var di = 0; di < descNodes.length; di++) {
+            var dn = descNodes[di];
+            if (
+              isVisible(dn) &&
+              isBelowTrigger(dn) &&
+              matchesTargetLeafText(dn)
+            ) {
+              hasSameTextDesc = true;
+              break;
+            }
+          }
+          if (hasSameTextDesc) continue;
+          leafMatches.push(candEl);
+        }
+      }
+      if (leafMatches.length === 1) {
+        matchedLeafEl = leafMatches[0];
+        matchedOption = resolveClickableTarget(matchedLeafEl);
+        matchedName =
+          stripCount(clean(getText(matchedLeafEl))) ||
+          clean(getText(matchedLeafEl));
+        matchedStrategy = "text_leaf";
+        var panelAnc = matchedOption ? matchedOption.parentElement : null;
+        while (panelAnc && panelAnc !== root) {
+          if (
+            panelAnc === docRef ||
+            (docRef &&
+              (panelAnc === docRef.body ||
+                panelAnc === docRef.documentElement))
+          ) {
+            break;
+          }
+          if (isInExcludedNavArea(panelAnc) || isInTriggerRow(panelAnc)) break;
+          if (isBelowTrigger(panelAnc)) {
+            matchedPopup = panelAnc;
+          }
+          panelAnc = panelAnc.parentElement;
+        }
+      }
+    }
+
+    if (!isSphPlatform && hasEntryRect && !popupBelowHasOptions) {
+      if (matchedPopup && isBelowTrigger(matchedPopup)) {
+        belowCandidates = collectBelowCandidates(matchedPopup);
+      }
+      if (belowCandidates.length === 0) {
+        belowCandidates = collectBelowCandidates(root);
+      }
+    }
+
+    var candidates = [];
+    var seenCand = {};
+    var appendCandidates = function (list) {
+      for (var i = 0; i < list.length; i++) {
+        var cname = list[i];
+        var ckey = norm(cname);
+        if (!ckey || (!isSphPlatform && isNonTargetOption(ckey))) continue;
+        if (!seenCand[ckey]) {
+          seenCand[ckey] = true;
+          candidates.push(cname);
+        }
+      }
+    };
+    appendCandidates(belowPopupCandidates);
+    appendCandidates(belowCandidates);
+    appendCandidates(otherPopupCandidates);
+
     if (!matchedOption) {
+      var failReason =
+        candidates.length > 0
+          ? "option_not_found"
+          : popups.length === 0
+          ? "popup_not_found"
+          : "options_empty";
       return {
         ok: false,
-        reason: candidates.length === 0 ? "options_empty" : "option_not_found",
-        popupFound: true,
+        reason: failReason,
+        popupFound: popups.length > 0,
         candidates: candidates.slice(0, candidateLimit),
         totalCandidates: candidates.length,
+        domSnippet: getSanitizedDomSnippet(findClosestBelowPopupEl()),
       };
     }
 
-    if (isOptionDisabled(matchedOption)) {
+    if (
+      isOptionDisabled(matchedOption) ||
+      (matchedLeafEl && isOptionDisabled(matchedLeafEl))
+    ) {
       return {
         ok: false,
         reason: "option_disabled",
-        popupFound: true,
+        popupFound: popups.length > 0 || matchedStrategy === "text_leaf",
         candidates: candidates.slice(0, candidateLimit),
         totalCandidates: candidates.length,
+        domSnippet: getSanitizedDomSnippet(findClosestBelowPopupEl()),
       };
     }
 
@@ -1444,6 +2137,7 @@ export function runCollectionDomAction(payload) {
     return {
       ok: true,
       matchedName: matchedName,
+      strategy: matchedStrategy,
       candidates: candidates.slice(0, candidateLimit),
       totalCandidates: candidates.length,
       inModal: inModal,
@@ -1680,6 +2374,8 @@ export function readSelectedCollectionInDom(payload) {
       "未选择",
       "不加入合集",
       "不添加到合集",
+      "不选择合集",
+      "选择要加入到的合集",
       "暂不加入",
       "不选择",
       "无合集",
@@ -2033,6 +2729,17 @@ export async function selectPlatformCollection(
     );
     const isEntryDisabled =
       openResult && openResult.reason === "entry_disabled";
+    const entryDomSnippet = String(
+      (openResult &&
+        ((openResult.diagnostics && openResult.diagnostics.domSnippet) ||
+          openResult.domSnippet)) ||
+        ""
+    );
+    if (!isEntryDisabled) {
+      console.log(
+        `[collection] ${canonicalPlatform} DOM 片段: ${entryDomSnippet || "（无）"}`
+      );
+    }
     const reasonText =
       openResult && openResult.reason === "shadow_root_not_found"
         ? "未穿透 wujie 影子树（shadowRoot 不存在）"
@@ -2051,6 +2758,7 @@ export async function selectPlatformCollection(
         targetName,
         entryLookup: (openResult && openResult.diagnostics) || null,
         candidates: [],
+        domSnippet: entryDomSnippet,
       }
     );
   }
@@ -2098,8 +2806,9 @@ export async function selectPlatformCollection(
       if (pickResult && pickResult.ok) break;
       if (
         pickResult &&
-        (pickResult.reason === "option_not_found" ||
-          pickResult.reason === "option_disabled")
+        (pickResult.reason === "option_disabled" ||
+          (pickResult.reason === "option_not_found" &&
+            pickResult.popupFound === true))
       ) {
         break;
       }
@@ -2115,6 +2824,12 @@ export async function selectPlatformCollection(
     const candidateSummary = formatCandidateListSummary(candidateNames);
 
     if (!pickResult || !pickResult.ok) {
+      const optionDomSnippet = String(
+        (pickResult && pickResult.domSnippet) || ""
+      );
+      console.log(
+        `[collection] ${canonicalPlatform} DOM 片段: ${optionDomSnippet || "（无）"}`
+      );
       const reasonDesc =
         pickResult && pickResult.reason === "popup_not_found"
           ? "打开入口后未检测到合集列表弹层"
@@ -2129,11 +2844,14 @@ export async function selectPlatformCollection(
         entryLookup: openResult,
         reason: (pickResult && pickResult.reason) || "option_not_found",
         candidates: candidateNames,
+        domSnippet: optionDomSnippet,
       });
     }
 
     console.log(
-      `[collection] ${canonicalPlatform} 已选中匹配合集：「${pickResult.matchedName}」（候选=${candidateNames.length}个：[${candidateSummary}]）`
+      `[collection] ${canonicalPlatform} 已选中匹配合集：「${pickResult.matchedName}」（策略=${
+        pickResult.strategy || "popup"
+      }，候选=${candidateNames.length}个：[${candidateSummary}]）`
     );
 
     // 若平台以弹窗呈现合集选择，经 safeClick 触发可选的「确定/确认/完成」按钮
@@ -2196,11 +2914,13 @@ export async function selectPlatformCollection(
       lastDisplayed = String(
         (readbackResult && readbackResult.displayedText) || ""
       ).trim();
+      const stripCountSuffix = config.platformKey !== "sph";
       if (
         readbackResult &&
         readbackResult.ok &&
         matchesCollectionReadback(readbackResult, targetName, {
           placeholders: config.entryTexts,
+          stripCountSuffix,
         })
       ) {
         const matchedDisplay =
@@ -2208,6 +2928,7 @@ export async function selectPlatformCollection(
             readbackResult.selectedTexts.find((t) =>
               matchesCollectionReadback(t, targetName, {
                 placeholders: config.entryTexts,
+                stripCountSuffix,
               })
             )) ||
           lastDisplayed;

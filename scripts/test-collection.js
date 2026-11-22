@@ -101,6 +101,17 @@ class FakeElement {
   get innerText() {
     return this.textContent;
   }
+  get outerHTML() {
+    const tag = this.tagName.toLowerCase();
+    const attrStr = Object.entries(this.attrs)
+      .map(([k, v]) => ` ${k}="${String(v).replace(/"/g, "&quot;")}"`)
+      .join("");
+    if (tag === "img" || tag === "input" || tag === "br" || tag === "hr") {
+      return `<${tag}${attrStr}>`;
+    }
+    const inner = this._text + this.children.map((c) => c.outerHTML).join("");
+    return `<${tag}${attrStr}>${inner}</${tag}>`;
+  }
   getAttribute(k) {
     return Object.prototype.hasOwnProperty.call(this.attrs, k)
       ? this.attrs[k]
@@ -2879,6 +2890,585 @@ async function testS12Fix2StructuralGuards() {
   console.log("✓ 12. S12-fix2 safeClick 唯一出口、跨行隔离、「校园发布会」与内嵌 span 占位回读通过");
 }
 
+/* ------------------------------------------------------------------ *
+ * 13. S12-cal1：真机校准（抖音 text_leaf / 去计数后缀 / 排除导航 / DOM 诊断；快手「加入合集」）
+ * ------------------------------------------------------------------ */
+async function testS12Cal1Calibration() {
+  const sharedCollection = require(path.join(root, "src/shared/collectionShared.js"));
+  const fastTimeouts = {
+    entryTimeoutMs: 0,
+    optionTimeoutMs: 0,
+    readbackTimeoutMs: 0,
+    pollIntervalMs: 0,
+    afterOpenDelayMs: 0,
+    afterSelectDelayMs: 0,
+  };
+
+  // 13a. 计数后缀归一化与「不选择合集」禁选纯函数
+  assert.strictEqual(
+    sharedCollection.stripCollectionCountSuffix("民间故事 共21个作品"),
+    "民间故事"
+  );
+  assert.strictEqual(
+    sharedCollection.stripCollectionCountSuffix("钟馗说案 / 共10个作品"),
+    "钟馗说案"
+  );
+  assert.strictEqual(
+    sharedCollection.stripCollectionCountSuffix("民间故事21个作品"),
+    "民间故事"
+  );
+  assert.strictEqual(
+    sharedCollection.stripCollectionCountSuffix("民间故事（共21个作品）"),
+    "民间故事"
+  );
+  assert.strictEqual(
+    sharedCollection.stripCollectionCountSuffix("共21个作品"),
+    ""
+  );
+  assert.strictEqual(
+    sharedCollection.stripCollectionCountSuffix("民间故事续集"),
+    "民间故事续集"
+  );
+  assert.strictEqual(
+    sharedCollection.stripCollectionCountSuffix("民间故事2"),
+    "民间故事2"
+  );
+
+  assert.strictEqual(
+    collectionMod.isExactCollectionMatch("民间故事 共21个作品", "民间故事"),
+    true
+  );
+  assert.strictEqual(
+    collectionMod.isExactCollectionMatch("民间故事续集 共21个作品", "民间故事"),
+    false
+  );
+  assert.strictEqual(
+    collectionMod.isExactCollectionMatch("不选择合集", "不选择合集"),
+    false,
+    "「不选择合集」不能被当成目标"
+  );
+
+  assert.strictEqual(
+    collectionMod.matchesCollectionReadback("民间故事 共21个作品", "民间故事"),
+    true,
+    "抖音回读带计数后缀应归一化后精确通过"
+  );
+  assert.strictEqual(
+    collectionMod.matchesCollectionReadback("民间故事续集 共21个作品", "民间故事"),
+    false,
+    "带计数后缀但主名不同绝不能用包含误过"
+  );
+  assert.strictEqual(
+    collectionMod.matchesCollectionReadback("不选择合集", "不选择合集"),
+    false
+  );
+  assert.strictEqual(
+    collectionMod.matchesCollectionReadback("选择要加入到的合集", "合集"),
+    false
+  );
+
+  assert.deepStrictEqual(
+    collectionMod.formatCollectionCandidates([
+      "不选择合集",
+      "民间故事 共21个作品",
+      "钟馗说案 / 共10个作品",
+      "共5个作品",
+      "民间故事 21个作品",
+    ]),
+    ["民间故事", "钟馗说案"]
+  );
+
+  // 配置检查：快手 labelTexts 首位「加入合集」，entryTexts 含「选择要加入到的合集」
+  assert.strictEqual(
+    collectionMod.PLATFORM_COLLECTION_CONFIGS.ks.labelTexts[0],
+    "加入合集"
+  );
+  assert.ok(
+    collectionMod.PLATFORM_COLLECTION_CONFIGS.ks.entryTexts.includes(
+      "选择要加入到的合集"
+    )
+  );
+
+  const makeDoc = () => {
+    const doc = new FakeElement("document");
+    const body = new FakeElement("body");
+    doc.body = body;
+    doc.documentElement = doc;
+    doc.append(body);
+    doc.getElementById = (id) => doc.querySelector(`[id="${id}"]`);
+    return { doc, body };
+  };
+  const makeEvalPage = (doc) => ({
+    async evaluate(fn, arg) {
+      const prevDoc = global.document;
+      const prevStyle = global.getComputedStyle;
+      const prevMouse = global.MouseEvent;
+      const prevWindow = global.window;
+      global.document = doc;
+      global.getComputedStyle = (el) => ({
+        display: el && el.hidden ? "none" : "block",
+        visibility: "visible",
+        opacity: "1",
+      });
+      global.MouseEvent = FakeMouseEvent;
+      global.window = {};
+      try {
+        const runner = new Function(
+          "document",
+          "getComputedStyle",
+          "MouseEvent",
+          "window",
+          "arg",
+          `return (${fn.toString()})(arg);`
+        );
+        return runner(doc, global.getComputedStyle, FakeMouseEvent, {}, arg);
+      } finally {
+        if (prevDoc === undefined) delete global.document;
+        else global.document = prevDoc;
+        if (prevStyle === undefined) delete global.getComputedStyle;
+        else global.getComputedStyle = prevStyle;
+        if (prevMouse === undefined) delete global.MouseEvent;
+        else global.MouseEvent = prevMouse;
+        if (prevWindow === undefined) delete global.window;
+        else global.window = prevWindow;
+      }
+    },
+    async waitForTimeout() {},
+  });
+
+  /**
+   * 构造抖音真机场景假 DOM：
+   * - 左侧导航 <nav> + <ul role="menu" class="semi-navigation-list"> 含 首页/内容管理/数据中心/收入变现/创作服务
+   * - 同行左侧「合集」类型下拉 + 右侧「请选择合集」触发器
+   * - 点击触发器后在触发器正下方挂载无已知 class 的自定义弹层
+   */
+  const buildDouyinCalibratedPage = ({
+    items,
+    splitNodes = true,
+    readbackWithCount = false,
+    extraPopupHtmlPad = 0,
+    duplicateTarget = false,
+    decoyInRow = false,
+  }) => {
+    const { doc, body } = makeDoc();
+
+    // 左侧导航（同时含 nav 与 role="menu" 的 li，复现真机误入导航菜单的问题）
+    const nav = new FakeElement("nav", "", { class: "creator-left-nav" });
+    nav.rect = { left: 0, top: 0, width: 180, height: 800 };
+    const navList = new FakeElement("ul", "", {
+      role: "menu",
+      class: "semi-navigation-list",
+    });
+    navList.rect = { left: 0, top: 60, width: 180, height: 400 };
+    const navItems = ["首页", "内容管理", "数据中心", "收入变现", "创作服务"];
+    navItems.forEach((txt, idx) => {
+      const li = new FakeElement("li", txt, { role: "menuitem" });
+      li.rect = { left: 0, top: 60 + idx * 44, width: 180, height: 40 };
+      navList.append(li);
+    });
+    nav.append(navList);
+
+    // 额外在页面顶部 header 放一个同名干扰项（不应被 text_leaf 命中）
+    const header = new FakeElement("header", "", { class: "top-bar" });
+    header.rect = { left: 240, top: 0, width: 600, height: 50 };
+    const headerDecoy = new FakeElement("span", "民间故事");
+    headerDecoy.rect = { left: 400, top: 10, width: 80, height: 24 };
+    header.append(headerDecoy);
+
+    // 表单行：「添加合集」标签 + 左侧「合集」类型下拉 + 右侧「请选择合集」
+    const row = new FakeElement("div", "", {
+      class: "setting-item",
+      style: "display:flex",
+    });
+    row.rect = { left: 240, top: 200, width: 520, height: 40 };
+    const rowLabel = new FakeElement("div", "添加合集", { class: "item-label" });
+    rowLabel.rect = { left: 240, top: 206, width: 80, height: 24 };
+    const typeSelect = new FakeElement("div", "", {
+      class: "semi-select",
+      role: "combobox",
+    });
+    typeSelect.rect = { left: 330, top: 202, width: 80, height: 34 };
+    const typeSpan = new FakeElement("span", "合集", {
+      class: "semi-select-selection-text",
+    });
+    typeSpan.rect = { left: 340, top: 208, width: 40, height: 20 };
+    typeSelect.append(typeSpan);
+
+    const colSelect = new FakeElement("div", "", {
+      class: "semi-select",
+      role: "combobox",
+    });
+    colSelect.rect = { left: 420, top: 202, width: 240, height: 34 }; // bottom = 236
+    const colDisplay = new FakeElement("span", "请选择合集", {
+      class: "semi-select-selection-text",
+    });
+    colDisplay.rect = { left: 432, top: 208, width: 160, height: 20 };
+    colSelect.append(colDisplay);
+    row.append(rowLabel, typeSelect, colSelect);
+
+    // 可选：触发器所在行内放一个位于触发器下方的同名提示（text_leaf 必须排除行本身）
+    let decoyClicked = 0;
+    if (decoyInRow) {
+      const rowHint = new FakeElement("div", "民间故事", { class: "row-hint" });
+      rowHint.rect = { left: 420, top: 244, width: 120, height: 24 };
+      rowHint.onClick = () => {
+        decoyClicked += 1;
+      };
+      row.append(rowHint);
+    }
+
+    body.append(nav, header, row);
+
+    const clickedItems = [];
+    let typeSelectClicked = 0;
+    typeSelect.onClick = () => {
+      typeSelectClicked += 1;
+    };
+
+    colSelect.onClick = () => {
+      if (doc.querySelector(".douyin-custom-mix-panel")) return;
+      // 无已知 popupSelectors class，纯自定义弹层，紧贴触发器正下方（top=240 >= 236-4）
+      const panel = new FakeElement("div", "", {
+        class: "douyin-custom-mix-panel",
+        style: "position:fixed;left:420px;top:240px;z-index:1000",
+      });
+      panel.rect = { left: 420, top: 240, width: 280, height: 200 };
+
+      const listToRender = duplicateTarget ? items.concat(items[1]) : items;
+      listToRender.forEach((entry, idx) => {
+        const y = 244 + idx * 44;
+        const optRow = new FakeElement("div", "", {
+          class: "custom-mix-row",
+          style: "display:flex;align-items:center",
+        });
+        optRow.rect = { left: 420, top: y, width: 280, height: 40 };
+
+        if (entry.isNone) {
+          optRow._text = entry.title;
+        } else if (splitNodes) {
+          const thumb = new FakeElement("img", "", {
+            src: "https://cdn.example.com/secret-cover.jpg?token=xyz",
+            style: "width:32px;height:32px;border-radius:4px",
+            alt: "thumb",
+          });
+          thumb.rect = { left: 428, top: y + 4, width: 32, height: 32 };
+          const nameEl = new FakeElement("span", entry.title, {
+            class: "custom-mix-title",
+          });
+          nameEl.rect = { left: 468, top: y + 10, width: 110, height: 20 };
+          const countEl = new FakeElement("span", entry.countText || "", {
+            class: "custom-mix-count",
+            style: "color:#999",
+          });
+          countEl.rect = { left: 584, top: y + 10, width: 90, height: 20 };
+          optRow.append(thumb, nameEl, countEl);
+        } else {
+          optRow._text = entry.countText
+            ? `${entry.title} ${entry.countText}`
+            : entry.title;
+        }
+
+        optRow.onClick = () => {
+          clickedItems.push(entry.title);
+          colDisplay.textContent =
+            readbackWithCount && entry.countText
+              ? `${entry.title} ${entry.countText}`
+              : entry.title;
+          panel.remove();
+        };
+        panel.append(optRow);
+      });
+
+      if (extraPopupHtmlPad > 0) {
+        const pad = new FakeElement("div", "", {
+          "data-pad": "x".repeat(extraPopupHtmlPad),
+        });
+        pad.rect = { left: 420, top: 430, width: 10, height: 10 };
+        panel.append(pad);
+      }
+      body.append(panel);
+    };
+
+    return {
+      page: makeEvalPage(doc),
+      clickedItems,
+      getTypeSelectClicked: () => typeSelectClicked,
+      getDecoyClicked: () => decoyClicked,
+    };
+  };
+
+  const origLog = console.log;
+  const origError = console.error;
+  const logs = [];
+  console.log = (...a) => logs.push(a.join(" "));
+  console.error = (...a) => logs.push(a.join(" "));
+
+  try {
+    // 13b. 抖音真机场景（拆分节点 + 左侧导航 + 回读带计数后缀）：
+    //      text_leaf 精准选中「民间故事」、回读通过、候选不含导航项与「不选择合集」
+    {
+      logs.length = 0;
+      const ctx = buildDouyinCalibratedPage({
+        items: [
+          { title: "不选择合集", isNone: true },
+          { title: "民间故事", countText: "共21个作品" },
+          { title: "钟馗说案", countText: "共10个作品" },
+        ],
+        splitNodes: true,
+        readbackWithCount: true,
+      });
+      const res = await collectionMod.selectPlatformCollection(
+        ctx.page,
+        "抖音",
+        { collection: "民间故事" },
+        { timeouts: fastTimeouts, captureScreenshot: async () => "" }
+      );
+      assert.strictEqual(res.selected, true, "抖音 text_leaf 应选中民间故事并回读通过");
+      assert.strictEqual(res.name, "民间故事");
+      assert.strictEqual(res.displayedText, "民间故事 共21个作品");
+      assert.strictEqual(ctx.getTypeSelectClicked(), 0, "不得误点左侧「合集」类型下拉");
+      assert.deepStrictEqual(ctx.clickedItems, ["民间故事"]);
+      assert.deepStrictEqual(res.candidates, ["民间故事", "钟馗说案"]);
+      for (const navTxt of ["首页", "内容管理", "数据中心", "收入变现", "创作服务", "不选择合集"]) {
+        assert.strictEqual(
+          res.candidates.includes(navTxt),
+          false,
+          `候选名不得包含「${navTxt}」`
+        );
+      }
+    }
+
+    // 13c. 抖音真机场景（单文本节点「民间故事 共21个作品」）
+    {
+      logs.length = 0;
+      const ctx = buildDouyinCalibratedPage({
+        items: [
+          { title: "不选择合集", isNone: true },
+          { title: "民间故事", countText: "共21个作品" },
+          { title: "钟馗说案", countText: "共10个作品" },
+        ],
+        splitNodes: false,
+        readbackWithCount: false,
+      });
+      const res = await collectionMod.selectPlatformCollection(
+        ctx.page,
+        "抖音",
+        { collection: "民间故事" },
+        { timeouts: fastTimeouts, captureScreenshot: async () => "" }
+      );
+      assert.strictEqual(res.selected, true);
+      assert.deepStrictEqual(ctx.clickedItems, ["民间故事"]);
+      assert.deepStrictEqual(res.candidates, ["民间故事", "钟馗说案"]);
+    }
+
+    // 13d. 抖音弹层只有「民间故事续集」→ 报 collection_option_not_found、不误选、
+    //      候选不含导航项、打印脱敏且截断至 3000 字符的 DOM 片段
+    {
+      logs.length = 0;
+      const ctx = buildDouyinCalibratedPage({
+        items: [
+          { title: "不选择合集", isNone: true },
+          { title: "民间故事续集", countText: "共8个作品" },
+        ],
+        splitNodes: true,
+        extraPopupHtmlPad: 4000,
+      });
+      await assert.rejects(
+        () =>
+          collectionMod.selectPlatformCollection(
+            ctx.page,
+            "抖音",
+            { collection: "民间故事" },
+            { timeouts: fastTimeouts, captureScreenshot: async () => "/tmp/dy-cal-miss.png" }
+          ),
+        (err) => {
+          assert.strictEqual(err.code, "collection_option_not_found");
+          assert.strictEqual(err.deterministic, true);
+          assert.deepStrictEqual(err.details.candidates, ["民间故事续集"]);
+          return true;
+        }
+      );
+      assert.deepStrictEqual(ctx.clickedItems, [], "弹层只有「民间故事续集」时不得误选");
+      const domLog = logs.find((l) => l.includes("[collection] 抖音 DOM 片段:"));
+      assert.ok(domLog, "option_not_found 必须打印 [collection] 抖音 DOM 片段:");
+      const snippetBody = domLog.split("[collection] 抖音 DOM 片段: ")[1] || "";
+      assert.ok(snippetBody.includes("douyin-custom-mix-panel"), "DOM 片段应包含触发器下方弹层");
+      assert.ok(!snippetBody.includes("secret-cover.jpg"), "DOM 片段必须去掉 img src 属性");
+      assert.ok(!snippetBody.includes("style="), "DOM 片段必须去掉 style 属性");
+      assert.ok(
+        snippetBody.length <= 3000,
+        `DOM 片段必须截断到 3000 字符以内，实际=${snippetBody.length}`
+      );
+    }
+
+    // 13e. 抖音 text_leaf 防护：多个同名项不点击、触发器所在行内同名干扰不点击、「不选择合集」不能被当成目标
+    {
+      const dupCtx = buildDouyinCalibratedPage({
+        items: [
+          { title: "不选择合集", isNone: true },
+          { title: "民间故事", countText: "共21个作品" },
+        ],
+        duplicateTarget: true,
+      });
+      await assert.rejects(
+        () =>
+          collectionMod.selectPlatformCollection(
+            dupCtx.page,
+            "抖音",
+            { collection: "民间故事" },
+            { timeouts: fastTimeouts, captureScreenshot: async () => "" }
+          ),
+        (err) => err.code === "collection_option_not_found"
+      );
+      assert.deepStrictEqual(dupCtx.clickedItems, [], "命中多个同名叶子时不得点击");
+
+      const rowDecoyCtx = buildDouyinCalibratedPage({
+        items: [{ title: "不选择合集", isNone: true }],
+        decoyInRow: true,
+      });
+      await assert.rejects(
+        () =>
+          collectionMod.selectPlatformCollection(
+            rowDecoyCtx.page,
+            "抖音",
+            { collection: "民间故事" },
+            { timeouts: fastTimeouts, captureScreenshot: async () => "" }
+          ),
+        (err) => err.code === "collection_option_not_found"
+      );
+      assert.strictEqual(rowDecoyCtx.getDecoyClicked(), 0, "触发器所在行本身不得被 text_leaf 点击");
+
+      const noneTargetCtx = buildDouyinCalibratedPage({
+        items: [
+          { title: "不选择合集", isNone: true },
+          { title: "民间故事", countText: "共21个作品" },
+        ],
+      });
+      await assert.rejects(
+        () =>
+          collectionMod.selectPlatformCollection(
+            noneTargetCtx.page,
+            "抖音",
+            { collection: "不选择合集" },
+            { timeouts: fastTimeouts, captureScreenshot: async () => "" }
+          ),
+        (err) => err.code === "collection_option_not_found"
+      );
+      assert.deepStrictEqual(noneTargetCtx.clickedItems, [], "「不选择合集」绝不能被当成目标点击");
+    }
+
+    // 13f. 快手真机校准：表单标签「加入合集」+ Ant Design Select 占位「选择要加入到的合集」
+    //      （覆盖 placeholder span 与内部 input[placeholder] 两种形态）
+    for (const placeholderMode of ["span", "input"]) {
+      logs.length = 0;
+      const { doc, body } = makeDoc();
+      const row = new FakeElement("div", "", { class: "ant-form-item" });
+      const labelWrap = new FakeElement("div", "", { class: "ant-form-item-label" });
+      labelWrap.append(new FakeElement("label", "加入合集"));
+      const ctrlWrap = new FakeElement("div", "", { class: "ant-form-item-control" });
+      const antSelect = new FakeElement("div", "", { class: "ant-select" });
+      const selector = new FakeElement("div", "", {
+        class: "ant-select-selector",
+        role: "combobox",
+      });
+      let displayEl = null;
+      if (placeholderMode === "span") {
+        displayEl = new FakeElement("span", "选择要加入到的合集", {
+          class: "ant-select-selection-placeholder",
+        });
+        selector.append(displayEl);
+      } else {
+        const searchInput = new FakeElement("input", "", {
+          type: "search",
+          placeholder: "选择要加入到的合集",
+        });
+        selector.append(searchInput);
+      }
+      antSelect.append(selector);
+      ctrlWrap.append(antSelect);
+      row.append(labelWrap, ctrlWrap);
+      body.append(row);
+
+      let opened = false;
+      let picked = "";
+      selector.onMouseDown = () => {
+        opened = true;
+        if (doc.querySelector(".ant-select-dropdown")) return;
+        const dropdown = new FakeElement("div", "", {
+          class: "ant-select-dropdown",
+          role: "listbox",
+        });
+        for (const title of ["钟馗说案", "民间故事"]) {
+          const opt = new FakeElement("div", "", {
+            class: "ant-select-item-option",
+            role: "option",
+            title,
+          });
+          opt.append(
+            new FakeElement("div", title, { class: "ant-select-item-option-content" })
+          );
+          opt.onMouseDown = () => {
+            picked = title;
+            selector.children = [];
+            selector.append(
+              new FakeElement("span", title, { class: "ant-select-selection-item" })
+            );
+            dropdown.remove();
+          };
+          dropdown.append(opt);
+        }
+        body.append(dropdown);
+      };
+
+      const ksRes = await collectionMod.selectPlatformCollection(
+        makeEvalPage(doc),
+        "快手",
+        { collection: "民间故事" },
+        { timeouts: fastTimeouts, captureScreenshot: async () => "" }
+      );
+      assert.strictEqual(opened, true, `快手(${placeholderMode})应经 mousedown 打开「加入合集」入口`);
+      assert.strictEqual(picked, "民间故事");
+      assert.strictEqual(ksRes.selected, true);
+      assert.strictEqual(ksRes.displayedText, "民间故事");
+    }
+
+    // 13g. 快手 entry_not_found 时打印脱敏 DOM 片段
+    {
+      logs.length = 0;
+      const { doc, body } = makeDoc();
+      const row = new FakeElement("div", "", {
+        class: "ant-form-item",
+        style: "margin-bottom:16px",
+      });
+      row.append(
+        new FakeElement("label", "未知合集入口"),
+        new FakeElement("img", "", { src: "https://cdn.example.com/a.png", style: "width:16px" })
+      );
+      body.append(row);
+      await assert.rejects(
+        () =>
+          collectionMod.selectPlatformCollection(
+            makeEvalPage(doc),
+            "快手",
+            { collection: "民间故事" },
+            { timeouts: fastTimeouts, captureScreenshot: async () => "" }
+          ),
+        (err) => err.code === "collection_entry_not_found"
+      );
+      const domLog = logs.find((l) => l.includes("[collection] 快手 DOM 片段:"));
+      assert.ok(domLog, "entry_not_found 必须打印 [collection] 快手 DOM 片段:");
+      assert.ok(domLog.includes("未知合集入口"));
+      assert.ok(!domLog.includes("cdn.example.com/a.png"));
+      assert.ok(!domLog.includes("style="));
+    }
+  } finally {
+    console.log = origLog;
+    console.error = origError;
+  }
+
+  console.log("✓ 13. S12-cal1 抖音 text_leaf/计数后缀/排除导航/DOM 片段与快手「加入合集」单测通过");
+}
+
 (async () => {
   testSharedCollectionResolution();
   testExcelCollectionColumn();
@@ -2891,6 +3481,7 @@ async function testS12Fix2StructuralGuards() {
   await testScheduledReuseCollectionConflict();
   await testMcpCollectionAndE2eEvidence();
   await testS12Fix2StructuralGuards();
+  await testS12Cal1Calibration();
   console.log("\ntest-collection: 全部断言通过");
 })().catch((e) => {
   console.error(e);
