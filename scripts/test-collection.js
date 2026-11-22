@@ -2806,7 +2806,8 @@ async function testS12Fix2StructuralGuards() {
           const opt = new FakeElement("div", "", { class: "semi-select-option collection-option" });
           opt.append(new FakeElement("span", name, { class: "option-title-WKxxu3" }));
           opt.append(new FakeElement("span", cnt, { class: "option-extra-text-i_ch3r" }));
-          opt.onClick = () => { picked = name; selText.textContent = name; pop.remove(); };
+          // 真机第 4 轮：选中后控件渲染整条选项文本「民间故事共21个作品」
+          opt.onClick = () => { picked = name; selText.textContent = name + cnt; pop.remove(); };
           list.append(opt);
         }
         dd.append(list);

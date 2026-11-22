@@ -116,7 +116,11 @@ export const PLATFORM_COLLECTION_CONFIGS = {
       ".title",
       ".name",
     ],
+    // 2026-11-22 真机第 4 轮：选中后控件渲染整条选项「民间故事共21个作品」→ 先取 option-title，
+    // 并剥掉结尾「共N个作品」后再做精确比对（仍须与目标名完全相等）
+    readbackStripSuffix: "\\s*共\\d+个作品$",
     readbackSelectors: [
+      "[class*='select-collection'] [class*='option-title']",
       "[class*='select-collection'] .semi-select-selection-text",
       "[class*='select-collection'] .semi-select-selection",
     ],
@@ -1799,8 +1803,15 @@ export function readSelectedCollectionInDom(payload) {
     var firstDisplayText = "";
     var firstReadbackSource = "";
 
+    var stripRe = null;
+    try {
+      stripRe = cfg.readbackStripSuffix ? new RegExp(cfg.readbackStripSuffix) : null;
+    } catch (_) {
+      stripRe = null;
+    }
     var pushCandidate = function (txt, source) {
       var c = clean(txt);
+      if (c && stripRe) c = clean(c.replace(stripRe, ""));
       if (!c) return;
       if (!firstDisplayText) {
         firstDisplayText = c;
