@@ -105,22 +105,17 @@ export const PLATFORM_COLLECTION_CONFIGS = {
       "button",
       "[role='button']",
     ],
+    // 2026-11-22 真机 DOM：.semi-popover-content > .mix-dropdown > .semi-select-option-list >
+    // .semi-select-option.collection-option，名称在 span.option-title-*，旁边 option-extra-text「共N个作品」。
+    // 去掉 role=menu / li 等泛选择器：会把左侧导航（首页/内容管理…）当成选项弹层。
     popupSelectors: [
+      ".mix-dropdown",
       ".semi-select-option-list",
       ".semi-portal .semi-popover-content",
-      ".semi-popover",
-      ".semi-modal-body",
-      "[role='listbox']",
-      "[role='menu']",
     ],
-    optionSelectors: [
-      ".semi-select-option",
-      "[role='option']",
-      "[role='menuitem']",
-      "label.semi-radio",
-      "li",
-    ],
+    optionSelectors: [".semi-select-option"],
     optionTextSelectors: [
+      "[class*='option-title']",
       ".semi-select-option-text",
       ".semi-radio-addon",
       ".title",
@@ -139,6 +134,7 @@ export const PLATFORM_COLLECTION_CONFIGS = {
     platformKey: "ks",
     platformName: "快手",
     useShadowRoot: false,
+    openDropdownSelector: ".ant-select-dropdown:not(.ant-select-dropdown-hidden)",
     shadowHostSelector: "",
     dispatchMouseDown: true,
     labelTexts: ["加入合集", "合集", "选择合集", "添加到合集", "作品合集", "所属合集"],
@@ -149,6 +145,7 @@ export const PLATFORM_COLLECTION_CONFIGS = {
       "添加至合集",
       "不加入合集",
       "暂不选择",
+      // 2026-11-22 真机：快手「加入合集」下拉占位文案；放最后＝最低优先（按词表顺序择优）
       "选择要加入到的合集",
     ],
     rowContainerSelectors: [
@@ -844,14 +841,18 @@ export function runCollectionDomAction(payload) {
       return false;
     };
 
-    var matchEntryText = function (text) {
-      if (!text || text.length > 24) return false;
+    // 返回命中的入口文案在词表中的序号（越小越优先），未命中 -1
+    var entryTextRank = function (text) {
+      if (!text || text.length > 24) return -1;
       for (var i = 0; i < entryTexts.length; i++) {
         if (text === entryTexts[i] || text.indexOf(entryTexts[i]) !== -1) {
-          return true;
+          return i;
         }
       }
-      return false;
+      return -1;
+    };
+    var matchEntryText = function (text) {
+      return entryTextRank(text) !== -1;
     };
 
     var isSemanticSelect = function (el) {
@@ -1181,16 +1182,26 @@ export function runCollectionDomAction(payload) {
             return !isDisabled(el);
           });
           if (enabledTriggers.length > 0) {
+            // 按入口词表顺序择优（不按 DOM 先后），避免低优先文案抢在真正下拉前
+            var bestRank = -1;
+            var bestByText = null;
+            for (var ei = 0; ei < enabledTriggers.length; ei++) {
+              var etxt = norm(getText(enabledTriggers[ei]));
+              var eph = norm(
+                typeof enabledTriggers[ei].getAttribute === "function"
+                  ? enabledTriggers[ei].getAttribute("placeholder")
+                  : ""
+              );
+              var r1 = entryTextRank(etxt);
+              var r2 = entryTextRank(eph);
+              var er = r1 === -1 ? r2 : r2 === -1 ? r1 : Math.min(r1, r2);
+              if (er !== -1 && (bestRank === -1 || er < bestRank)) {
+                bestRank = er;
+                bestByText = enabledTriggers[ei];
+              }
+            }
             var preferred =
-              enabledTriggers.find(function (el) {
-                var txt = norm(getText(el));
-                var ph = norm(
-                  typeof el.getAttribute === "function"
-                    ? el.getAttribute("placeholder")
-                    : ""
-                );
-                return matchEntryText(txt) || matchEntryText(ph);
-              }) ||
+              bestByText ||
               enabledTriggers.find(isSemanticSelect) ||
               enabledTriggers[0];
             chosenTrigger = preferred;
@@ -1979,10 +1990,21 @@ function collectCollectionDomOutline(args) {
     if (!visible(el)) return;
     var tag = (el.tagName || "").toLowerCase();
     if (tag === "script" || tag === "style" || tag === "svg" || tag === "img") return;
-    var t = ownText(el)
-      .replace(/(https?:|blob:|data:)\S*/gi, "[url]")
-      .replace(/\S+\.(com|cn|net)\S*/gi, "[url]")
-      .slice(0, 30);
+    // 脱敏：只保留含合集名/「合集」或界面控件词的短文本，其余只记长度；数字串与域名一律遮蔽
+    var raw = ownText(el);
+    var keep = false;
+    for (var q = 0; q < needles.length; q++) if (needles[q] && raw.indexOf(needles[q]) >= 0) keep = true;
+    if (!keep && raw.length <= 12 && /合集|选择|请|添加|加入|作品|确定|取消|搜索|创建|新建|设置/.test(raw)) keep = true;
+    var t = keep
+      ? raw
+          .replace(/\S*[A-Za-z0-9-]+\.[A-Za-z]{2,}\S*/g, "[url]")
+          .replace(/(https?:|blob:|data:)\S*/gi, "[url]")
+          .replace(/\d{5,}/g, "[n]")
+          .replace(/\S+@\S+/g, "[at]")
+          .slice(0, 30)
+      : raw
+        ? "[t:" + raw.length + "]"
+        : "";
     lines.push(
       new Array(depth + 1).join("  ") + tag + cls(el) + (t ? " \"" + t + "\"" : "")
     );
@@ -2089,6 +2111,39 @@ export async function selectPlatformCollection(
       "/"
     )}，入口=${config.entryTexts.join("/")}）`
   );
+
+  // ---------- 第 0 步：收起前面步骤残留的下拉（2026-11-22 真机：快手「作者声明」下拉未收起，盖住合集控件） ----------
+  if (config.openDropdownSelector) {
+    try {
+      const stillOpen = () =>
+        page.evaluate(function (sel) {
+          var list = document.querySelectorAll(sel);
+          for (var i = 0; i < list.length; i++) {
+            var r = list[i].getBoundingClientRect();
+            var cs = window.getComputedStyle(list[i]);
+            if (r.width > 0 && r.height > 0 && cs.display !== "none" && cs.visibility !== "hidden") return true;
+          }
+          return false;
+        }, config.openDropdownSelector);
+      if (await stillOpen()) {
+        console.log(`[collection] ${canonicalPlatform} 发现未收起的下拉，先收起`);
+        await page.evaluate(function () {
+          var a = document.activeElement;
+          if (a && a !== document.body && typeof a.blur === "function") a.blur();
+        });
+        await page.waitForTimeout(300);
+        if (await stillOpen()) {
+          await page.keyboard.press("Escape");
+          await page.waitForTimeout(300);
+        }
+        if (await stillOpen()) {
+          console.warn(`[collection] ${canonicalPlatform} 残留下拉仍未收起，继续尝试打开合集入口`);
+        }
+      }
+    } catch (closeErr) {
+      console.warn(`[collection] ${canonicalPlatform} 收起残留下拉出错（忽略）: ${closeErr?.message || closeErr}`);
+    }
+  }
 
   // ---------- 第 1 步：定位并经 safeClick 打开合集选择入口 ----------
   let openResult = null;

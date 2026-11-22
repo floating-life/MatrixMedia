@@ -391,10 +391,6 @@ async function fillBjhTitle(page, titleHandle, title) {
   await page.keyboard.type(title, { delay: 50 });
 }
 
-function isDraftModeForRetry(data) {
-  return data.publishMode === "draft" || data.publishToDraft === true;
-}
-
 // 发布前终检：百家号在视频解析完成后会异步把文件名回填/追加进标题，
 // 早先填好的标题可能被拼成「标题+文件名」。这里在点发布前重读标题，不符就重填。
 async function ensureBjhTitle(page, title, fileStem) {
@@ -607,116 +603,76 @@ export default async function (page, data, window, event) {
 
 
     // 2026-11-22 线上事故：成功提示图标不是 info-circle 时被当失败，循环连点「发布」，
-    // 同一视频被发了 5 次。规则（宁漏勿重）：
-    //   - 发布模式：只点一次，任何情况都不重试；出现明确失败提示 → 报失败并提示去后台核对；
-    //   - 草稿模式：仅 close-circle 且提示已消失、仍在编辑页时重试，最多共 3 次；
-    //   - 读取提示本身出错（如成功跳转导致上下文销毁）→ 视为已点击，交给结果判定。
-    const maxClicks = isDraftMode ? 3 : 1;
-    let clickSuccess = false;
+    // 同一视频被发了 5 次。规则（宁漏勿重）：发布与存草稿都只点一次，点过之后任何失败
+    // 都不在本窗口重点、也不让外层重开窗口（catch 里带 noRetry），交用户核对后手动补发。
     const urlBefore = readPageUrl(page);
-    for (let attempt = 1; attempt <= maxClicks; attempt++) {
-      if (attempt > 1) {
-        const urlNow = readPageUrl(page);
-        const titleBox = await page.$(BJH_TITLE_SELECTOR).catch(() => null);
-        if ((urlBefore && urlNow && urlNow !== urlBefore) || !titleBox) {
-          console.log(`[bjh] 重试前发现页面已离开编辑页（url=${urlNow}），视为已点击，不再点击`);
-          clickSuccess = true;
-          break;
-        }
-      }
-      // 点击前等旧提示消失，确保点击后读到的是本次点击产生的提示；仍在则本次提示不可信
-      const staleToastBefore = !(await page
-        .waitForSelector(".cheetah-message.cheetah-message-top", {
-          hidden: true,
-          timeout: 8000,
-        })
-        .then(() => true)
-        .catch(() => false));
-      if (staleToastBefore) console.warn("[bjh] 点击前旧提示未消失，本次点击后的失败提示不作为可重试依据");
-      // 视频解析完成后百家号可能把文件名回填进标题：紧挨点击前终检（放在等待之后，避免等待期间被回填）
-      await ensureBjhTitle(page, wantTitle, fileStem);
-      bjhClickDispatched = true;
-      await page.mouse.click(cx, cy, { delay: 80 });
-      console.log(
-        `[bjh] 第 ${attempt}/${maxClicks} 次点击「${actionText}」at (${Math.round(
-          cx
-        )}, ${Math.round(cy)})`
-      );
-
-      let msg = null;
-      try {
-        const appeared = await page
-          .waitForSelector(".cheetah-message.cheetah-message-top", {
-            visible: true,
-            timeout: 10000,
-          })
-          .then(() => true)
-          .catch(() => false);
-        if (appeared) {
-          msg = await page.evaluate(function () {
-            var el = document.querySelector(".cheetah-message.cheetah-message-top");
-            if (!el) return null;
-            var icon = el.querySelector('span[role="img"]');
-            return {
-              type: icon ? icon.getAttribute("aria-label") || "unknown" : "unknown",
-              text: (el.innerText || el.textContent || "").trim().slice(0, 120),
-            };
-          });
-        }
-      } catch (readErr) {
-        console.log(`[bjh] 读取提示出错（多半页面已跳转），视为已点击: ${readErr?.message || readErr}`);
-        msg = null;
-      }
-
-      if (!msg) {
-        console.log(`[bjh] 未读到提示，视为已点击`);
-        clickSuccess = true;
-        break;
-      }
-      console.log(`[bjh] 消息提示: type=${msg.type} text="${msg.text}"`);
-      if (msg.type !== "close-circle" || /成功/.test(msg.text)) {
-        console.log(`[bjh] 非明确失败提示，视为已点击`);
-        clickSuccess = true;
-        break;
-      }
-
-      if (!isDraftMode) {
-        // 「请添加/请上传/请填写/请选择…」「…不能为空」属于发布前校验，可确认未发出，允许外层整体重试；
-        // 其余失败提示无法排除已发出，标记 noRetry，防止外层重开窗口再发一次。
-        const preValidation =
-          !staleToastBefore &&
-          /^(请|未)先?(添加|上传|填写|选择|设置|输入|完成)|不能为空|不能少于|不能超过/.test(
-            msg.text || ""
-          );
-        const postClickErr = new Error(
-          preValidation
-            ? `百家号点击「发布」后被平台校验拦下：${msg.text}（未自动重试，请处理后手动重发）`
-            : `百家号点击「发布」后出现失败提示：${msg.text || msg.type}。为防重复发布未自动重试，请先到百家号后台核对是否已发出再决定是否重发`
-        );
-        throw postClickErr;
-      }
-      if (staleToastBefore) {
-        throw new Error(`百家号「${actionText}」点击后读到的失败提示可能是残留提示（${msg.text || msg.type}），停止重试，请到平台核对`);
-      }
-      if (attempt >= maxClicks) {
-        throw new Error(`百家号「${actionText}」${attempt} 次点击均出现失败提示：${msg.text || msg.type}`);
-      }
-      const hidden = await page
+    // 视频解析完成后百家号可能把文件名回填进标题：先纠正标题，再等旧提示消失，
+    // 最后只读复核；若等待期间又被回填，纠正后再等一次提示消失，确保点击后读到的是本次结果。
+    await ensureBjhTitle(page, wantTitle, fileStem);
+    const waitToastHidden = () =>
+      page
         .waitForSelector(".cheetah-message.cheetah-message-top", {
           hidden: true,
           timeout: 8000,
         })
         .then(() => true)
         .catch(() => false);
-      if (!hidden) {
-        throw new Error(`百家号「${actionText}」失败提示未消失，停止重试：${msg.text || msg.type}`);
+    let staleToastBefore = !(await waitToastHidden());
+    const titleHandleNow = await page.$(BJH_TITLE_SELECTOR).catch(() => null);
+    const titleNow = titleHandleNow
+      ? normBjhTitle(await titleHandleNow.evaluate((el) => el.textContent || "").catch(() => ""))
+      : "";
+    if (!bjhTitleOk(titleNow, normBjhTitle(wantTitle), fileStem) && normBjhTitle(wantTitle)) {
+      console.warn(`[bjh] 等待提示期间标题变为「${titleNow}」，重新纠正`);
+      await ensureBjhTitle(page, wantTitle, fileStem);
+      staleToastBefore = !(await waitToastHidden());
+    }
+    if (staleToastBefore) console.warn("[bjh] 点击前旧提示未消失，点击后读到的提示可能是残留");
+
+    bjhClickDispatched = true;
+    await page.mouse.click(cx, cy, { delay: 80 });
+    console.log(
+      `[bjh] 点击「${actionText}」at (${Math.round(cx)}, ${Math.round(cy)})（只点一次）`
+    );
+
+    let msg = null;
+    try {
+      const appeared = await page
+        .waitForSelector(".cheetah-message.cheetah-message-top", {
+          visible: true,
+          timeout: 10000,
+        })
+        .then(() => true)
+        .catch(() => false);
+      if (appeared) {
+        msg = await page.evaluate(function () {
+          var el = document.querySelector(".cheetah-message.cheetah-message-top");
+          if (!el) return null;
+          var icon = el.querySelector('span[role="img"]');
+          return {
+            type: icon ? icon.getAttribute("aria-label") || "unknown" : "unknown",
+            text: (el.innerText || el.textContent || "").trim().slice(0, 120),
+          };
+        });
       }
-      console.warn(`[bjh] 存草稿出现失败提示，第 ${attempt} 次后重试...`);
-      await page.waitForTimeout(1500);
+    } catch (readErr) {
+      console.log(`[bjh] 读取提示出错（多半页面已跳转），视为已点击: ${readErr?.message || readErr}`);
+      msg = null;
     }
 
-    if (!clickSuccess) {
-      throw new Error(`百家号「${actionText}」多次点击后仍出现失败提示，放弃`);
+    if (msg) console.log(`[bjh] 消息提示: type=${msg.type} text="${msg.text}"`);
+    else console.log(`[bjh] 未读到提示，视为已点击`);
+    if (msg && msg.type === "close-circle" && !/成功/.test(msg.text)) {
+      const preValidation =
+        !staleToastBefore &&
+        /^(请|未)先?(添加|上传|填写|选择|设置|输入|完成)|不能为空|不能少于|不能超过/.test(
+          msg.text || ""
+        );
+      throw new Error(
+        preValidation
+          ? `百家号点击「${actionText}」后被平台校验拦下：${msg.text}（未自动重试，请处理后手动重发）`
+          : `百家号点击「${actionText}」后出现失败提示：${msg.text || msg.type}。为防重复${isDraftMode ? "存草稿" : "发布"}未自动重试，请先到百家号后台核对是否已${isDraftMode ? "存成" : "发出"}再决定是否重发`
+      );
     }
 
     console.log(
@@ -741,11 +697,9 @@ export default async function (page, data, window, event) {
       message: failMessage,
       closeWindow: false,
       extraPayload:
-        // 发布模式一旦派发过点击，任何失败（含「请添加横版封面」等校验提示）都不整体重试：
-        // 提示可能是残留/误读，无法证明未发出。宁可报失败让用户手动补发，也不重复发布。
-        !isDraftModeForRetry(data) && bjhClickDispatched
-          ? { noRetry: true }
-          : {},
+        // 发布/存草稿一旦派发过点击，任何失败（含「请添加横版封面」等校验提示）都不整体重试：
+        // 提示可能是残留/误读，无法证明未发出。宁可报失败让用户手动补发，也不重复发布或重复存稿。
+        bjhClickDispatched ? { noRetry: true } : {},
     });
     console.error("点击提交按钮失败:", err);
   }
