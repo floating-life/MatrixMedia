@@ -29,35 +29,6 @@ export function collapseCollectionText(value) {
   return normalizeCollectionName(value).replace(/\s+/g, "");
 }
 
-/**
- * 去掉合集选项 / 回读文本尾部的作品计数后缀（如「共21个作品」「21个作品」「/ 共10个作品」「（共21个作品）」）。
- * 仅用于页面候选项匹配、候选列表展示与回读归一化，不得截断正常合集名（如「民间故事续集」「民间故事2」）。
- */
-export const COLLECTION_COUNT_SUFFIX_RE =
-  /(?:\s*[/·•|｜]\s*|\s+[-—]\s+|\s*)(?:[\(（]\s*(?:共\s*)?\d+\s*(?:个|条|篇|部)?\s*(?:作品|视频)\s*[\)）]|(?:共\s*)?\d+\s*(?:个|条|篇|部)?\s*(?:作品|视频))$/;
-
-export function stripCollectionCountSuffix(value) {
-  const cleaned = normalizeCollectionName(value);
-  if (!cleaned) return "";
-  return cleaned.replace(COLLECTION_COUNT_SUFFIX_RE, "").trim();
-}
-
-/** 禁止被当作目标合集选中的「不选/清空」选项文案（精确匹配，去空白后比较） */
-export const NON_COLLECTION_OPTION_TEXTS = Object.freeze(["不选择合集"]);
-
-export function isNonCollectionOptionText(value) {
-  const raw = collapseCollectionText(value);
-  if (!raw) return false;
-  const stripped = collapseCollectionText(stripCollectionCountSuffix(value));
-  for (let i = 0; i < NON_COLLECTION_OPTION_TEXTS.length; i++) {
-    const item = NON_COLLECTION_OPTION_TEXTS[i];
-    if (raw === item || (stripped && stripped === item)) {
-      return true;
-    }
-  }
-  return false;
-}
-
 /** 各平台提交 / 存草稿按钮选择器常量（与 dy.js / ks.js / sph.js 保持单一真源） */
 export const DY_PUBLISH_BUTTON_SELECTOR = "#popover-tip-container";
 export const DY_DRAFT_BUTTON_SELECTOR = "#popover-tip-container+button";
