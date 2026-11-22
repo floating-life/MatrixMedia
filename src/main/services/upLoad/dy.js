@@ -3,6 +3,7 @@ import fs from "fs";
 import { normalizeCoverForUpload } from "../coverCompat.js";
 import { resolveVideoLinkOption } from "../../../shared/videoLink.js";
 import { attachDyProductLink } from "./dyProductLink.js";
+import { selectPlatformCollection } from "./collection.js";
 import { resolveDyCreativeStatementLabel } from "../../../shared/creativeStatement.js";
 import {
   readPageUrl,
@@ -991,6 +992,12 @@ export default async function (page, data, window, event) {
     const productLink = resolveVideoLinkOption("抖音", data.publishOptions);
     if (productLink.enabled) await attachDyProductLink(page, productLink);
 
+    // 选择合集（留空跳过；找不到入口/同名合集/回读不符时抛确定性错误中止发布且不重试）
+    await selectPlatformCollection(page, "抖音", data.publishOptions, {
+      data,
+      window,
+    });
+
     // 发布前最后一道闸：复核简介未重复/未残缺（中间步骤可能动过编辑器状态），
     // 复核不过自动重填一轮，仍不过则中止——绝不带重复/空简介点发布
     await verifyDyDescriptionBeforePublish(page, text, data);
@@ -1010,6 +1017,8 @@ export default async function (page, data, window, event) {
       event,
       urlBefore,
       isDraftMode,
+      // 抖音编辑页视频上传完常驻「上传成功」，发布模式不能把它当发布成功信号
+      excludeSuccessToasts: ["上传成功", "草稿已保存"],
       successMessage: isDraftMode
         ? "已点击存草稿（抖音网页端无草稿箱，无法核验）"
         : "上传成功",
@@ -1017,12 +1026,26 @@ export default async function (page, data, window, event) {
     });
   } catch (e) {
     const detail = (e && e.message) || String(e);
+    const isCollectionError = Boolean(e && e.isCollectionError);
     await replyPublishFailure({
       page,
       data,
       window,
       event,
-      message: detail.length > 200 ? `${detail.slice(0, 200)}…` : detail,
+      message: isCollectionError
+        ? detail
+        : detail.length > 200
+        ? `${detail.slice(0, 200)}…`
+        : detail,
+      ...(isCollectionError
+        ? {
+            extraPayload: {
+              outcome: "collection_failed",
+              needsAttention: true,
+              ...(e.failScreenshot ? { failScreenshot: e.failScreenshot } : {}),
+            },
+          }
+        : {}),
       // 抖音发布失败后窗口是否关闭沿用原行为（上游统一处理）
       closeWindow: false,
     });

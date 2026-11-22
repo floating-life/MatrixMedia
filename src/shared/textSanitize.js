@@ -211,6 +211,15 @@ function normalizeBatchXlsxRows(rows) {
             ? map["creativestatement"]
             : map["cs"] || ""
         ),
+        collection: sanitizeTitle(
+          map["合集"] != null
+            ? map["合集"]
+            : map["合集名称"] != null
+            ? map["合集名称"]
+            : map["collection"] != null
+            ? map["collection"]
+            : ""
+        ),
       };
     })
     .filter((r) => r.fileName);
@@ -219,6 +228,43 @@ function normalizeBatchXlsxRows(rows) {
 const TITLE_BODY_KEYS = ["title", "bt1", "shortTitle", "short_title"];
 const DESC_BODY_KEYS = ["description", "desc", "bdText"];
 const TAG_BODY_KEYS = ["tags", "bq"];
+
+function sanitizeCollectionMap(rawMap) {
+  if (!rawMap || typeof rawMap !== "object" || Array.isArray(rawMap)) return rawMap;
+  const next = { ...rawMap };
+  for (const k of Object.keys(next)) {
+    if (typeof next[k] === "string") {
+      next[k] = sanitizeTitle(next[k]);
+    }
+  }
+  return next;
+}
+
+function sanitizePlatformOptionsCollections(rawPlatformOptions) {
+  if (
+    !rawPlatformOptions ||
+    typeof rawPlatformOptions !== "object" ||
+    Array.isArray(rawPlatformOptions)
+  ) {
+    return rawPlatformOptions;
+  }
+  const next = { ...rawPlatformOptions };
+  for (const ptKey of Object.keys(next)) {
+    const entry = next[ptKey];
+    if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+      if (
+        Object.prototype.hasOwnProperty.call(entry, "collection") &&
+        typeof entry.collection === "string"
+      ) {
+        next[ptKey] = {
+          ...entry,
+          collection: sanitizeTitle(entry.collection),
+        };
+      }
+    }
+  }
+  return next;
+}
 
 /**
  * 清洗单条 HTTP /publish 请求体（或 platforms[] 子对象）的文案字段。
@@ -236,6 +282,26 @@ function sanitizePublishPayloadObject(raw, parentPlatform = "") {
     if (Object.prototype.hasOwnProperty.call(out, k) && out[k] != null) {
       out[k] = sanitizeTitle(out[k]);
     }
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(out, "collection") &&
+    typeof out.collection === "string"
+  ) {
+    out.collection = sanitizeTitle(out.collection);
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(out, "collections") &&
+    out.collections &&
+    typeof out.collections === "object"
+  ) {
+    out.collections = sanitizeCollectionMap(out.collections);
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(out, "platformOptions") &&
+    out.platformOptions &&
+    typeof out.platformOptions === "object"
+  ) {
+    out.platformOptions = sanitizePlatformOptionsCollections(out.platformOptions);
   }
   for (const k of DESC_BODY_KEYS) {
     if (Object.prototype.hasOwnProperty.call(out, k) && out[k] != null) {
@@ -270,7 +336,7 @@ function sanitizePublishPayloadObject(raw, parentPlatform = "") {
   return out;
 }
 
-const CLI_TITLE_FLAGS = new Set(["-t", "--title", "--short-title"]);
+const CLI_TITLE_FLAGS = new Set(["-t", "--title", "--short-title", "--collection"]);
 const CLI_DESC_FLAGS = new Set(["--description", "--desc"]);
 const CLI_TAG_FLAGS = new Set(["--tags", "--bq"]);
 const CLI_VALUE_FLAGS = new Set([
@@ -297,6 +363,7 @@ const CLI_VALUE_FLAGS = new Set([
   "--cover",
   "--creative-statement",
   "--cs",
+  "--collection",
   "--sph-link-type",
   "--sph-link-value",
   "--sph-product-id",

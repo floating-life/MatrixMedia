@@ -35,7 +35,11 @@ buildSync({
   outfile: resultBundle,
 });
 
-const { replyPublishOutcome } = require(outcomeBundle);
+const {
+  replyPublishOutcome,
+  waitForPublishSignal,
+  PUBLISH_UNCONFIRMED_MESSAGE,
+} = require(outcomeBundle);
 const { resolvePublishCompletion } = require(resultBundle);
 
 function createPage(urls) {
@@ -553,6 +557,138 @@ function createSignalPage(urls, full, overlay) {
     assert.strictEqual(plainFail.status, "failed");
     assert.strictEqual(plainFail.exitCode, 3);
     assert.strictEqual(plainFail.loginRequired, false);
+  }
+
+  // 9. 任务 A（S12）：抖音 / 快手发布模式排除常驻「上传成功」信号，防止停草稿箱假成功
+  {
+    const PNG_1PX = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+      "base64"
+    );
+
+    // 9a. 抖音 / 快手页面只含「上传成功」（以及「草稿已保存」）且地址不变 → 非成功（publish_abnormal + needsAttention + 截图 + 不重试）
+    for (const pt of ["抖音", "快手"]) {
+      let screenshotCalled = 0;
+      const page = createTextPage(
+        ["https://creator.example.com/publish", "https://creator.example.com/publish"],
+        "视频已处理 上传成功 100% 草稿已保存 发布"
+      );
+      page.isClosed = () => false;
+      page.screenshot = async () => {
+        screenshotCalled += 1;
+        return PNG_1PX;
+      };
+      const event = createEvent();
+      await replyPublishOutcome({
+        page,
+        data: { pt, closeWindowAfterPublish: false },
+        window: null,
+        event,
+        urlBefore: "https://creator.example.com/publish",
+        waitMs: 0,
+        successMessage: "上传成功",
+      });
+      const payload = event.calls[0].payload;
+      assert.strictEqual(payload.status, true, `${pt} 异常仍以 status:true 回执（不触发重试重传）`);
+      assert.strictEqual(payload.publishAbnormal, true, `${pt} 仅含「上传成功」且地址不变不得判成功`);
+      assert.strictEqual(payload.needsAttention, true, `${pt} 应标 needsAttention`);
+      assert.strictEqual(payload.outcome, "publish_abnormal");
+      assert.strictEqual(payload.publishSignal, "none");
+      assert.ok(
+        payload.message.includes("点击发布后未确认发出，请到平台草稿箱核对"),
+        `${pt} 异常消息应提示到草稿箱核对，实际: ${payload.message}`
+      );
+      assert.strictEqual(payload.message, PUBLISH_UNCONFIRMED_MESSAGE);
+      assert.strictEqual(screenshotCalled, 1, `${pt} 未确认发出时应截图留证`);
+      assert.ok(payload.failScreenshot, `${pt} 回执应携带截图路径`);
+      const completion = resolvePublishCompletion(payload);
+      assert.strictEqual(completion.recordStatus, "abnormal");
+      assert.strictEqual(completion.status, "publish_abnormal");
+      assert.strictEqual(completion.exitCode, 4);
+    }
+
+    // 9b. 抖音 / 快手页面含「发布成功」（即使同时含「上传成功」且地址未变）→ 成功
+    for (const pt of ["抖音", "快手"]) {
+      const page = createTextPage(
+        ["https://creator.example.com/publish", "https://creator.example.com/publish"],
+        "视频上传成功 发布成功"
+      );
+      const event = createEvent();
+      await replyPublishOutcome({
+        page,
+        data: { pt, closeWindowAfterPublish: false },
+        window: null,
+        event,
+        urlBefore: "https://creator.example.com/publish",
+        waitMs: 0,
+        successMessage: "上传成功",
+      });
+      const payload = event.calls[0].payload;
+      assert.strictEqual(payload.status, true);
+      assert.strictEqual(payload.publishAbnormal, undefined, `${pt} 出现「发布成功」应判成功`);
+      assert.strictEqual(payload.publishSignal, "toast:发布成功");
+      assert.strictEqual(payload.message, "上传成功");
+    }
+
+    // 9c. 抖音 / 快手点击发布后 URL 跳离发布编辑页 → 成功
+    for (const pt of ["抖音", "快手"]) {
+      const page = createTextPage(
+        ["https://creator.example.com/publish", "https://creator.example.com/manage"],
+        "上传成功"
+      );
+      const event = createEvent();
+      await replyPublishOutcome({
+        page,
+        data: { pt, closeWindowAfterPublish: false },
+        window: null,
+        event,
+        urlBefore: "https://creator.example.com/publish",
+        waitMs: 0,
+        successMessage: "上传成功",
+      });
+      const payload = event.calls[0].payload;
+      assert.strictEqual(payload.status, true);
+      assert.strictEqual(payload.publishAbnormal, undefined, `${pt} URL 跳转应判成功`);
+      assert.strictEqual(payload.publishSignal, "url_changed");
+      assert.strictEqual(payload.message, "上传成功");
+    }
+
+    // 9d. 视频号 / B 站 / 百家号页面含「上传成功」→ 仍成功（不回归）
+    for (const pt of ["视频号", "哔哩哔哩", "百家号"]) {
+      const page = createTextPage(
+        ["https://creator.example.com/publish", "https://creator.example.com/publish"],
+        "上传成功"
+      );
+      const event = createEvent();
+      await replyPublishOutcome({
+        page,
+        data: { pt, closeWindowAfterPublish: false },
+        window: null,
+        event,
+        urlBefore: "https://creator.example.com/publish",
+        waitMs: 0,
+        successMessage: "上传成功",
+      });
+      const payload = event.calls[0].payload;
+      assert.strictEqual(payload.status, true);
+      assert.strictEqual(payload.publishAbnormal, undefined, `${pt} 含「上传成功」应保持成功不回归`);
+      assert.strictEqual(payload.publishSignal, "toast:上传成功");
+      assert.strictEqual(payload.message, "上传成功");
+    }
+
+    // 9e. waitForPublishSignal 支持显式传 excludeSuccessToasts 参数
+    {
+      const page = createTextPage(
+        ["https://x.com/publish", "https://x.com/publish"],
+        "上传成功"
+      );
+      const excluded = await waitForPublishSignal(page, "https://x.com/publish", 2000, {
+        platform: "视频号",
+        excludeSuccessToasts: ["上传成功"],
+      });
+      assert.strictEqual(excluded.ok, false, "显式排除「上传成功」时不应判成功");
+      assert.strictEqual(excluded.signal, "none");
+    }
   }
 
   console.log("test-publish-abnormal: 全部断言通过");

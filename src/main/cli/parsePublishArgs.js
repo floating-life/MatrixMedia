@@ -14,6 +14,9 @@ import {
 import {
   VIDEO_LINK_TYPES,
   buildVideoLinkOption,
+  normalizeCollectionName,
+  platformSupportsCollection,
+  resolveCollectionOption,
 } from "../../shared/videoLink.js";
 import {
   sanitizeTitle,
@@ -56,6 +59,7 @@ export function parsePublishArgs(subArgv) {
     allowDuplicate: false,
     noThrottle: false,
     noDownload: false,
+    collection: "",
     sphLinkType: null,
     sphLinkValue: null,
     publishOptions: {},
@@ -97,6 +101,10 @@ export function parsePublishArgs(subArgv) {
       out.cover = args[++i];
     } else if (a === "--creative-statement" || a === "--cs") {
       out.creativeStatement = args[++i];
+    } else if (a === "--collection") {
+      out.collection = args[++i] || "";
+    } else if (a.startsWith("--collection=")) {
+      out.collection = a.slice("--collection=".length);
     } else if (a === "--draft") {
       out.draft = true;
     } else if (a === "--allow-duplicate") {
@@ -313,6 +321,17 @@ export function parsePublishArgs(subArgv) {
     out.publishOptions = { ...(out.publishOptions || {}), allowDuplicate: true };
   }
 
+  // 合集名称（仅抖音 / 快手 / 视频号生效；留空或非支持平台忽略，不污染 publishOptions）
+  out.collection = normalizeCollectionName(out.collection);
+  if (out.collection && platformSupportsCollection(out.platform)) {
+    out.publishOptions = {
+      ...(out.publishOptions || {}),
+      collection: out.collection,
+    };
+  } else {
+    out.collection = "";
+  }
+
   return { ok: true, value: out };
 }
 
@@ -376,6 +395,9 @@ export function publishBodyToArgv(body) {
     "--creative-statement"
   );
   pushPair(["cover", "coverPath", "cover-path"], "--cover");
+  if (typeof body.collection === "string" && body.collection.trim() !== "") {
+    argv.push("--collection", body.collection);
+  }
   const sphLink =
     (body.sphLink && typeof body.sphLink === "object" && body.sphLink) ||
     (body.platformOptions &&
@@ -429,7 +451,14 @@ export function publishBodyToArgv(body) {
  * @param {object} body
  */
 export function parsePublishRequest(body) {
-  return parsePublishArgs(publishBodyToArgv(body));
+  const err = validateHttpCollectionInput(body);
+  if (err) return { ok: false, error: err };
+  const parsed = parsePublishArgs(publishBodyToArgv(body));
+  if (!parsed.ok) return parsed;
+  return {
+    ok: true,
+    value: applyHttpCollection(body, parsed.value, body),
+  };
 }
 
 const SHARED_PUBLISH_BODY_KEYS = [
@@ -457,6 +486,8 @@ const SHARED_PUBLISH_BODY_KEYS = [
   "cover",
   "coverPath",
   "cover-path",
+  "collection",
+  "collections",
   "show",
   "closeWindowAfterPublish",
   "draft",
@@ -592,21 +623,135 @@ export function resolveHttpPublishCreativeStatement(
   return resolveCreativeStatementForPlatform(raw, platformPt);
 }
 
+function hasOwnKey(obj, key) {
+  return Boolean(obj && Object.prototype.hasOwnProperty.call(obj, key));
+}
+
+function isValidCollectionValue(val) {
+  if (val === undefined || val === null || typeof val === "string") return true;
+  if (typeof val === "object" && !Array.isArray(val)) {
+    const hasName = hasOwnKey(val, "name") && (val.name == null || typeof val.name === "string");
+    const hasValue = hasOwnKey(val, "value") && (val.value == null || typeof val.value === "string");
+    const hasEnabled = hasOwnKey(val, "enabled") && typeof val.enabled === "boolean";
+    return hasName || hasValue || hasEnabled;
+  }
+  return false;
+}
+
+function validateHttpCollectionInput(obj) {
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return "";
+  if (hasOwnKey(obj, "collection") && !isValidCollectionValue(obj.collection)) {
+    return "collection 必须是合集名称字符串";
+  }
+  if (hasOwnKey(obj, "collections") && obj.collections != null) {
+    if (typeof obj.collections !== "object" || Array.isArray(obj.collections)) {
+      return "collections 必须是按平台映射的对象";
+    }
+    for (const [k, v] of Object.entries(obj.collections)) {
+      if (!isValidCollectionValue(v)) {
+        return `collections.${k} 必须是合集名称字符串`;
+      }
+    }
+  }
+  if (
+    hasOwnKey(obj, "platformOptions") &&
+    obj.platformOptions &&
+    typeof obj.platformOptions === "object" &&
+    !Array.isArray(obj.platformOptions)
+  ) {
+    for (const [ptKey, opts] of Object.entries(obj.platformOptions)) {
+      if (
+        opts &&
+        typeof opts === "object" &&
+        !Array.isArray(opts) &&
+        hasOwnKey(opts, "collection") &&
+        !isValidCollectionValue(opts.collection)
+      ) {
+        return `platformOptions.${ptKey}.collection 必须是合集名称字符串`;
+      }
+    }
+  }
+  return "";
+}
+
+/**
+ * HTTP 合集解析（与 resolveCollectionOption 保持一致）：
+ * 优先级：target.collection > target.platformOptions[平台].collection >
+ *        body.platformOptions[平台].collection > body.collections[平台] > body.collection。
+ * 显式传空串（如 collections: { ks: "" } 或 target: { platform: "ks", collection: "" }）可覆盖全局为不选合集。
+ */
+export function resolveHttpPublishCollection(body, platformPt, target) {
+  if (!platformSupportsCollection(platformPt)) return "";
+  const rootBody = body && typeof body === "object" ? body : {};
+  const tgt = target && typeof target === "object" ? target : {};
+
+  // 1. 多平台 target 子对象显式传了 collection（含显式空串 "" 取消全局合集）
+  if (tgt !== rootBody && hasOwnKey(tgt, "collection") && tgt.collection !== undefined && tgt.collection !== null) {
+    const resolved = resolveCollectionOption(platformPt, {
+      collection: tgt.collection,
+    });
+    return resolved.enabled ? resolved.name : "";
+  }
+  // 2. target.platformOptions[平台].collection
+  if (tgt !== rootBody && tgt.platformOptions && typeof tgt.platformOptions === "object") {
+    const fromTargetPlatform = resolveCollectionOption(platformPt, {
+      platformOptions: tgt.platformOptions,
+    });
+    const probeGlobal = resolveCollectionOption(platformPt, {
+      collection: "__probe_fallback__",
+      platformOptions: tgt.platformOptions,
+    });
+    if (probeGlobal.name !== "__probe_fallback__") {
+      return fromTargetPlatform.enabled ? fromTargetPlatform.name : "";
+    }
+  }
+  // 3-5. 复用 resolveCollectionOption(platformPt, { platformOptions, collections, collection })
+  const resolved = resolveCollectionOption(platformPt, {
+    platformOptions: rootBody.platformOptions,
+    collections: rootBody.collections,
+    collection: rootBody.collection,
+  });
+  return resolved.enabled ? resolved.name : "";
+}
+
+function applyHttpCollection(body, parsedValue, target = {}) {
+  const collection = resolveHttpPublishCollection(
+    body,
+    parsedValue.platform,
+    target
+  );
+  const nextPublishOptions = { ...(parsedValue.publishOptions || {}) };
+  if (collection) {
+    nextPublishOptions.collection = collection;
+  } else {
+    delete nextPublishOptions.collection;
+  }
+  return {
+    ...parsedValue,
+    collection,
+    publishOptions: nextPublishOptions,
+  };
+}
+
 function applyHttpCreativeStatements(
   body,
   parsedValue,
   target = {},
   options = {}
 ) {
-  return {
-    ...parsedValue,
-    creativeStatement: resolveHttpPublishCreativeStatement(
-      body,
-      parsedValue.platform,
-      target,
-      options
-    ),
-  };
+  return applyHttpCollection(
+    body,
+    {
+      ...parsedValue,
+      creativeStatement: resolveHttpPublishCreativeStatement(
+        body,
+        parsedValue.platform,
+        target,
+        options
+      ),
+    },
+    target
+  );
 }
 
 /**
@@ -618,6 +763,11 @@ function applyHttpCreativeStatements(
 export function parseMultiPublishRequest(body, options = {}) {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     return { ok: false, error: "请求体必须是 JSON 对象" };
+  }
+
+  const rootCollectionErr = validateHttpCollectionInput(body);
+  if (rootCollectionErr) {
+    return { ok: false, error: rootCollectionErr };
   }
 
   const targets = normalizePublishTargets(body);
@@ -643,6 +793,12 @@ export function parseMultiPublishRequest(body, options = {}) {
   const skipped = [];
 
   for (let i = 0; i < targets.length; i++) {
+    const targetCollectionErr = validateHttpCollectionInput(targets[i]);
+    if (targetCollectionErr) {
+      const label =
+        targets[i].platform != null ? String(targets[i].platform) : `#${i + 1}`;
+      return { ok: false, error: `平台 ${label}: ${targetCollectionErr}` };
+    }
     const merged = mergePublishBody(shared, targets[i]);
     const item = parsePublishRequest(merged);
     if (!item.ok) {
@@ -710,7 +866,7 @@ export function publishHelpText() {
   -p, --platform <id>   平台：dy|抖音、tt|头条、ks|快手、blbl|哔哩哔哩、bjh|百家号、sph|视频号、xhs|小红书、fqsp|番茄视频
   -f, --file <path>     本地视频文件路径，或 http(s) 远程视频 URL（远程会先下载到临时目录，发布结束后自动删除）
       --dir <path>          [batch] video directory path; must be paired with --config
-      --config <path>       [batch] xlsx 声明文件（列：文件名/标题/简介/标签/视频号短标题/创作声明）
+      --config <path>       [batch] xlsx 声明文件（列：文件名/标题/简介/标签/视频号短标题/封面/创作声明/合集）
       --cs, --creative-statement <val>  creative statement value for single-file mode.
                             Valid values: none | ai_generated | fiction | marketing | personal_opinion | repost | self_made_no_repost
                             (self_made_no_repost is blbl-only). Default: configured setting (default ai_generated; unsupported platforms fall back to none).
@@ -718,6 +874,9 @@ export function publishHelpText() {
                             抖音横封面基于竖封面自动生成；视频号仅收 jpg/png）。
                             单文件模式传绝对路径；--dir 批量模式下全局覆盖 xlsx「封面」列，
                             未传时用 xlsx 每行的封面列（相对路径相对视频目录解析）
+      --collection <name> 发布时选择的合集名称（抖音/快手/视频号生效，按去空白后完全匹配；留空不选，
+                            其他平台忽略）。--dir 批量模式下每行优先用 xlsx「合集」列，留空时回退本参数；
+                            找不到入口、找不到同名合集或回读不符时中止发布、截图留证且不重试
       --phone <id>      账号手机号（与 GUI 账号树一致，可与 partition 二选一）
       --partition <p>   完整 session partition，如 persist:13800138000抖音
   -t, --title <text>    视频标题（必填）→ data.title
@@ -772,6 +931,8 @@ export function publishHelpText() {
   matrixmedia cli publish -p blbl --phone 13800138000 -f ./v.mp4 -t "标题" --tags "游戏 解说 开黑"
   # 一次性定时发布：必须提供实际视频、标题、账号等完整发布参数
   matrixmedia cli publish -p dy --phone 13800138000 -f ./v.mp4 -t "标题" --publish-at "2026-05-05 20:30:00"
+  # 指定合集发布（抖音/快手/视频号生效）：
+  matrixmedia cli publish -p dy --phone 13800138000 -f ./v.mp4 -t "标题" --collection "民间故事"
   # batch publish with xlsx config:
   matrixmedia cli publish -p dy --phone 13800138000 --dir ./videos --config ./videos/batch.xlsx
 `.trim();

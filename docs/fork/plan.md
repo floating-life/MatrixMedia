@@ -24,6 +24,17 @@
 | S9 | feat/stats-intraday | 固定时段内每 N 小时（默认 2）自动采集 + 分时段作品快照 `works-intraday/YYYY-MM-DD.json`（含保留期清理）+ 作品趋势「按天/按时段」+「最近采集」列 +「新作品前 24 小时」图 + Excel「作品时段明细」sheet |
 | S10 | feat/stats-quality | 标题/文案共享清洗（`_x000d_`/`\r`）+ 分析页加权互动率与三项互动率 + 总览实际覆盖天数与账号快照涨粉主口径 + 作品/账号防假 0 覆写 + 连续采集失败告警与系统通知 + 7 天同平台重复发布拦截（GUI/CLI/HTTP） |
 | S11 | feat/stats-throttle | 发布节流（同账号最小间隔/每日上限/允许时段 UTC+8）+ 平台错峰延迟（百家号可设 +10h）+ 自动转定时任务与重启恢复 + GUI 排期预览表与设置入口 + 默认 AI 创作声明（`ai_generated`，三端共用） |
+| S12 | feat/stats-collection | 抖音/快手发布模式假成功修复（排除常驻「上传成功」信号）+ 发布时指定合集（抖音/快手/视频号，GUI/Excel/CLI/HTTP 四端通路 + 确定性失败截图中止） |
+
+## S12：抖音/快手发布假成功修复 + 发布时指定合集（`feat/stats-collection`）
+- **抖音/快手发布模式成功判定收紧（`src/main/services/upLoad/publishOutcome.js` + `dy.js` + `ks.js`）**：
+  - 根因：抖音/快手编辑页在视频上传完成后常驻「上传成功」字样，原 `SUCCESS_TOAST_TEXTS` 含「上传成功」，导致点击「发布」未生效时误判成功并关窗，平台自动把作品留进草稿箱。
+  - 方案：`publishOutcome.js` 新增 `PLATFORM_EXCLUDED_SUCCESS_TOASTS`、`resolveExcludedSuccessToasts` 与 `PUBLISH_UNCONFIRMED_MESSAGE`；`waitForPublishSignal` 支持按平台或显式 `excludeSuccessToasts` 排除文案；`dy.js` / `ks.js` 在发布模式排除「上传成功」「草稿已保存」，只认 URL 跳离发布页或「发布成功/发表成功/投稿成功」等完整短语。20 秒无证据走现有 `publish_abnormal` / `needs_attention`（不重试、不重传），截图留证并提示「发布异常：点击发布后未确认发出，请到平台草稿箱核对」。视频号 / B 站 / 百家号等其他平台与草稿模式行为完全不变。
+- **发布时选择合集（`src/shared/videoLink.js` + `textSanitize.js` + `xhsPublishPolicy.js` + `upLoad/collection.js` + `dy.js`/`ks.js`/`sph.js` + `parsePublishArgs.js` + `cli/index.js` + `publishVideo.js` + `LocalVideoPublish.vue`）**：
+  - 数据通路：在 `publishOptions` 扩展 `collection`（全局）与按平台覆盖（`collections[平台]` / `platformOptions[平台].collection`，优先级 `target.collection > target.platformOptions > platformOptions > collections > collection`，显式空串可取消全局）；GUI「本地视频发布」批量设置区新增「合集」输入框（可留空）与单账号覆盖列，Excel 导入识别「合集」列，CLI `publish` 支持 `--collection`，HTTP `POST /publish` 支持 `collection` / `collections` / `platformOptions.<pt>.collection`。留空完全跳过合集逻辑。
+  - 平台自动化：`src/main/services/upLoad/collection.js` 集中实现三步流程（可见文本定位打开入口 → 精确匹配去空白相等合集项 → 控件回读含目标合集名校验），各平台文案/选择器写成 `PLATFORM_COLLECTION_CONFIGS` 常量便于真机校准；视频号按 `wujie-app.wujie_iframe` shadowRoot 穿透，快手按 Ant Design 派发 mousedown/mouseup/click；每步打印 `[collection] <平台> …` 诊断日志。
+  - 确定性失败保护：找不到入口、找不到同名合集、回读不符均调用 `capturePublishFailureScreenshot` 留证并抛确定性错误（带最多 10 个页面候选合集名与入口查找详情），中止本平台发布；`xhsPublishPolicy.getPublishAttemptLimit` 对显式启用合集的任务限重试 1 次（不重试、不重传）。
+  - 单测：`scripts/test-publish-abnormal.js` 补全 dy/ks 假成功收紧与视频号不回归用例；新增 `scripts/test-collection.js`（`yarn test:collection`）覆盖字段解析/优先级、Excel、CLI/HTTP、回读匹配、留空短路及 fake page 三条失败路径。
 
 ## S11：发布节流 / 平台错峰 / 默认 AI 创作声明（`feat/stats-throttle`）
 - **主进程持久化设置（`src/shared/publishThrottle.js` + `src/main/services/publishThrottle.js` + `ipcMain.js`）**：配置保存在 `<userData>/publish-throttle-settings.json`（原子写），GUI / CLI / HTTP 共用；IPC 通道 `publish-throttle:get-settings` / `save-settings` / `reset-settings` / `plan` / `create-scheduled`。出厂默认值：

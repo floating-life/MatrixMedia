@@ -32,6 +32,7 @@ import { resolveAccountPublishMode } from "./accountPublishSettingsResolver.js";
 import { resolveTaskPartition } from "./accountLookup.js";
 import { resolvePublishCompletion } from "../../shared/publishResult.js";
 import { normalizeVideoMetadata } from "../../shared/videoMetadata.js";
+import { resolveCollectionOption } from "../../shared/videoLink.js";
 
 /** 读取全部 pushData 记录（跨日期平铺），用于定时任务查重 */
 function listPushDataRecords() {
@@ -234,6 +235,26 @@ async function runSingleFilePublishInner(
     : [];
   const isThrottled = Boolean(v.throttled);
 
+  const effectivePublishOptions =
+    v.publishOptions && typeof v.publishOptions === "object"
+      ? { ...v.publishOptions }
+      : {};
+  if (
+    !Object.prototype.hasOwnProperty.call(
+      effectivePublishOptions,
+      "collection"
+    ) &&
+    v.collection != null &&
+    String(v.collection).trim() !== ""
+  ) {
+    const resolvedCol = resolveCollectionOption(v.platform, {
+      collection: v.collection,
+    });
+    if (resolvedCol.enabled) {
+      effectivePublishOptions.collection = resolvedCol.name;
+    }
+  }
+
   const taskPayload = {
     taskId: Date.now() + Math.random(),
     ...(activeReservationId ? { throttleReservationId: activeReservationId } : {}),
@@ -255,7 +276,7 @@ async function runSingleFilePublishInner(
     mmCliSuppressWindow: false,
     publishMode: effectivePublishMode.publishMode,
     publishToDraft: effectivePublishMode.publishToDraft,
-    publishOptions: v.publishOptions || {},
+    publishOptions: effectivePublishOptions,
     closeWindowAfterPublish: v.show ? v.closeWindowAfterPublish : true,
     useragent: cfg.useragent,
     partition: v.partition,
@@ -304,7 +325,7 @@ async function runSingleFilePublishInner(
     publishFailCount: 0,
     publishMode: effectivePublishMode.publishMode,
     publishToDraft: effectivePublishMode.publishToDraft,
-    publishOptions: v.publishOptions || {},
+    publishOptions: effectivePublishOptions,
     publishStatus: effectivePublishMode.publishToDraft
       ? "drafting"
       : "publishing",

@@ -1,5 +1,7 @@
 "use strict";
 
+import { resolveCollectionOption } from "./videoLink.js";
+
 export const XHS_SECOND_CLICK_DELAY_MIN_MS = 5000;
 export const XHS_SECOND_CLICK_DELAY_MAX_MS = 10000;
 export const XHS_PLATFORM_STAGGER_MIN_MS = 15000;
@@ -31,6 +33,15 @@ export function getPublishAttemptLimit(data, defaultLimit = 5) {
     link.enabled === true &&
     link.type === "product"
   ) {
+    return 1;
+  }
+  // 显式指定合集时：找不到入口/同名合集/回读不符属于确定性失败，
+  // 重开窗口重传既无法修复名称/DOM 差异，也不应反复上传视频。
+  const collection = resolveCollectionOption(
+    platform,
+    data && data.publishOptions
+  );
+  if (collection && collection.enabled === true) {
     return 1;
   }
   return defaultLimit;

@@ -257,6 +257,24 @@
             应用到已勾选
           </el-button>
         </span>
+        <span class="batch-collection-wrap">
+          <span class="batch-statement-label">合集</span>
+          <el-input
+            v-model="batchCollection"
+            class="batch-collection-input"
+            size="small"
+            clearable
+            placeholder="留空不选（抖音/快手/视频号）"
+          />
+          <el-button
+            type="text"
+            size="small"
+            :disabled="checkedPlatformNodes.length === 0"
+            @click="applyBatchCollection"
+          >
+            应用到已勾选
+          </el-button>
+        </span>
       </div>
 
       <el-tree
@@ -496,6 +514,19 @@
             <span v-else class="attrs-unsupported">暂不支持第三方属性</span>
           </template>
         </el-table-column>
+        <el-table-column label="合集（可选）" min-width="170">
+          <template slot-scope="{ row }">
+            <el-input
+              v-if="platformSupportsCollection(row.pt)"
+              :value="getPlatformCollection(row.id, row.pt)"
+              size="mini"
+              clearable
+              placeholder="留空不选"
+              @input="setPlatformCollection(row.id, $event)"
+            />
+            <span v-else class="attrs-unsupported">暂不支持</span>
+          </template>
+        </el-table-column>
       </el-table>
 
       <p v-if="attrsHasProductLink" class="bt2-tip">
@@ -582,7 +613,7 @@
       </div>
       <p class="bt2-tip" style="margin-bottom: 12px">
         声明文件支持列：文件名 / 标题 / 简介 / 标签 / 视频号短标题 / 封面（选填，填图片路径，绝对路径或相对视频目录均可；视频号仅支持
-        jpg/png，路径无效会阻断发布）。
+        jpg/png，路径无效会阻断发布）/ 合集（选填，抖音/快手/视频号生效，留空不选）。
       </p>
 
       <el-table
@@ -625,6 +656,12 @@
         <el-table-column
           prop="coverPath"
           label="封面"
+          min-width="120"
+          show-overflow-tooltip
+        />
+        <el-table-column
+          prop="collection"
+          label="合集"
           min-width="120"
           show-overflow-tooltip
         />
@@ -793,7 +830,10 @@ import {
   buildVideoLinkOption,
   getDisplayableVideoLinkTypes,
   getVideoLinkTypeCapability,
+  normalizeCollectionName,
+  platformSupportsCollection,
   platformSupportsVideoLink,
+  resolveCollectionOption,
   resolveVideoLinkOption,
   validateVideoLinkValue,
   VIDEO_LINK_TYPES,
@@ -858,6 +898,8 @@ export default {
       bqComposing: false,
       platformStatements: {},
       platformVideoLinks: {},
+      platformCollections: {},
+      batchCollection: "",
       platformProductOptions: {},
       platformProductLoading: {},
       // 短剧/剧集搜索下拉：key 为 `${nodeId}:${linkType}`
@@ -1004,6 +1046,7 @@ export default {
       this._pushBqTags(list);
     },
     platformSupportsVideoLink,
+    platformSupportsCollection,
     /** 把字符串按 # / 空格 / 逗号 / 分号 / 顿号 切成多个标签 */
     _splitBqTokens(raw) {
       if (!raw) return [];
@@ -1127,6 +1170,7 @@ export default {
       this.loadPublishThrottleDefaults();
       this.resetPlatformStatementState();
       this.resetPlatformVideoLinks();
+      this.resetPlatformCollections();
       this.form = {
         title: defaultTitle,
         bt1: "",
@@ -1184,6 +1228,7 @@ export default {
       this.loadPublishThrottleDefaults();
       this.resetPlatformStatementState();
       this.resetPlatformVideoLinks();
+      this.resetPlatformCollections();
       this.thisShow = false;
       this.closeWindow = true;
       this.scheduledPublish = false;
@@ -1207,6 +1252,7 @@ export default {
         }
         this.applyRepublishPlatformStatements(form.creativeStatement);
         this.applyRepublishPlatformVideoLinks();
+        this.applyRepublishPlatformCollections();
         this.onTreeCheck();
       });
       return true;
@@ -1719,16 +1765,95 @@ export default {
         { shortTitle: this.getPlatformVideoLinkShortTitle(platformNode.id) }
       );
       if (!link.ok) throw new Error(link.error);
+      const collection = this.resolvePlatformCollectionValue(
+        platformNode.id,
+        platformNode.pt
+      );
       return {
         ...baseVideo,
         publishOptions: {
           link: link.value,
+          ...(collection ? { collection } : {}),
         },
         data: {
           ...baseVideo.data,
           creativeStatement: this.getPlatformStatement(platformNode.id),
         },
       };
+    },
+    resetPlatformCollections() {
+      this.batchCollection = "";
+      this.platformCollections = {};
+    },
+    getPlatformCollection(nodeId, pt) {
+      if (!platformSupportsCollection(pt)) return "";
+      const map = this.platformCollections || {};
+      if (Object.prototype.hasOwnProperty.call(map, nodeId)) {
+        return String(map[nodeId] == null ? "" : map[nodeId]);
+      }
+      return String(this.batchCollection == null ? "" : this.batchCollection);
+    },
+    setPlatformCollection(nodeId, value) {
+      if (!this.platformCollections) this.platformCollections = {};
+      this.$set(
+        this.platformCollections,
+        nodeId,
+        String(value == null ? "" : value)
+      );
+    },
+    resolvePlatformCollectionValue(nodeId, pt, rowCollection = "") {
+      if (!platformSupportsCollection(pt)) return "";
+      const map = this.platformCollections || {};
+      if (Object.prototype.hasOwnProperty.call(map, nodeId)) {
+        const resolved = resolveCollectionOption(pt, {
+          collection: map[nodeId],
+        });
+        return resolved.enabled ? resolved.name : "";
+      }
+      const rowNorm = normalizeCollectionName(rowCollection);
+      if (rowNorm) return rowNorm;
+      const globalResolved = resolveCollectionOption(pt, {
+        collection: this.batchCollection,
+      });
+      return globalResolved.enabled ? globalResolved.name : "";
+    },
+    applyBatchCollection(options = {}) {
+      const { silent = false } = options;
+      const val = normalizeCollectionName(this.batchCollection);
+      const targets = (this.checkedPlatformNodes || []).filter((node) =>
+        platformSupportsCollection(node.pt)
+      );
+      if (targets.length === 0) {
+        if (!silent && this.$message) {
+          this.$message.warning(
+            "已勾选账号中没有支持合集的平台（仅支持抖音/快手/视频号）"
+          );
+        }
+        return;
+      }
+      const next = { ...(this.platformCollections || {}) };
+      targets.forEach((node) => {
+        next[node.id] = val;
+      });
+      this.platformCollections = next;
+      if (!silent && this.$message) {
+        this.$message.success(
+          val
+            ? `已为 ${targets.length} 个账号设置合集「${val}」`
+            : `已清空 ${targets.length} 个账号的合集设置`
+        );
+      }
+    },
+    applyRepublishPlatformCollections() {
+      const next = { ...(this.platformCollections || {}) };
+      this.getAllPlatformLeafNodes().forEach((node) => {
+        const rec = this.findRepublishRecord(node.pt, node);
+        const col = resolveCollectionOption(node.pt, rec && rec.publishOptions);
+        if (col && col.enabled && col.name) {
+          next[node.id] = col.name;
+        }
+      });
+      this.platformCollections = next;
     },
     resetPlatformStatementState() {
       this.platformStatements = {};
@@ -2340,6 +2465,7 @@ export default {
       this.bqComposing = false;
       this.resetPlatformStatementState();
       this.resetPlatformVideoLinks();
+      this.resetPlatformCollections();
       this.form = {
         title: "",
         bt1: "",
@@ -2921,6 +3047,7 @@ export default {
       this.dirXlsxRows = [];
       this.dirXlsxError = "";
       this.resetPlatformVideoLinks();
+      this.resetPlatformCollections();
       this.scheduledPublish = false;
       this.publishAt = "";
       this.dirPublishVisible = true;
@@ -3251,6 +3378,14 @@ export default {
           const creativeStatement = rowExplicitCs
             ? resolveCreativeStatementForPlatform(rowExplicitCs, p.pt)
             : this.getPlatformStatement(p.id, p.pt);
+          const dirCollection = this.resolvePlatformCollectionValue(
+            p.id,
+            p.pt,
+            fileRow && fileRow.collection
+          );
+          const dirPublishOptions = dirCollection
+            ? { collection: dirCollection }
+            : {};
           const effectiveMode = resolveEffectivePublishMode(isDraftMode, p);
 
           // Format bq for this platform
@@ -3320,6 +3455,9 @@ export default {
                   creativeStatement,
                   coverPath: fileRow.coverResolved || "",
                   noDownload: this.form.noDownload === true,
+                  ...(Object.keys(dirPublishOptions).length > 0
+                    ? { publishOptions: dirPublishOptions }
+                    : {}),
                   filePath,
                   useragent: this.ptConfig[p.pt].useragent,
                   phone: p.phone,
@@ -3378,6 +3516,9 @@ export default {
                 creativeStatement,
                 coverPath: fileRow.coverResolved || "",
                 noDownload: this.form.noDownload === true,
+                ...(Object.keys(dirPublishOptions).length > 0
+                  ? { publishOptions: dirPublishOptions }
+                  : {}),
                 filePath,
                 useragent: this.ptConfig[p.pt].useragent,
                 phone: p.phone,
@@ -3476,6 +3617,9 @@ export default {
             selectedFile,
             publishMode: effectiveMode.publishMode,
             publishToDraft: effectiveMode.publishToDraft,
+            ...(Object.keys(dirPublishOptions).length > 0
+              ? { publishOptions: dirPublishOptions }
+              : {}),
             url: this.ptConfig[p.pt].upload,
             show: shouldShow,
             closeWindowAfterPublish: shouldCloseWindowAfterPublish,
@@ -3653,6 +3797,15 @@ export default {
   color: #606266;
 }
 .batch-statement-select {
+  width: 200px;
+}
+.batch-collection-wrap {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.batch-collection-input {
   width: 200px;
 }
 .custom-tree-node {

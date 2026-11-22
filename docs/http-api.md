@@ -134,17 +134,21 @@
 | `publishAt`          | 否     | 一次性定时发布，格式 `YYYY-MM-DD HH:mm:ss`（多平台时需全部一致）                                                                         |
 | `draft`              | 否     | `true` 时保存到平台草稿箱，不直接发布                                                                                                    |
 | `cover`              | 否     | 自定义封面图片路径（别名 `coverPath` / `cover-path`；抖音 / 快手 / 视频号生效；竖封面 3:4 比例最佳，抖音横封面基于竖封面自动生成；视频号仅收 jpg/png）           |
+| `collection`         | 否     | 发布时选择的合集名称字符串（如 `"民间故事"`；仅抖音 / 快手 / 视频号生效，按去空白后完全匹配；留空不选，其他平台忽略）。找不到入口、找不到同名合集或回读不符时中止本平台发布、截图留证且不重试 |
+| `collections`        | 否     | 按平台覆盖合集名称，key 用 code 或中文名，如 `{ "dy": "抖音合集", "ks": "" }`（显式传 `""` 可取消该平台的全局合集） |
 | `sphProductId`       | 否     | 视频号商品上架快捷字段（商品编号）；仅视频号生效，等价于 `platformOptions.sph.link.type=product` |
 | `sphDramaId` | 否 | 视频号小程序短剧挂载快捷字段（**短剧名称**，如 `泳陷错恋`）；仅视频号生效，等价于 `platformOptions.sph.link.type=mini_drama`                                         |
 | `sphSeriesId` | 否 | 视频号剧集挂载快捷字段（**剧集名称**，视频号原生剧集）；仅视频号生效，等价于 `platformOptions.sph.link.type=sph_series`                                         |
 | `sphLink`            | 否     | 视频号链接对象，如 `{ "type": "product", "value": "商品编号" }`、`{ "type": "mini_drama", "value": "短剧名称" }` 或 `{ "type": "sph_series", "value": "剧集名称" }`；与三个快捷字段同时传时优先快捷字段                           |
-| `platformOptions`    | 否     | 平台专属参数容器；视频号商品也可用 `platformOptions.sph.link`，不会应用到其他平台                                                        |
+| `platformOptions`    | 否     | 平台专属参数容器；视频号商品可用 `platformOptions.sph.link`，各平台合集亦可用 `platformOptions.<dy\|ks\|sph>.collection` 覆盖 |
 | `creativeStatement`  | 否     | 全局创作声明，等同 GUI「批量设置创作声明」；未传时套用发布设置里的默认声明（出厂默认 `ai_generated`，可在 GUI「发布节流设置」修改为 `none` 等）；支持 value、中文 label 或平台页面原文案（如 `内容由AI生成`） |
 | `creativeStatements` | 否     | 按平台覆盖声明，key 用 code 或中文名，如 `{ "dy": "ai_generated", "blbl": "fiction" }`；某平台不支持所选值时回退 `none`                  |
 | `allowDuplicate`     | 否     | 默认 `false`；7 天内同平台+同账号+清洗后同标题已有成功/进行中记录时默认拦截，传 `true` 才放行（亦可在多平台 `platforms[]` 子对象内按平台单独指定） |
 | `noThrottle`         | 否     | 默认 `false`；开启发布节流时同账号间隔不足、超出允许发布时段（默认 06:00–23:30 UTC+8）、达当日上限或配置了平台错峰延迟会自动顺延为定时任务（显式 `publishAt` 同样只顺延不提前），传 `true` 可绕过（支持顶层或 `platforms[]` 单平台覆盖） |
 
 **创作声明优先级**（与 GUI 一致）：`platforms[].creativeStatement` > `creativeStatements[平台]` > `creativeStatement` > 主进程发布设置 `defaultCreativeStatement`（出厂默认 `ai_generated`）。
+
+**合集覆盖优先级**（仅抖音 / 快手 / 视频号生效，其他平台忽略）：`platforms[].collection` > `platforms[].platformOptions[平台].collection` > `platformOptions[平台].collection` > `collections[平台]` > `collection`（全局）。任一层显式传空串 `""` 可取消该平台的全局合集。留空时不执行合集逻辑；配置合集后若找不到入口、找不到同名合集或回读不符，将中止本平台发布（不发布、不重试），回执 `status: "failed"`、`exitCode: 3` 且错误信息带页面候选合集名（最多 10 个）与入口查找情况。
 
 视频号已支持「视频标注」创作声明。某平台不支持所选值（如番茄视频）时按现有规则自动回退为 `none`。响应体及多平台 `results[]` 明细中均会写出最终生效的 `creativeStatement`。可用 `GET /creative-statements` 查询当前默认值与各平台可用选项。
 

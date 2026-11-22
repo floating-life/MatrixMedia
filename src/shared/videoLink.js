@@ -271,3 +271,208 @@ export function resolveVideoLinkOption(platform, publishOptions = {}) {
   }
   return buildVideoLinkOption(platform, VIDEO_LINK_TYPES.NONE, "").value;
 }
+
+/** 支持发布时选择合集的平台表（抖音 / 快手 / 视频号） */
+export const COLLECTION_SUPPORTED_PLATFORMS = {
+  抖音: { platformKey: "dy", aliases: ["dy", "douyin", "抖音"] },
+  快手: { platformKey: "ks", aliases: ["ks", "kuaishou", "快手"] },
+  视频号: { platformKey: "sph", aliases: ["sph", "视频号"] },
+};
+
+function hasOwnCollectionProp(obj, key) {
+  return Boolean(obj && Object.prototype.hasOwnProperty.call(obj, key));
+}
+
+export function getCollectionCanonicalPlatform(platform) {
+  const raw = String(platform || "").trim();
+  if (!raw) return "";
+  const lower = raw.toLowerCase();
+  const keys = Object.keys(COLLECTION_SUPPORTED_PLATFORMS);
+  for (let i = 0; i < keys.length; i++) {
+    const canonical = keys[i];
+    const entry = COLLECTION_SUPPORTED_PLATFORMS[canonical];
+    if (
+      raw.includes(canonical) ||
+      entry.aliases.some((alias) => alias.toLowerCase() === lower)
+    ) {
+      return canonical;
+    }
+  }
+  return "";
+}
+
+export function getCollectionPlatformKey(platform) {
+  const canonical = getCollectionCanonicalPlatform(platform);
+  return canonical ? COLLECTION_SUPPORTED_PLATFORMS[canonical].platformKey : "";
+}
+
+export function platformSupportsCollection(platform) {
+  return Boolean(getCollectionCanonicalPlatform(platform));
+}
+
+/**
+ * 清洗合集名称：去掉 Excel `_x000d_` 转义、零宽字符、NBSP，将换行/制表符折成空格并 trim。
+ * 留空返回 ""（表示不选合集）。
+ */
+export function normalizeCollectionName(value) {
+  if (value == null) return "";
+  return String(value)
+    .replace(/_x000d_/gi, "")
+    .replace(/[\uFEFF\u200B\u200C\u200D]/g, "")
+    .replace(/\u00A0/g, " ")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** 去所有空白字符，用于与页面合集名做完全匹配比对 */
+export function collapseCollectionText(value) {
+  return normalizeCollectionName(value).replace(/\s+/g, "");
+}
+
+function getCollectionLookupKeys(platform) {
+  const canonical = getCollectionCanonicalPlatform(platform);
+  if (!canonical) return [];
+  const entry = COLLECTION_SUPPORTED_PLATFORMS[canonical];
+  return [canonical, entry.platformKey, ...entry.aliases];
+}
+
+function pickCollectionEntryFromMap(map, platform) {
+  if (!map || typeof map !== "object" || Array.isArray(map)) {
+    return { found: false, value: undefined };
+  }
+  const lookupKeys = getCollectionLookupKeys(platform);
+  const keySet = new Set(lookupKeys.map((k) => k.toLowerCase()));
+  // 优先精确 key 顺序命中，再大小写不敏感匹配
+  for (let i = 0; i < lookupKeys.length; i++) {
+    const k = lookupKeys[i];
+    if (hasOwnCollectionProp(map, k) && map[k] !== undefined && map[k] !== null) {
+      return { found: true, value: map[k] };
+    }
+  }
+  const mapKeys = Object.keys(map);
+  for (let i = 0; i < mapKeys.length; i++) {
+    const mk = mapKeys[i];
+    if (keySet.has(mk.toLowerCase()) && map[mk] !== undefined && map[mk] !== null) {
+      return { found: true, value: map[mk] };
+    }
+  }
+  return { found: false, value: undefined };
+}
+
+function pickCollectionFromPlatformOptions(platformOptions, platform) {
+  const hit = pickCollectionEntryFromMap(platformOptions, platform);
+  if (!hit.found || !hit.value || typeof hit.value !== "object") {
+    return { found: false, value: undefined };
+  }
+  if (
+    hasOwnCollectionProp(hit.value, "collection") &&
+    hit.value.collection !== undefined &&
+    hit.value.collection !== null
+  ) {
+    return { found: true, value: hit.value.collection };
+  }
+  return { found: false, value: undefined };
+}
+
+function toResolvedCollection(raw, platformKey) {
+  if (raw && typeof raw === "object") {
+    if (raw.enabled === false) {
+      return {
+        enabled: false,
+        name: "",
+        platformKey,
+        supported: true,
+        failurePolicy: "stop",
+      };
+    }
+    const name = normalizeCollectionName(
+      raw.name != null ? raw.name : raw.value != null ? raw.value : ""
+    );
+    return {
+      enabled: Boolean(name),
+      name,
+      platformKey,
+      supported: true,
+      failurePolicy: "stop",
+    };
+  }
+  const name = normalizeCollectionName(raw);
+  return {
+    enabled: Boolean(name),
+    name,
+    platformKey,
+    supported: true,
+    failurePolicy: "stop",
+  };
+}
+
+export function buildCollectionOption(platform, name) {
+  const platformKey = getCollectionPlatformKey(platform);
+  if (!platformKey) {
+    return {
+      ok: true,
+      value: {
+        enabled: false,
+        name: "",
+        platformKey: "",
+        supported: false,
+        failurePolicy: "stop",
+      },
+    };
+  }
+  return {
+    ok: true,
+    value: toResolvedCollection(name, platformKey),
+  };
+}
+
+/**
+ * 解析当前平台最终生效的合集配置（仿 resolveVideoLinkOption）。
+ * 覆盖优先级：publishOptions.platformOptions[平台].collection > publishOptions.collections[平台] > publishOptions.collection（全局）。
+ * 显式按平台覆盖为空串或 { enabled: false } 时关闭该平台合集，不再回退全局。
+ * 非支持平台（仅支持抖音/快手/视频号）始终返回 enabled: false。
+ */
+export function resolveCollectionOption(platform, publishOptions = {}) {
+  const platformKey = getCollectionPlatformKey(platform);
+  if (!platformKey) {
+    return {
+      enabled: false,
+      name: "",
+      platformKey: "",
+      supported: false,
+      failurePolicy: "stop",
+    };
+  }
+  const options =
+    publishOptions && typeof publishOptions === "object" ? publishOptions : {};
+
+  const fromPlatformOpts = pickCollectionFromPlatformOptions(
+    options.platformOptions,
+    platform
+  );
+  if (fromPlatformOpts.found) {
+    return toResolvedCollection(fromPlatformOpts.value, platformKey);
+  }
+
+  const fromMap = pickCollectionEntryFromMap(options.collections, platform);
+  if (fromMap.found) {
+    return toResolvedCollection(fromMap.value, platformKey);
+  }
+
+  if (
+    hasOwnCollectionProp(options, "collection") &&
+    options.collection !== undefined &&
+    options.collection !== null
+  ) {
+    return toResolvedCollection(options.collection, platformKey);
+  }
+
+  return {
+    enabled: false,
+    name: "",
+    platformKey,
+    supported: true,
+    failurePolicy: "stop",
+  };
+}

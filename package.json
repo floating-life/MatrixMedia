@@ -111,6 +111,7 @@
     "test:stats-quality": "node scripts/test-stats-quality.js",
     "test:publish-duplicate-guard": "node scripts/test-publish-duplicate-guard.js",
     "test:publish-throttle": "node scripts/test-publish-throttle.js",
+    "test:collection": "node scripts/test-collection.js",
     "test:fork-guard": "node scripts/test-fork-guard.js"
   },
   "build": {

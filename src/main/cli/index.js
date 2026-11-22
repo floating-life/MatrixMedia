@@ -55,6 +55,7 @@ import { resolveAccountPublishMode } from "../services/accountPublishSettingsRes
 import { resolveTaskPartition } from "../services/accountLookup.js";
 import { ensureAccountRecordsMigrated } from "../services/accountMigration.js";
 import { normalizeVideoMetadata } from "../../shared/videoMetadata.js";
+import { resolveCollectionOption } from "../../shared/videoLink.js";
 import {
   normalizeBatchXlsxRows,
   sanitizePublishCliArgs,
@@ -552,6 +553,20 @@ async function runBatchDirPublish(v, cfg) {
       (v.creativeStatement && String(v.creativeStatement).trim()) ||
       throttleSettings.defaultCreativeStatement;
     const cs = resolveCreativeStatementForPlatform(rawCs, v.platform);
+    // 合集：优先使用 xlsx 每行「合集」列，留空时回退 CLI --collection；非支持平台自动忽略
+    const rowPublishOptions = { ...(v.publishOptions || {}) };
+    const rowCollectionInput =
+      (row.collection && String(row.collection).trim()) ||
+      (v.collection && String(v.collection).trim()) ||
+      "";
+    const resolvedRowCol = resolveCollectionOption(v.platform, {
+      collection: rowCollectionInput,
+    });
+    if (resolvedRowCol.enabled) {
+      rowPublishOptions.collection = resolvedRowCol.name;
+    } else {
+      delete rowPublishOptions.collection;
+    }
     const metadata = normalizeVideoMetadata(
       {
         title: bt1,
@@ -677,7 +692,7 @@ async function runBatchDirPublish(v, cfg) {
       publishFailCount: 0,
       publishMode: effectivePublishMode.publishMode,
       publishToDraft: effectivePublishMode.publishToDraft,
-      publishOptions: v.publishOptions || {},
+      publishOptions: rowPublishOptions,
       publishStatus: effectivePublishMode.publishToDraft
         ? "drafting"
         : "publishing",
@@ -901,7 +916,7 @@ async function runBatchDirPublish(v, cfg) {
       mmCliSuppressWindow: false,
       publishMode: effectivePublishMode.publishMode,
       publishToDraft: effectivePublishMode.publishToDraft,
-      publishOptions: v.publishOptions || {},
+      publishOptions: rowPublishOptions,
       closeWindowAfterPublish: true,
       useragent: cfg.useragent,
       partition: v.partition,

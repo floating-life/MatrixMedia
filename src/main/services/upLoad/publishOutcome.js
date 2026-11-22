@@ -7,6 +7,10 @@ export const PUBLISH_NAVIGATE_WAIT_MS = 5000;
 export const PUBLISH_ABNORMAL_MESSAGE =
   "发布异常：点击发布后 5 秒页面地址未变化，可能未真正发布，请到平台确认";
 
+/** 抖音/快手发布模式收紧判据后 20 秒内无成功证据时的提示文案（避免假成功留草稿） */
+export const PUBLISH_UNCONFIRMED_MESSAGE =
+  "发布异常：点击发布后未确认发出，请到平台草稿箱核对";
+
 /** 发布模式判定窗口：固定 5 秒对慢平台（转码/审核排队）会把已发布误判成异常（PR #52） */
 export const PUBLISH_VERDICT_TIMEOUT_MS = 20000;
 
@@ -25,6 +29,41 @@ const SUCCESS_TOAST_TEXTS = [
   "投稿成功",
   "草稿已保存",
 ];
+
+/**
+ * 按平台默认排除的成功提示文案：
+ * 抖音/快手编辑页在视频文件传完后常驻「上传成功」字样，
+ * 点击「发布」未生效时若把「上传成功」当成功信号会关窗导致作品停在草稿箱；
+ * 「草稿已保存」同样不代表正式发布成功。
+ * 视频号 / B 站 / 百家号等其他平台保持原样，避免回归。
+ */
+export const PLATFORM_EXCLUDED_SUCCESS_TOASTS = {
+  抖音: ["上传成功", "草稿已保存"],
+  快手: ["上传成功", "草稿已保存"],
+};
+
+/**
+ * 计算发布模式应排除的成功提示词列表：
+ * - 若调用方显式传入 excludeSuccessToasts 数组，直接使用该数组；
+ * - 否则按平台（抖音 / 快手）应用默认排除表；其他平台返回空数组。
+ */
+export function resolveExcludedSuccessToasts(platform, excludeSuccessToasts) {
+  if (Array.isArray(excludeSuccessToasts)) {
+    return excludeSuccessToasts
+      .map((kw) => String(kw || "").trim())
+      .filter(Boolean);
+  }
+  const pt = String(platform || "").trim();
+  if (!pt) return [];
+  const lower = pt.toLowerCase();
+  if (pt.includes("抖音") || lower === "dy" || lower === "douyin") {
+    return PLATFORM_EXCLUDED_SUCCESS_TOASTS["抖音"].slice();
+  }
+  if (pt.includes("快手") || lower === "ks" || lower === "kuaishou") {
+    return PLATFORM_EXCLUDED_SUCCESS_TOASTS["快手"].slice();
+  }
+  return [];
+}
 
 /**
  * 平台侧「拦住这次提交」的校验提示（点发布后页面弹出来、并吞掉点击的提示）。
@@ -51,10 +90,28 @@ const BLOCKING_TIP_PATTERNS = [
 
 /**
  * 发布模式轮询等待成功信号：URL 跳转或平台成功提示，任一命中立即返回。
+ * 支持按平台或显式 `excludeSuccessToasts` 排除特定成功提示词（如 dy/ks 排除常驻「上传成功」）。
  * 全程顺带记录页面上的「阻断类校验提示」，供地址未变化时补充失败原因。
- * @returns {Promise<{ok: boolean, signal: string, urlAfter: string, blockHint: string}>}
+ * @param {import("puppeteer-core").Page} page
+ * @param {string} urlBefore
+ * @param {number} timeoutMs
+ * @param {{ platform?: string, excludeSuccessToasts?: string[] }} [options]
+ * @returns {Promise<{ok: boolean, signal: string, urlAfter: string, blockHint: string, excludedToasts: string[]}>}
  */
-async function waitForPublishSignal(page, urlBefore, timeoutMs) {
+export async function waitForPublishSignal(
+  page,
+  urlBefore,
+  timeoutMs,
+  options = {}
+) {
+  const excludedToasts = resolveExcludedSuccessToasts(
+    options && options.platform,
+    options && options.excludeSuccessToasts
+  );
+  const excludedSet = new Set(excludedToasts);
+  const allowedToasts = SUCCESS_TOAST_TEXTS.filter(
+    (kw) => !excludedSet.has(kw)
+  );
   // 按轮次而不是墙钟计时：每轮含 1 秒等待，真实环境等价于 timeoutMs；
   // 单测里 waitForTimeout 是空实现，也不会空转 20 秒。
   const maxRounds = Math.max(2, Math.ceil(timeoutMs / 1000));
@@ -67,14 +124,26 @@ async function waitForPublishSignal(page, urlBefore, timeoutMs) {
       urlAfter &&
       normalizeUrl(urlAfter) !== normalizeUrl(urlBefore)
     ) {
-      return { ok: true, signal: "url_changed", urlAfter, blockHint: "" };
+      return {
+        ok: true,
+        signal: "url_changed",
+        urlAfter,
+        blockHint: "",
+        excludedToasts,
+      };
     }
     const signals = await readPageTextSignals(page);
     const text = signals.full;
     if (text) {
-      for (const kw of SUCCESS_TOAST_TEXTS) {
+      for (const kw of allowedToasts) {
         if (text.includes(kw)) {
-          return { ok: true, signal: `toast:${kw}`, urlAfter, blockHint: "" };
+          return {
+            ok: true,
+            signal: `toast:${kw}`,
+            urlAfter,
+            blockHint: "",
+            excludedToasts,
+          };
         }
       }
       // 阻断提示只在弹层文本里找：整页正文里的常驻静态文案（字数上限等）
@@ -89,7 +158,13 @@ async function waitForPublishSignal(page, urlBefore, timeoutMs) {
     }
     await delay(page, 1000);
   }
-  return { ok: false, signal: "none", urlAfter: readPageUrl(page), blockHint };
+  return {
+    ok: false,
+    signal: "none",
+    urlAfter: readPageUrl(page),
+    blockHint,
+    excludedToasts,
+  };
 }
 
 /** 存草稿结果的轮询间隔：toast 存活一般 ≥2 秒，400ms 足够捕捉 */
@@ -404,6 +479,8 @@ export async function replyPublishOutcome({
   draftVerdictOverride,
   closeWindowData,
   waitMs = PUBLISH_NAVIGATE_WAIT_MS,
+  excludeSuccessToasts,
+  abnormalMessage,
 }) {
   // 草稿模式：先轮询页面信号校验保存结果，再决定回执（#42）。
   // 此前只要点击不抛错就一律 status:true，后台无草稿也回报成功。
@@ -484,12 +561,30 @@ export async function replyPublishOutcome({
   }
 
   // 发布模式判定窗口用 20 秒信号轮询；waitMs 仅约束草稿模式（存稿 5 秒足够）
-  const verdict = await waitForPublishSignal(page, urlBefore, PUBLISH_VERDICT_TIMEOUT_MS);
+  const verdict = await waitForPublishSignal(
+    page,
+    urlBefore,
+    PUBLISH_VERDICT_TIMEOUT_MS,
+    {
+      platform: data && data.pt,
+      excludeSuccessToasts,
+    }
+  );
   const urlAfter = verdict.urlAfter;
   // 读不到地址（窗口已关/页面销毁）时 abnormal 为 false，不误报异常
   const abnormal = !verdict.ok && !!verdict.urlAfter;
+  const excludedList = Array.isArray(verdict.excludedToasts)
+    ? verdict.excludedToasts
+    : [];
+  const baseAbnormalMessage =
+    abnormalMessage ||
+    (excludedList.length > 0
+      ? PUBLISH_UNCONFIRMED_MESSAGE
+      : PUBLISH_ABNORMAL_MESSAGE);
   console.log(
-    `[publish] ${data.pt || ""} 发布判定 signal=${verdict.signal} ${
+    `[publish] ${data.pt || ""} 发布判定 signal=${verdict.signal}${
+      excludedList.length ? ` excluded=[${excludedList.join(",")}]` : ""
+    } ${
       abnormal
         ? "→ 异常"
         : verdict.ok
@@ -505,7 +600,7 @@ export async function replyPublishOutcome({
     publishPageUrl: urlAfter,
     publishSignal: verdict.signal,
     message: abnormal
-      ? `${PUBLISH_ABNORMAL_MESSAGE}${
+      ? `${baseAbnormalMessage}${
           verdict.blockHint ? `；页面提示「${verdict.blockHint}」` : ""
         }`
       : successMessage,
@@ -558,7 +653,9 @@ export async function replyPublishFailure({
   extraPayload = {},
   closeWindow = true,
 }) {
-  const shot = await capturePublishFailureScreenshot(page, data, { window });
+  const shot =
+    (extraPayload && extraPayload.failScreenshot) ||
+    (await capturePublishFailureScreenshot(page, data, { window }));
   try {
     event.reply("puppeteerFile-done", {
       ...data,

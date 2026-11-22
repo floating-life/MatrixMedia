@@ -9,6 +9,7 @@ import {
   resolveSphCreativeStatementLabel,
 } from "../../../shared/creativeStatement.js";
 import { attachSphVideoLink } from "./sphLink.js";
+import { selectPlatformCollection } from "./collection.js";
 import {
   WAIT_SELECTOR_APPEAR_MS,
   WAIT_UPLOAD_PROCESSING_MS,
@@ -635,7 +636,13 @@ export default async function (page, data, window, event, onFinish) {
       await uploadSphCustomCover(page, coverPath);
     }
 
-    // 所有表单项（包括商品）完成后，草稿和发布只能二选一执行。
+    // 选择合集（留空跳过；找不到入口/同名合集/回读不符时抛确定性错误中止发布且不重试）
+    await selectPlatformCollection(page, "视频号", data.publishOptions, {
+      data,
+      window,
+    });
+
+    // 所有表单项（包括商品、合集）完成后，草稿和发布只能二选一执行。
     const urlBefore = readPageUrl(page);
     if (isDraftMode) await clickSphDraftButton(page);
     else await clickSphPublishButton(page);
@@ -710,6 +717,7 @@ export default async function (page, data, window, event, onFinish) {
   } catch (err) {
     const detail =
       (err && err.message) || (typeof err === "string" ? err : String(err));
+    const isCollectionError = Boolean(err && err.isCollectionError);
     console.error("❌ 视频号发布失败:", err);
     // 失败瞬间截图留证（登录过期 / 风控弹窗 / 元素改版都能一眼看出）
     await replyPublishFailure({
@@ -717,10 +725,22 @@ export default async function (page, data, window, event, onFinish) {
       data,
       window,
       event,
-      message:
-        detail && detail.length > 400
-          ? `${detail.slice(0, 400)}…`
-          : detail || "上传失败",
+      message: isCollectionError
+        ? detail
+        : detail && detail.length > 400
+        ? `${detail.slice(0, 400)}…`
+        : detail || "上传失败",
+      ...(isCollectionError
+        ? {
+            extraPayload: {
+              outcome: "collection_failed",
+              needsAttention: true,
+              ...(err.failScreenshot
+                ? { failScreenshot: err.failScreenshot }
+                : {}),
+            },
+          }
+        : {}),
       closeWindow: true,
     });
   }

@@ -666,6 +666,26 @@ export default async function (page, data, window, event) {
       await attachKsProductLink(page, link);
       productAttachmentPending = false;
     }
+
+    // 选择合集（留空跳过；仅在传入合集相关配置时加载 collection.js 以兼容离线挂车单测）
+    const rawPublishOptions = data && data.publishOptions;
+    const mayHaveCollection = Boolean(
+      rawPublishOptions &&
+        (rawPublishOptions.collection ||
+          (rawPublishOptions.collections &&
+            typeof rawPublishOptions.collections === "object") ||
+          (rawPublishOptions.platformOptions &&
+            typeof rawPublishOptions.platformOptions === "object"))
+    );
+    if (mayHaveCollection) {
+      const { selectPlatformCollection } = await import(
+        /* webpackMode: "eager" */ "./collection.js"
+      );
+      await selectPlatformCollection(page, "快手", data.publishOptions, {
+        data,
+        window,
+      });
+    }
     await page.waitForFunction(
       (text) => {
         const bar = document.querySelector("#setting-tours + div");
@@ -733,6 +753,8 @@ export default async function (page, data, window, event) {
       event,
       urlBefore,
       isDraftMode,
+      // 快手编辑页视频上传完常驻「上传成功」，发布模式不能把它当发布成功信号
+      excludeSuccessToasts: ["上传成功", "草稿已保存"],
       successMessage: isDraftMode
         ? "已点击取消发布/存草稿入口（快手网页端无草稿箱，无法核验）"
         : "上传成功",
@@ -741,6 +763,7 @@ export default async function (page, data, window, event) {
   } catch (e) {
     // 失败瞬间截图留证（登录过期 / 风控弹窗 / 元素改版都能一眼看出）
     const detail = (e && e.message) || String(e);
+    const isCollectionError = Boolean(e && e.isCollectionError);
     await replyPublishFailure({
       page,
       data,
@@ -748,10 +771,24 @@ export default async function (page, data, window, event) {
       event,
       message: productAttachmentPending
         ? `快手挂车失败，已停止发布：${e && e.message ? e.message : "无法确认商品状态"}`
-        : detail.length > 200 ? `${detail.slice(0, 200)}…` : detail,
-      ...(productAttachmentPending ? {
-        extraPayload: { outcome: "product_link_failed", needsAttention: true },
-      } : {}),
+        : isCollectionError
+        ? detail
+        : detail.length > 200
+        ? `${detail.slice(0, 200)}…`
+        : detail,
+      ...(productAttachmentPending
+        ? {
+            extraPayload: { outcome: "product_link_failed", needsAttention: true },
+          }
+        : isCollectionError
+        ? {
+            extraPayload: {
+              outcome: "collection_failed",
+              needsAttention: true,
+              ...(e.failScreenshot ? { failScreenshot: e.failScreenshot } : {}),
+            },
+          }
+        : {}),
     });
     console.error("❌ 发布失败", e);
   }
