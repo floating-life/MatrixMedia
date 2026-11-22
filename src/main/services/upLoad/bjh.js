@@ -600,82 +600,89 @@ export default async function (page, data, window, event) {
     console.log("[bjh] 视频上传进度条已消失，准备点击");
 
 
-    // 点击后解析 .cheetah-message.cheetah-message-top 的图标类型。
-    // 2026-11-22 线上事故：成功提示的图标不是 info-circle（如 check-circle），
-    // 旧逻辑把它当失败连点「发布」，同一视频被发了 5 次。现在的规则（宁漏勿重）：
-    //   - 只有 close-circle（明确失败）且提示里没有「成功」才重试，最多共 BJH_MAX_ACTION_CLICKS 次；
-    //   - 其它任何提示/无提示 → 视为已点击，交给 replyPublishOutcome 判定；
-    //   - 每次重试前先确认仍停在编辑页（地址未变、标题框还在），否则视为已发出，绝不再点。
-    const BJH_MAX_ACTION_CLICKS = 3;
+    // 2026-11-22 线上事故：成功提示图标不是 info-circle 时被当失败，循环连点「发布」，
+    // 同一视频被发了 5 次。规则（宁漏勿重）：
+    //   - 发布模式：只点一次，任何情况都不重试；出现明确失败提示 → 报失败并提示去后台核对；
+    //   - 草稿模式：仅 close-circle 且提示已消失、仍在编辑页时重试，最多共 3 次；
+    //   - 读取提示本身出错（如成功跳转导致上下文销毁）→ 视为已点击，交给结果判定。
+    const maxClicks = isDraftMode ? 3 : 1;
     let clickSuccess = false;
     const urlBefore = readPageUrl(page);
-    for (let attempt = 1; attempt <= BJH_MAX_ACTION_CLICKS; attempt++) {
+    for (let attempt = 1; attempt <= maxClicks; attempt++) {
       if (attempt > 1) {
         const urlNow = readPageUrl(page);
         const titleBox = await page.$(BJH_TITLE_SELECTOR).catch(() => null);
         if ((urlBefore && urlNow && urlNow !== urlBefore) || !titleBox) {
-          console.log(
-            `[bjh] 重试前发现页面已离开编辑页（url=${urlNow}，标题框${
-              titleBox ? "在" : "不在"
-            }），视为已发出，不再点击`
-          );
+          console.log(`[bjh] 重试前发现页面已离开编辑页（url=${urlNow}），视为已点击，不再点击`);
           clickSuccess = true;
           break;
         }
       }
-      // 视频解析完成后百家号可能把文件名回填进标题：每次点击前都终检
+      // 视频解析完成后百家号可能把文件名回填进标题：点击前终检
       await ensureBjhTitle(page, wantTitle, fileStem);
       await page.mouse.click(cx, cy, { delay: 80 });
       console.log(
-        `[bjh] 第 ${attempt} 次点击「${actionText}」at (${Math.round(
+        `[bjh] 第 ${attempt}/${maxClicks} 次点击「${actionText}」at (${Math.round(
           cx
         )}, ${Math.round(cy)})`
       );
 
-      // 等最多 10s，监听消息框出现
-      const appeared = await page
+      let msg = null;
+      try {
+        const appeared = await page
+          .waitForSelector(".cheetah-message.cheetah-message-top", {
+            visible: true,
+            timeout: 10000,
+          })
+          .then(() => true)
+          .catch(() => false);
+        if (appeared) {
+          msg = await page.evaluate(function () {
+            var el = document.querySelector(".cheetah-message.cheetah-message-top");
+            if (!el) return null;
+            var icon = el.querySelector('span[role="img"]');
+            return {
+              type: icon ? icon.getAttribute("aria-label") || "unknown" : "unknown",
+              text: (el.innerText || el.textContent || "").trim().slice(0, 120),
+            };
+          });
+        }
+      } catch (readErr) {
+        console.log(`[bjh] 读取提示出错（多半页面已跳转），视为已点击: ${readErr?.message || readErr}`);
+        msg = null;
+      }
+
+      if (!msg) {
+        console.log(`[bjh] 未读到提示，视为已点击`);
+        clickSuccess = true;
+        break;
+      }
+      console.log(`[bjh] 消息提示: type=${msg.type} text="${msg.text}"`);
+      if (msg.type !== "close-circle" || /成功/.test(msg.text)) {
+        console.log(`[bjh] 非明确失败提示，视为已点击`);
+        clickSuccess = true;
+        break;
+      }
+
+      if (!isDraftMode) {
+        throw new Error(
+          `百家号点击「发布」后出现失败提示：${msg.text || msg.type}。为防重复发布未自动重试，请先到百家号后台核对是否已发出再决定是否重发`
+        );
+      }
+      if (attempt >= maxClicks) {
+        throw new Error(`百家号「${actionText}」${attempt} 次点击均出现失败提示：${msg.text || msg.type}`);
+      }
+      const hidden = await page
         .waitForSelector(".cheetah-message.cheetah-message-top", {
-          visible: true,
-          timeout: 10000,
+          hidden: true,
+          timeout: 8000,
         })
         .then(() => true)
         .catch(() => false);
-
-      if (!appeared) {
-        console.log(`[bjh] 10s 内未出现任何提示，视为已点击`);
-        clickSuccess = true;
-        break;
+      if (!hidden) {
+        throw new Error(`百家号「${actionText}」失败提示未消失，停止重试：${msg.text || msg.type}`);
       }
-
-      const msg = await page.evaluate(function () {
-        var el = document.querySelector(".cheetah-message.cheetah-message-top");
-        if (!el) return { type: "unknown", text: "" };
-        var icon = el.querySelector('span[role="img"]');
-        return {
-          type: icon ? icon.getAttribute("aria-label") || "unknown" : "unknown",
-          text: (el.innerText || el.textContent || "").trim().slice(0, 120),
-        };
-      });
-      console.log(`[bjh] 消息提示: type=${msg.type} text="${msg.text}"`);
-
-      if (msg.type !== "close-circle" || /成功/.test(msg.text)) {
-        console.log(`[bjh] 非明确失败提示，视为已点击，不再重试`);
-        clickSuccess = true;
-        break;
-      }
-
-      if (attempt >= BJH_MAX_ACTION_CLICKS) {
-        throw new Error(
-          `百家号「${actionText}」${attempt} 次点击均出现失败提示：${msg.text || msg.type}`
-        );
-      }
-      console.warn(`[bjh] 出现失败提示，第 ${attempt} 次点击后重试...`);
-      await page
-        .waitForSelector(".cheetah-message.cheetah-message-top", {
-          hidden: true,
-          timeout: 5000,
-        })
-        .catch(() => {});
+      console.warn(`[bjh] 存草稿出现失败提示，第 ${attempt} 次后重试...`);
       await page.waitForTimeout(1500);
     }
 
