@@ -600,13 +600,29 @@ export default async function (page, data, window, event) {
     console.log("[bjh] 视频上传进度条已消失，准备点击");
 
 
-    // 点击后解析 .cheetah-message.cheetah-message-top 的图标类型：
-    //   aria-label="info-circle"  → 成功提示，直接结束
-    //   aria-label="close-circle" → 失败提示，重试
-    //   10s 内不出现任何提示      → 也视为成功
+    // 点击后解析 .cheetah-message.cheetah-message-top 的图标类型。
+    // 2026-11-22 线上事故：成功提示的图标不是 info-circle（如 check-circle），
+    // 旧逻辑把它当失败连点「发布」，同一视频被发了 5 次。现在的规则（宁漏勿重）：
+    //   - 只有 close-circle（明确失败）且提示里没有「成功」才重试，最多共 BJH_MAX_ACTION_CLICKS 次；
+    //   - 其它任何提示/无提示 → 视为已点击，交给 replyPublishOutcome 判定；
+    //   - 每次重试前先确认仍停在编辑页（地址未变、标题框还在），否则视为已发出，绝不再点。
+    const BJH_MAX_ACTION_CLICKS = 3;
     let clickSuccess = false;
     const urlBefore = readPageUrl(page);
-    for (let attempt = 1; attempt <= 10; attempt++) {
+    for (let attempt = 1; attempt <= BJH_MAX_ACTION_CLICKS; attempt++) {
+      if (attempt > 1) {
+        const urlNow = readPageUrl(page);
+        const titleBox = await page.$(BJH_TITLE_SELECTOR).catch(() => null);
+        if ((urlBefore && urlNow && urlNow !== urlBefore) || !titleBox) {
+          console.log(
+            `[bjh] 重试前发现页面已离开编辑页（url=${urlNow}，标题框${
+              titleBox ? "在" : "不在"
+            }），视为已发出，不再点击`
+          );
+          clickSuccess = true;
+          break;
+        }
+      }
       // 视频解析完成后百家号可能把文件名回填进标题：每次点击前都终检
       await ensureBjhTitle(page, wantTitle, fileStem);
       await page.mouse.click(cx, cy, { delay: 80 });
@@ -626,35 +642,41 @@ export default async function (page, data, window, event) {
         .catch(() => false);
 
       if (!appeared) {
-        console.log(`[bjh] 10s 内未出现任何提示，点击成功`);
+        console.log(`[bjh] 10s 内未出现任何提示，视为已点击`);
         clickSuccess = true;
         break;
       }
 
-      // 出现提示后，读取图标 aria-label 判断成功/失败
-      const msgType = await page.evaluate(function () {
+      const msg = await page.evaluate(function () {
         var el = document.querySelector(".cheetah-message.cheetah-message-top");
-        if (!el) return "unknown";
+        if (!el) return { type: "unknown", text: "" };
         var icon = el.querySelector('span[role="img"]');
-        return icon ? icon.getAttribute("aria-label") || "unknown" : "unknown";
+        return {
+          type: icon ? icon.getAttribute("aria-label") || "unknown" : "unknown",
+          text: (el.innerText || el.textContent || "").trim().slice(0, 120),
+        };
       });
-      console.log(`[bjh] 消息提示图标类型: ${msgType}`);
+      console.log(`[bjh] 消息提示: type=${msg.type} text="${msg.text}"`);
 
-      if (msgType === "info-circle") {
-        console.log(`[bjh] 出现 info-circle 成功提示，点击成功`);
+      if (msg.type !== "close-circle" || /成功/.test(msg.text)) {
+        console.log(`[bjh] 非明确失败提示，视为已点击，不再重试`);
         clickSuccess = true;
         break;
       }
 
-      // close-circle 或其他 → 失败，等提示消失后重试
-      console.warn(`[bjh] 出现 ${msgType} 失败提示，第 ${attempt} 次重试...`);
+      if (attempt >= BJH_MAX_ACTION_CLICKS) {
+        throw new Error(
+          `百家号「${actionText}」${attempt} 次点击均出现失败提示：${msg.text || msg.type}`
+        );
+      }
+      console.warn(`[bjh] 出现失败提示，第 ${attempt} 次点击后重试...`);
       await page
         .waitForSelector(".cheetah-message.cheetah-message-top", {
           hidden: true,
           timeout: 5000,
         })
         .catch(() => {});
-      await page.waitForTimeout(500);
+      await page.waitForTimeout(1500);
     }
 
     if (!clickSuccess) {
