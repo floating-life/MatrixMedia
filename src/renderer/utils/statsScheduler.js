@@ -34,6 +34,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
 const UTC8_MS = 8 * 3600 * 1000;
 const DAY_MS = 24 * 3600 * 1000;
 const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
+const END_TIME_RE = /^(?:(?:[01]\d|2[0-3]):[0-5]\d|24:00)$/;
 const DATE_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
 const SLOT_RE = /^(\d{4}-\d{2}-\d{2}) ([01]\d|2[0-3]):([0-5]\d)$/;
 const MAIN_ROUTE_PREFIXES = [
@@ -50,10 +51,20 @@ export function isValidTimeStr(time) {
   return typeof time === "string" && TIME_RE.test(time);
 }
 
+export function isValidEndTimeStr(time) {
+  return typeof time === "string" && END_TIME_RE.test(time);
+}
+
 export function parseTimeToMinutes(time) {
   if (typeof time !== "string") return null;
   const match = TIME_RE.exec(time);
   return match ? Number(match[1]) * 60 + Number(match[2]) : null;
+}
+
+export function parseEndTimeToMinutes(time) {
+  if (typeof time !== "string") return null;
+  if (time === "24:00") return 1440;
+  return parseTimeToMinutes(time);
 }
 
 export function isValidDateStr(date) {
@@ -139,7 +150,7 @@ export function normalizeSettings(raw) {
     startTime: isValidTimeStr(raw.startTime)
       ? raw.startTime
       : DEFAULT_SETTINGS.startTime,
-    endTime: isValidTimeStr(raw.endTime) ? raw.endTime : DEFAULT_SETTINGS.endTime,
+    endTime: isValidEndTimeStr(raw.endTime) ? raw.endTime : DEFAULT_SETTINGS.endTime,
     intervalHours: normalizeIntervalHours(raw.intervalHours),
     time: isValidTimeStr(raw.time) ? raw.time : DEFAULT_SETTINGS.time,
     retentionDays: normalizeRetentionDays(raw.retentionDays),
@@ -151,30 +162,38 @@ export function normalizeSettings(raw) {
 /**
  * 计算以指定 UTC+8 日历日 baseDate 为起点的固定时段内所有槽：
  * - 从 startTime 起每 intervalHours 小时一个槽，若 endTime 恰好落在槽上则包含 endTime
+ * - endTime === "24:00"（1440 分钟）视为排他末端：不额外生成 24:00 / 次日 00:00 槽，末槽窗口截止到次日 00:00
  * - endTime < startTime 视为跨零点（延续到次日 endTime），每个槽的日期按槽开始时刻的 UTC+8 日历日
  * - 非末槽有效窗口为 [startMs, 下一槽开始)
- * - 末槽有效窗口截断到 endTime（[lastSlotStart, endTime)）；若 endTime 恰为槽时刻，该槽有效窗口为 [endTime, endTime + END_SLOT_GRACE_MS(5分钟))
+ * - 末槽有效窗口截断到 endTime（[lastSlotStart, endTime)）；若 endTime (<24:00) 恰为槽时刻，该槽有效窗口为 [endTime, endTime + END_SLOT_GRACE_MS(5分钟))
  */
 export function buildScheduleSlots(baseDate, settings) {
   const baseStartMs = utc8DayStartMs(baseDate);
   if (baseStartMs === null) return [];
   const cfg = normalizeSettings(settings);
   const startMin = parseTimeToMinutes(cfg.startTime);
-  const endMin = parseTimeToMinutes(cfg.endTime);
+  const endMin = parseEndTimeToMinutes(cfg.endTime);
   if (startMin === null || endMin === null) return [];
 
+  const isExclusiveEnd = endMin === 1440;
   const stepMin = cfg.intervalHours * 60;
   const spanMin = endMin < startMin ? endMin + 1440 - startMin : endMin - startMin;
   const windowEndMs = baseStartMs + (startMin + spanMin) * 60000;
   const slots = [];
 
-  for (let offsetMin = 0; offsetMin <= spanMin; offsetMin += stepMin) {
+  for (
+    let offsetMin = 0;
+    isExclusiveEnd ? offsetMin < spanMin : offsetMin <= spanMin;
+    offsetMin += stepMin
+  ) {
     const startMs = baseStartMs + (startMin + offsetMin) * 60000;
-    const isLastSlot = offsetMin + stepMin > spanMin;
+    const isLastSlot = isExclusiveEnd
+      ? offsetMin + stepMin >= spanMin
+      : offsetMin + stepMin > spanMin;
     let endMs;
     if (!isLastSlot) {
       endMs = startMs + stepMin * 60000;
-    } else if (startMs === windowEndMs) {
+    } else if (!isExclusiveEnd && startMs === windowEndMs) {
       endMs = windowEndMs + END_SLOT_GRACE_MS;
     } else {
       endMs = windowEndMs;
@@ -470,7 +489,7 @@ function defaultAutoRun(accounts, meta) {
     if (meta && typeof meta.startTime === "string" && isValidTimeStr(meta.startTime)) {
       payload.startTime = meta.startTime;
     }
-    if (meta && typeof meta.endTime === "string" && isValidTimeStr(meta.endTime)) {
+    if (meta && typeof meta.endTime === "string" && isValidEndTimeStr(meta.endTime)) {
       payload.endTime = meta.endTime;
     }
     return ipcRenderer.invoke("stats:auto-run", payload);
@@ -757,7 +776,9 @@ export default {
   VALID_INTERVAL_HOURS,
   DEFAULT_RETENTION_DAYS,
   isValidTimeStr,
+  isValidEndTimeStr,
   parseTimeToMinutes,
+  parseEndTimeToMinutes,
   isValidDateStr,
   isValidSlotStr,
   formatLocalDate,

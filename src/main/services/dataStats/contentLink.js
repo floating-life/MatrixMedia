@@ -615,6 +615,23 @@ function isUnstableRecordKey(key) {
   return typeof key === "string" && UNSTABLE_RECORD_KEY_RE.test(key);
 }
 
+function isPosRecordKey(key) {
+  return typeof key === "string" && (key.startsWith("record:pos:") || isUnstableRecordKey(key));
+}
+
+function normalizeDeletedTitle(title) {
+  return typeof title === "string" ? title.trim() : "";
+}
+
+const FORBIDDEN_PROTO_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+function isValidDeletableContentKey(key) {
+  if (typeof key !== "string") return false;
+  const trimmed = key.trim();
+  if (!trimmed || trimmed !== key) return false;
+  return !FORBIDDEN_PROTO_KEYS.has(trimmed);
+}
+
 /** 作品身份键：`platform|workId`（不含 group，同一账号挂多分组共享同一作品身份） */
 function makeWorkIdentityKey(platform, workId) {
   return `${toSafeString(platform)}|${toSafeString(workId)}`;
@@ -642,33 +659,65 @@ function computeAutoClusterKey(sortedMemberKeys) {
 }
 
 /**
- * 清洗手工矫正配置，兼容传入 `{ version, updatedAt, contents?, excludedAuto?, overrides }` 或直接传入 overrides 字典。
+ * 清洗手工矫正配置，兼容传入 `{ version, updatedAt, contents?, excludedAuto?, deletedContents?, overrides? }` 或直接传入 overrides 字典。
  * overrides 键为作品身份 `platform|workId`；
- * 返回 `{ overrides: Map<pwKey, entry>, contents: Map<contentKey, { title, createdAt }>, excludedAuto: Set<pwKey> }`。
+ * 返回 `{ overrides: Map<pwKey, entry>, contents: Map<contentKey, { title, createdAt }>, excludedAuto: Set<pwKey>, deletedContents: Map<contentKey, { deletedAt, title?, pwKeys? }> }`。
  */
+function normalizeDeletedContentEntry(meta) {
+  if (!isPlainObject(meta)) return null;
+  if (typeof meta.deletedAt !== "number" || !Number.isFinite(meta.deletedAt) || meta.deletedAt < 0) {
+    return null;
+  }
+  const out = { deletedAt: meta.deletedAt };
+  if (hasOwn(meta, "title") && typeof meta.title === "string") {
+    const trimmed = meta.title.trim();
+    if (trimmed) out.title = trimmed;
+  }
+  if (hasOwn(meta, "pwKeys") && Array.isArray(meta.pwKeys)) {
+    const seen = new Set();
+    const validPwKeys = [];
+    for (const rawKey of meta.pwKeys) {
+      if (!isValidWorkIdentityKey(rawKey)) continue;
+      if (seen.has(rawKey)) continue;
+      seen.add(rawKey);
+      validPwKeys.push(rawKey);
+    }
+    validPwKeys.sort(compareText);
+    out.pwKeys = validPwKeys;
+  }
+  return out;
+}
+
 function normalizeOverridesDoc(raw) {
   const overrides = new Map();
   const contents = new Map();
   const excludedAuto = new Set();
-  if (!isPlainObject(raw)) return { overrides, contents, excludedAuto };
+  const deletedContents = new Map();
+  if (!isPlainObject(raw)) return { overrides, contents, excludedAuto, deletedContents };
   const isDoc =
-    hasOwn(raw, "overrides") && isPlainObject(raw.overrides) && typeof raw.action !== "string";
-  const source = isDoc ? raw.overrides : raw;
-  for (const pwKey of Object.keys(source)) {
-    if (!isValidWorkIdentityKey(pwKey)) continue;
-    const desc = Object.getOwnPropertyDescriptor(source, pwKey);
-    const entry = desc ? desc.value : null;
-    if (!isPlainObject(entry)) continue;
-    const action = typeof entry.action === "string" ? entry.action.trim() : "";
-    if (action === "detach") {
-      overrides.set(pwKey, { action: "detach" });
-      excludedAuto.add(pwKey);
-    } else if (action === "assign") {
-      const contentKey = typeof entry.contentKey === "string" ? entry.contentKey.trim() : "";
-      if (contentKey && !contentKey.startsWith("unlinked:")) {
-        overrides.set(pwKey, { action: "assign", contentKey });
-        if (entry.excludeAuto === true) {
-          excludedAuto.add(pwKey);
+    typeof raw.action !== "string" &&
+    ((hasOwn(raw, "overrides") && isPlainObject(raw.overrides)) ||
+      (hasOwn(raw, "deletedContents") && isPlainObject(raw.deletedContents)) ||
+      (hasOwn(raw, "contents") && isPlainObject(raw.contents)) ||
+      (hasOwn(raw, "excludedAuto") && isPlainObject(raw.excludedAuto)));
+  const source = isDoc ? (isPlainObject(raw.overrides) ? raw.overrides : null) : raw;
+  if (source) {
+    for (const pwKey of Object.keys(source)) {
+      if (!isValidWorkIdentityKey(pwKey)) continue;
+      const desc = Object.getOwnPropertyDescriptor(source, pwKey);
+      const entry = desc ? desc.value : null;
+      if (!isPlainObject(entry)) continue;
+      const action = typeof entry.action === "string" ? entry.action.trim() : "";
+      if (action === "detach") {
+        overrides.set(pwKey, { action: "detach" });
+        excludedAuto.add(pwKey);
+      } else if (action === "assign") {
+        const contentKey = typeof entry.contentKey === "string" ? entry.contentKey.trim() : "";
+        if (contentKey && !contentKey.startsWith("unlinked:")) {
+          overrides.set(pwKey, { action: "assign", contentKey });
+          if (entry.excludeAuto === true) {
+            excludedAuto.add(pwKey);
+          }
         }
       }
     }
@@ -693,7 +742,166 @@ function normalizeOverridesDoc(raw) {
       contents.set(ck, { title: meta.title, createdAt: meta.createdAt });
     }
   }
-  return { overrides, contents, excludedAuto };
+  if (isDoc && hasOwn(raw, "deletedContents") && isPlainObject(raw.deletedContents)) {
+    for (const ck of Object.keys(raw.deletedContents)) {
+      if (!isValidDeletableContentKey(ck)) continue;
+      const desc = Object.getOwnPropertyDescriptor(raw.deletedContents, ck);
+      const normalized = normalizeDeletedContentEntry(desc ? desc.value : null);
+      if (normalized) {
+        deletedContents.set(ck, normalized);
+      }
+    }
+  }
+  return { overrides, contents, excludedAuto, deletedContents };
+}
+
+/**
+ * 判断内容行（contentKey + 当前行标题）是否命中 deletedContents 条目：
+ * - record:pos:* 与不稳定位置键必须条目含有效 title 且与当前行标题一致才算命中
+ * - 其余稳定键（file:/record:id:/manual:/auto:/unlinked: 等）只按 contentKey 匹配，不看标题
+ */
+function isContentRowDeleted(contentKey, rowTitle, deletedContents) {
+  if (!(deletedContents instanceof Map) || deletedContents.size === 0) return false;
+  const entry = deletedContents.get(contentKey);
+  if (!entry) return false;
+  if (isPosRecordKey(contentKey)) {
+    const snapTitle = normalizeDeletedTitle(entry.title);
+    const curTitle = normalizeDeletedTitle(rowTitle);
+    return Boolean(snapTitle) && snapTitle === curTitle;
+  }
+  return true;
+}
+
+function extractPwKeyFromLinkKey(rawKey) {
+  if (typeof rawKey !== "string" || !rawKey) return "";
+  if (isValidWorkIdentityKey(rawKey)) return rawKey;
+  const lastPipe = rawKey.lastIndexOf("|");
+  if (lastPipe <= 0) return "";
+  const prevPipe = rawKey.lastIndexOf("|", lastPipe - 1);
+  if (prevPipe < 0) return "";
+  const candidate = rawKey.slice(prevPipe + 1);
+  return isValidWorkIdentityKey(candidate) ? candidate : "";
+}
+
+/**
+ * 收集所有至少包含一个已删除成员作品（pwKey 命中 deletedPwKeys）的内容行 contentKey。
+ * 例如双平台自动聚类被删除后新平台加入导致 auto:<hash> 换键时，新聚类仍含原已删除成员，整行及全部成员一律隐藏。
+ */
+function collectDeletedRowKeysByPwKeys(link, deletedPwKeys) {
+  const rowKeys = new Set();
+  if (!(link instanceof Map) || !(deletedPwKeys instanceof Set) || deletedPwKeys.size === 0) {
+    return rowKeys;
+  }
+  const linkMeta = LINK_RESULT_META.get(link);
+  if (linkMeta && linkMeta.byWorkIdentity instanceof Map) {
+    for (const [pwKey, entry] of linkMeta.byWorkIdentity.entries()) {
+      if (!deletedPwKeys.has(pwKey)) continue;
+      if (entry && entry.contentKey != null) {
+        const ck = toSafeString(entry.contentKey);
+        if (ck) rowKeys.add(ck);
+      }
+    }
+    return rowKeys;
+  }
+  for (const [workKey, entry] of link.entries()) {
+    if (!entry || entry.contentKey == null) continue;
+    const pwKey = extractPwKeyFromLinkKey(workKey);
+    if (!pwKey || !deletedPwKeys.has(pwKey)) continue;
+    const ck = toSafeString(entry.contentKey);
+    if (ck) rowKeys.add(ck);
+  }
+  return rowKeys;
+}
+
+/**
+ * 构建统一的已删除过滤上下文（供日明细、时段明细、分析与汇总共享）：
+ * - deletedContents: Map<contentKey, { deletedAt, title?, pwKeys? }>
+ * - deletedPwKeys: Set<pwKey>（所有删除条目 pwKeys 的并集，与日期截止、聚类键变化无关）
+ * - deletedRowKeysByPw: Set<contentKey>（任一成员作品 pwKey 命中 deletedPwKeys 的内容行键集合，整行连同全部作品隐藏）
+ * - contentTitleByKey: Map<contentKey, title>（用于校验 record:pos:* 对应当前行的标题）
+ */
+function buildDeletedFilter(overrides, { contents, link } = {}) {
+  const { deletedContents, contents: overrideContents } = normalizeOverridesDoc(overrides);
+  const deletedPwKeys = new Set();
+  for (const meta of deletedContents.values()) {
+    if (Array.isArray(meta.pwKeys)) {
+      for (const pwKey of meta.pwKeys) {
+        deletedPwKeys.add(pwKey);
+      }
+    }
+  }
+  const deletedRowKeysByPw = collectDeletedRowKeysByPwKeys(link, deletedPwKeys);
+  const contentTitleByKey = new Map();
+  if (Array.isArray(contents)) {
+    for (const c of contents) {
+      if (isPlainObject(c) && c.contentKey) {
+        contentTitleByKey.set(
+          toSafeString(c.contentKey),
+          toSafeString(c.displayTitle) || "(无标题)"
+        );
+      }
+    }
+  }
+  const linkMeta = link instanceof Map ? LINK_RESULT_META.get(link) : null;
+  if (linkMeta && linkMeta.syntheticTitlesByKey instanceof Map) {
+    for (const [ck, t] of linkMeta.syntheticTitlesByKey.entries()) {
+      if (!contentTitleByKey.has(ck)) {
+        contentTitleByKey.set(ck, t);
+      }
+    }
+  }
+  for (const [ck, meta] of overrideContents.entries()) {
+    if (meta && meta.title) {
+      contentTitleByKey.set(ck, meta.title);
+    }
+  }
+  return {
+    active: deletedContents.size > 0,
+    deletedContents,
+    deletedPwKeys,
+    deletedRowKeysByPw,
+    contentTitleByKey,
+  };
+}
+
+/**
+ * 判断单条平台作品是否应被 deletedFilter 隐藏：
+ * 1. 作品 pwKey 在任一删除条目的 pwKeys 里 → 隐藏（与日期截止、聚类键变化无关）
+ * 2. 作品所属内容行任一成员作品 pwKey 命中 deletedPwKeys（deletedRowKeysByPw）→ 整行连同其全部作品隐藏
+ * 3. 否则按其当前有效 contentKey（record:pos:* 额外校验行标题）检查 isContentRowDeleted
+ */
+function isWorkDeleted(group, platform, workId, link, deletedFilter, workTitle = "") {
+  if (!deletedFilter || !deletedFilter.active) return false;
+  const groupStr = toSafeString(group);
+  const platformStr = toSafeString(platform);
+  const workIdStr = toSafeString(workId);
+  const pwKey = makeWorkIdentityKey(platformStr, workIdStr);
+  if (deletedFilter.deletedPwKeys instanceof Set && deletedFilter.deletedPwKeys.has(pwKey)) {
+    return true;
+  }
+  const linkInfo =
+    link instanceof Map
+      ? link.get(`${groupStr}|${platformStr}|${workIdStr}`) ||
+        link.get(`${platformStr}|${workIdStr}`) ||
+        null
+      : null;
+  const hasLinked = Boolean(linkInfo && linkInfo.contentKey != null);
+  const effectiveContentKey = hasLinked
+    ? String(linkInfo.contentKey)
+    : `unlinked:${platformStr}:${workIdStr}`;
+  if (
+    hasLinked &&
+    deletedFilter.deletedRowKeysByPw instanceof Set &&
+    deletedFilter.deletedRowKeysByPw.has(effectiveContentKey)
+  ) {
+    return true;
+  }
+  const rowTitle = hasLinked
+    ? deletedFilter.contentTitleByKey instanceof Map
+      ? deletedFilter.contentTitleByKey.get(effectiveContentKey) || ""
+      : ""
+    : workTitle;
+  return isContentRowDeleted(effectiveContentKey, rowTitle, deletedFilter.deletedContents);
 }
 
 function buildPreparedCores(titles) {
@@ -2361,7 +2569,16 @@ function pickMinValidPubMs(obsList) {
  * - 按 `platform|workId` 跨组去重：只取一份 ≤date 的最近快照，归组列沿用按分组名排序的首个匹配分组
  * - worksDaily 中出现但 works.json 缺失的作品 ID 纳入手工覆盖范围，未关联时保留为未关联行（title "(已删除或未匹配)"）
  */
-function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, overrides, groups } = {}) {
+function buildContentSummaryRows({
+  contents,
+  accounts,
+  link,
+  worksDaily,
+  date,
+  overrides,
+  groups,
+  includeDeleted = false,
+} = {}) {
   const { ok, cutoffDate } = parseCutoffDate(date);
   if (!ok) return [];
 
@@ -2371,7 +2588,18 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, o
     overrides: overrideMap,
     contents: overrideContents,
     excludedAuto: excludedAutoSet,
+    deletedContents,
   } = normalizeOverridesDoc(overrides);
+  const deletedPwKeys = new Set();
+  if (!includeDeleted && deletedContents.size > 0) {
+    for (const meta of deletedContents.values()) {
+      if (Array.isArray(meta.pwKeys)) {
+        for (const pwKey of meta.pwKeys) {
+          deletedPwKeys.add(pwKey);
+        }
+      }
+    }
+  }
   const groupSet =
     groups instanceof Set
       ? groups.size > 0
@@ -2404,6 +2632,10 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, o
   const rawAutoByWorkKey = linkMeta && linkMeta.rawAutoByWorkKey ? linkMeta.rawAutoByWorkKey : null;
   const metaSyntheticTitles =
     linkMeta && linkMeta.syntheticTitlesByKey ? linkMeta.syntheticTitlesByKey : null;
+  const deletedRowKeysByPw =
+    !includeDeleted && deletedPwKeys.size > 0
+      ? collectDeletedRowKeysByPwKeys(resolvedLink, deletedPwKeys)
+      : new Set();
 
   const contentByKey = new Map();
   const buckets = new Map();
@@ -2426,6 +2658,7 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, o
     platforms: new Set(),
     perPlatform: {},
     workItems: [],
+    hiddenWorkCount: 0,
   });
 
   for (const c of Array.isArray(contents) ? contents : []) {
@@ -2554,7 +2787,7 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, o
         fromWorksJson: true,
       };
       pushToMap(obsByPw, pwKey, obs);
-      if (linkedKey && !contentByKey.has(linkedKey)) {
+      if (linkedKey && !contentByKey.has(linkedKey) && (includeDeleted || !deletedPwKeys.has(pwKey))) {
         pushToMap(syntheticObsByContentKey, linkedKey, obs);
       }
     }
@@ -2607,7 +2840,7 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, o
           fromWorksJson: false,
         };
         pushToMap(obsByPw, pwKey, obs);
-        if (linkedKey && !contentByKey.has(linkedKey)) {
+        if (linkedKey && !contentByKey.has(linkedKey) && (includeDeleted || !deletedPwKeys.has(pwKey))) {
           pushToMap(syntheticObsByContentKey, linkedKey, obs);
         }
       }
@@ -2648,6 +2881,17 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, o
     const resolvedScore = obsList[0].score;
     const hasOverride = overrideMap.has(pwKey) || excludedAutoSet.has(pwKey);
     const bestSnap = pickLatestSnapshot(obsList);
+
+    if (!includeDeleted && deletedPwKeys.has(pwKey)) {
+      if (resolvedLinkedKey != null) {
+        deletedRowKeysByPw.add(resolvedLinkedKey);
+      }
+      if (resolvedLinkedKey != null && bestSnap) {
+        const existingBucket = buckets.get(`linked:${resolvedLinkedKey}`);
+        if (existingBucket) existingBucket.hiddenWorkCount++;
+      }
+      continue;
+    }
 
     if (resolvedLinkedKey != null) {
       // 既有归组列：若存在自动匹配到同一 contentKey 的观测则取按分组名排序的首组，否则取全观测首组
@@ -2759,6 +3003,11 @@ function buildContentSummaryRows({ contents, accounts, link, worksDaily, date, o
 
   const rows = [];
   for (const b of buckets.values()) {
+    if (!includeDeleted) {
+      if (isContentRowDeleted(b.contentKey, b.title, deletedContents)) continue;
+      if (deletedRowKeysByPw.has(b.contentKey)) continue;
+      if (b.hiddenWorkCount > 0 && b.platforms.size === 0) continue;
+    }
     // 保证每个平台单元格内 works / workIds 顺序确定（按 workId 升序）
     for (const cell of Object.values(b.perPlatform)) {
       if (Array.isArray(cell.works) && cell.works.length > 1) {
@@ -2829,7 +3078,13 @@ module.exports = {
   isValidManualContentKey,
   isValidSyntheticContentKey,
   isUnstableRecordKey,
+  isPosRecordKey,
+  isValidDeletableContentKey,
   isValidWorkIdentityKey,
+  normalizeOverridesDoc,
+  isContentRowDeleted,
+  buildDeletedFilter,
+  isWorkDeleted,
   computeTitleSimilarity,
   buildTitleIndex,
   normalizeStatusTitle,

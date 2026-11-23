@@ -18,6 +18,8 @@
  * - stats:merge-works          合并多条未关联作品为同一 manual 内容
  * - stats:clear-link-override  清除单条作品手工矫正，恢复自动匹配
  * - stats:apply-link-overrides 批量原子应用多条手工矫正操作（assign / detach / clear / merge），一次写盘
+ * - stats:delete-contents      批量隐藏/删除内容行（写入 deletedContents，不物理删快照）
+ * - stats:restore-contents     批量恢复已隐藏/删除的内容行（从 deletedContents 移除）
  * - stats:export-xlsx          导出统计 Excel 工作簿（含本地页面校验与保存对话框）
  * - stats:match-works          发布状态匹配（与采集共享 collecting 互斥锁）
  *
@@ -38,13 +40,16 @@ const {
   isValidAutoContentKey,
   isValidManualContentKey,
   isUnstableRecordKey,
+  isValidDeletableContentKey,
   isValidWorkIdentityKey,
+  isContentRowDeleted,
 } = require("./contentLink");
 const {
   validateExportDateRange,
   assertExportRangeNotAllFuture,
   buildDefaultExportFileName,
   resolveLinkValidationContext,
+  resolveDeleteContentSnapshots,
   buildContentSummaryData,
   buildContentTrendData,
   buildContentIntradayData,
@@ -55,11 +60,22 @@ const {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+const LINK_OVERRIDES_READ_ERROR_MESSAGE =
+  store.LINK_OVERRIDES_READ_ERROR_MESSAGE || "读取手工矫正配置失败，请稍后重试";
+
+function isLinkOverridesReadErr(err) {
+  if (typeof store.isLinkOverridesReadError === "function" && store.isLinkOverridesReadError(err)) {
+    return true;
+  }
+  return Boolean(err && typeof err === "object" && err.isLinkOverridesReadError === true);
+}
+
 const VALID_TRIGGERS = new Set(["auto", "manual"]);
 const VALID_INTERVAL_HOURS = new Set([1, 2, 3, 4, 6]);
 const RATE_LIMIT_GRACE_MINUTES = 10;
 const SLOT_STR_RE = /^(\d{4})-(\d{2})-(\d{2}) ([01]\d|2[0-3]):([0-5]\d)$/;
 const TIME_HHMM_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
+const END_TIME_HHMM_RE = /^(?:(?:[01]\d|2[0-3]):[0-5]\d|24:00)$/;
 const PNG_DATA_URL_PREFIX = "data:image/png;base64,";
 const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 const MAX_CHART_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -149,6 +165,105 @@ function cloneNoProtoBoolMap(raw) {
     }
   }
   return out;
+}
+
+function normalizeDeletedContentEntryForIpc(val) {
+  if (
+    !val ||
+    typeof val !== "object" ||
+    Array.isArray(val) ||
+    typeof val.deletedAt !== "number" ||
+    !Number.isFinite(val.deletedAt) ||
+    val.deletedAt < 0
+  ) {
+    return null;
+  }
+  const entry = { deletedAt: val.deletedAt };
+  if (Object.prototype.hasOwnProperty.call(val, "title") && typeof val.title === "string") {
+    const trimmed = val.title.trim();
+    if (trimmed) entry.title = trimmed;
+  }
+  if (Object.prototype.hasOwnProperty.call(val, "pwKeys") && Array.isArray(val.pwKeys)) {
+    const seen = new Set();
+    const pwKeys = [];
+    for (const k of val.pwKeys) {
+      if (!isValidWorkIdentityKey(k) || seen.has(k)) continue;
+      seen.add(k);
+      pwKeys.push(k);
+    }
+    pwKeys.sort();
+    entry.pwKeys = pwKeys;
+  }
+  return entry;
+}
+
+function toPlainDeletedContents(raw) {
+  const out = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const key of Object.keys(raw)) {
+    if (!isValidDeletableContentKey(key)) continue;
+    const desc = Object.getOwnPropertyDescriptor(raw, key);
+    const normalized = normalizeDeletedContentEntryForIpc(desc ? desc.value : null);
+    if (normalized) {
+      Object.defineProperty(out, key, {
+        value: normalized,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+    }
+  }
+  return out;
+}
+
+function cloneNoProtoDeletedContents(raw) {
+  const out = Object.create(null);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const key of Object.keys(raw)) {
+    if (!isValidDeletableContentKey(key)) continue;
+    const desc = Object.getOwnPropertyDescriptor(raw, key);
+    const normalized = normalizeDeletedContentEntryForIpc(desc ? desc.value : null);
+    if (normalized) {
+      out[key] = normalized;
+    }
+  }
+  return out;
+}
+
+function normalizeContentKeysArg(args) {
+  if (!args || typeof args !== "object" || Array.isArray(args)) {
+    throw new Error("参数无效");
+  }
+  let rawList = null;
+  if (Array.isArray(args.contentKeys)) {
+    rawList = args.contentKeys;
+  } else if (typeof args.contentKey === "string") {
+    rawList = [args.contentKey];
+  } else {
+    throw new Error("contentKeys 必须为非空数组");
+  }
+  if (!rawList.length) {
+    throw new Error("contentKeys 不能为空");
+  }
+  const uniqueKeys = [];
+  const seen = new Set();
+  for (let i = 0; i < rawList.length; i++) {
+    const raw = rawList[i];
+    if (typeof raw !== "string") {
+      throw new Error(`第 ${i + 1} 条 contentKey 无效`);
+    }
+    const ck = raw.trim();
+    if (!isValidDeletableContentKey(ck)) {
+      throw new Error(`第 ${i + 1} 条 contentKey 无效`);
+    }
+    if (seen.has(ck)) continue;
+    seen.add(ck);
+    uniqueKeys.push(ck);
+  }
+  if (!uniqueKeys.length) {
+    throw new Error("contentKeys 不能为空");
+  }
+  return uniqueKeys;
 }
 
 function normalizeOverrideOps(rawOps) {
@@ -257,12 +372,13 @@ function resolveOpWorkIdentity(
 
 function applyOverrideOpsSync(rawOps, exportDeps) {
   const ops = normalizeOverrideOps(rawOps);
-  const current = store.readLinkOverrides();
+  const current = store.readLinkOverrides({ strict: true });
   const workingDoc = {
     version: current.version,
     updatedAt: current.updatedAt,
     contents: cloneNoProtoMap(current.contents),
     excludedAuto: cloneNoProtoBoolMap(current.excludedAuto),
+    deletedContents: cloneNoProtoDeletedContents(current.deletedContents),
     overrides: cloneNoProtoMap(current.overrides),
   };
 
@@ -423,6 +539,7 @@ function applyOverrideOpsSync(rawOps, exportDeps) {
       overrides: workingDoc.overrides,
       contents: workingDoc.contents,
       excludedAuto: workingDoc.excludedAuto,
+      deletedContents: workingDoc.deletedContents,
     },
     now
   );
@@ -1160,7 +1277,7 @@ function registerDataStatsIpc(options = {}) {
           ? args.startTime.trim()
           : "";
       const reqEnd =
-        typeof args.endTime === "string" && TIME_HHMM_RE.test(args.endTime.trim())
+        typeof args.endTime === "string" && END_TIME_HHMM_RE.test(args.endTime.trim())
           ? args.endTime.trim()
           : "";
       const reqInterval = normalizeIntervalHoursArg(args.intervalHours);
@@ -1428,19 +1545,26 @@ function registerDataStatsIpc(options = {}) {
   ipcMain.handle("stats:get-content-summary", async (event, args) => {
     try {
       if (!isLocalFrameEvent(event)) {
-        return { rows: [], date: "", error: "不允许外部页面读取作品汇总" };
+        return { rows: [], deletedRows: [], date: "", error: "不允许外部页面读取作品汇总" };
       }
       if (args != null && (typeof args !== "object" || Array.isArray(args))) {
-        return { rows: [], date: "", error: "查询参数无效" };
+        return { rows: [], deletedRows: [], date: "", error: "查询参数无效" };
       }
       await overrideWriteChain;
       const date = args && args.date !== undefined ? args.date : undefined;
       return buildContentSummaryData({ date }, exportDeps);
     } catch (err) {
+      const isOvReadErr = isLinkOverridesReadErr(err);
       return {
         rows: [],
+        deletedRows: [],
         date: "",
-        error: (err && err.message) || "读取作品汇总失败",
+        error: isOvReadErr
+          ? LINK_OVERRIDES_READ_ERROR_MESSAGE
+          : (err && err.message) || "读取作品汇总失败",
+        ...(isOvReadErr
+          ? { errorCode: "LINK_OVERRIDES_READ_ERROR", detail: (err && err.message) || "" }
+          : {}),
       };
     }
   });
@@ -1469,9 +1593,15 @@ function registerDataStatsIpc(options = {}) {
       );
       return { ok: true, ...data };
     } catch (err) {
+      const isOvReadErr = isLinkOverridesReadErr(err);
       return {
         ok: false,
-        error: (err && err.message) || "读取作品趋势失败",
+        error: isOvReadErr
+          ? LINK_OVERRIDES_READ_ERROR_MESSAGE
+          : (err && err.message) || "读取作品趋势失败",
+        ...(isOvReadErr
+          ? { errorCode: "LINK_OVERRIDES_READ_ERROR", detail: (err && err.message) || "" }
+          : {}),
       };
     }
   });
@@ -1500,9 +1630,15 @@ function registerDataStatsIpc(options = {}) {
       );
       return { ok: true, ...data };
     } catch (err) {
+      const isOvReadErr = isLinkOverridesReadErr(err);
       return {
         ok: false,
-        error: (err && err.message) || "读取作品分时段趋势失败",
+        error: isOvReadErr
+          ? LINK_OVERRIDES_READ_ERROR_MESSAGE
+          : (err && err.message) || "读取作品分时段趋势失败",
+        ...(isOvReadErr
+          ? { errorCode: "LINK_OVERRIDES_READ_ERROR", detail: (err && err.message) || "" }
+          : {}),
       };
     }
   });
@@ -1522,9 +1658,15 @@ function registerDataStatsIpc(options = {}) {
       const data = buildStatsAnalysisData({ period, to }, exportDeps);
       return { ok: true, ...data };
     } catch (err) {
+      const isOvReadErr = isLinkOverridesReadErr(err);
       return {
         ok: false,
-        error: (err && err.message) || "读取数据分析失败",
+        error: isOvReadErr
+          ? LINK_OVERRIDES_READ_ERROR_MESSAGE
+          : (err && err.message) || "读取数据分析失败",
+        ...(isOvReadErr
+          ? { errorCode: "LINK_OVERRIDES_READ_ERROR", detail: (err && err.message) || "" }
+          : {}),
       };
     }
   });
@@ -1680,25 +1822,34 @@ function registerDataStatsIpc(options = {}) {
           error: "不允许外部页面读取手动关联配置",
           contents: {},
           excludedAuto: {},
+          deletedContents: {},
           overrides: {},
         };
       }
       await overrideWriteChain;
-      const doc = store.readLinkOverrides();
+      const doc = store.readLinkOverrides({ strict: true });
       return {
         ok: true,
         version: doc.version,
         updatedAt: doc.updatedAt,
         contents: toPlainOverrides(doc.contents),
         excludedAuto: toPlainBoolMap(doc.excludedAuto),
+        deletedContents: toPlainDeletedContents(doc.deletedContents),
         overrides: toPlainOverrides(doc.overrides),
       };
     } catch (err) {
+      const isOvReadErr = isLinkOverridesReadErr(err);
       return {
         ok: false,
-        error: (err && err.message) || "读取手动关联配置失败",
+        error: isOvReadErr
+          ? LINK_OVERRIDES_READ_ERROR_MESSAGE
+          : (err && err.message) || "读取手动关联配置失败",
+        ...(isOvReadErr
+          ? { errorCode: "LINK_OVERRIDES_READ_ERROR", detail: (err && err.message) || "" }
+          : {}),
         contents: {},
         excludedAuto: {},
+        deletedContents: {},
         overrides: {},
       };
     }
@@ -1843,6 +1994,162 @@ function registerDataStatsIpc(options = {}) {
     }
   });
 
+  ipcMain.handle("stats:delete-contents", async (event, args) => {
+    try {
+      if (!isLocalFrameEvent(event)) {
+        return { ok: false, error: "不允许外部页面删除内容行" };
+      }
+      const uniqueKeys = normalizeContentKeysArg(args);
+      const rawMode =
+        args && Object.prototype.hasOwnProperty.call(args, "mode") ? args.mode : undefined;
+      let isEmptyOnly = false;
+      if (rawMode !== undefined && rawMode !== null && rawMode !== "") {
+        if (typeof rawMode !== "string") {
+          return { ok: false, error: "mode 参数无效" };
+        }
+        const trimmedMode = rawMode.trim();
+        if (trimmedMode === "empty-only") {
+          isEmptyOnly = true;
+        } else if (trimmedMode !== "normal") {
+          return { ok: false, error: "mode 参数无效" };
+        }
+      }
+      const res = await enqueueOverrideWrite(() => {
+        const current = store.readLinkOverrides({ strict: true });
+        const deletedContents = cloneNoProtoDeletedContents(current.deletedContents);
+        const { visibleRowByKey, snapshotByKey } = resolveDeleteContentSnapshots(
+          uniqueKeys,
+          current,
+          exportDeps
+        );
+        const now = Date.now();
+        let added = 0;
+        const deletedKeys = [];
+        const skippedKeys = [];
+        for (const ck of uniqueKeys) {
+          const visibleRow = visibleRowByKey.get(ck) || null;
+          const snap = snapshotByKey.get(ck) || null;
+          const existing = Object.prototype.hasOwnProperty.call(deletedContents, ck)
+            ? deletedContents[ck]
+            : null;
+          if (isEmptyOnly) {
+            if (visibleRow === null && existing) {
+              continue;
+            }
+            const isStillEmptyRow =
+              visibleRow !== null &&
+              Number(visibleRow.platformCount) === 0 &&
+              (!snap || !Array.isArray(snap.pwKeys) || snap.pwKeys.length === 0);
+            if (!isStillEmptyRow) {
+              skippedKeys.push(ck);
+              continue;
+            }
+          }
+          const shouldWrite =
+            !existing ||
+            (visibleRow !== null &&
+              !isContentRowDeleted(ck, visibleRow.title, new Map([[ck, existing]])));
+          if (shouldWrite) {
+            const entry = { deletedAt: now };
+            if (snap && snap.title) entry.title = snap.title;
+            if (snap && Array.isArray(snap.pwKeys)) entry.pwKeys = [...snap.pwKeys];
+            deletedContents[ck] = entry;
+            added++;
+            deletedKeys.push(ck);
+          } else if (!isEmptyOnly) {
+            deletedKeys.push(ck);
+          }
+        }
+        if (isEmptyOnly && added === 0) {
+          return {
+            doc: current,
+            added: 0,
+            deletedKeys,
+            skippedKeys,
+            skipped: skippedKeys.length,
+          };
+        }
+        const doc = store.writeLinkOverrides(
+          {
+            overrides: current.overrides,
+            contents: current.contents,
+            excludedAuto: current.excludedAuto,
+            deletedContents,
+          },
+          now
+        );
+        return {
+          doc,
+          added,
+          deletedKeys,
+          skippedKeys,
+          skipped: skippedKeys.length,
+        };
+      });
+      return {
+        ok: true,
+        ...(isEmptyOnly ? { mode: "empty-only" } : {}),
+        deletedKeys: res.deletedKeys,
+        skipped: res.skipped,
+        skippedKeys: res.skippedKeys,
+        added: res.added,
+        totalDeleted: Object.keys(res.doc.deletedContents).length,
+        updatedAt: res.doc.updatedAt,
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        error: (err && err.message) || "删除内容失败",
+      };
+    }
+  });
+
+  ipcMain.handle("stats:restore-contents", async (event, args) => {
+    try {
+      if (!isLocalFrameEvent(event)) {
+        return { ok: false, error: "不允许外部页面恢复内容行" };
+      }
+      const uniqueKeys = normalizeContentKeysArg(args);
+      const res = await enqueueOverrideWrite(() => {
+        const current = store.readLinkOverrides({ strict: true });
+        const deletedContents = cloneNoProtoDeletedContents(current.deletedContents);
+        const now = Date.now();
+        let restored = 0;
+        for (const ck of uniqueKeys) {
+          if (Object.prototype.hasOwnProperty.call(deletedContents, ck)) {
+            delete deletedContents[ck];
+            restored++;
+          }
+        }
+        const doc = store.writeLinkOverrides(
+          {
+            overrides: current.overrides,
+            contents: current.contents,
+            excludedAuto: current.excludedAuto,
+            deletedContents,
+          },
+          now
+        );
+        return {
+          doc,
+          restored,
+        };
+      });
+      return {
+        ok: true,
+        restoredKeys: uniqueKeys,
+        restored: res.restored,
+        totalDeleted: Object.keys(res.doc.deletedContents).length,
+        updatedAt: res.doc.updatedAt,
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        error: (err && err.message) || "恢复内容失败",
+      };
+    }
+  });
+
   ipcMain.handle("stats:export-xlsx", async (event, args = {}) => {
     try {
       if (!isLocalFrameEvent(event)) {
@@ -1906,7 +2213,17 @@ function registerDataStatsIpc(options = {}) {
         counts: data.counts,
       };
     } catch (err) {
-      return { ok: false, message: (err && err.message) || "导出失败" };
+      const isOvReadErr = isLinkOverridesReadErr(err);
+      const msg = isOvReadErr
+        ? LINK_OVERRIDES_READ_ERROR_MESSAGE
+        : (err && err.message) || "导出失败";
+      return {
+        ok: false,
+        message: msg,
+        ...(isOvReadErr
+          ? { error: msg, errorCode: "LINK_OVERRIDES_READ_ERROR", detail: (err && err.message) || "" }
+          : {}),
+      };
     }
   });
 

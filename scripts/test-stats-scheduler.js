@@ -2329,6 +2329,232 @@ async function main() {
           }
           console.log("✓ [S9-r3 #1] testS9R3_1_StatsApiAndSchedulerNeverSendOrOverrideRetentionDays 通过");
         }
+
+        // S13: 分时段循环支持全天 00:00–24:00（排他末端，不额外生成 24:00 槽；仅结束时间接受 24:00；旧配置不变）
+        {
+          // 1) 时间校验函数：仅 endTime 接受 24:00（=1440 分钟）
+          assert.strictEqual(schedulerMod.isValidEndTimeStr("24:00"), true);
+          assert.strictEqual(schedulerMod.isValidEndTimeStr("23:59"), true);
+          assert.strictEqual(schedulerMod.isValidEndTimeStr("24:01"), false);
+          assert.strictEqual(schedulerMod.isValidEndTimeStr("24:30"), false);
+          assert.strictEqual(schedulerMod.isValidTimeStr("24:00"), false, "每日定时与开始时间不得接受 24:00");
+          assert.strictEqual(schedulerMod.parseEndTimeToMinutes("24:00"), 1440);
+          assert.strictEqual(schedulerMod.parseTimeToMinutes("24:00"), null);
+
+          // 2) normalizeSettings：保留 endTime="24:00"，拒绝 startTime/time="24:00" 与 endTime="24:30"
+          const normFullDay = normalizeSettings({
+            enabled: true,
+            mode: "interval",
+            startTime: "00:00",
+            endTime: "24:00",
+            intervalHours: 2,
+          });
+          assert.strictEqual(normFullDay.startTime, "00:00");
+          assert.strictEqual(normFullDay.endTime, "24:00");
+
+          const normBadStart = normalizeSettings({
+            enabled: true,
+            mode: "interval",
+            startTime: "24:00",
+            endTime: "24:00",
+            time: "24:00",
+          });
+          assert.strictEqual(normBadStart.startTime, DEFAULT_SETTINGS.startTime);
+          assert.strictEqual(normBadStart.time, DEFAULT_SETTINGS.time);
+          assert.strictEqual(normBadStart.endTime, "24:00");
+
+          const normBadEnd = normalizeSettings({
+            enabled: true,
+            mode: "interval",
+            startTime: "00:00",
+            endTime: "24:30",
+          });
+          assert.strictEqual(normBadEnd.endTime, DEFAULT_SETTINGS.endTime);
+
+          // 3) 00:00–24:00 每 2 小时 → 12 个槽 00:00..22:00，无 24:00/次日00:00 槽
+          const slots00_24_2h = buildScheduleSlots("2026-11-20", normFullDay);
+          assert.strictEqual(slots00_24_2h.length, 12, "00:00–24:00 每 2 小时应为 12 个槽");
+          assert.deepStrictEqual(
+            slots00_24_2h.map((s) => s.slot),
+            [
+              "2026-11-20 00:00",
+              "2026-11-20 02:00",
+              "2026-11-20 04:00",
+              "2026-11-20 06:00",
+              "2026-11-20 08:00",
+              "2026-11-20 10:00",
+              "2026-11-20 12:00",
+              "2026-11-20 14:00",
+              "2026-11-20 16:00",
+              "2026-11-20 18:00",
+              "2026-11-20 20:00",
+              "2026-11-20 22:00",
+            ]
+          );
+          assert.strictEqual(
+            slots00_24_2h[11].endMs,
+            cnTime(2026, 11, 21, 0, 0, 0),
+            "22:00 末槽应截止到次日 00:00:00（不顺延 5 分钟避免与次日 00:00 冲突）"
+          );
+          // 跨天无缝衔接
+          assert.strictEqual(getCurrentSlot(cnTime(2026, 11, 20, 23, 59, 59), normFullDay).slot, "2026-11-20 22:00");
+          assert.strictEqual(getCurrentSlot(cnTime(2026, 11, 21, 0, 0, 0), normFullDay).slot, "2026-11-21 00:00");
+
+          // 4) 08:00–24:00 每 2 小时 → 8 个槽 08:00..22:00；次日 00:00 归 null
+          const cfg08_24 = { enabled: true, mode: "interval", startTime: "08:00", endTime: "24:00", intervalHours: 2 };
+          const slots08_24 = buildScheduleSlots("2026-11-20", cfg08_24);
+          assert.strictEqual(slots08_24.length, 8, "08:00–24:00 每 2 小时应为 8 个槽");
+          assert.deepStrictEqual(
+            slots08_24.map((s) => s.time),
+            ["08:00", "10:00", "12:00", "14:00", "16:00", "18:00", "20:00", "22:00"]
+          );
+          assert.strictEqual(slots08_24[7].endMs, cnTime(2026, 11, 21, 0, 0, 0));
+          assert.strictEqual(getCurrentSlot(cnTime(2026, 11, 20, 23, 59, 0), cfg08_24).slot, "2026-11-20 22:00");
+          assert.strictEqual(getCurrentSlot(cnTime(2026, 11, 21, 0, 0, 0), cfg08_24), null);
+
+          // 5) 非整除起点（09:00–24:00/2h=8 槽，23:30–24:00/2h=1 槽）及其他步长（1/3/4/6h）
+          const slots09_24 = buildScheduleSlots("2026-11-20", {
+            enabled: true,
+            mode: "interval",
+            startTime: "09:00",
+            endTime: "24:00",
+            intervalHours: 2,
+          });
+          assert.deepStrictEqual(
+            slots09_24.map((s) => s.time),
+            ["09:00", "11:00", "13:00", "15:00", "17:00", "19:00", "21:00", "23:00"]
+          );
+          assert.strictEqual(slots09_24[7].endMs, cnTime(2026, 11, 21, 0, 0, 0));
+          const slots2330_24 = buildScheduleSlots("2026-11-20", {
+            enabled: true,
+            mode: "interval",
+            startTime: "23:30",
+            endTime: "24:00",
+            intervalHours: 2,
+          });
+          assert.deepStrictEqual(slots2330_24.map((s) => s.slot), ["2026-11-20 23:30"]);
+          assert.strictEqual(slots2330_24[0].endMs, cnTime(2026, 11, 21, 0, 0, 0));
+          assert.strictEqual(buildScheduleSlots("2026-11-20", { ...normFullDay, intervalHours: 1 }).length, 24);
+          assert.strictEqual(buildScheduleSlots("2026-11-20", { ...normFullDay, intervalHours: 3 }).length, 8);
+          assert.strictEqual(buildScheduleSlots("2026-11-20", { ...normFullDay, intervalHours: 4 }).length, 6);
+          assert.strictEqual(buildScheduleSlots("2026-11-20", { ...normFullDay, intervalHours: 6 }).length, 4);
+
+          // 6) 旧配置（开始=结束、endTime 落槽、跨零点）完全不变
+          const slotsSame = buildScheduleSlots("2026-11-20", {
+            enabled: true,
+            mode: "interval",
+            startTime: "08:00",
+            endTime: "08:00",
+            intervalHours: 2,
+          });
+          assert.strictEqual(slotsSame.length, 1);
+          assert.strictEqual(slotsSame[0].slot, "2026-11-20 08:00");
+          assert.strictEqual(slotsSame[0].endMs, cnTime(2026, 11, 20, 8, 5, 0));
+
+          const slotsOld22 = buildScheduleSlots("2026-11-20", {
+            enabled: true,
+            mode: "interval",
+            startTime: "08:00",
+            endTime: "22:00",
+            intervalHours: 2,
+          });
+          assert.strictEqual(slotsOld22.length, 8);
+          assert.strictEqual(slotsOld22[7].slot, "2026-11-20 22:00");
+          assert.strictEqual(slotsOld22[7].endMs, cnTime(2026, 11, 20, 22, 5, 0));
+
+          // 7) 主进程 store.writeAutoSettings / stats:save-auto-settings / stats:auto-run 均接受 endTime="24:00"
+          const s13Root = fs.mkdtempSync(path.join(os.tmpdir(), "mm-s13-24h-"));
+          const origGetPath = require.cache[electronId].exports.app.getPath;
+          const origHandle = require.cache[electronId].exports.ipcMain.handle;
+          const origInvoke = require.cache[electronId].exports.ipcRenderer.invoke;
+          const localHandlers = new Map();
+          const sentS13Payloads = [];
+          try {
+            require.cache[electronId].exports.app.getPath = () => s13Root;
+            require.cache[electronId].exports.ipcMain.handle = (ch, fn) => localHandlers.set(ch, fn);
+            require.cache[electronId].exports.ipcRenderer.invoke = async (ch, payload) => {
+              sentS13Payloads.push({ ch, payload });
+              const fn = localHandlers.get(ch);
+              return fn
+                ? fn({ sender: { send: () => {} }, senderFrame: { url: "file:///app/index.html" } }, payload)
+                : null;
+            };
+            delete require.cache[storeId];
+            delete require.cache[indexId];
+            const storeS13 = require(storeId);
+            require(indexId).registerDataStatsIpc();
+
+            const saveRes = await withMockDateNow(
+              () => cnTime(2026, 11, 20, 8, 0, 0),
+              () =>
+                localHandlers.get("stats:save-auto-settings")(
+                  { senderFrame: { url: "file:///app/index.html" } },
+                  { enabled: true, mode: "interval", startTime: "00:00", endTime: "24:00", intervalHours: 2 }
+                )
+            );
+            assert.strictEqual(saveRes.ok, true);
+            assert.strictEqual(saveRes.settings.endTime, "24:00");
+            assert.strictEqual(storeS13.readAutoSettings().endTime, "24:00");
+
+            // startTime / time 传 24:00 仍被拒绝回落默认
+            const badMain = storeS13.writeAutoSettings(
+              {
+                mode: "interval",
+                startTime: "24:00",
+                endTime: "24:00",
+                time: "24:00",
+              },
+              cnTime(2026, 11, 20, 8, 1, 0)
+            );
+            assert.strictEqual(badMain.startTime, "08:00");
+            assert.strictEqual(badMain.time, "10:00");
+            assert.strictEqual(badMain.endTime, "24:00");
+
+            // 调度器 defaultAutoRun 携带 endTime="24:00" 且主进程 stats:auto-run 正常接纳并同步配置
+            // 先把主进程设置切回 00:00-24:00（生效边界 08:02 早于 22:00 槽），验证 22:00 槽正常执行
+            storeS13.writeAutoSettings(
+              { enabled: true, mode: "interval", startTime: "00:00", endTime: "24:00", intervalHours: 2 },
+              cnTime(2026, 11, 20, 8, 2, 0)
+            );
+            const s13Storage = createMemoryStorage();
+            saveSettings(
+              { enabled: true, mode: "interval", startTime: "00:00", endTime: "24:00", intervalHours: 2 },
+              s13Storage
+            );
+            const acc24 = { group: "G24", platform: "抖音", partition: "persist:g24-dy" };
+            await withImmediateTimers(async () => {
+              await withMockDateNow(
+                () => cnTime(2026, 11, 20, 22, 10, 0),
+                async () => {
+                  const s24 = createStatsScheduler({
+                    storage: s13Storage,
+                    now: () => cnTime(2026, 11, 20, 22, 10, 0),
+                    monotonicNow: () => STARTUP_DELAY_MS,
+                    startupDelayMs: 0,
+                    getAccounts: () => [acc24],
+                    setIntervalFn: () => 1,
+                    clearIntervalFn: () => {},
+                  });
+                  s24.start();
+                  const tickRes = await s24.tick();
+                  s24.stop();
+                  assert.strictEqual(tickRes.ran, true);
+                  assert.strictEqual(tickRes.slot, "2026-11-20 22:00");
+                  const autoCall = sentS13Payloads.find((x) => x.ch === "stats:auto-run");
+                  assert.ok(autoCall && autoCall.payload.endTime === "24:00", "defaultAutoRun 必须携带 endTime='24:00'");
+                  assert.strictEqual(storeS13.readAutoSettings().startTime, "00:00");
+                  assert.strictEqual(storeS13.readAutoSettings().endTime, "24:00");
+                }
+              );
+            });
+          } finally {
+            require.cache[electronId].exports.app.getPath = origGetPath;
+            require.cache[electronId].exports.ipcMain.handle = origHandle;
+            require.cache[electronId].exports.ipcRenderer.invoke = origInvoke;
+            fs.rmSync(s13Root, { recursive: true, force: true });
+          }
+          console.log("✓ [S13] 全天 00:00–24:00 槽生成、排他末端、旧配置兼容与主进程持久化/IPC 全通过");
+        }
       }
     } finally {
       if (origGlobalLS === undefined) delete global.localStorage;

@@ -27,9 +27,14 @@ const {
   isManagementUrl,
   isValidAutoContentKey,
   isUnstableRecordKey,
+  isValidWorkIdentityKey,
   makeWorkKey,
   makeWorkIdentityKey,
   getLinkResultMeta,
+  normalizeOverridesDoc,
+  isContentRowDeleted,
+  buildDeletedFilter,
+  isWorkDeleted,
 } = require("./contentLink");
 const {
   DEFAULT_ANALYSIS_PERIOD,
@@ -447,21 +452,41 @@ function resolveIoDeps(options = {}, depsArg) {
     readLinkOverrides: isPlainObject(options.linkOverrides)
       ? () => options.linkOverrides
       : typeof injected.readLinkOverrides === "function"
-      ? injected.readLinkOverrides
+      ? (readOpts) => injected.readLinkOverrides(readOpts)
+      : storeApi && typeof storeApi.readLinkOverridesStrict === "function"
+      ? () => storeApi.readLinkOverridesStrict()
       : storeApi && typeof storeApi.readLinkOverrides === "function"
-      ? () => storeApi.readLinkOverrides()
+      ? (readOpts) => storeApi.readLinkOverrides(readOpts)
       : hasInjectedDataSource
       ? emptyOverrides
-      : () => {
+      : (readOpts) => {
           const s = getStore();
+          if (typeof s.readLinkOverridesStrict === "function") {
+            return s.readLinkOverridesStrict();
+          }
           return typeof s.readLinkOverrides === "function"
-            ? s.readLinkOverrides()
+            ? s.readLinkOverrides(readOpts)
             : emptyOverrides();
         },
     now: injected.now !== undefined ? injected.now : options.now,
     appVersion:
       injected.appVersion !== undefined ? injected.appVersion : options.appVersion,
   };
+}
+
+function readStrictLinkOverrides(io) {
+  try {
+    return io.readLinkOverrides({ strict: true });
+  } catch (err) {
+    if (err && typeof err === "object") {
+      err.isLinkOverridesReadError = true;
+      throw err;
+    }
+    const wrapped = new Error(String(err || "读取手工矫正配置失败，请稍后重试"));
+    wrapped.code = "LINK_OVERRIDES_READ_ERROR";
+    wrapped.isLinkOverridesReadError = true;
+    throw wrapped;
+  }
 }
 
 function resolveRecordGroup(rec) {
@@ -672,7 +697,7 @@ function loadRawDataset(options = {}, depsArg) {
   // 保留全量分组账号与发布记录用于全量作品身份归属裁决，输出阶段再按 groupSet 裁剪
   const allPushRecords = io.readPushRecords() || [];
   const latestDataDate = resolveDefaultCutoffDate(allAccountsData, (g, p) => io.readDaily(g, p));
-  const linkOverrides = io.readLinkOverrides();
+  const linkOverrides = readStrictLinkOverrides(io);
 
   return {
     io,
@@ -746,7 +771,7 @@ function loadSummaryDataset(options = {}, depsArg, explicitCutoffDate = "") {
   const latestDataDate = explicitCutoffDate
     ? ""
     : resolveDefaultCutoffDate(allAccountsData, (g, p) => io.readDaily(g, p));
-  const linkOverrides = io.readLinkOverrides();
+  const linkOverrides = readStrictLinkOverrides(io);
 
   return {
     io,
@@ -788,13 +813,201 @@ function computeWorkCountsFromSummaryRows(summaryRows) {
   return { works, unlinkedWorks };
 }
 
-function countWorkDailyRows(accountsData, from, to) {
+function hasActiveDeletedFilter(deletedFilterOrSet) {
+  if (!deletedFilterOrSet) return false;
+  if (deletedFilterOrSet instanceof Set) return deletedFilterOrSet.size > 0;
+  return Boolean(deletedFilterOrSet.active);
+}
+
+function isWorkHiddenByDeletedContents(
+  groupStr,
+  platformStr,
+  workId,
+  link,
+  deletedFilterOrSet,
+  workTitle = ""
+) {
+  if (!deletedFilterOrSet) return false;
+  if (deletedFilterOrSet instanceof Set) {
+    if (deletedFilterOrSet.size === 0) return false;
+    const linkInfo =
+      link instanceof Map
+        ? link.get(`${groupStr}|${platformStr}|${workId}`) ||
+          link.get(`${platformStr}|${workId}`) ||
+          null
+        : null;
+    const effectiveContentKey =
+      linkInfo && linkInfo.contentKey != null
+        ? String(linkInfo.contentKey)
+        : `unlinked:${platformStr}:${workId}`;
+    return deletedFilterOrSet.has(effectiveContentKey);
+  }
+  return isWorkDeleted(groupStr, platformStr, workId, link, deletedFilterOrSet, workTitle);
+}
+
+function buildWorkTitleMap(works) {
+  const map = new Map();
+  if (Array.isArray(works)) {
+    for (let i = 0; i < works.length; i++) {
+      const w = works[i];
+      if (w && w.workId != null && w.workId !== "") {
+        map.set(String(w.workId), w.title || "(无标题)");
+      }
+    }
+  }
+  return map;
+}
+
+function extractRowPwKeys(row) {
+  const set = new Set();
+  if (!isPlainObject(row) || !isPlainObject(row.perPlatform)) return [];
+  for (const [pgKey, cell] of Object.entries(row.perPlatform)) {
+    if (!isPlainObject(cell)) continue;
+    const { platform } = parsePgKey(pgKey);
+    if (Array.isArray(cell.works)) {
+      for (const w of cell.works) {
+        if (!isPlainObject(w)) continue;
+        if (typeof w.workKey === "string" && isValidWorkIdentityKey(w.workKey)) {
+          set.add(w.workKey);
+        } else if (w.workId != null && w.workId !== "") {
+          const p = typeof w.platform === "string" && w.platform ? w.platform : platform;
+          const pwKey = makeWorkIdentityKey(p, String(w.workId));
+          if (isValidWorkIdentityKey(pwKey)) set.add(pwKey);
+        }
+      }
+    } else if (Array.isArray(cell.workIds)) {
+      for (const wid of cell.workIds) {
+        if (wid == null || wid === "") continue;
+        const pwKey = makeWorkIdentityKey(platform, String(wid));
+        if (isValidWorkIdentityKey(pwKey)) set.add(pwKey);
+      }
+    }
+  }
+  return [...set].sort(compareText);
+}
+
+/**
+ * 为 stats:delete-contents 计算待删除内容行的实时快照（title + 当时挂着的全部平台作品 pwKeys）。
+ * 复用 currentOverrides（不再重复读 link-overrides.json），按全量分组最新汇总口径提取。
+ */
+function resolveDeleteContentSnapshots(contentKeys, currentOverrides, depsArg) {
+  const keys = Array.isArray(contentKeys) ? contentKeys : [];
+  const dataset = loadSummaryDataset({ linkOverrides: currentOverrides }, depsArg, "");
+  const cutoffDate = dataset.latestDataDate || "";
+  const allContents = buildContentIndex(dataset.allPushRecords);
+  const link = linkWorks({
+    contents: allContents,
+    accounts: dataset.allAccountsData,
+    worksDaily: dataset.allWorksDailyByGp,
+    date: cutoffDate || undefined,
+    overrides: currentOverrides,
+  });
+  const visibleRows = buildContentSummaryRows({
+    contents: allContents,
+    accounts: dataset.allAccountsData,
+    link,
+    worksDaily: dataset.allWorksDailyByGp,
+    date: cutoffDate || undefined,
+    overrides: currentOverrides,
+    includeDeleted: false,
+  });
+
+  const visibleRowByKey = new Map();
+  for (const row of visibleRows) {
+    if (row && row.contentKey) visibleRowByKey.set(row.contentKey, row);
+  }
+  const contentTitleByKey = new Map();
+  for (const c of allContents) {
+    if (isPlainObject(c) && c.contentKey) {
+      contentTitleByKey.set(String(c.contentKey), String(c.displayTitle || "").trim());
+    }
+  }
+  const { contents: overrideContents } = normalizeOverridesDoc(currentOverrides);
+  const currentDeletedFilter = buildDeletedFilter(currentOverrides, {
+    contents: allContents,
+    link,
+  });
+  const linkMeta = getLinkResultMeta(link);
+  const byWorkIdentity = linkMeta && linkMeta.byWorkIdentity ? linkMeta.byWorkIdentity : null;
+
+  const snapshotByKey = new Map();
+  for (const ck of keys) {
+    const visibleRow = visibleRowByKey.get(ck) || null;
+    const pwKeySet = new Set(visibleRow ? extractRowPwKeys(visibleRow) : []);
+    if (byWorkIdentity instanceof Map) {
+      for (const [pwKey, entry] of byWorkIdentity.entries()) {
+        if (!entry || entry.contentKey !== ck) continue;
+        if (currentDeletedFilter.deletedPwKeys.has(pwKey)) continue;
+        if (isValidWorkIdentityKey(pwKey)) pwKeySet.add(pwKey);
+      }
+    }
+    if (ck.startsWith("unlinked:")) {
+      const rest = ck.slice("unlinked:".length);
+      const sep = rest.indexOf(":");
+      if (sep > 0 && sep < rest.length - 1) {
+        const pwKey = makeWorkIdentityKey(rest.slice(0, sep), rest.slice(sep + 1));
+        if (isValidWorkIdentityKey(pwKey)) pwKeySet.add(pwKey);
+      }
+    }
+    let title = "";
+    if (visibleRow && typeof visibleRow.title === "string") {
+      title = visibleRow.title.trim();
+    } else if (contentTitleByKey.has(ck)) {
+      title = contentTitleByKey.get(ck) || "";
+    } else {
+      const persisted = overrideContents.get(ck);
+      if (persisted && typeof persisted.title === "string") {
+        title = persisted.title.trim();
+      }
+    }
+    snapshotByKey.set(ck, {
+      title,
+      pwKeys: [...pwKeySet].sort(compareText),
+    });
+  }
+
+  return { visibleRowByKey, snapshotByKey };
+}
+
+function countSummaryRowWorks(row) {
+  if (!isPlainObject(row) || !isPlainObject(row.perPlatform)) return 0;
   let count = 0;
+  for (const cell of Object.values(row.perPlatform)) {
+    if (!isPlainObject(cell)) continue;
+    if (Array.isArray(cell.workIds)) {
+      count += cell.workIds.length;
+    } else if (Array.isArray(cell.works)) {
+      count += cell.works.length;
+    }
+  }
+  return count;
+}
+
+function countWorkDailyRows(accountsData, from, to, link, deletedFilterOrSet) {
+  let count = 0;
+  const hasDeletedFilter = hasActiveDeletedFilter(deletedFilterOrSet);
   for (const acc of Array.isArray(accountsData) ? accountsData : []) {
     if (!isPlainObject(acc) || !isPlainObject(acc.worksDaily)) continue;
+    const groupStr = acc.group == null ? "" : String(acc.group);
+    const platformStr = acc.platform == null ? "" : String(acc.platform);
+    const workTitleById = hasDeletedFilter ? buildWorkTitleMap(acc.works) : null;
     const workIds = Object.keys(acc.worksDaily);
     for (let wi = 0; wi < workIds.length; wi++) {
-      const dateMap = safeOwnGet(acc.worksDaily, workIds[wi]);
+      const workId = workIds[wi];
+      if (
+        hasDeletedFilter &&
+        isWorkHiddenByDeletedContents(
+          groupStr,
+          platformStr,
+          workId,
+          link,
+          deletedFilterOrSet,
+          workTitleById.get(workId) || DELETED_WORK_TITLE
+        )
+      ) {
+        continue;
+      }
+      const dateMap = safeOwnGet(acc.worksDaily, workId);
       if (!isPlainObject(dateMap)) continue;
       const dates = Object.keys(dateMap);
       for (let di = 0; di < dates.length; di++) {
@@ -839,14 +1052,33 @@ function loadAccountsWorksIntraday(accountsData, io, range) {
   return entries;
 }
 
-function countWorkIntradayRows(accountsWithIntraday, from, to) {
+function countWorkIntradayRows(accountsWithIntraday, from, to, link, deletedFilterOrSet) {
   let count = 0;
+  const hasDeletedFilter = hasActiveDeletedFilter(deletedFilterOrSet);
   for (const entry of Array.isArray(accountsWithIntraday) ? accountsWithIntraday : []) {
     const map = entry && isPlainObject(entry.worksIntraday) ? entry.worksIntraday : null;
     if (!map) continue;
+    const acc = entry && isPlainObject(entry.acc) ? entry.acc : null;
+    const groupStr = acc && acc.group != null ? String(acc.group) : "";
+    const platformStr = acc && acc.platform != null ? String(acc.platform) : "";
+    const workTitleById = hasDeletedFilter && acc ? buildWorkTitleMap(acc.works) : null;
     const workIds = Object.keys(map);
     for (let wi = 0; wi < workIds.length; wi++) {
-      const list = safeOwnGet(map, workIds[wi]);
+      const workId = workIds[wi];
+      if (
+        hasDeletedFilter &&
+        isWorkHiddenByDeletedContents(
+          groupStr,
+          platformStr,
+          workId,
+          link,
+          deletedFilterOrSet,
+          (workTitleById && workTitleById.get(workId)) || DELETED_WORK_TITLE
+        )
+      ) {
+        continue;
+      }
+      const list = safeOwnGet(map, workId);
       if (!Array.isArray(list) || !list.length) continue;
       const seenSlots = new Set();
       for (let pi = 0; pi < list.length; pi++) {
@@ -1053,6 +1285,10 @@ function buildContentSummaryData(options = {}, depsArg) {
     date: cutoffDate || undefined,
     overrides: dataset.linkOverrides,
   });
+  const {
+    contents: overrideContents,
+    deletedContents: deletedMap,
+  } = normalizeOverridesDoc(dataset.linkOverrides);
   let rows = buildContentSummaryRows({
     contents,
     accounts: dataset.allAccountsData,
@@ -1061,7 +1297,67 @@ function buildContentSummaryData(options = {}, depsArg) {
     date: cutoffDate || undefined,
     overrides: dataset.linkOverrides,
     groups: dataset.groupSet,
+    includeDeleted: false,
   });
+  const deletedRows = [];
+  if (deletedMap.size > 0) {
+    const allRows = buildContentSummaryRows({
+      contents,
+      accounts: dataset.allAccountsData,
+      link,
+      worksDaily: dataset.allWorksDailyByGp,
+      date: cutoffDate || undefined,
+      overrides: dataset.linkOverrides,
+      groups: dataset.groupSet,
+      includeDeleted: true,
+    });
+    const deletedRowByKey = new Map();
+    for (let i = 0; i < allRows.length; i++) {
+      const r = allRows[i];
+      if (r && isContentRowDeleted(r.contentKey, r.title, deletedMap)) {
+        deletedRowByKey.set(r.contentKey, r);
+      }
+    }
+    for (const [ck, meta] of deletedMap.entries()) {
+      const r = deletedRowByKey.get(ck);
+      if (r) {
+        deletedRows.push({
+          contentKey: ck,
+          title: r.title || meta.title || "(无标题)",
+          file: r.file || "",
+          firstPublishDate: r.firstPublishDate || "",
+          platformCount: typeof r.platformCount === "number" ? r.platformCount : 0,
+          workCount: countSummaryRowWorks(r),
+          totalPlay: r.totalPlay != null ? r.totalPlay : null,
+          isUnlinked: Boolean(r.isUnlinked),
+          deletedAt: meta.deletedAt,
+        });
+      } else {
+        const persisted = overrideContents.get(ck);
+        const snapPwKeys = Array.isArray(meta.pwKeys) ? meta.pwKeys : [];
+        const snapPlatforms = new Set();
+        for (const pw of snapPwKeys) {
+          const sep = pw.indexOf("|");
+          if (sep > 0) snapPlatforms.add(pw.slice(0, sep));
+        }
+        deletedRows.push({
+          contentKey: ck,
+          title: meta.title || (persisted && persisted.title) || ck,
+          file: ck.startsWith("file:") ? ck.slice("file:".length) : "",
+          firstPublishDate: "",
+          platformCount: snapPlatforms.size,
+          workCount: snapPwKeys.length,
+          totalPlay: null,
+          isUnlinked: ck.startsWith("unlinked:"),
+          deletedAt: meta.deletedAt,
+        });
+      }
+    }
+    deletedRows.sort((a, b) => {
+      if (b.deletedAt !== a.deletedAt) return b.deletedAt - a.deletedAt;
+      return compareText(a.contentKey, b.contentKey);
+    });
+  }
   if (dataset.groupSet) {
     rows = filterSummaryRowsByGroupScope(
       rows,
@@ -1082,6 +1378,7 @@ function buildContentSummaryData(options = {}, depsArg) {
 
   return {
     rows,
+    deletedRows,
     date: cutoffDate,
     counts: {
       accounts: dataset.outputAccountsData.length,
@@ -1343,9 +1640,18 @@ function parsePublishTimeForTable(raw) {
 function collectWorkDailyStructured(
   accountsData,
   link,
-  { from = "", to = "", needSheetRows = false, needAnalysisRows = false } = {}
+  {
+    from = "",
+    to = "",
+    needSheetRows = false,
+    needAnalysisRows = false,
+    deletedContentKeys = null,
+    deletedFilter = null,
+  } = {}
 ) {
   const hasLink = link instanceof Map;
+  const activeDeletedFilter = deletedFilter || deletedContentKeys;
+  const hasDeletedFilter = hasActiveDeletedFilter(activeDeletedFilter);
   const fromDayNum = from ? dateStrToDayNum(from) : null;
   const toDayNum = to ? dateStrToDayNum(to) : null;
   const sheetRows = needSheetRows ? [] : null;
@@ -1374,6 +1680,22 @@ function collectWorkDailyStructured(
       const dateMap = safeOwnGet(acc.worksDaily, workId);
       if (!isPlainObject(dateMap)) continue;
 
+      const meta = workById.get(workId);
+      const title = meta ? meta.title || "(无标题)" : DELETED_WORK_TITLE;
+      if (
+        hasDeletedFilter &&
+        isWorkHiddenByDeletedContents(
+          groupStr,
+          platformStr,
+          workId,
+          link,
+          activeDeletedFilter,
+          title
+        )
+      ) {
+        continue;
+      }
+
       const linkInfo = hasLink
         ? link.get(`${groupStr}|${platformStr}|${workId}`) ||
           link.get(`${platformStr}|${workId}`) ||
@@ -1392,8 +1714,6 @@ function collectWorkDailyStructured(
           ? linkInfo.score
           : null;
 
-      const meta = workById.get(workId);
-      const title = meta ? meta.title || "(无标题)" : DELETED_WORK_TITLE;
       const url = meta ? meta.url || "" : "";
       const { ms: publishTimeMs, iso: publishTimeIso, utc8Date: publishDateStr } = meta
         ? parsePublishTimeForTable(meta.publishTime)
@@ -1610,9 +1930,13 @@ function collectWorkIntradayStructured(
     needAnalysisRows = false,
     analysisFrom = "",
     analysisTo = "",
+    deletedContentKeys = null,
+    deletedFilter = null,
   } = {}
 ) {
   const hasLink = link instanceof Map;
+  const activeDeletedFilter = deletedFilter || deletedContentKeys;
+  const hasDeletedFilter = hasActiveDeletedFilter(activeDeletedFilter);
   const sheetRows = needSheetRows ? [] : null;
   const analysisRows = needAnalysisRows ? [] : null;
 
@@ -1636,6 +1960,11 @@ function collectWorkIntradayStructured(
         from,
         to,
         link: hasLink ? link : undefined,
+        deletedContentKeys:
+          deletedContentKeys instanceof Set && deletedContentKeys.size > 0
+            ? deletedContentKeys
+            : undefined,
+        deletedFilter: deletedFilter && deletedFilter.active ? deletedFilter : undefined,
       });
       for (let i = 0; i < accRows.length; i++) {
         const r = accRows[i];
@@ -1662,6 +1991,22 @@ function collectWorkIntradayStructured(
         const list = safeOwnGet(entry.worksIntraday, workId);
         if (!Array.isArray(list) || !list.length) continue;
 
+        const meta = workById.get(workId);
+        const title = meta ? meta.title || "(无标题)" : DELETED_WORK_TITLE;
+        if (
+          hasDeletedFilter &&
+          isWorkHiddenByDeletedContents(
+            groupStr,
+            platformStr,
+            workId,
+            link,
+            activeDeletedFilter,
+            title
+          )
+        ) {
+          continue;
+        }
+
         const linkInfo = hasLink
           ? link.get(`${groupStr}|${platformStr}|${workId}`) ||
             link.get(`${platformStr}|${workId}`) ||
@@ -1669,8 +2014,6 @@ function collectWorkIntradayStructured(
           : null;
         const contentKey =
           hasLink && linkInfo && linkInfo.contentKey != null ? linkInfo.contentKey : null;
-        const meta = workById.get(workId);
-        const title = meta ? meta.title || "(无标题)" : DELETED_WORK_TITLE;
         const { ms: publishTimeMs, utc8Date: publishDateStr } = meta
           ? parsePublishTimeForTable(meta.publishTime)
           : { ms: 0, utc8Date: null };
@@ -1858,11 +2201,13 @@ function resolveAnalysisPublishTimes(
   allAccountsData,
   link,
   cutoffTo,
-  allPushRecords
+  allPushRecords,
+  deletedFilter = null
 ) {
   if (!Array.isArray(summaryRows) || summaryRows.length === 0) {
     return { summaryRows: [], workFallbackByPwKey: new Map() };
   }
+  const hasDeletedFilter = hasActiveDeletedFilter(deletedFilter);
   const linkMeta = link instanceof Map ? getLinkResultMeta(link) : null;
   const byWorkIdentity = linkMeta && linkMeta.byWorkIdentity ? linkMeta.byWorkIdentity : null;
   const excludedFuturePwKeys =
@@ -1887,6 +2232,12 @@ function resolveAnalysisPublishTimes(
       const workId = String(w.workId);
       const pwKey = makeWorkIdentityKey(rawPlatform, workId);
       if (excludedFuturePwKeys && excludedFuturePwKeys.has(pwKey)) continue;
+      if (
+        hasDeletedFilter &&
+        isWorkHiddenByDeletedContents(rawGroup, rawPlatform, workId, link, deletedFilter, w.title || "")
+      ) {
+        continue;
+      }
       const pubMs = parseRawTimestampMs(w.publishTime);
       const pubDate = pubMs !== null ? formatUtc8Date(pubMs) : "";
       if (cutoffTo && pubDate && pubDate > cutoffTo) continue;
@@ -3423,10 +3774,16 @@ function buildStatsAnalysisData(options = {}, depsArg) {
     );
   }
 
+  const deletedFilter = buildDeletedFilter(dataset.linkOverrides, {
+    contents: allContents,
+    link,
+  });
+
   // 仅收集分析用结构化全量行（含截止日后快照供掉 0 恢复识别；不生成 Excel 二维表）
   const { analysisRows } = collectWorkDailyStructured(dataset.outputAccountsData, link, {
     needSheetRows: false,
     needAnalysisRows: true,
+    deletedFilter,
   });
   const accountDaily = collectAccountDailyRows(dataset.outputAccountsData, "", resolvedTo, {
     sortRows: false,
@@ -3437,7 +3794,8 @@ function buildStatsAnalysisData(options = {}, depsArg) {
     dataset.allAccountsData,
     link,
     resolvedTo,
-    dataset.allPushRecords
+    dataset.allPushRecords,
+    deletedFilter
   );
   applyWorkFallbackPublishTimes(analysisRows, workFallbackByPwKey);
 
@@ -3455,6 +3813,7 @@ function buildStatsAnalysisData(options = {}, depsArg) {
       needAnalysisRows: true,
       analysisFrom: recent7From,
       analysisTo: resolvedTo,
+      deletedFilter,
     }
   );
   applyWorkFallbackPublishTimes(intradayAnalysisRows, workFallbackByPwKey);
@@ -3529,26 +3888,10 @@ function buildStatsWorkbookData(options = {}, deps) {
     throw new Error(FUTURE_DATE_RANGE_ERROR);
   }
 
+  const earlyDeletedFilter = buildDeletedFilter(dataset.linkOverrides);
+  const hasDeletedFilter = earlyDeletedFilter.active;
+
   // 构建前先计数「作品日明细」「作品时段明细」与「账号日快照」行数，超限直接拒绝，避免无谓排序与高内存占用
-  const estWorkDailyRows = countWorkDailyRows(
-    dataset.outputAccountsData,
-    resolvedFrom,
-    resolvedTo
-  );
-  if (estWorkDailyRows > maxRows) {
-    throw createRowLimitError(estWorkDailyRows, maxRows, "作品日明细");
-  }
-  const outputIntradayEntries = loadAccountsWorksIntraday(dataset.outputAccountsData, dataset.io, {
-    to: resolvedTo,
-  });
-  const estWorkIntradayRows = countWorkIntradayRows(
-    outputIntradayEntries,
-    resolvedFrom,
-    resolvedTo
-  );
-  if (estWorkIntradayRows > maxRows) {
-    throw createRowLimitError(estWorkIntradayRows, maxRows, "作品时段明细");
-  }
   const estAccountDailyRows = countAccountDailyRows(
     dataset.outputAccountsData,
     resolvedFrom,
@@ -3556,6 +3899,29 @@ function buildStatsWorkbookData(options = {}, deps) {
   );
   if (estAccountDailyRows > maxRows) {
     throw createRowLimitError(estAccountDailyRows, maxRows, "账号日快照");
+  }
+  if (!hasDeletedFilter) {
+    const estWorkDailyRows = countWorkDailyRows(
+      dataset.outputAccountsData,
+      resolvedFrom,
+      resolvedTo
+    );
+    if (estWorkDailyRows > maxRows) {
+      throw createRowLimitError(estWorkDailyRows, maxRows, "作品日明细");
+    }
+  }
+  const outputIntradayEntries = loadAccountsWorksIntraday(dataset.outputAccountsData, dataset.io, {
+    to: resolvedTo,
+  });
+  if (!hasDeletedFilter) {
+    const estWorkIntradayRows = countWorkIntradayRows(
+      outputIntradayEntries,
+      resolvedFrom,
+      resolvedTo
+    );
+    if (estWorkIntradayRows > maxRows) {
+      throw createRowLimitError(estWorkIntradayRows, maxRows, "作品时段明细");
+    }
   }
 
   // 预归约截至 resolvedTo 的单日最新快照，避免 linkWorks / buildContentSummaryRows 重复遍历全历史
@@ -3573,6 +3939,31 @@ function buildStatsWorkbookData(options = {}, deps) {
     date: resolvedTo,
     overrides: dataset.linkOverrides,
   });
+  const deletedFilter = hasDeletedFilter
+    ? buildDeletedFilter(dataset.linkOverrides, { contents: allContents, link })
+    : earlyDeletedFilter;
+  if (hasDeletedFilter) {
+    const estWorkDailyRows = countWorkDailyRows(
+      dataset.outputAccountsData,
+      resolvedFrom,
+      resolvedTo,
+      link,
+      deletedFilter
+    );
+    if (estWorkDailyRows > maxRows) {
+      throw createRowLimitError(estWorkDailyRows, maxRows, "作品日明细");
+    }
+    const estWorkIntradayRows = countWorkIntradayRows(
+      outputIntradayEntries,
+      resolvedFrom,
+      resolvedTo,
+      link,
+      deletedFilter
+    );
+    if (estWorkIntradayRows > maxRows) {
+      throw createRowLimitError(estWorkIntradayRows, maxRows, "作品时段明细");
+    }
+  }
   let summaryRows = buildContentSummaryRows({
     contents: allContents,
     accounts: dataset.allAccountsData,
@@ -3604,6 +3995,7 @@ function buildStatsWorkbookData(options = {}, deps) {
       to: resolvedTo,
       needSheetRows: true,
       needAnalysisRows: true,
+      deletedFilter,
     }
   );
   const workDailyAoa = formatWorkDailyAoa(workDailyRows);
@@ -3616,6 +4008,7 @@ function buildStatsWorkbookData(options = {}, deps) {
       needAnalysisRows: true,
       analysisFrom: recent7From,
       analysisTo: resolvedTo,
+      deletedFilter,
     });
   const workIntradayAoa = formatWorkIntradayAoa(workIntradayRows);
   const contentSummary = buildContentSummarySheet(summaryRows);
@@ -3633,7 +4026,8 @@ function buildStatsWorkbookData(options = {}, deps) {
     dataset.allAccountsData,
     link,
     resolvedTo,
-    dataset.allPushRecords
+    dataset.allPushRecords,
+    deletedFilter
   );
   applyWorkFallbackPublishTimes(analysisRows, workFallbackByPwKey);
   applyWorkFallbackPublishTimes(intradayAnalysisRows, workFallbackByPwKey);
@@ -4455,6 +4849,7 @@ module.exports = {
   buildDefaultExportFileName,
   resolveDefaultCutoffDate,
   resolveLinkValidationContext,
+  resolveDeleteContentSnapshots,
   countWorkDailyRows,
   countWorkIntradayRows,
   computeWorkCountsFromSummaryRows,

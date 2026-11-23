@@ -89,7 +89,7 @@
               :disabled="!autoCollect.enabled"
               :clearable="false"
               :editable="false"
-              :picker-options="{ start: '00:00', step: '00:30', end: '23:30' }"
+              :picker-options="{ start: '00:00', step: '00:30', end: '24:00' }"
               placeholder="结束时间"
               @change="onAutoCollectChange"
             />
@@ -178,27 +178,59 @@
                 未关联作品（{{ unlinkedWorkRows.length }}）
               </el-radio-button>
             </el-radio-group>
-            <div v-if="summaryFilter === 'unlinked'" class="unlinked-actions">
+            <div class="summary-toolbar-actions">
+              <template v-if="summaryFilter === 'unlinked'">
+                <el-button
+                  type="primary"
+                  size="mini"
+                  :loading="mutatingLink"
+                  :disabled="selectedUnlinkedWorks.length < 2 || mutatingLink"
+                  @click="mergeSelectedUnlinked"
+                >
+                  合并为同一视频（已选 {{ selectedUnlinkedWorks.length }} 条）
+                </el-button>
+              </template>
+              <template v-else>
+                <el-button
+                  type="danger"
+                  plain
+                  size="mini"
+                  :loading="mutatingLink"
+                  :disabled="!selectedSummaryRows.length || mutatingLink"
+                  @click="deleteSelectedSummaryRows"
+                >
+                  批量删除（已选 {{ selectedSummaryRows.length }} 条）
+                </el-button>
+                <el-button
+                  size="mini"
+                  :loading="mutatingLink"
+                  :disabled="emptyPlatformSummaryRows.length === 0 || mutatingLink"
+                  @click="cleanEmptyPlatformRows"
+                >
+                  清理空行（{{ emptyPlatformSummaryRows.length }}）
+                </el-button>
+              </template>
               <el-button
-                type="primary"
                 size="mini"
-                :loading="mutatingLink"
-                :disabled="selectedUnlinkedWorks.length < 2 || mutatingLink"
-                @click="mergeSelectedUnlinked"
+                icon="el-icon-delete"
+                @click="openDeletedContentsDialog"
               >
-                合并为同一视频（已选 {{ selectedUnlinkedWorks.length }} 条）
+                已删除（{{ deletedContentRows.length }}）
               </el-button>
             </div>
           </div>
           <el-table
             v-if="summaryFilter !== 'unlinked'"
+            ref="summaryTable"
             v-loading="loadingSummary"
             :data="displayedSummaryRows"
             row-key="contentKey"
             border
             stripe
             class="works-summary-table"
+            @selection-change="onSummarySelectionChange"
           >
+            <el-table-column type="selection" width="44" />
             <el-table-column type="expand">
               <template #default="{ row }">
                 <div class="expand-box">
@@ -509,15 +541,26 @@
                 </span>
               </template>
             </el-table-column>
-            <el-table-column label="趋势" width="72" align="center">
+            <el-table-column label="操作" width="116" align="center">
               <template #default="{ row }">
-                <el-button
-                  type="text"
-                  size="mini"
-                  @click.stop="openContentTrend(row)"
-                >
-                  趋势
-                </el-button>
+                <div class="summary-row-actions">
+                  <el-button
+                    type="text"
+                    size="mini"
+                    @click.stop="openContentTrend(row)"
+                  >
+                    趋势
+                  </el-button>
+                  <el-button
+                    type="text"
+                    size="mini"
+                    class="danger-text-btn"
+                    :disabled="mutatingLink"
+                    @click.stop="deleteSingleContentRow(row)"
+                  >
+                    删除
+                  </el-button>
+                </div>
               </template>
             </el-table-column>
             <template #empty>
@@ -778,6 +821,75 @@
           />
           <template #footer>
             <el-button size="small" @click="contentTrendVisible = false">关闭</el-button>
+          </template>
+        </el-dialog>
+        <el-dialog
+          :title="`已删除内容（${deletedContentRows.length}）`"
+          :visible.sync="deletedDialogVisible"
+          width="780px"
+          append-to-body
+        >
+          <div class="deleted-dialog-head">
+            <span class="card-tip">
+              已删除内容仅做隐藏排除，原始采集快照未删除，可随时恢复
+            </span>
+            <el-button
+              v-if="deletedContentRows.length"
+              type="primary"
+              plain
+              size="mini"
+              :loading="mutatingLink"
+              :disabled="mutatingLink"
+              @click="restoreAllDeletedContents"
+            >
+              全部恢复（{{ deletedContentRows.length }}）
+            </el-button>
+          </div>
+          <el-table
+            :data="deletedContentRows"
+            row-key="contentKey"
+            size="mini"
+            border
+            stripe
+            max-height="380"
+          >
+            <el-table-column prop="title" label="标题" min-width="200" show-overflow-tooltip />
+            <el-table-column prop="contentKey" label="内容ID" min-width="180" show-overflow-tooltip />
+            <el-table-column prop="platformCount" label="平台数" width="72" align="right">
+              <template #default="{ row }">
+                <span class="num">{{ row.platformCount }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="workCount" label="作品数" width="72" align="right">
+              <template #default="{ row }">
+                <span class="num">{{ row.workCount }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="删除时间" width="146">
+              <template #default="{ row }">
+                <span class="num" :class="{ muted: !row.deletedAt }">
+                  {{ formatUtc8FullDateTime(row.deletedAt) || "-" }}
+                </span>
+              </template>
+            </el-table-column>
+            <el-table-column label="操作" width="76" align="center">
+              <template #default="{ row }">
+                <el-button
+                  type="text"
+                  size="mini"
+                  :disabled="mutatingLink"
+                  @click="restoreDeletedContent(row.contentKey)"
+                >
+                  恢复
+                </el-button>
+              </template>
+            </el-table-column>
+            <template #empty>
+              <span class="card-empty-inline">暂无已删除内容</span>
+            </template>
+          </el-table>
+          <template #footer>
+            <el-button size="small" @click="deletedDialogVisible = false">关闭</el-button>
           </template>
         </el-dialog>
       </el-tab-pane>
@@ -1931,9 +2043,12 @@ export default {
       // 未手动调整导出区间时保持为空，由后端共享默认截止日（作品快照最新日）与近 30 天口径决定
       exportRange: null,
       contentSummaryRows: [],
+      deletedContentRows: [],
       contentSummaryDate: "",
       loadingSummary: false,
       summaryFilter: "all",
+      selectedSummaryRows: [],
+      deletedDialogVisible: false,
       selectedUnlinkedWorks: [],
       mutatingLink: false,
       reassignVisible: false,
@@ -2001,6 +2116,9 @@ export default {
     },
     fuzzySummaryRows() {
       return this.contentSummaryRows.filter((r) => this.canConfirmRow(r));
+    },
+    emptyPlatformSummaryRows() {
+      return this.contentSummaryRows.filter((r) => r && Number(r.platformCount) === 0);
     },
     displayedSummaryRows() {
       if (this.summaryFilter === "fuzzy") return this.fuzzySummaryRows;
@@ -2297,7 +2415,11 @@ export default {
       }
     },
     summaryFilter() {
+      this.selectedSummaryRows = [];
       this.selectedUnlinkedWorks = [];
+      if (this.$refs && this.$refs.summaryTable && typeof this.$refs.summaryTable.clearSelection === "function") {
+        this.$refs.summaryTable.clearSelection();
+      }
     },
     reassignKeyword() {
       this.reassignTargetKey = "";
@@ -2419,7 +2541,11 @@ export default {
         const res = await ipcRenderer.invoke("stats:get-analysis", payload);
         if (reqId !== this._analysisReqId) return;
         if (!res || res.ok === false || res.error) {
-          this.$message.warning((res && res.error) || "读取数据分析失败");
+          if (res && res.errorCode === "LINK_OVERRIDES_READ_ERROR") {
+            this.$message.error(res.error || "读取手工矫正配置失败，请稍后重试");
+          } else {
+            this.$message.warning((res && res.error) || "读取数据分析失败");
+          }
           this.analysisData = null;
           return;
         }
@@ -2582,7 +2708,11 @@ export default {
         const res = await ipcRenderer.invoke("stats:get-content-trend", payload);
         if (reqId !== this._contentTrendReqId) return;
         if (!res || res.ok === false || res.error) {
-          this.$message.warning((res && res.error) || "读取作品趋势失败");
+          if (res && res.errorCode === "LINK_OVERRIDES_READ_ERROR") {
+            this.$message.error(res.error || "读取手工矫正配置失败，请稍后重试");
+          } else {
+            this.$message.warning((res && res.error) || "读取作品趋势失败");
+          }
           this.contentTrendData = null;
           return;
         }
@@ -2616,7 +2746,11 @@ export default {
         const res = await ipcRenderer.invoke("stats:get-content-intraday", payload);
         if (reqId !== this._contentTrendReqId) return;
         if (!res || res.ok === false || res.error) {
-          this.$message.warning((res && res.error) || "读取作品分时段趋势失败");
+          if (res && res.errorCode === "LINK_OVERRIDES_READ_ERROR") {
+            this.$message.error(res.error || "读取手工矫正配置失败，请稍后重试");
+          } else {
+            this.$message.warning((res && res.error) || "读取作品分时段趋势失败");
+          }
           this.contentIntradayData = null;
           return;
         }
@@ -2748,15 +2882,25 @@ export default {
         const res = await ipcRenderer.invoke("stats:get-content-summary", {});
         if (reqId !== this._summaryReqId) return;
         if (res && res.error) {
-          this.$message.warning(res.error);
+          if (res.errorCode === "LINK_OVERRIDES_READ_ERROR") {
+            this.$message.error(res.error || "读取手工矫正配置失败，请稍后重试");
+          } else {
+            this.$message.warning(res.error);
+          }
           this.contentSummaryRows = [];
+          this.deletedContentRows = [];
           this.contentSummaryDate = "";
           return;
         }
         this.contentSummaryRows = Array.isArray(res && res.rows) ? res.rows : [];
+        this.deletedContentRows = Array.isArray(res && res.deletedRows) ? res.deletedRows : [];
         this.contentSummaryDate = (res && res.date) || "";
+        this.selectedSummaryRows = [];
         this.selectedUnlinkedWorks = [];
-        if (this.$refs.unlinkedTable && typeof this.$refs.unlinkedTable.clearSelection === "function") {
+        if (this.$refs && this.$refs.summaryTable && typeof this.$refs.summaryTable.clearSelection === "function") {
+          this.$refs.summaryTable.clearSelection();
+        }
+        if (this.$refs && this.$refs.unlinkedTable && typeof this.$refs.unlinkedTable.clearSelection === "function") {
           this.$refs.unlinkedTable.clearSelection();
         }
       } catch (err) {
@@ -2892,6 +3036,178 @@ export default {
         }
       }
       return out;
+    },
+    onSummarySelectionChange(selection) {
+      this.selectedSummaryRows = Array.isArray(selection) ? selection : [];
+    },
+    countRowWorks(row) {
+      if (!row || !row.perPlatform || typeof row.perPlatform !== "object") return 0;
+      let count = 0;
+      for (const cell of Object.values(row.perPlatform)) {
+        if (!cell || typeof cell !== "object") continue;
+        if (Array.isArray(cell.workIds)) {
+          count += cell.workIds.length;
+        } else if (Array.isArray(cell.works)) {
+          count += cell.works.length;
+        }
+      }
+      return count;
+    },
+    buildDeleteConfirmMessage(rows, mode = "single") {
+      const list = Array.isArray(rows) ? rows.filter((r) => r && r.contentKey) : [];
+      const totalWorks = list.reduce((sum, r) => sum + this.countRowWorks(r), 0);
+      const workNotice =
+        totalWorks > 0
+          ? `，挂着的 ${totalWorks} 个作品数据也不再统计（含汇总、分析、趋势及 Excel 导出）`
+          : "（不再出现在汇总、分析及 Excel 导出）";
+      if (mode === "single") {
+        const first = list[0] || {};
+        const name = first.title || first.contentKey || "该内容";
+        return `确定删除「${name}」？该内容将被隐藏${workNotice}，可在「已删除」中随时恢复。`;
+      }
+      if (mode === "empty") {
+        return `确定清理 ${list.length} 条覆盖平台数为 0 的空行？这些空行将被隐藏${workNotice}，可在「已删除」中随时恢复。`;
+      }
+      return `确定删除已选的 ${list.length} 条内容？这些内容将被隐藏${workNotice}，可在「已删除」中随时恢复。`;
+    },
+    async confirmAndDeleteContents(rows, { mode = "single", dialogTitle = "确认删除", successText = "" } = {}) {
+      if (this.mutatingLink) return { ok: false, busy: true };
+      const validRows = Array.isArray(rows) ? rows.filter((r) => r && r.contentKey) : [];
+      const contentKeys = [];
+      const seen = new Set();
+      for (const r of validRows) {
+        const ck = typeof r.contentKey === "string" ? r.contentKey.trim() : "";
+        if (!ck || seen.has(ck)) continue;
+        seen.add(ck);
+        contentKeys.push(ck);
+      }
+      if (!contentKeys.length) return { ok: false, empty: true };
+      const message = this.buildDeleteConfirmMessage(validRows, mode);
+      try {
+        await this.$confirm(message, dialogTitle, {
+          confirmButtonText: "确定删除",
+          cancelButtonText: "取消",
+          type: "warning",
+        });
+      } catch (_) {
+        return { ok: false, canceled: true };
+      }
+      this.mutatingLink = true;
+      try {
+        const payload = mode === "empty" ? { contentKeys, mode: "empty-only" } : { contentKeys };
+        const res = await ipcRenderer.invoke("stats:delete-contents", payload);
+        if (!res || !res.ok) {
+          this.$message.error((res && res.error) || "删除内容失败");
+          return { ok: false, error: res && res.error };
+        }
+        const skippedCount =
+          typeof res.skipped === "number" && Number.isFinite(res.skipped) && res.skipped > 0
+            ? res.skipped
+            : Array.isArray(res.skippedKeys)
+            ? res.skippedKeys.length
+            : 0;
+        const deletedKeys = Array.isArray(res.deletedKeys) ? res.deletedKeys : contentKeys;
+        const deletedCount =
+          mode === "empty"
+            ? typeof res.added === "number" && Number.isFinite(res.added)
+              ? res.added
+              : deletedKeys.length
+            : deletedKeys.length;
+        if (mode === "empty" && skippedCount > 0) {
+          if (deletedCount > 0) {
+            this.$message.warning(
+              `已清理 ${deletedCount} 条空行，${skippedCount} 条已有新数据，未删除`
+            );
+          } else {
+            this.$message.warning(`${skippedCount} 条已有新数据，未删除`);
+          }
+        } else {
+          this.$message.success(
+            successText || `已隐藏 ${deletedKeys.length} 条内容，可在「已删除」中恢复`
+          );
+        }
+        await this.loadContentSummary();
+        return {
+          ok: true,
+          deletedKeys,
+          ...(skippedCount > 0
+            ? {
+                skipped: skippedCount,
+                skippedKeys: Array.isArray(res.skippedKeys) ? res.skippedKeys : [],
+              }
+            : {}),
+        };
+      } catch (err) {
+        this.$message.error(`删除内容失败：${(err && err.message) || err}`);
+        return { ok: false, error: (err && err.message) || String(err) };
+      } finally {
+        this.mutatingLink = false;
+      }
+    },
+    deleteSingleContentRow(row) {
+      if (!row || !row.contentKey) return Promise.resolve({ ok: false, empty: true });
+      return this.confirmAndDeleteContents([row], {
+        mode: "single",
+        dialogTitle: "确认删除内容",
+        successText: "已隐藏该内容，可在「已删除」中恢复",
+      });
+    },
+    deleteSelectedSummaryRows() {
+      const rows = (this.selectedSummaryRows || []).filter((r) => r && r.contentKey);
+      if (!rows.length) return Promise.resolve({ ok: false, empty: true });
+      return this.confirmAndDeleteContents(rows, {
+        mode: "batch",
+        dialogTitle: "确认批量删除",
+        successText: `已隐藏 ${rows.length} 条内容，可在「已删除」中恢复`,
+      });
+    },
+    cleanEmptyPlatformRows() {
+      const rows = this.emptyPlatformSummaryRows;
+      if (!rows.length) return Promise.resolve({ ok: false, empty: true });
+      return this.confirmAndDeleteContents(rows, {
+        mode: "empty",
+        dialogTitle: "清理 0 平台空行",
+        successText: `已清理 ${rows.length} 条空行，可在「已删除」中恢复`,
+      });
+    },
+    openDeletedContentsDialog() {
+      this.deletedDialogVisible = true;
+    },
+    async restoreDeletedContents(contentKeys, successText = "") {
+      if (this.mutatingLink) return { ok: false, busy: true };
+      const uniqueKeys = [];
+      const seen = new Set();
+      for (const raw of Array.isArray(contentKeys) ? contentKeys : [contentKeys]) {
+        const ck = typeof raw === "string" ? raw.trim() : "";
+        if (!ck || seen.has(ck)) continue;
+        seen.add(ck);
+        uniqueKeys.push(ck);
+      }
+      if (!uniqueKeys.length) return { ok: false, empty: true };
+      this.mutatingLink = true;
+      try {
+        const res = await ipcRenderer.invoke("stats:restore-contents", { contentKeys: uniqueKeys });
+        if (!res || !res.ok) {
+          this.$message.error((res && res.error) || "恢复内容失败");
+          return { ok: false, error: res && res.error };
+        }
+        this.$message.success(successText || `已恢复 ${uniqueKeys.length} 条内容`);
+        await this.loadContentSummary();
+        return { ok: true, restoredKeys: uniqueKeys };
+      } catch (err) {
+        this.$message.error(`恢复内容失败：${(err && err.message) || err}`);
+        return { ok: false, error: (err && err.message) || String(err) };
+      } finally {
+        this.mutatingLink = false;
+      }
+    },
+    restoreDeletedContent(contentKey) {
+      return this.restoreDeletedContents([contentKey], "已恢复该内容");
+    },
+    restoreAllDeletedContents() {
+      const keys = (this.deletedContentRows || []).map((r) => r && r.contentKey).filter(Boolean);
+      if (!keys.length) return Promise.resolve({ ok: false, empty: true });
+      return this.restoreDeletedContents(keys, `已恢复全部 ${keys.length} 条内容`);
     },
     onUnlinkedSelectionChange(selection) {
       this.selectedUnlinkedWorks = Array.isArray(selection) ? selection : [];
@@ -3385,10 +3701,40 @@ export default {
   margin-bottom: 10px;
 }
 
+.summary-toolbar-actions,
 .unlinked-actions {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
+}
+
+.summary-row-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.danger-text-btn {
+  color: #f56c6c;
+
+  &:hover,
+  &:focus {
+    color: #f78989;
+  }
+
+  &.is-disabled {
+    color: #c0c4cc;
+  }
+}
+
+.deleted-dialog-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
 }
 
 .match-cell {

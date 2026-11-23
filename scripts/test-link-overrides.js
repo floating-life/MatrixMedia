@@ -30,6 +30,8 @@ const {
   buildContentIndex,
   linkWorks,
   buildContentSummaryRows,
+  normalizeOverridesDoc,
+  isContentRowDeleted,
 } = require("../src/main/services/dataStats/contentLink.js");
 const {
   buildContentSummaryData,
@@ -68,6 +70,7 @@ async function main() {
   const origIndexCache = require.cache[indexId];
   const origCollectorCache = require.cache[collectorId];
 
+  let nextSaveDialogResult = { canceled: true, filePath: "" };
   require.cache[electronId] = {
     id: electronId,
     filename: electronId,
@@ -84,7 +87,7 @@ async function main() {
         fromWebContents: () => ({ id: 1 }),
       },
       dialog: {
-        showSaveDialog: async () => ({ canceled: true, filePath: "" }),
+        showSaveDialog: async () => nextSaveDialogResult,
       },
     },
   };
@@ -1551,6 +1554,754 @@ async function main() {
       console.log("✓ IPC 安全/参数/并发串行写入 + S6-fix#4/#6/#13 + S6-r3#1/#2/#9/#11 + S6-r4#3 端到端与导出一致性全通过");
     }
 
+    /* ---------- 3.5. S13：deletedContents 清洗、防原型污染、IPC 删/恢复与并发不丢写 ---------- */
+    {
+      // 3.5a. store.js：deletedContents 无原型字典、防原型污染、坏条目丢弃、旧 v1 兼容、与 overrides 互不覆盖
+      fs.rmSync(overridesFile, { force: true });
+      const legacyNoDeleted = {
+        version: 1,
+        updatedAt: 6000,
+        contents: {},
+        excludedAuto: {},
+        overrides: { "抖音|s13_keep": { action: "detach" } },
+      };
+      fs.writeFileSync(overridesFile, JSON.stringify(legacyNoDeleted), "utf8");
+      const { result: legacyRead, warnings: legacyWarns } = captureWarn(() => store.readLinkOverrides());
+      assert.deepStrictEqual(legacyWarns, [], "旧 v1 文件不含 deletedContents 时应静默兼容");
+      assert.strictEqual(Object.getPrototypeOf(legacyRead.deletedContents), null, "deletedContents 必须为无原型字典");
+      assert.deepStrictEqual(Object.keys(legacyRead.deletedContents), []);
+
+      // 顶层 deletedContents 非纯对象 → warn 并回落为空
+      for (const badTop of [
+        '{"version":1,"updatedAt":6001,"deletedContents":[],"overrides":{}}',
+        '{"version":1,"updatedAt":6001,"deletedContents":null,"overrides":{}}',
+        '{"version":1,"updatedAt":6001,"deletedContents":"bad","overrides":{}}',
+      ]) {
+        fs.writeFileSync(overridesFile, badTop, "utf8");
+        const { result: badRes, warnings: badWarns } = captureWarn(() => store.readLinkOverrides());
+        assert.strictEqual(Object.getPrototypeOf(badRes.deletedContents), null);
+        assert.deepStrictEqual(Object.keys(badRes.deletedContents), []);
+        assert.ok(badWarns.some((w) => w.includes("deletedContents")), `非法 deletedContents 应 warn: ${badTop}`);
+      }
+
+      // 原型污染键名与坏条目清洗
+      const rawPoisonJson =
+        '{"version":1,"updatedAt":6002,"contents":{},"excludedAuto":{},"overrides":{},"deletedContents":{' +
+        '"__proto__":{"deletedAt":100},' +
+        '"constructor":{"deletedAt":200},' +
+        '"prototype":{"deletedAt":300},' +
+        '"":{"deletedAt":400},' +
+        '" file:/untrimmed.mp4 ":{"deletedAt":500},' +
+        '"file:/bad_ts_str.mp4":{"deletedAt":"600"},' +
+        '"file:/bad_ts_neg.mp4":{"deletedAt":-1},' +
+        '"file:/bad_null.mp4":null,' +
+        '"file:c:/users/ggcle/downloads/empty.mp4":{"deletedAt":7000,"extra":"stripped"},' +
+        '"unlinked:抖音:w_del":{"deletedAt":7001}' +
+        "}}";
+      fs.writeFileSync(overridesFile, rawPoisonJson, "utf8");
+      const { result: cleanedDoc, warnings: cleanedWarns } = captureWarn(() => store.readLinkOverrides());
+      assert.deepStrictEqual(cleanedWarns, []);
+      assert.strictEqual(Object.getPrototypeOf(cleanedDoc.deletedContents), null);
+      assert.strictEqual(({}).deletedAt, undefined, "不得发生原型污染");
+      assert.deepStrictEqual(Object.keys(cleanedDoc.deletedContents).sort(), [
+        "file:c:/users/ggcle/downloads/empty.mp4",
+        "unlinked:抖音:w_del",
+      ]);
+      assert.deepStrictEqual(
+        cleanedDoc.deletedContents["file:c:/users/ggcle/downloads/empty.mp4"],
+        { deletedAt: 7000 }
+      );
+
+      // contentLink.normalizeOverridesDoc 同样清洗原型污染键与坏条目（含仅含 deletedContents 的部分文档）
+      const parsedPoison = JSON.parse(rawPoisonJson);
+      const normOnlyDeleted = normalizeOverridesDoc({ deletedContents: parsedPoison.deletedContents });
+      assert.deepStrictEqual([...normOnlyDeleted.deletedContents.keys()].sort(), [
+        "file:c:/users/ggcle/downloads/empty.mp4",
+        "unlinked:抖音:w_del",
+      ]);
+      assert.strictEqual(normalizeOverridesDoc({ deletedContents: [] }).deletedContents.size, 0);
+
+      // store.deleteContentsOverride / restoreContentsOverride 与其他写入互不覆盖
+      fs.rmSync(overridesFile, { force: true });
+      store.setLinkOverride("抖音|s13_ov", { action: "detach" }, 7100);
+      const afterDel = store.deleteContentsOverride(["file:/v/s13_a.mp4", "file:/v/s13_b.mp4"], 7200);
+      assert.deepStrictEqual(afterDel.deletedContents["file:/v/s13_a.mp4"], { deletedAt: 7200 });
+      assert.deepStrictEqual(afterDel.overrides["抖音|s13_ov"], { action: "detach" });
+      // 幂等重复删除保留原 deletedAt
+      const afterDupDel = store.deleteContentsOverride(["file:/v/s13_a.mp4"], 7300);
+      assert.deepStrictEqual(afterDupDel.deletedContents["file:/v/s13_a.mp4"], { deletedAt: 7200 });
+      // 再次 setLinkOverride / clearLinkOverride 必须保留 deletedContents
+      const afterSet2 = store.setLinkOverride("快手|s13_ov2", { action: "detach" }, 7400);
+      assert.deepStrictEqual(afterSet2.deletedContents["file:/v/s13_a.mp4"], { deletedAt: 7200 });
+      const afterClear2 = store.clearLinkOverride("快手|s13_ov2", 7500);
+      assert.deepStrictEqual(afterClear2.deletedContents["file:/v/s13_a.mp4"], { deletedAt: 7200 });
+      // 拒绝原型污染键与空键
+      assert.throws(() => store.deleteContentsOverride(["__proto__"]));
+      assert.throws(() => store.deleteContentsOverride(["constructor"]));
+      assert.throws(() => store.deleteContentsOverride(["prototype"]));
+      assert.throws(() => store.deleteContentsOverride([""]));
+      assert.throws(() => store.restoreContentsOverride(["__proto__"]));
+      // 恢复单条
+      const afterRestore = store.restoreContentsOverride(["file:/v/s13_a.mp4"], 7600);
+      assert.strictEqual(afterRestore.deletedContents["file:/v/s13_a.mp4"], undefined);
+      assert.deepStrictEqual(afterRestore.deletedContents["file:/v/s13_b.mp4"], { deletedAt: 7200 });
+
+      // 3.5b. IPC stats:delete-contents / stats:restore-contents / stats:get-content-summary / 并发写
+      fs.rmSync(overridesFile, { force: true });
+      const deleteContentsIpc = ipcHandlers.get("stats:delete-contents");
+      const restoreContentsIpc = ipcHandlers.get("stats:restore-contents");
+      const getOverridesIpc = ipcHandlers.get("stats:get-link-overrides");
+      const setOverrideIpc = ipcHandlers.get("stats:set-link-override");
+      const getSummaryIpc = ipcHandlers.get("stats:get-content-summary");
+      assert.strictEqual(typeof deleteContentsIpc, "function");
+      assert.strictEqual(typeof restoreContentsIpc, "function");
+
+      const localEvS13 = { sender: {}, senderFrame: { url: "file:///app/index.html" } };
+      // 外部页面拦截
+      const extEvS13 = { sender: {}, senderFrame: { url: "https://evil.example/" } };
+      assert.strictEqual((await deleteContentsIpc(extEvS13, { contentKeys: ["file:/a.mp4"] })).ok, false);
+      assert.strictEqual((await restoreContentsIpc(extEvS13, { contentKeys: ["file:/a.mp4"] })).ok, false);
+      // 参数与防原型污染拦截
+      assert.strictEqual((await deleteContentsIpc(localEvS13, null)).ok, false);
+      assert.strictEqual((await deleteContentsIpc(localEvS13, { contentKeys: [] })).ok, false);
+      assert.strictEqual((await deleteContentsIpc(localEvS13, { contentKeys: ["__proto__"] })).ok, false);
+      assert.strictEqual((await deleteContentsIpc(localEvS13, { contentKeys: ["constructor"] })).ok, false);
+      assert.strictEqual((await deleteContentsIpc(localEvS13, { contentKeys: ["prototype"] })).ok, false);
+      assert.strictEqual((await restoreContentsIpc(localEvS13, { contentKeys: [] })).ok, false);
+      assert.strictEqual((await restoreContentsIpc(localEvS13, { contentKeys: ["__proto__"] })).ok, false);
+
+      // 真实数据：1 条 0 平台空行（file:c:/users/ggcle/downloads/orphan.mp4）+ 1 条挂作品行 + 1 条保留行
+      const s13PushFile = path.join(pushDataDir, "2026-11-19.json");
+      fs.writeFileSync(
+        s13PushFile,
+        JSON.stringify([
+          {
+            id: "s13-empty-rec",
+            pt: "抖音",
+            group: "S13组",
+            publishStatus: "success",
+            title: "被改关联后留下的空行",
+            filePath: "C:\\Users\\ggcle\\Downloads\\orphan.mp4",
+            lastPublishAt: dayTs("2026-11-19"),
+          },
+          {
+            id: "s13-with-work",
+            pt: "抖音",
+            group: "S13组",
+            publishStatus: "success",
+            title: "挂有作品的待删内容",
+            filePath: "C:\\Users\\ggcle\\Downloads\\with_work.mp4",
+            videoLink: "https://www.douyin.com/video/s13_w1",
+            lastPublishAt: dayTs("2026-11-19"),
+          },
+          {
+            id: "s13-keep",
+            pt: "抖音",
+            group: "S13组",
+            publishStatus: "success",
+            title: "正常保留内容",
+            filePath: "C:\\Users\\ggcle\\Downloads\\keep.mp4",
+            videoLink: "https://www.douyin.com/video/s13_w2",
+            lastPublishAt: dayTs("2026-11-19"),
+          },
+        ]),
+        "utf8"
+      );
+      store.mergeWorks(
+        "S13组",
+        "抖音",
+        [
+          {
+            workId: "s13_w1",
+            title: "挂有作品的待删内容",
+            url: "https://www.douyin.com/video/s13_w1",
+            publishTime: dayTs("2026-11-19"),
+            play: 888,
+          },
+          {
+            workId: "s13_w2",
+            title: "正常保留内容",
+            url: "https://www.douyin.com/video/s13_w2",
+            publishTime: dayTs("2026-11-19"),
+            play: 555,
+          },
+          {
+            workId: "s13_w_relink",
+            title: "稍后关联进已删内容的作品",
+            publishTime: dayTs("2026-11-19"),
+            play: 333,
+          },
+        ],
+        dayTs("2026-11-19")
+      );
+
+      const sumBeforeS13 = await getSummaryIpc(localEvS13, { date: "2026-11-19" });
+      const orphanKey = "file:c:/users/ggcle/downloads/orphan.mp4";
+      const withWorkKey = "file:c:/users/ggcle/downloads/with_work.mp4";
+      const keepKey = "file:c:/users/ggcle/downloads/keep.mp4";
+      const orphanRow = sumBeforeS13.rows.find((r) => r.contentKey === orphanKey);
+      assert.ok(orphanRow && orphanRow.platformCount === 0, "空行覆盖平台数应为 0");
+
+      // 并发：删除两个内容 + 手工把 s13_w_relink assign 进已被删除的 orphanKey（仍应被隐藏且不丢写）
+      const [delRes, assignRes] = await Promise.all([
+        deleteContentsIpc(localEvS13, { contentKeys: [orphanKey, withWorkKey] }),
+        setOverrideIpc(localEvS13, {
+          workKey: "抖音|s13_w_relink",
+          action: "assign",
+          contentKey: orphanKey,
+        }),
+      ]);
+      assert.strictEqual(delRes.ok, true);
+      assert.strictEqual(assignRes.ok, true);
+
+      const ovAfterConc = await getOverridesIpc(localEvS13);
+      assert.strictEqual(ovAfterConc.ok, true);
+      assert.ok(ovAfterConc.deletedContents[orphanKey] && ovAfterConc.deletedContents[withWorkKey]);
+      assert.deepStrictEqual(ovAfterConc.overrides["抖音|s13_w_relink"], {
+        action: "assign",
+        contentKey: orphanKey,
+      });
+
+      // 汇总中 orphanKey 与 withWorkKey 均隐藏（含新关联进 orphanKey 的 s13_w_relink），且 deletedRows 列出两者
+      const sumAfterDel = await getSummaryIpc(localEvS13, { date: "2026-11-19" });
+      assert.strictEqual(sumAfterDel.rows.some((r) => r.contentKey === orphanKey), false);
+      assert.strictEqual(sumAfterDel.rows.some((r) => r.contentKey === withWorkKey), false);
+      assert.strictEqual(sumAfterDel.rows.some((r) => r.contentKey === keepKey), true);
+      assert.strictEqual(
+        sumAfterDel.rows.some((r) => r.contentKey === "unlinked:抖音:s13_w_relink"),
+        false,
+        "关联进已删除内容的作品必须以删除为准继续隐藏"
+      );
+      const delRowOrphan = sumAfterDel.deletedRows.find((r) => r.contentKey === orphanKey);
+      const delRowWithWork = sumAfterDel.deletedRows.find((r) => r.contentKey === withWorkKey);
+      assert.ok(delRowOrphan && delRowOrphan.workCount === 1, "已删除列表应展示关联作品数");
+      assert.ok(delRowWithWork && delRowWithWork.workCount === 1 && delRowWithWork.platformCount === 1);
+
+      // 一键恢复后正常显示（含之前关联进来的 s13_w_relink）
+      const restoreRes = await restoreContentsIpc(localEvS13, { contentKeys: [orphanKey, withWorkKey] });
+      assert.strictEqual(restoreRes.ok, true);
+      assert.strictEqual(restoreRes.restored, 2);
+      const sumAfterRestore = await getSummaryIpc(localEvS13, { date: "2026-11-19" });
+      assert.strictEqual(sumAfterRestore.deletedRows.length, 0);
+      const restoredOrphan = sumAfterRestore.rows.find((r) => r.contentKey === orphanKey);
+      assert.ok(restoredOrphan && restoredOrphan.platformCount === 1 && restoredOrphan.totalPlay === 333);
+      assert.ok(sumAfterRestore.rows.some((r) => r.contentKey === withWorkKey));
+
+      // 清理 S13 测试文件
+      fs.rmSync(overridesFile, { force: true });
+      fs.rmSync(s13PushFile, { force: true });
+      fs.rmSync(path.join(userDataDir, "data-stats", "S13组"), { recursive: true, force: true });
+      console.log("✓ S13 deletedContents 清洗/防原型污染/IPC删恢复/并发写/关联进已删内容仍隐藏全通过");
+    }
+
+    /* ---------- 3.6. S13-r1 返修 4 个 P2 回归：快照格式、EBUSY/损坏读失败不覆盖、第三平台加入、历史截止、pos 键错位 ---------- */
+    {
+      const deleteContentsIpc = ipcHandlers.get("stats:delete-contents");
+      const restoreContentsIpc = ipcHandlers.get("stats:restore-contents");
+      const getOverridesIpc = ipcHandlers.get("stats:get-link-overrides");
+      const setOverrideIpc = ipcHandlers.get("stats:set-link-override");
+      const clearOverrideIpc = ipcHandlers.get("stats:clear-link-override");
+      const mergeWorksIpc = ipcHandlers.get("stats:merge-works");
+      const applyOverridesIpc = ipcHandlers.get("stats:apply-link-overrides");
+      const getSummaryIpc = ipcHandlers.get("stats:get-content-summary");
+      const localEv = { sender: {}, senderFrame: { url: "file:///app/index.html" } };
+
+      // 3.6a. P2 #4：区分 ENOENT（视为空）与读/解析失败（EBUSY / 损坏 JSON），所有写路径遇读失败一律报错且不覆盖原文件
+      fs.rmSync(overridesFile, { force: true });
+      // ENOENT 时 strict 读取正常返回空配置且写路径可正常新建文件
+      const enoentStrict = store.readLinkOverridesStrict();
+      assert.deepStrictEqual(Object.keys(enoentStrict.overrides), []);
+      assert.deepStrictEqual(Object.keys(enoentStrict.deletedContents), []);
+
+      // 写入包含 assign / merge / excludedAuto / deletedContents(含 title+pwKeys) 的完整配置
+      store.setLinkOverride("抖音|p2_keep_assign", { action: "assign", contentKey: "file:/v/p2_a.mp4" }, 8001);
+      store.setLinkOverride("快手|p2_keep_detach", { action: "detach" }, 8002);
+      const mergedP2 = store.mergeWorksOverride(["抖音|p2_m1", "快手|p2_m2"], 8003, "手工合并保留项");
+      store.deleteContentsOverride(
+        [{ contentKey: "file:/v/p2_del.mp4", title: "已删保留标题", pwKeys: ["抖音|p2_dw1", "快手|p2_dw2"] }],
+        8004
+      );
+      const intactBytes = fs.readFileSync(overridesFile, "utf8");
+      const parsedIntact = JSON.parse(intactBytes);
+      assert.deepStrictEqual(parsedIntact.deletedContents["file:/v/p2_del.mp4"], {
+        deletedAt: 8004,
+        title: "已删保留标题",
+        pwKeys: ["快手|p2_dw2", "抖音|p2_dw1"],
+      });
+
+      // 注入短暂 EBUSY 读失败：strict 抛错、默认只读仍 warn 返回空、全部 store 与 IPC 写路径报错且原文件字节一字不变
+      const origReadFileSync = fs.readFileSync;
+      let injectEbusy = true;
+      fs.readFileSync = function patchedRead(target, ...rest) {
+        if (injectEbusy && path.resolve(String(target)) === path.resolve(overridesFile)) {
+          const err = new Error("EBUSY: resource busy or locked");
+          err.code = "EBUSY";
+          throw err;
+        }
+        return origReadFileSync.call(this, target, ...rest);
+      };
+      try {
+        assert.throws(
+          () => store.readLinkOverridesStrict(),
+          (err) => err && err.code === "EBUSY"
+        );
+        assert.throws(
+          () => store.readLinkOverrides({ strict: true }),
+          (err) => err && err.code === "EBUSY"
+        );
+        const { result: nonStrictRes, warnings: nonStrictWarns } = captureWarn(() =>
+          store.readLinkOverrides()
+        );
+        assert.deepStrictEqual(Object.keys(nonStrictRes.overrides), []);
+        assert.ok(nonStrictWarns.some((w) => w.includes("EBUSY")));
+
+        // store 写路径全部拒绝且不写盘
+        assert.throws(() => store.deleteContentsOverride(["file:/v/ebusy_new.mp4"]), /EBUSY/);
+        assert.throws(() => store.restoreContentsOverride(["file:/v/p2_del.mp4"]), /EBUSY/);
+        assert.throws(() => store.setLinkOverride("抖音|ebusy_x", { action: "detach" }), /EBUSY/);
+        assert.throws(() => store.clearLinkOverride("快手|p2_keep_detach"), /EBUSY/);
+        assert.throws(() => store.mergeWorksOverride(["抖音|eb1", "快手|eb2"]), /EBUSY/);
+
+        // IPC 全部写路径返回 { ok: false, error } 且不覆盖文件
+        const delBusy = await deleteContentsIpc(localEv, { contentKeys: ["file:/v/ebusy_ipc.mp4"] });
+        assert.strictEqual(delBusy.ok, false, "EBUSY 时 stats:delete-contents 必须返回错误");
+        assert.ok(delBusy.error && delBusy.error.includes("EBUSY"));
+
+        const resBusy = await restoreContentsIpc(localEv, { contentKeys: ["file:/v/p2_del.mp4"] });
+        assert.strictEqual(resBusy.ok, false, "EBUSY 时 stats:restore-contents 必须返回错误");
+        assert.ok(resBusy.error && resBusy.error.includes("EBUSY"));
+
+        const setBusy = await setOverrideIpc(localEv, { workKey: "抖音|p2_keep_assign", action: "detach" });
+        assert.strictEqual(setBusy.ok, false, "EBUSY 时 stats:set-link-override 必须返回错误");
+        assert.ok(setBusy.error && setBusy.error.includes("EBUSY"));
+
+        const clrBusy = await clearOverrideIpc(localEv, { workKey: "快手|p2_keep_detach" });
+        assert.strictEqual(clrBusy.ok, false, "EBUSY 时 stats:clear-link-override 必须返回错误");
+        assert.ok(clrBusy.error && clrBusy.error.includes("EBUSY"));
+
+        const mrgBusy = await mergeWorksIpc(localEv, { workKeys: ["抖音|eb1", "快手|eb2"] });
+        assert.strictEqual(mrgBusy.ok, false, "EBUSY 时 stats:merge-works 必须返回错误");
+        assert.ok(mrgBusy.error && mrgBusy.error.includes("EBUSY"));
+
+        const appBusy = await applyOverridesIpc(localEv, {
+          ops: [{ action: "clear", workKey: "快手|p2_keep_detach" }],
+        });
+        assert.strictEqual(appBusy.ok, false, "EBUSY 时 stats:apply-link-overrides 必须返回错误");
+        assert.ok(appBusy.error && appBusy.error.includes("EBUSY"));
+      } finally {
+        injectEbusy = false;
+        fs.readFileSync = origReadFileSync;
+      }
+
+      // 解除 EBUSY 后校验原文件字节与内容完好无损
+      assert.strictEqual(
+        fs.readFileSync(overridesFile, "utf8"),
+        intactBytes,
+        "S13-r1#4: 短暂 EBUSY 读失败期间不得覆盖 link-overrides.json"
+      );
+
+      // 解除 EBUSY 后串行队列恢复正常，后续写操作不丢原有手工关联/合并/删除标记
+      const afterRecoverDel = await deleteContentsIpc(localEv, { contentKeys: ["file:/v/after_ebusy.mp4"] });
+      assert.strictEqual(afterRecoverDel.ok, true);
+      const ovAfterRecover = await getOverridesIpc(localEv);
+      assert.strictEqual(ovAfterRecover.ok, true);
+      assert.deepStrictEqual(ovAfterRecover.overrides["抖音|p2_keep_assign"], {
+        action: "assign",
+        contentKey: "file:/v/p2_a.mp4",
+      });
+      assert.ok(ovAfterRecover.contents[mergedP2.contentKey], "原有手工合并 contents 必须完好保留");
+      assert.strictEqual(ovAfterRecover.excludedAuto["快手|p2_keep_detach"], true);
+      assert.deepStrictEqual(ovAfterRecover.deletedContents["file:/v/p2_del.mp4"], {
+        deletedAt: 8004,
+        title: "已删保留标题",
+        pwKeys: ["快手|p2_dw2", "抖音|p2_dw1"],
+      });
+      assert.ok(ovAfterRecover.deletedContents["file:/v/after_ebusy.mp4"]);
+
+      // JSON 损坏时同样拒绝写盘、不覆盖损坏文件
+      fs.writeFileSync(overridesFile, "{corrupt json!!!", "utf8");
+      assert.throws(() => store.deleteContentsOverride(["file:/v/x.mp4"]));
+      assert.strictEqual(
+        (await deleteContentsIpc(localEv, { contentKeys: ["file:/v/x.mp4"] })).ok,
+        false
+      );
+      assert.strictEqual(
+        (await restoreContentsIpc(localEv, { contentKeys: ["file:/v/p2_del.mp4"] })).ok,
+        false
+      );
+      assert.strictEqual(
+        (await applyOverridesIpc(localEv, { ops: [{ action: "clear", workKey: "快手|p2_keep_detach" }] })).ok,
+        false
+      );
+      assert.strictEqual(
+        fs.readFileSync(overridesFile, "utf8"),
+        "{corrupt json!!!",
+        "S13-r1#4: JSON 解析失败时写路径不得用空配置覆盖磁盘文件"
+      );
+
+      // 3.6b. P2 #1/#2/#3 IPC 端到端快照写入与恢复校验
+      fs.rmSync(overridesFile, { force: true });
+      const r1PushFile = path.join(pushDataDir, "2026-11-20.json");
+      fs.writeFileSync(
+        r1PushFile,
+        JSON.stringify([
+          // pos:0（无 id、无 filePath）
+          {
+            pt: "抖音",
+            group: "R1组",
+            publishStatus: "success",
+            title: "旧位置记录甲",
+            date: "2026-11-12",
+          },
+          // pos:1（无 id、无 filePath），稍后删除甲后将接用 record:pos:0
+          {
+            pt: "抖音",
+            group: "R1组",
+            publishStatus: "success",
+            title: "旧位置记录乙",
+            date: "2026-11-12",
+          },
+          // 较晚日期目标内容（2026-11-18）
+          {
+            id: "r1-late-target",
+            pt: "抖音",
+            group: "R1组",
+            publishStatus: "success",
+            title: "较晚日期目标内容",
+            filePath: "C:\\Users\\ggcle\\Downloads\\r1_late.mp4",
+            lastPublishAt: dayTs("2026-11-18"),
+          },
+        ]),
+        "utf8"
+      );
+      // 提前写入历史日期（2026-11-12）与最新日期（2026-11-20）的作品快照
+      const dyWorksR1 = [
+        { workId: "r1_pos_a", title: "旧位置记录甲", publishTime: dayTs("2026-11-12"), play: 800 },
+        { workId: "r1_pos_b", title: "旧位置记录乙", publishTime: dayTs("2026-11-12"), play: 400 },
+        { workId: "r1_early_w", title: "较早发布手工挂到较晚内容的作品", publishTime: dayTs("2026-11-10"), play: 999 },
+        { workId: "r1_auto_dy", title: "周末户外露营必带十件实用装备清单", publishTime: dayTs("2026-11-15"), play: 1000 },
+      ];
+      store.mergeWorks("R1组", "抖音", dyWorksR1, dayTs("2026-11-12"));
+      store.mergeWorks("R1组", "抖音", dyWorksR1, dayTs("2026-11-20"));
+      store.mergeWorks(
+        "R1组",
+        "快手",
+        [{ workId: "r1_auto_ks", title: "周末户外露营必带十件实用装备清单", publishTime: dayTs("2026-11-15"), play: 2000 }],
+        dayTs("2026-11-20")
+      );
+
+      // 1) 手工将较早作品 r1_early_w 关联到 2026-11-18 的 r1_late.mp4，再删除 r1_late.mp4
+      const lateKey = "file:c:/users/ggcle/downloads/r1_late.mp4";
+      assert.strictEqual(
+        (await setOverrideIpc(localEv, { workKey: "抖音|r1_early_w", action: "assign", contentKey: lateKey })).ok,
+        true
+      );
+      const sumBeforeR1 = await getSummaryIpc(localEv, { date: "2026-11-20" });
+      const autoRowBefore = sumBeforeR1.rows.find(
+        (r) => r.contentKey.startsWith("auto:") && r.title === "周末户外露营必带十件实用装备清单"
+      );
+      assert.ok(autoRowBefore && autoRowBefore.platformCount === 2, "应先形成双平台自动聚类");
+      const autoOldKey = autoRowBefore.contentKey;
+      const posARowBefore = sumBeforeR1.rows.find((r) => r.title === "旧位置记录甲");
+      assert.ok(posARowBefore && posARowBefore.contentKey.startsWith("record:pos:"), "旧位置记录甲应使用 record:pos:N 键");
+      const posAKey = posARowBefore.contentKey;
+
+      // 通过 IPC 批量删除：r1_late.mp4、双平台 autoOldKey、以及 posAKey（旧位置记录甲）
+      const delR1 = await deleteContentsIpc(localEv, {
+        contentKeys: [lateKey, autoOldKey, posAKey],
+      });
+      assert.strictEqual(delR1.ok, true);
+
+      // 验证写盘快照都完整记录了 title 与 pwKeys
+      const ovR1 = await getOverridesIpc(localEv);
+      assert.strictEqual(ovR1.deletedContents[lateKey].title, "较晚日期目标内容");
+      assert.deepStrictEqual(ovR1.deletedContents[lateKey].pwKeys, ["抖音|r1_early_w"]);
+      assert.strictEqual(ovR1.deletedContents[autoOldKey].title, "周末户外露营必带十件实用装备清单");
+      assert.deepStrictEqual(ovR1.deletedContents[autoOldKey].pwKeys, ["快手|r1_auto_ks", "抖音|r1_auto_dy"]);
+      assert.strictEqual(ovR1.deletedContents[posAKey].title, "旧位置记录甲");
+      assert.deepStrictEqual(ovR1.deletedContents[posAKey].pwKeys, ["抖音|r1_pos_a"]);
+
+      // P2 #1 校验：按更早截止日期 2026-11-12 查询汇总，r1_late.mp4 被日期裁掉但 r1_early_w 仍隐藏（不得以未关联重现）
+      const sumHist = await getSummaryIpc(localEv, { date: "2026-11-12" });
+      assert.strictEqual(
+        sumHist.rows.some((r) => r.contentKey === "unlinked:抖音:r1_early_w" || r.contentKey === lateKey),
+        false,
+        "S13-r1#1: 历史截止查询中已删除作品不得以未关联重现"
+      );
+      assert.ok(
+        sumHist.deletedRows.some((r) => r.contentKey === lateKey && r.title === "较晚日期目标内容" && r.workCount === 1),
+        "已删除弹窗应通过快照标题与作品数正确展示"
+      );
+
+      // P2 #2 / S13-r2#1 校验：采到第三个平台小红书使自动聚类成员哈希变化，整行连同小红书作品一律隐藏
+      store.mergeWorks(
+        "R1组",
+        "小红书",
+        [{ workId: "r1_auto_xhs", title: "周末户外露营必带十件实用装备清单", publishTime: dayTs("2026-11-16"), play: 300 }],
+        dayTs("2026-11-20")
+      );
+      const sumAfter3rd = await getSummaryIpc(localEv, { date: "2026-11-20" });
+      const autoRowsAfter3rd = sumAfter3rd.rows.filter(
+        (r) => r.contentKey.startsWith("auto:") && r.title === "周末户外露营必带十件实用装备清单"
+      );
+      assert.strictEqual(
+        autoRowsAfter3rd.length,
+        0,
+        "S13-r2#1: 第三平台小红书加入已删除聚类后，整行连同全部作品（含小红书）必须一律隐藏"
+      );
+      assert.strictEqual(
+        sumAfter3rd.rows.some((r) => r.contentKey === "unlinked:小红书:r1_auto_xhs"),
+        false,
+        "新加入的小红书作品也不得以未关联重现"
+      );
+
+      // 恢复 autoOldKey 后三平台全部回来
+      assert.strictEqual((await restoreContentsIpc(localEv, { contentKeys: [autoOldKey] })).ok, true);
+      const sumAfterRestoreAuto = await getSummaryIpc(localEv, { date: "2026-11-20" });
+      const restoredAutoRow = sumAfterRestoreAuto.rows.find(
+        (r) => r.contentKey.startsWith("auto:") && r.title === "周末户外露营必带十件实用装备清单"
+      );
+      assert.ok(restoredAutoRow && restoredAutoRow.platformCount === 3 && restoredAutoRow.totalPlay === 3300);
+
+      // P2 #3 校验：删除旧记录甲使旧记录乙接用 posAKey（同一 record:pos:N），旧记录乙不得被误隐藏，旧作品 r1_pos_a 仍保持隐藏
+      fs.writeFileSync(
+        r1PushFile,
+        JSON.stringify([
+          {
+            pt: "抖音",
+            group: "R1组",
+            publishStatus: "success",
+            title: "旧位置记录乙",
+            date: "2026-11-12",
+          },
+          {
+            id: "r1-late-target",
+            pt: "抖音",
+            group: "R1组",
+            publishStatus: "success",
+            title: "较晚日期目标内容",
+            filePath: "C:\\Users\\ggcle\\Downloads\\r1_late.mp4",
+            lastPublishAt: dayTs("2026-11-18"),
+          },
+        ]),
+        "utf8"
+      );
+      const sumAfterPosShift = await getSummaryIpc(localEv, { date: "2026-11-20" });
+      const posBVisible = sumAfterPosShift.rows.find((r) => r.contentKey === posAKey);
+      assert.ok(
+        posBVisible && posBVisible.title === "旧位置记录乙" && posBVisible.totalPlay === 400,
+        "S13-r1#3: 接用同一 record:pos:N 的旧记录乙标题不同，不得被误隐藏"
+      );
+      assert.strictEqual(
+        sumAfterPosShift.rows.some((r) => r.contentKey === "unlinked:抖音:r1_pos_a"),
+        false,
+        "旧记录甲挂过的作品 r1_pos_a 仍须保持隐藏"
+      );
+      const posADelRow = sumAfterPosShift.deletedRows.find((r) => r.contentKey === posAKey);
+      assert.ok(posADelRow && posADelRow.title === "旧位置记录甲", "已删除列表仍展示旧记录甲而非误显示旧记录乙");
+
+      // 错位后用户再主动删除旧记录乙（同一 posAKey）应正常写入新快照并隐藏旧记录乙
+      const delPosB = await deleteContentsIpc(localEv, { contentKeys: [posAKey] });
+      assert.strictEqual(delPosB.ok, true);
+      assert.strictEqual(delPosB.added, 1);
+      const sumAfterDelPosB = await getSummaryIpc(localEv, { date: "2026-11-20" });
+      assert.strictEqual(sumAfterDelPosB.rows.some((r) => r.contentKey === posAKey), false);
+
+      // 清理 S13-r1 测试文件
+      fs.rmSync(overridesFile, { force: true });
+      fs.rmSync(r1PushFile, { force: true });
+      fs.rmSync(path.join(userDataDir, "data-stats", "R1组"), { recursive: true, force: true });
+      console.log("✓ S13-r1 4 个 P2 回归（EBUSY/损坏不覆盖、历史截止、第三平台整行隐藏、pos 键错位与快照恢复）全通过");
+    }
+
+    /* ---------- 3.7. S13-r2 返修 4 项 IPC 端到端回归：稳定键不看标题、empty-only 复核跳过、读失败 IPC 报错中止 ---------- */
+    {
+      const deleteContentsIpc = ipcHandlers.get("stats:delete-contents");
+      const getSummaryIpc = ipcHandlers.get("stats:get-content-summary");
+      const getAnalysisIpc = ipcHandlers.get("stats:get-analysis");
+      const getTrendIpc = ipcHandlers.get("stats:get-content-trend");
+      const getIntradayIpc = ipcHandlers.get("stats:get-content-intraday");
+      const exportXlsxIpc = ipcHandlers.get("stats:export-xlsx");
+      const getOverridesIpc = ipcHandlers.get("stats:get-link-overrides");
+      const localEv = { sender: {}, senderFrame: { url: "file:///app/index.html" } };
+
+      // 3.7a. S13-r2#2 单元测试：isContentRowDeleted 仅对 record:pos:* 校验标题，file:/record:id:/manual:/auto:/unlinked: 只看 contentKey
+      const delCheckMap = new Map([
+        ["file:c:/v/stable.mp4", { deletedAt: 1000, title: "旧展示标题" }],
+        ["record:id:rec1", { deletedAt: 1000, title: "旧记录标题" }],
+        ["manual:abcdef01", { deletedAt: 1000, title: "旧手工标题" }],
+        ["auto:1234567890abcdef", { deletedAt: 1000, title: "旧聚类标题" }],
+        ["unlinked:抖音:w1", { deletedAt: 1000, title: "旧作品标题" }],
+        ["record:pos:0", { deletedAt: 1000, title: "位置记录甲" }],
+        ["record:id:dup:pos:1", { deletedAt: 1000, title: "冲突位置记录甲" }],
+      ]);
+      assert.strictEqual(isContentRowDeleted("file:c:/v/stable.mp4", "完全不同的新标题", delCheckMap), true);
+      assert.strictEqual(isContentRowDeleted("record:id:rec1", "完全不同的新标题", delCheckMap), true);
+      assert.strictEqual(isContentRowDeleted("manual:abcdef01", "完全不同的新标题", delCheckMap), true);
+      assert.strictEqual(isContentRowDeleted("auto:1234567890abcdef", "完全不同的新标题", delCheckMap), true);
+      assert.strictEqual(isContentRowDeleted("unlinked:抖音:w1", "完全不同的新标题", delCheckMap), true);
+      assert.strictEqual(isContentRowDeleted("record:pos:0", "位置记录乙", delCheckMap), false);
+      assert.strictEqual(isContentRowDeleted("record:pos:0", "位置记录甲", delCheckMap), true);
+      assert.strictEqual(isContentRowDeleted("record:id:dup:pos:1", "冲突位置记录乙", delCheckMap), false);
+      assert.strictEqual(isContentRowDeleted("record:id:dup:pos:1", "冲突位置记录甲", delCheckMap), true);
+
+      // 3.7b. S13-r2#3：清理空行 mode:"empty-only" 在写入前用最新快照复核仍为 0 平台；确认期间采到作品的行跳过不删
+      fs.rmSync(overridesFile, { force: true });
+      const r2PushFile = path.join(pushDataDir, "2026-11-21.json");
+      const emptyKeepKey = "file:c:/users/ggcle/downloads/r2_empty_still.mp4";
+      const emptyRaceKey = "file:c:/users/ggcle/downloads/r2_empty_race.mp4";
+      fs.writeFileSync(
+        r2PushFile,
+        JSON.stringify([
+          {
+            id: "r2-empty-still",
+            pt: "抖音",
+            group: "R2组",
+            publishStatus: "success",
+            title: "确认后仍为0平台的空行",
+            filePath: "C:\\Users\\ggcle\\Downloads\\r2_empty_still.mp4",
+            date: "2026-11-21",
+          },
+          {
+            id: "r2-empty-race",
+            pt: "抖音",
+            group: "R2组",
+            publishStatus: "success",
+            title: "确认期间新采到作品的空行",
+            filePath: "C:\\Users\\ggcle\\Downloads\\r2_empty_race.mp4",
+            date: "2026-11-21",
+          },
+        ]),
+        "utf8"
+      );
+
+      // 先写入一条无关作品，确保默认截止日为 2026-11-21 且两条目标行均以 0 平台空行可见
+      store.mergeWorks(
+        "R2组",
+        "抖音",
+        [{ workId: "r2_existing_other", title: "已有其他正常作品", publishTime: dayTs("2026-11-21"), play: 100 }],
+        dayTs("2026-11-21")
+      );
+
+      // 打开确认框时两者均为 0 平台空行
+      const sumBeforeRace = await getSummaryIpc(localEv, {});
+      const emptyBefore = sumBeforeRace.rows.filter((r) => r.platformCount === 0);
+      assert.ok(emptyBefore.some((r) => r.contentKey === emptyKeepKey));
+      assert.ok(emptyBefore.some((r) => r.contentKey === emptyRaceKey));
+
+      // 非法 mode 参数被拒绝
+      const badModeRes = await deleteContentsIpc(localEv, {
+        contentKeys: [emptyKeepKey],
+        mode: "unknown-mode",
+      });
+      assert.strictEqual(badModeRes.ok, false);
+
+      // 确认期间自动采集新采到了 emptyRaceKey 对应的作品，使其从 0 平台变为 1 平台
+      store.mergeWorks(
+        "R2组",
+        "抖音",
+        [
+          { workId: "r2_existing_other", title: "已有其他正常作品", publishTime: dayTs("2026-11-21"), play: 100 },
+          { workId: "r2_race_work", title: "确认期间新采到作品的空行", publishTime: dayTs("2026-11-21"), play: 666 },
+        ],
+        dayTs("2026-11-21")
+      );
+
+      // 点击「清理空行」确认框 → mode:"empty-only" 复核：只删 emptyKeepKey，跳过 emptyRaceKey
+      const cleanRaceRes = await deleteContentsIpc(localEv, {
+        contentKeys: [emptyKeepKey, emptyRaceKey],
+        mode: "empty-only",
+      });
+      assert.strictEqual(cleanRaceRes.ok, true);
+      assert.strictEqual(cleanRaceRes.mode, "empty-only");
+      assert.strictEqual(cleanRaceRes.added, 1);
+      assert.deepStrictEqual(cleanRaceRes.deletedKeys, [emptyKeepKey]);
+      assert.strictEqual(cleanRaceRes.skipped, 1);
+      assert.deepStrictEqual(cleanRaceRes.skippedKeys, [emptyRaceKey]);
+
+      const sumAfterRace = await getSummaryIpc(localEv, {});
+      assert.strictEqual(sumAfterRace.rows.some((r) => r.contentKey === emptyKeepKey), false, "仍为 0 平台的空行应被清理");
+      const raceVisible = sumAfterRace.rows.find((r) => r.contentKey === emptyRaceKey);
+      assert.ok(
+        raceVisible && raceVisible.platformCount === 1 && raceVisible.totalPlay === 666,
+        "S13-r2#3: 确认期间已有新数据的行必须被跳过、不得误删"
+      );
+
+      // 全部跳过时不写盘、报告 skipped=1
+      const beforeAllSkipBytes = fs.readFileSync(overridesFile, "utf8");
+      const allSkipRes = await deleteContentsIpc(localEv, {
+        contentKeys: [emptyRaceKey],
+        mode: "empty-only",
+      });
+      assert.strictEqual(allSkipRes.ok, true);
+      assert.strictEqual(allSkipRes.added, 0);
+      assert.deepStrictEqual(allSkipRes.deletedKeys, []);
+      assert.strictEqual(allSkipRes.skipped, 1);
+      assert.deepStrictEqual(allSkipRes.skippedKeys, [emptyRaceKey]);
+      assert.strictEqual(fs.readFileSync(overridesFile, "utf8"), beforeAllSkipBytes);
+
+      // 普通手动删除（不带 mode）不受 0 平台限制，仍可直接删除已有作品的行
+      const manualDelRace = await deleteContentsIpc(localEv, { contentKeys: [emptyRaceKey] });
+      assert.strictEqual(manualDelRace.ok, true);
+      assert.strictEqual(manualDelRace.added, 1);
+      assert.strictEqual(manualDelRace.skipped, 0);
+
+      // 3.7c. S13-r2#4：读 link-overrides.json 失败（EBUSY / 损坏 JSON）时，汇总/分析/趋势/导出/get-link-overrides IPC 一律报错中止并返回标准中文提示
+      const r2ExportOut = path.join(tmpRoot, "r2-ebusy-should-not-exist.xlsx");
+      nextSaveDialogResult = { canceled: false, filePath: r2ExportOut };
+      const origReadSyncR2 = fs.readFileSync;
+      fs.readFileSync = function patchedR2Busy(target, ...rest) {
+        if (path.resolve(String(target)) === path.resolve(overridesFile)) {
+          const err = new Error("EBUSY: sharing violation");
+          err.code = "EBUSY";
+          throw err;
+        }
+        return origReadSyncR2.call(this, target, ...rest);
+      };
+      try {
+        const expectedMsg = "读取手工矫正配置失败，请稍后重试";
+        const sumBusy = await getSummaryIpc(localEv, {});
+        assert.strictEqual(sumBusy.error, expectedMsg);
+        assert.strictEqual(sumBusy.errorCode, "LINK_OVERRIDES_READ_ERROR");
+        assert.deepStrictEqual(sumBusy.rows, []);
+
+        const anaBusy = await getAnalysisIpc(localEv, { period: 7 });
+        assert.strictEqual(anaBusy.ok, false);
+        assert.strictEqual(anaBusy.error, expectedMsg);
+        assert.strictEqual(anaBusy.errorCode, "LINK_OVERRIDES_READ_ERROR");
+
+        const trendBusy = await getTrendIpc(localEv, { contentKey: emptyRaceKey });
+        assert.strictEqual(trendBusy.ok, false);
+        assert.strictEqual(trendBusy.error, expectedMsg);
+        assert.strictEqual(trendBusy.errorCode, "LINK_OVERRIDES_READ_ERROR");
+
+        const intraBusy = await getIntradayIpc(localEv, { contentKey: emptyRaceKey, days: 3 });
+        assert.strictEqual(intraBusy.ok, false);
+        assert.strictEqual(intraBusy.error, expectedMsg);
+        assert.strictEqual(intraBusy.errorCode, "LINK_OVERRIDES_READ_ERROR");
+
+        const expBusy = await exportXlsxIpc(localEv, {});
+        assert.strictEqual(expBusy.ok, false);
+        assert.strictEqual(expBusy.message, expectedMsg);
+        assert.strictEqual(expBusy.errorCode, "LINK_OVERRIDES_READ_ERROR");
+        assert.strictEqual(fs.existsSync(r2ExportOut), false, "读失败中止导出时不得生成 xlsx 文件");
+
+        const ovBusy = await getOverridesIpc(localEv);
+        assert.strictEqual(ovBusy.ok, false);
+        assert.strictEqual(ovBusy.error, expectedMsg);
+        assert.strictEqual(ovBusy.errorCode, "LINK_OVERRIDES_READ_ERROR");
+      } finally {
+        fs.readFileSync = origReadSyncR2;
+        nextSaveDialogResult = { canceled: true, filePath: "" };
+      }
+
+      // 清理 S13-r2 测试文件
+      fs.rmSync(overridesFile, { force: true });
+      fs.rmSync(r2PushFile, { force: true });
+      fs.rmSync(path.join(userDataDir, "data-stats", "R2组"), { recursive: true, force: true });
+      console.log("✓ S13-r2 IPC 端到端回归（稳定键不看标题、empty-only 复核跳过、读失败全读/导出链路报错中止）全通过");
+    }
+
     /* ---------- 4. dataStats/index.vue 模板编译与手工矫正交互方法校验 ---------- */
     {
       const vuePath = path.resolve(__dirname, "../src/renderer/views/dataStats/index.vue");
@@ -1595,6 +2346,7 @@ async function main() {
       const Module = require("module");
       const invokeCalls = [];
       let nextInvokeResult = { ok: true };
+      let invokeOverride = null;
       const origLoad = Module._load;
       Module._load = function (request, ...rest) {
         if (request === "electron") {
@@ -1602,6 +2354,9 @@ async function main() {
             ipcRenderer: {
               invoke: async (channel, payload) => {
                 invokeCalls.push({ channel, payload });
+                if (typeof invokeOverride === "function") {
+                  return invokeOverride(channel, payload);
+                }
                 if (channel === "stats:get-content-summary") return { rows: [], date: "2026-11-12" };
                 return nextInvokeResult;
               },
@@ -1802,6 +2557,216 @@ async function main() {
           messages.some((x) => x.type === "error" && x.m.includes("模拟写入失败")),
           "操作失败时必须调用 $message.error 报错"
         );
+
+        // S13 Vue 交互：0 平台空行计数、二次确认文案（含挂着 N 个作品）、批量删除、清理空行、恢复、24:00 选择器
+        assert.ok(
+          sfc.template.content.includes("end: '24:00'"),
+          "S13: 分时段结束时间选择器必须支持 24:00"
+        );
+        const pickerMatches = sfc.template.content.match(/:picker-options="\{ start: '00:00', step: '00:30', end: '[^']+' \}"/g) || [];
+        assert.strictEqual(pickerMatches.length, 3, "应有 3 个时间选择器（每日时间/开始时间/结束时间）");
+        assert.ok(pickerMatches[0].includes("23:30"), "每日定时时间不得包含 24:00");
+        assert.ok(pickerMatches[1].includes("23:30"), "分时段开始时间不得包含 24:00");
+        assert.ok(pickerMatches[2].includes("24:00"), "仅分时段结束时间包含 24:00");
+
+        const confirmCalls = [];
+        let confirmShouldReject = false;
+        ctx.$confirm = async (message, title, opts) => {
+          confirmCalls.push({ message, title, opts });
+          if (confirmShouldReject) throw "cancel";
+        };
+        nextInvokeResult = { ok: true };
+        const s13SampleRows = [
+          {
+            contentKey: "file:c:/empty1.mp4",
+            title: "空行1",
+            platformCount: 0,
+            perPlatform: {},
+          },
+          {
+            contentKey: "file:c:/empty2.mp4",
+            title: "空行2",
+            platformCount: 0,
+            perPlatform: {},
+          },
+          {
+            contentKey: "file:c:/busy.mp4",
+            title: "有作品内容",
+            platformCount: 2,
+            perPlatform: {
+              "抖音|G1": { workIds: ["w1", "w2"] },
+              "快手|G1": { workIds: ["w3"] },
+            },
+          },
+        ];
+        ctx.contentSummaryRows = [...s13SampleRows];
+        assert.strictEqual(ctx.emptyPlatformSummaryRows.length, 2, "应准确统计 2 条 0 平台空行");
+        assert.strictEqual(ctx.countRowWorks(s13SampleRows[2]), 3, "应准确统计挂着的 3 个作品");
+
+        // 单行删除取消：不发 IPC
+        confirmShouldReject = true;
+        const beforeCancelCalls = invokeCalls.length;
+        const cancelRes = await ctx.deleteSingleContentRow(s13SampleRows[2]);
+        assert.strictEqual(cancelRes.canceled, true);
+        assert.strictEqual(invokeCalls.length, beforeCancelCalls, "取消确认框不得调用 stats:delete-contents");
+        assert.ok(
+          confirmCalls[confirmCalls.length - 1].message.includes("挂着的 3 个作品数据也不再统计"),
+          "删除挂作品内容时确认框必须写明「挂着的 N 个作品数据也不再统计」"
+        );
+
+        // 单行删除确认：调用 stats:delete-contents
+        confirmShouldReject = false;
+        const delSingleRes = await ctx.deleteSingleContentRow(s13SampleRows[2]);
+        assert.strictEqual(delSingleRes.ok, true);
+        const lastDelCall = invokeCalls.filter((c) => c.channel === "stats:delete-contents").pop();
+        assert.deepStrictEqual(lastDelCall.payload, { contentKeys: ["file:c:/busy.mp4"] });
+
+        // 多选批量删除：合并挂着作品计数并一次批量调用
+        ctx.contentSummaryRows = [...s13SampleRows];
+        ctx.onSummarySelectionChange([s13SampleRows[0], s13SampleRows[2]]);
+        const delBatchRes = await ctx.deleteSelectedSummaryRows();
+        assert.strictEqual(delBatchRes.ok, true);
+        assert.ok(
+          confirmCalls[confirmCalls.length - 1].message.includes("挂着的 3 个作品数据也不再统计")
+        );
+        const batchDelCall = invokeCalls.filter((c) => c.channel === "stats:delete-contents").pop();
+        assert.deepStrictEqual(batchDelCall.payload, {
+          contentKeys: ["file:c:/empty1.mp4", "file:c:/busy.mp4"],
+        });
+
+        // 一键清理 0 平台空行（走独立 mode:"empty-only"）
+        ctx.contentSummaryRows = [...s13SampleRows];
+        nextInvokeResult = {
+          ok: true,
+          mode: "empty-only",
+          deletedKeys: ["file:c:/empty1.mp4", "file:c:/empty2.mp4"],
+          added: 2,
+          skipped: 0,
+          skippedKeys: [],
+        };
+        const cleanEmptyRes = await ctx.cleanEmptyPlatformRows();
+        assert.strictEqual(cleanEmptyRes.ok, true);
+        const emptyDelCall = invokeCalls.filter((c) => c.channel === "stats:delete-contents").pop();
+        assert.deepStrictEqual(emptyDelCall.payload, {
+          contentKeys: ["file:c:/empty1.mp4", "file:c:/empty2.mp4"],
+          mode: "empty-only",
+        });
+
+        // S13-r2#3: 清理空行期间部分/全部行有新数据时前端提示「N 条已有新数据，未删除」
+        ctx.contentSummaryRows = [...s13SampleRows];
+        const msgCountBeforePartial = messages.length;
+        nextInvokeResult = {
+          ok: true,
+          mode: "empty-only",
+          deletedKeys: ["file:c:/empty1.mp4"],
+          added: 1,
+          skipped: 1,
+          skippedKeys: ["file:c:/empty2.mp4"],
+        };
+        const cleanPartialRes = await ctx.cleanEmptyPlatformRows();
+        assert.strictEqual(cleanPartialRes.ok, true);
+        assert.strictEqual(cleanPartialRes.skipped, 1);
+        assert.ok(
+          messages
+            .slice(msgCountBeforePartial)
+            .some((x) => x.type === "warning" && x.m.includes("1 条已有新数据，未删除")),
+          "部分空行有新数据时必须提示「1 条已有新数据，未删除」"
+        );
+
+        ctx.contentSummaryRows = [...s13SampleRows];
+        const msgCountBeforeAllSkip = messages.length;
+        nextInvokeResult = {
+          ok: true,
+          mode: "empty-only",
+          deletedKeys: [],
+          added: 0,
+          skipped: 2,
+          skippedKeys: ["file:c:/empty1.mp4", "file:c:/empty2.mp4"],
+        };
+        const cleanAllSkipRes = await ctx.cleanEmptyPlatformRows();
+        assert.strictEqual(cleanAllSkipRes.ok, true);
+        assert.strictEqual(cleanAllSkipRes.skipped, 2);
+        assert.ok(
+          messages
+            .slice(msgCountBeforeAllSkip)
+            .some((x) => x.type === "warning" && x.m === "2 条已有新数据，未删除"),
+          "全部空行有新数据时必须提示「2 条已有新数据，未删除」"
+        );
+        nextInvokeResult = { ok: true };
+
+        // S13-r2#4: 读 link-overrides.json 失败时，汇总/分析/趋势/分时段趋势/导出 GUI 均显示错误提示「读取手工矫正配置失败，请稍后重试」
+        {
+          const expectedGuiErr = "读取手工矫正配置失败，请稍后重试";
+          const readErrRes = {
+            ok: false,
+            error: expectedGuiErr,
+            message: expectedGuiErr,
+            errorCode: "LINK_OVERRIDES_READ_ERROR",
+          };
+          invokeOverride = async () => readErrRes;
+          try {
+            const m0 = messages.length;
+            await ctx.loadContentSummary();
+            assert.ok(
+              messages.slice(m0).some((x) => x.type === "error" && x.m === expectedGuiErr),
+              "汇总读配置失败必须以 error 显示「读取手工矫正配置失败，请稍后重试」"
+            );
+
+            const m1 = messages.length;
+            await ctx.loadAnalysis();
+            assert.ok(
+              messages.slice(m1).some((x) => x.type === "error" && x.m === expectedGuiErr),
+              "分析读配置失败必须以 error 显示「读取手工矫正配置失败，请稍后重试」"
+            );
+
+            const m2 = messages.length;
+            ctx.contentTrendRow = { contentKey: "file:c:/busy.mp4", title: "有作品内容" };
+            await ctx.loadContentDailyTrend();
+            assert.ok(
+              messages.slice(m2).some((x) => x.type === "error" && x.m === expectedGuiErr),
+              "日趋势读配置失败必须以 error 显示「读取手工矫正配置失败，请稍后重试」"
+            );
+
+            const m3 = messages.length;
+            await ctx.loadContentIntraday();
+            assert.ok(
+              messages.slice(m3).some((x) => x.type === "error" && x.m === expectedGuiErr),
+              "分时段趋势读配置失败必须以 error 显示「读取手工矫正配置失败，请稍后重试」"
+            );
+
+            const m4 = messages.length;
+            await ctx.exportXlsx();
+            assert.ok(
+              messages.slice(m4).some((x) => x.type === "error" && x.m === expectedGuiErr),
+              "导出读配置失败必须以 error 显示「读取手工矫正配置失败，请稍后重试」"
+            );
+          } finally {
+            invokeOverride = null;
+          }
+        }
+
+        // N=0 时不发起调用
+        ctx.contentSummaryRows = [s13SampleRows[2]];
+        assert.strictEqual(ctx.emptyPlatformSummaryRows.length, 0);
+        const emptyZeroRes = await ctx.cleanEmptyPlatformRows();
+        assert.strictEqual(emptyZeroRes.empty, true);
+
+        // 恢复单条与全部恢复
+        const s13SampleDeleted = [
+          { contentKey: "file:c:/empty1.mp4", title: "空行1", platformCount: 0, workCount: 0, deletedAt: 1000 },
+          { contentKey: "file:c:/empty2.mp4", title: "空行2", platformCount: 0, workCount: 0, deletedAt: 2000 },
+        ];
+        ctx.deletedContentRows = [...s13SampleDeleted];
+        await ctx.restoreDeletedContent("file:c:/empty1.mp4");
+        let lastRestoreCall = invokeCalls.filter((c) => c.channel === "stats:restore-contents").pop();
+        assert.deepStrictEqual(lastRestoreCall.payload, { contentKeys: ["file:c:/empty1.mp4"] });
+
+        ctx.deletedContentRows = [...s13SampleDeleted];
+        await ctx.restoreAllDeletedContents();
+        lastRestoreCall = invokeCalls.filter((c) => c.channel === "stats:restore-contents").pop();
+        assert.deepStrictEqual(lastRestoreCall.payload, {
+          contentKeys: ["file:c:/empty1.mp4", "file:c:/empty2.mp4"],
+        });
       } finally {
         Module._load = origLoad;
         delete require.cache[bundlePath];

@@ -902,6 +902,7 @@ function recordWorksDaily(group, platform, works, now = Date.now()) {
 
 const DEFAULT_INTRADAY_RETENTION_DAYS = 60;
 const SLOT_TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
+const END_TIME_RE = /^(?:(?:[01]\d|2[0-3]):[0-5]\d|24:00)$/;
 const AUTO_RUN_SLOT_RE = /^(\d{4}-\d{2}-\d{2}) ([01]\d|2[0-3]):([0-5]\d)$/;
 const DAY_MS = 86400000;
 // 记录每个 works-intraday 目录当天是否已完成过期清理：dir -> "YYYY-MM-DD|retentionDays"
@@ -1995,7 +1996,7 @@ function normalizeAutoSettingsDoc(raw) {
       ? raw.startTime.trim()
       : DEFAULT_AUTO_SETTINGS.startTime;
   const endTime =
-    typeof raw.endTime === "string" && SLOT_TIME_RE.test(raw.endTime.trim())
+    typeof raw.endTime === "string" && END_TIME_RE.test(raw.endTime.trim())
       ? raw.endTime.trim()
       : DEFAULT_AUTO_SETTINGS.endTime;
   const time =
@@ -2307,6 +2308,15 @@ function updateAutoRunTimestamps({ lastAutoRunAt, partitionAutoRunAt } = {}) {
 /* ---------------- link-overrides（跨平台关联手工矫正） ---------------- */
 
 const LINK_OVERRIDES_VERSION = 1;
+const FORBIDDEN_PROTO_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+const UNSTABLE_RECORD_KEY_RE = /^record:(?:.*:)?pos:\d+$/;
+
+function isPosRecordKey(key) {
+  return (
+    typeof key === "string" &&
+    (key.startsWith("record:pos:") || UNSTABLE_RECORD_KEY_RE.test(key))
+  );
+}
 
 function linkOverridesFile() {
   return path.join(baseDir(), "link-overrides.json");
@@ -2318,6 +2328,7 @@ function emptyLinkOverrides() {
     updatedAt: 0,
     contents: Object.create(null),
     excludedAuto: Object.create(null),
+    deletedContents: Object.create(null),
     overrides: Object.create(null),
   };
 }
@@ -2328,6 +2339,14 @@ function isSyntheticContentKey(key) {
     ((key.startsWith("auto:") && key.length > "auto:".length) ||
       (key.startsWith("manual:") && key.length > "manual:".length))
   );
+}
+
+/** 校验可删除/隐藏的内容键：非空、无首尾空白、禁止原型污染键名 */
+function isValidDeletableContentKey(key) {
+  if (typeof key !== "string") return false;
+  const trimmed = key.trim();
+  if (!trimmed || trimmed !== key) return false;
+  return !FORBIDDEN_PROTO_KEYS.has(trimmed);
 }
 
 /** 校验作品身份键 `platform|workId`（恰含一个 `|` 且平台与作品 ID 均非空） */
@@ -2370,6 +2389,49 @@ function normalizeExcludedAutoMap(rawMap) {
     const desc = Object.getOwnPropertyDescriptor(rawMap, pwKey);
     if (desc && desc.value === true) {
       out[pwKey] = true;
+    }
+  }
+  return out;
+}
+
+function normalizeDeletedContentEntry(entry) {
+  if (!isPlainObject(entry)) return null;
+  if (
+    typeof entry.deletedAt !== "number" ||
+    !Number.isFinite(entry.deletedAt) ||
+    entry.deletedAt < 0
+  ) {
+    return null;
+  }
+  const out = { deletedAt: entry.deletedAt };
+  if (Object.prototype.hasOwnProperty.call(entry, "title") && typeof entry.title === "string") {
+    const trimmed = entry.title.trim();
+    if (trimmed) out.title = trimmed;
+  }
+  if (Object.prototype.hasOwnProperty.call(entry, "pwKeys") && Array.isArray(entry.pwKeys)) {
+    const seen = new Set();
+    const validPwKeys = [];
+    for (const rawKey of entry.pwKeys) {
+      if (!isValidWorkIdentityKey(rawKey)) continue;
+      if (seen.has(rawKey)) continue;
+      seen.add(rawKey);
+      validPwKeys.push(rawKey);
+    }
+    validPwKeys.sort();
+    out.pwKeys = validPwKeys;
+  }
+  return out;
+}
+
+function normalizeDeletedContentsMap(rawMap) {
+  const out = Object.create(null);
+  if (!isPlainObject(rawMap)) return out;
+  for (const contentKey of Object.keys(rawMap)) {
+    if (!isValidDeletableContentKey(contentKey)) continue;
+    const desc = Object.getOwnPropertyDescriptor(rawMap, contentKey);
+    const normalized = normalizeDeletedContentEntry(desc ? desc.value : null);
+    if (normalized) {
+      out[contentKey] = normalized;
     }
   }
   return out;
@@ -2419,59 +2481,142 @@ function syncExcludedAutoFromOverrides(excludedAuto, overrides, rawOverrides) {
   return excludedAuto;
 }
 
-/**
- * 读取 <userData>/data-stats/link-overrides.json。
- * 不存在静默返回空；严格校验 version === 1、updatedAt 为有限数字、overrides/contents/excludedAuto 结构；
- * 条目结构不对的逐条丢弃；任何读取/解析/校验异常均 console.warn 并视为空配置，绝不抛错。
- */
-function readLinkOverrides() {
-  const file = linkOverridesFile();
+const LINK_OVERRIDES_READ_ERROR_MESSAGE = "读取手工矫正配置失败，请稍后重试";
+const LINK_OVERRIDES_READ_ERROR_CODES = new Set([
+  "LINK_OVERRIDES_READ_ERROR",
+  "LINK_OVERRIDES_PARSE_ERROR",
+  "LINK_OVERRIDES_INVALID_SCHEMA",
+]);
+
+function makeLinkOverridesReadError(message, code, cause) {
+  const err = new Error(message);
+  if (code) err.code = code;
+  if (cause) err.cause = cause;
+  err.isLinkOverridesReadError = true;
+  return err;
+}
+
+function isLinkOverridesReadError(err) {
+  if (!err || typeof err !== "object") return false;
+  if (err.isLinkOverridesReadError === true) return true;
+  if (typeof err.code === "string" && LINK_OVERRIDES_READ_ERROR_CODES.has(err.code)) {
+    return true;
+  }
+  return false;
+}
+
+function readLinkOverridesInternal(file) {
   try {
     let raw;
     try {
       raw = fs.readFileSync(file, "utf8");
     } catch (err) {
-      if (err && err.code === "ENOENT") return emptyLinkOverrides();
-      console.warn(`[dataStats] 读取 link-overrides.json 失败 (${file}):`, (err && err.message) || err);
-      return emptyLinkOverrides();
+      if (err && err.code === "ENOENT") {
+        return { ok: true, missing: true, doc: emptyLinkOverrides() };
+      }
+      const reason = (err && err.message) || String(err);
+      return {
+        ok: false,
+        warnMsg: `[dataStats] 读取 link-overrides.json 失败 (${file}): ${reason}`,
+        error: makeLinkOverridesReadError(
+          `读取 link-overrides.json 失败: ${reason}`,
+          (err && err.code) || "LINK_OVERRIDES_READ_ERROR",
+          err
+        ),
+      };
     }
     let parsed;
     try {
       parsed = JSON.parse(raw);
     } catch (err) {
-      console.warn(`[dataStats] link-overrides.json JSON 损坏 (${file}):`, (err && err.message) || err);
-      return emptyLinkOverrides();
+      const reason = (err && err.message) || String(err);
+      return {
+        ok: false,
+        warnMsg: `[dataStats] link-overrides.json JSON 损坏 (${file}): ${reason}`,
+        error: makeLinkOverridesReadError(
+          `link-overrides.json JSON 损坏: ${reason}`,
+          "LINK_OVERRIDES_PARSE_ERROR",
+          err
+        ),
+      };
     }
     if (!isPlainObject(parsed)) {
-      console.warn(`[dataStats] link-overrides.json 结构无效 (${file})`);
-      return emptyLinkOverrides();
+      return {
+        ok: false,
+        warnMsg: `[dataStats] link-overrides.json 结构无效 (${file})`,
+        error: makeLinkOverridesReadError(
+          "link-overrides.json 结构无效",
+          "LINK_OVERRIDES_INVALID_SCHEMA"
+        ),
+      };
     }
     if (parsed.version !== LINK_OVERRIDES_VERSION) {
-      console.warn(
-        `[dataStats] link-overrides.json version 无效（需 === ${LINK_OVERRIDES_VERSION}）(${file})`
-      );
-      return emptyLinkOverrides();
+      return {
+        ok: false,
+        warnMsg: `[dataStats] link-overrides.json version 无效（需 === ${LINK_OVERRIDES_VERSION}）(${file})`,
+        error: makeLinkOverridesReadError(
+          `link-overrides.json version 无效（需 === ${LINK_OVERRIDES_VERSION}）`,
+          "LINK_OVERRIDES_INVALID_SCHEMA"
+        ),
+      };
     }
     if (typeof parsed.updatedAt !== "number" || !Number.isFinite(parsed.updatedAt)) {
-      console.warn(`[dataStats] link-overrides.json updatedAt 无效（需有限数字）(${file})`);
-      return emptyLinkOverrides();
+      return {
+        ok: false,
+        warnMsg: `[dataStats] link-overrides.json updatedAt 无效（需有限数字）(${file})`,
+        error: makeLinkOverridesReadError(
+          "link-overrides.json updatedAt 无效（需有限数字）",
+          "LINK_OVERRIDES_INVALID_SCHEMA"
+        ),
+      };
     }
     if (!isPlainObject(parsed.overrides)) {
-      console.warn(`[dataStats] link-overrides.json overrides 结构无效 (${file})`);
-      return emptyLinkOverrides();
+      return {
+        ok: false,
+        warnMsg: `[dataStats] link-overrides.json overrides 结构无效 (${file})`,
+        error: makeLinkOverridesReadError(
+          "link-overrides.json overrides 结构无效",
+          "LINK_OVERRIDES_INVALID_SCHEMA"
+        ),
+      };
     }
     const hasContents =
       Object.prototype.hasOwnProperty.call(parsed, "contents") && parsed.contents !== undefined;
     if (hasContents && !isPlainObject(parsed.contents)) {
-      console.warn(`[dataStats] link-overrides.json contents 结构无效 (${file})`);
-      return emptyLinkOverrides();
+      return {
+        ok: false,
+        warnMsg: `[dataStats] link-overrides.json contents 结构无效 (${file})`,
+        error: makeLinkOverridesReadError(
+          "link-overrides.json contents 结构无效",
+          "LINK_OVERRIDES_INVALID_SCHEMA"
+        ),
+      };
     }
     const hasExcludedAuto =
       Object.prototype.hasOwnProperty.call(parsed, "excludedAuto") &&
       parsed.excludedAuto !== undefined;
     if (hasExcludedAuto && !isPlainObject(parsed.excludedAuto)) {
-      console.warn(`[dataStats] link-overrides.json excludedAuto 结构无效 (${file})`);
-      return emptyLinkOverrides();
+      return {
+        ok: false,
+        warnMsg: `[dataStats] link-overrides.json excludedAuto 结构无效 (${file})`,
+        error: makeLinkOverridesReadError(
+          "link-overrides.json excludedAuto 结构无效",
+          "LINK_OVERRIDES_INVALID_SCHEMA"
+        ),
+      };
+    }
+    const hasDeletedContents =
+      Object.prototype.hasOwnProperty.call(parsed, "deletedContents") &&
+      parsed.deletedContents !== undefined;
+    if (hasDeletedContents && !isPlainObject(parsed.deletedContents)) {
+      return {
+        ok: false,
+        warnMsg: `[dataStats] link-overrides.json deletedContents 结构无效 (${file})`,
+        error: makeLinkOverridesReadError(
+          "link-overrides.json deletedContents 结构无效",
+          "LINK_OVERRIDES_INVALID_SCHEMA"
+        ),
+      };
     }
     const overrides = normalizeLinkOverridesMap(parsed.overrides);
     const excludedAuto = syncExcludedAutoFromOverrides(
@@ -2479,26 +2624,69 @@ function readLinkOverrides() {
       overrides,
       parsed.overrides
     );
+    const deletedContents = hasDeletedContents
+      ? normalizeDeletedContentsMap(parsed.deletedContents)
+      : Object.create(null);
     return {
-      version: LINK_OVERRIDES_VERSION,
-      updatedAt: parsed.updatedAt,
-      contents: hasContents ? normalizeLinkContentsMap(parsed.contents) : Object.create(null),
-      excludedAuto,
-      overrides,
+      ok: true,
+      missing: false,
+      doc: {
+        version: LINK_OVERRIDES_VERSION,
+        updatedAt: parsed.updatedAt,
+        contents: hasContents ? normalizeLinkContentsMap(parsed.contents) : Object.create(null),
+        excludedAuto,
+        deletedContents,
+        overrides,
+      },
     };
   } catch (err) {
-    console.warn(`[dataStats] 解析 link-overrides.json 异常 (${file}):`, (err && err.message) || err);
-    return emptyLinkOverrides();
+    const reason = (err && err.message) || String(err);
+    return {
+      ok: false,
+      warnMsg: `[dataStats] 解析 link-overrides.json 异常 (${file}): ${reason}`,
+      error: makeLinkOverridesReadError(
+        `解析 link-overrides.json 异常: ${reason}`,
+        (err && err.code) || "LINK_OVERRIDES_READ_ERROR",
+        err
+      ),
+    };
   }
+}
+
+/**
+ * 读取 <userData>/data-stats/link-overrides.json。
+ * - 文件不存在（ENOENT）一律视为空配置；
+ * - 严格校验 version === 1、updatedAt 为有限数字、overrides/contents/excludedAuto/deletedContents 结构；
+ * - strict/throwOnError 模式（供所有写路径及导出/汇总/分析/趋势读取路径使用）：区分 ENOENT 与读/解析失败，失败直接抛错，避免用空配置覆盖旧文件或漏出已删内容；
+ * - 未传 strict 时仅保留给遗留直接调用方的非抛出 warn + 空配置回退。
+ */
+function readLinkOverrides(options = {}) {
+  const strict = Boolean(options && (options.strict || options.throwOnError));
+  const res = readLinkOverridesInternal(linkOverridesFile());
+  if (res.ok) return res.doc;
+  if (strict) throw res.error;
+  console.warn(res.warnMsg);
+  return emptyLinkOverrides();
+}
+
+function readLinkOverridesStrict() {
+  return readLinkOverrides({ strict: true });
 }
 
 /** 原子写入 <userData>/data-stats/link-overrides.json（复用 tmp + fsync + rename） */
 function writeLinkOverrides(docOrMap, now = Date.now()) {
-  const isDoc = isPlainObject(docOrMap) && isPlainObject(docOrMap.overrides);
-  const rawMap = isDoc ? docOrMap.overrides : docOrMap;
+  const isDoc =
+    isPlainObject(docOrMap) &&
+    (isPlainObject(docOrMap.overrides) ||
+      isPlainObject(docOrMap.deletedContents) ||
+      isPlainObject(docOrMap.contents) ||
+      isPlainObject(docOrMap.excludedAuto));
+  const rawMap = isDoc ? (isPlainObject(docOrMap.overrides) ? docOrMap.overrides : null) : docOrMap;
   const rawContents = isDoc && isPlainObject(docOrMap.contents) ? docOrMap.contents : null;
   const rawExcludedAuto =
     isDoc && isPlainObject(docOrMap.excludedAuto) ? docOrMap.excludedAuto : null;
+  const rawDeletedContents =
+    isDoc && isPlainObject(docOrMap.deletedContents) ? docOrMap.deletedContents : null;
   const overrides = normalizeLinkOverridesMap(rawMap);
   const contents = normalizeLinkContentsMap(rawContents);
   const excludedAuto = syncExcludedAutoFromOverrides(
@@ -2506,12 +2694,14 @@ function writeLinkOverrides(docOrMap, now = Date.now()) {
     overrides,
     rawMap
   );
+  const deletedContents = normalizeDeletedContentsMap(rawDeletedContents);
   const ts = typeof now === "number" && Number.isFinite(now) ? now : Date.now();
   const payload = {
     version: LINK_OVERRIDES_VERSION,
     updatedAt: ts,
     contents,
     excludedAuto,
+    deletedContents,
     overrides,
   };
   writeWorksDailyAtomic(linkOverridesFile(), payload);
@@ -2527,7 +2717,7 @@ function setLinkOverride(workKey, entry, now = Date.now(), contentMeta) {
     throw new Error("无效的手动关联操作（需为 assign+contentKey 或 detach）");
   }
   const ts = typeof now === "number" && Number.isFinite(now) ? now : Date.now();
-  const current = readLinkOverrides();
+  const current = readLinkOverridesStrict();
   if (normalized.action === "detach" || (entry && entry.excludeAuto === true)) {
     current.excludedAuto[workKey] = true;
   }
@@ -2556,7 +2746,7 @@ function clearLinkOverride(workKey, now = Date.now()) {
   if (!isValidWorkIdentityKey(workKey)) {
     throw new Error("workKey 必须为有效的作品身份 platform|workId");
   }
-  const current = readLinkOverrides();
+  const current = readLinkOverridesStrict();
   delete current.overrides[workKey];
   delete current.excludedAuto[workKey];
   return writeLinkOverrides(current, now);
@@ -2578,7 +2768,7 @@ function mergeWorksOverride(workKeys, now = Date.now(), title = "") {
     throw new Error("至少需要选择 2 条作品才能合并");
   }
   const ts = typeof now === "number" && Number.isFinite(now) ? now : Date.now();
-  const current = readLinkOverrides();
+  const current = readLinkOverridesStrict();
   const contentKey = `manual:${crypto.randomBytes(8).toString("hex")}`;
   current.contents[contentKey] = {
     title: typeof title === "string" ? title : "",
@@ -2589,6 +2779,81 @@ function mergeWorksOverride(workKeys, now = Date.now(), title = "") {
   }
   const doc = writeLinkOverrides(current, ts);
   return { contentKey, workKeys: uniqueKeys, doc };
+}
+
+function deleteContentsOverride(contentKeys, now = Date.now()) {
+  const list = Array.isArray(contentKeys) ? contentKeys : [contentKeys];
+  const uniqueItems = [];
+  const seen = new Set();
+  for (const raw of list) {
+    let ck = "";
+    let title;
+    let pwKeys;
+    if (typeof raw === "string") {
+      ck = raw.trim();
+    } else if (isPlainObject(raw)) {
+      ck = typeof raw.contentKey === "string" ? raw.contentKey.trim() : "";
+      if (typeof raw.title === "string" && raw.title.trim()) {
+        title = raw.title.trim();
+      }
+      if (Array.isArray(raw.pwKeys)) {
+        pwKeys = raw.pwKeys;
+      }
+    }
+    if (!isValidDeletableContentKey(ck)) {
+      throw new Error("contentKey 无效");
+    }
+    if (seen.has(ck)) continue;
+    seen.add(ck);
+    uniqueItems.push({ ck, title, pwKeys });
+  }
+  if (!uniqueItems.length) {
+    throw new Error("contentKeys 不能为空");
+  }
+  const ts = typeof now === "number" && Number.isFinite(now) && now >= 0 ? now : Date.now();
+  const current = readLinkOverridesStrict();
+  for (const item of uniqueItems) {
+    const existing = Object.prototype.hasOwnProperty.call(current.deletedContents, item.ck)
+      ? current.deletedContents[item.ck]
+      : null;
+    const isPosTitleShift =
+      existing &&
+      isPosRecordKey(item.ck) &&
+      typeof item.title === "string" &&
+      item.title &&
+      existing.title !== item.title;
+    if (!existing || isPosTitleShift) {
+      const nextEntry = { deletedAt: ts };
+      if (item.title) nextEntry.title = item.title;
+      if (Array.isArray(item.pwKeys)) nextEntry.pwKeys = item.pwKeys;
+      current.deletedContents[item.ck] = normalizeDeletedContentEntry(nextEntry);
+    }
+  }
+  return writeLinkOverrides(current, ts);
+}
+
+function restoreContentsOverride(contentKeys, now = Date.now()) {
+  const list = Array.isArray(contentKeys) ? contentKeys : [contentKeys];
+  const uniqueKeys = [];
+  const seen = new Set();
+  for (const raw of list) {
+    const ck = typeof raw === "string" ? raw.trim() : "";
+    if (!isValidDeletableContentKey(ck)) {
+      throw new Error("contentKey 无效");
+    }
+    if (seen.has(ck)) continue;
+    seen.add(ck);
+    uniqueKeys.push(ck);
+  }
+  if (!uniqueKeys.length) {
+    throw new Error("contentKeys 不能为空");
+  }
+  const ts = typeof now === "number" && Number.isFinite(now) && now >= 0 ? now : Date.now();
+  const current = readLinkOverridesStrict();
+  for (const ck of uniqueKeys) {
+    delete current.deletedContents[ck];
+  }
+  return writeLinkOverrides(current, ts);
 }
 
 /* ---------------- 读取与聚合 ---------------- */
@@ -2715,10 +2980,17 @@ module.exports = {
   appendAutoRun,
   updateAutoRunTimestamps,
   LINK_OVERRIDES_VERSION,
+  LINK_OVERRIDES_READ_ERROR_MESSAGE,
+  isLinkOverridesReadError,
+  isValidDeletableContentKey,
+  normalizeDeletedContentsMap,
   readLinkOverrides,
+  readLinkOverridesStrict,
   writeLinkOverrides,
   setLinkOverride,
   clearLinkOverride,
   mergeWorksOverride,
+  deleteContentsOverride,
+  restoreContentsOverride,
   todayStr,
 };

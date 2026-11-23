@@ -3201,6 +3201,936 @@ async function main() {
       console.log("✓ S9 作品时段明细 sheet（顺序/19列/跨边界增量/距上次小时数/字段说明/行上限）与 [S9-fix #6] 通过");
     }
 
+    /* ---------- S13: deletedContents 全链路过滤（汇总/分析/趋势/xlsx所有sheet/CLI stats-export/恢复） ---------- */
+    {
+      const ts = (ymd, hh, mm = 0) =>
+        Date.parse(`${ymd}T${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}:00+08:00`);
+      const emptyKey = "file:c:/users/ggcle/downloads/empty_relinked.mp4";
+      const delWithWorksKey = "file:c:/users/ggcle/downloads/drop_with_works.mp4";
+      const keepKey = "file:c:/users/ggcle/downloads/keep_main.mp4";
+      const unlinkedDelKey = "unlinked:快手:KS_UNL_DEL";
+
+      let currentLinkOverrides = {
+        version: 1,
+        updatedAt: ts("2026-11-20", 12, 0),
+        contents: {},
+        excludedAuto: {},
+        deletedContents: {
+          [emptyKey]: { deletedAt: ts("2026-11-20", 12, 0) },
+          [delWithWorksKey]: { deletedAt: ts("2026-11-20", 12, 1) },
+          [unlinkedDelKey]: { deletedAt: ts("2026-11-20", 12, 2) },
+        },
+        overrides: {
+          // 模拟原空行作品被手工改关联到 keepKey；另一条新作品被关联到已删除的 emptyKey（以删除为准继续隐藏）
+          "抖音|DY_MOVED": { action: "assign", contentKey: keepKey },
+          "抖音|DY_NEW_INTO_DEL": { action: "assign", contentKey: emptyKey },
+        },
+      };
+
+      const s13Deps = {
+        now: ts("2026-11-20", 15, 0),
+        listAccounts: () => [
+          { group: "G1", platform: "抖音" },
+          { group: "G1", platform: "快手" },
+        ],
+        readWorks: (_g, p) => {
+          if (p === "抖音") {
+            return [
+              { workId: "DY_KEEP", title: "保留内容主视频", url: "https://www.douyin.com/video/s13_keep", publishTime: ts("2026-11-18", 10, 0) },
+              { workId: "DY_MOVED", title: "从空行改关联过来的视频", publishTime: ts("2026-11-18", 11, 0) },
+              { workId: "DY_DROP", title: "挂在已删内容上的抖音作品", url: "https://www.douyin.com/video/s13_drop", publishTime: ts("2026-11-18", 12, 0) },
+              { workId: "DY_NEW_INTO_DEL", title: "之后关联进已删内容的作品", publishTime: ts("2026-11-19", 10, 0) },
+            ];
+          }
+          return [
+            { workId: "KS_DROP", title: "挂在已删内容上的快手作品", url: "https://www.kuaishou.com/short-video/s13_drop", publishTime: ts("2026-11-18", 12, 0) },
+            { workId: "KS_UNL_DEL", title: "已删除的未关联作品", publishTime: ts("2026-11-19", 9, 0) },
+          ];
+        },
+        readWorksDaily: (_g, p) => {
+          if (p === "抖音") {
+            return {
+              DY_KEEP: {
+                "2026-11-19": { play: 100, like: 10, comment: 2 },
+                "2026-11-20": { play: 300, like: 30, comment: 5 },
+              },
+              DY_MOVED: {
+                "2026-11-20": { play: 50, like: 5, comment: 1 },
+              },
+              DY_DROP: {
+                "2026-11-19": { play: 9000, like: 900, comment: 90 },
+                "2026-11-20": { play: 12000, like: 1200, comment: 120 },
+              },
+              DY_NEW_INTO_DEL: {
+                "2026-11-20": { play: 777, like: 77, comment: 7 },
+              },
+            };
+          }
+          return {
+            KS_DROP: {
+              "2026-11-20": { play: 4000, like: 400, comment: 40 },
+            },
+            KS_UNL_DEL: {
+              "2026-11-20": { play: 666, like: 66, comment: 6 },
+            },
+          };
+        },
+        readWorksIntraday: (_g, p) => {
+          if (p === "抖音") {
+            return {
+              DY_KEEP: [
+                { date: "2026-11-20", slot: "08:00", collectedAt: ts("2026-11-20", 8, 0), play: 200, like: 20, comment: 3 },
+                { date: "2026-11-20", slot: "10:00", collectedAt: ts("2026-11-20", 10, 0), play: 300, like: 30, comment: 5 },
+              ],
+              DY_DROP: [
+                { date: "2026-11-20", slot: "08:00", collectedAt: ts("2026-11-20", 8, 0), play: 10000, like: 1000, comment: 100 },
+              ],
+              DY_NEW_INTO_DEL: [
+                { date: "2026-11-20", slot: "10:00", collectedAt: ts("2026-11-20", 10, 0), play: 777, like: 77, comment: 7 },
+              ],
+            };
+          }
+          return {
+            KS_DROP: [
+              { date: "2026-11-20", slot: "08:00", collectedAt: ts("2026-11-20", 8, 0), play: 4000, like: 400, comment: 40 },
+            ],
+            KS_UNL_DEL: [
+              { date: "2026-11-20", slot: "08:00", collectedAt: ts("2026-11-20", 8, 0), play: 666, like: 66, comment: 6 },
+            ],
+          };
+        },
+        readDaily: () => ({}),
+        readPushRecords: () => [
+          {
+            id: "s13-rec-empty",
+            filePath: "C:\\Users\\ggcle\\Downloads\\empty_relinked.mp4",
+            title: "原0平台空行",
+            pt: "抖音",
+            group: "G1",
+            publishStatus: "success",
+            lastPublishAt: ts("2026-11-18", 9, 0),
+          },
+          {
+            id: "s13-rec-keep",
+            filePath: "C:\\Users\\ggcle\\Downloads\\keep_main.mp4",
+            title: "保留内容主视频",
+            pt: "抖音",
+            group: "G1",
+            videoLink: "https://www.douyin.com/video/s13_keep",
+            publishStatus: "success",
+            lastPublishAt: ts("2026-11-18", 10, 0),
+          },
+          {
+            id: "s13-rec-drop-dy",
+            filePath: "C:\\Users\\ggcle\\Downloads\\drop_with_works.mp4",
+            title: "挂作品待删内容",
+            pt: "抖音",
+            group: "G1",
+            videoLink: "https://www.douyin.com/video/s13_drop",
+            publishStatus: "success",
+            lastPublishAt: ts("2026-11-18", 12, 0),
+          },
+          {
+            id: "s13-rec-drop-ks",
+            filePath: "C:\\Users\\ggcle\\Downloads\\drop_with_works.mp4",
+            title: "挂作品待删内容",
+            pt: "快手",
+            group: "G1",
+            videoLink: "https://www.kuaishou.com/short-video/s13_drop",
+            publishStatus: "success",
+            lastPublishAt: ts("2026-11-18", 12, 0),
+          },
+        ],
+        readLinkOverrides: () => currentLinkOverrides,
+      };
+
+      // 1) 汇总：仅剩 keepKey（含 DY_KEEP + DY_MOVED）
+      const sumDel = buildContentSummaryData({ date: "2026-11-20" }, s13Deps);
+      assert.deepStrictEqual(sumDel.rows.map((r) => r.contentKey), [keepKey]);
+      assert.strictEqual(sumDel.rows[0].totalPlay, 350);
+      assert.strictEqual(sumDel.counts.contents, 1);
+      assert.strictEqual(sumDel.counts.works, 2);
+      assert.strictEqual(sumDel.deletedRows.length, 3);
+
+      // 2) 趋势与分时段趋势：被删内容返回 found=false
+      const { buildContentTrendData, buildContentIntradayData, buildStatsAnalysisData } = require("../src/main/services/dataStats/statsExport.js");
+      assert.strictEqual(buildContentTrendData({ contentKey: delWithWorksKey, to: "2026-11-20" }, s13Deps).found, false);
+      assert.strictEqual(buildContentIntradayData({ contentKey: delWithWorksKey, to: "2026-11-20" }, s13Deps).found, false);
+      assert.strictEqual(buildContentTrendData({ contentKey: emptyKey, to: "2026-11-20" }, s13Deps).found, false);
+      assert.strictEqual(buildContentTrendData({ contentKey: keepKey, to: "2026-11-20" }, s13Deps).found, true);
+
+      // 3) 分析页：不含已删内容及其挂着的作品
+      const analysisDel = buildStatsAnalysisData({ period: 7, to: "2026-11-20" }, s13Deps);
+      assert.deepStrictEqual(
+        analysisDel.rankings.byPlay.top.map((x) => x.contentKey),
+        [keepKey],
+        "分析页排行不得出现已删内容"
+      );
+      assert.strictEqual(
+        analysisDel.overview.metrics.play.current,
+        200,
+        "分析页总览播放日增应仅统计未删作品（DY_KEEP +200），不含 DY_DROP(+3000)"
+      );
+      assert.strictEqual(
+        analysisDel.newWorksFirst24h.items.some((it) => it.contentKey === delWithWorksKey || it.contentKey === emptyKey),
+        false,
+        "新作品前 24 小时不得包含已删内容"
+      );
+
+      // 4) Excel 导出所有 sheet（含验证过滤后行数不会触发误超限）：
+      //    未过滤前作品日明细有 7 行，过滤后仅 3 行（DY_KEEP 2 天 + DY_MOVED 1 天）
+      assert.throws(
+        () => buildStatsWorkbookData({ from: "2026-11-19", to: "2026-11-20", maxRows: 2 }, s13Deps),
+        (err) => err.code === ROW_LIMIT_EXCEEDED_CODE && err.sheetName === "作品日明细" && err.rowCount === 3
+      );
+      const wbDel = buildStatsWorkbookData(
+        { from: "2026-11-19", to: "2026-11-20" },
+        s13Deps
+      );
+      assert.deepStrictEqual(
+        wbDel.sheets["作品跨平台汇总"].slice(1).map((r) => r[0]),
+        [keepKey],
+        "作品跨平台汇总仅含未删内容"
+      );
+      assert.deepStrictEqual(
+        wbDel.sheets["作品日明细"].slice(1).map((r) => r[6]).sort(),
+        ["DY_KEEP", "DY_KEEP", "DY_MOVED"],
+        "作品日明细必须排除挂在已删内容上的作品及已删未关联作品"
+      );
+      assert.deepStrictEqual(
+        wbDel.sheets["作品时段明细"].slice(1).map((r) => r[7]),
+        ["DY_KEEP", "DY_KEEP"],
+        "作品时段明细必须排除已删内容作品"
+      );
+      // 平台日汇总：仅抖音（快手全部作品均在已删内容下，不应出现快手）
+      assert.deepStrictEqual(
+        [...new Set(wbDel.sheets["平台日汇总"].slice(1).map((r) => r[1]))],
+        ["抖音"]
+      );
+      // 写出并读回 .xlsx 验证所有 sheet 均不含已删内容键与已删作品 ID
+      const s13Xlsx = path.join(tmpRoot, "s13-deleted-filter.xlsx");
+      writeStatsXlsx(wbDel, s13Xlsx);
+      const readS13Wb = xlsx.readFile(s13Xlsx);
+      for (const sName of readS13Wb.SheetNames) {
+        const txt = JSON.stringify(xlsx.utils.sheet_to_json(readS13Wb.Sheets[sName], { header: 1 }));
+        assert.strictEqual(txt.includes(emptyKey), false, `${sName} 不得含已删空行`);
+        assert.strictEqual(txt.includes(delWithWorksKey), false, `${sName} 不得含已删挂作品内容`);
+        assert.strictEqual(txt.includes("DY_DROP"), false, `${sName} 不得含已删内容的抖音作品`);
+        assert.strictEqual(txt.includes("KS_DROP"), false, `${sName} 不得含已删内容的快手作品`);
+        assert.strictEqual(txt.includes("DY_NEW_INTO_DEL"), false, `${sName} 不得含后关联进已删内容的作品`);
+        assert.strictEqual(txt.includes("KS_UNL_DEL"), false, `${sName} 不得含已删未关联作品`);
+      }
+
+      // 5) CLI stats-export 走同一导出函数并遵守 deletedContents
+      const { runStatsCli } = require("../src/main/cli/runStatsCli.js");
+      const cliOutPath = path.join(tmpRoot, "s13-cli-export.xlsx");
+      const cliRun = await captureConsole(() =>
+        runStatsCli({
+          action: "export",
+          out: cliOutPath,
+          from: "2026-11-19",
+          to: "2026-11-20",
+          deps: s13Deps,
+        })
+      );
+      assert.strictEqual(cliRun.res, 0);
+      const cliJson = JSON.parse(cliRun.logs.join("\n"));
+      assert.strictEqual(cliJson.success, true);
+      assert.strictEqual(cliJson.counts.contents, 1);
+      assert.strictEqual(cliJson.counts.works, 2);
+      const cliWb = xlsx.readFile(cliOutPath);
+      assert.strictEqual(xlsx.utils.sheet_to_json(cliWb.Sheets["作品跨平台汇总"], { header: 1 }).length, 2);
+
+      // 6) 恢复全部已删内容后，汇总/趋势/分析/导出全部恢复正常（含之前关联进 emptyKey 的 DY_NEW_INTO_DEL）
+      currentLinkOverrides = {
+        ...currentLinkOverrides,
+        deletedContents: {},
+      };
+      const sumRestored = buildContentSummaryData({ date: "2026-11-20" }, s13Deps);
+      assert.strictEqual(sumRestored.rows.length, 4);
+      assert.strictEqual(sumRestored.deletedRows.length, 0);
+      assert.strictEqual(buildContentTrendData({ contentKey: delWithWorksKey, to: "2026-11-20" }, s13Deps).found, true);
+      assert.strictEqual(buildContentIntradayData({ contentKey: delWithWorksKey, to: "2026-11-20" }, s13Deps).found, true);
+      const wbRestored = buildStatsWorkbookData({ from: "2026-11-19", to: "2026-11-20" }, s13Deps);
+      assert.strictEqual(wbRestored.counts.contents, 4);
+      assert.strictEqual(wbRestored.counts.works, 6);
+      assert.strictEqual(wbRestored.counts.workDailyRows, 8);
+      assert.strictEqual(wbRestored.counts.workIntradayRows, 6);
+      console.log("✓ S13 deletedContents 全链路过滤（空行/挂作品/后关联/趋势/分析/xlsx全sheet/CLI/恢复）通过");
+    }
+
+    /* ---------- S13-r1: 返修回归（历史截止导出、第三平台加入自动聚类、record:pos 错位、Rule 3 空行隐藏） ---------- */
+    {
+      const ts = (ymd, hh, mm = 0) =>
+        Date.parse(`${ymd}T${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}:00+08:00`);
+      const {
+        buildContentTrendData,
+        buildContentIntradayData,
+        buildStatsAnalysisData,
+        resolveDeleteContentSnapshots,
+      } = require("../src/main/services/dataStats/statsExport.js");
+      const { runStatsCli } = require("../src/main/cli/runStatsCli.js");
+
+      // 1) P2 #1：作品手工关联到较晚日期内容并删除 → 按更早截止日期导出（汇总/日明细/时段明细/分析/CLI/趋势）仍隐藏；
+      //    同时覆盖 Rule 3（若该作品在更早日期自动落回未删内容且使其变为 0 平台，该内容行也一并隐藏）
+      {
+        const keepKey = "file:c:/v/hist_keep.mp4";
+        const lateTargetKey = "file:c:/v/hist_late.mp4";
+        const earlyAutoKey = "file:c:/v/hist_early_auto.mp4";
+        let overrides = {
+          version: 1,
+          updatedAt: ts("2026-11-20", 12, 0),
+          contents: {},
+          excludedAuto: {},
+          deletedContents: {},
+          overrides: {
+            "抖音|W_HIST_UNL": { action: "assign", contentKey: lateTargetKey },
+            "抖音|W_HIST_FALLBACK": { action: "assign", contentKey: lateTargetKey },
+          },
+        };
+        const histDeps = {
+          now: ts("2026-11-20", 15, 0),
+          listAccounts: () => [{ group: "G1", platform: "抖音" }],
+          readWorks: () => [
+            { workId: "W_HIST_KEEP", title: "正常保留作品", url: "https://www.douyin.com/video/hist_keep", publishTime: ts("2026-11-10", 9, 0) },
+            { workId: "W_HIST_UNL", title: "手工挂到较晚内容的无记录作品", publishTime: ts("2026-11-10", 10, 0) },
+            { workId: "W_HIST_FALLBACK", title: "更早日期会回落旧内容的已删作品", url: "https://www.douyin.com/video/hist_fb", publishTime: ts("2026-11-10", 11, 0) },
+          ],
+          readWorksDaily: () => ({
+            W_HIST_KEEP: {
+              "2026-11-11": { play: 100, like: 10 },
+              "2026-11-12": { play: 220, like: 22 },
+              "2026-11-20": { play: 500, like: 50 },
+            },
+            W_HIST_UNL: {
+              "2026-11-11": { play: 1000, like: 100 },
+              "2026-11-12": { play: 2500, like: 250 },
+              "2026-11-20": { play: 4000, like: 400 },
+            },
+            W_HIST_FALLBACK: {
+              "2026-11-11": { play: 600, like: 60 },
+              "2026-11-12": { play: 900, like: 90 },
+              "2026-11-20": { play: 1200, like: 120 },
+            },
+          }),
+          readWorksIntraday: () => ({
+            W_HIST_KEEP: [
+              { date: "2026-11-12", slot: "10:00", collectedAt: ts("2026-11-12", 10, 0), play: 220 },
+            ],
+            W_HIST_UNL: [
+              { date: "2026-11-12", slot: "10:00", collectedAt: ts("2026-11-12", 10, 0), play: 2500 },
+            ],
+            W_HIST_FALLBACK: [
+              { date: "2026-11-12", slot: "10:00", collectedAt: ts("2026-11-12", 10, 0), play: 900 },
+            ],
+          }),
+          readDaily: () => ({}),
+          readPushRecords: () => [
+            {
+              id: "hist-keep-rec",
+              filePath: "C:\\v\\hist_keep.mp4",
+              title: "正常保留作品",
+              pt: "抖音",
+              group: "G1",
+              videoLink: "https://www.douyin.com/video/hist_keep",
+              publishStatus: "success",
+              lastPublishAt: ts("2026-11-10", 9, 0),
+            },
+            {
+              id: "hist-early-auto-rec",
+              filePath: "C:\\v\\hist_early_auto.mp4",
+              title: "更早日期会回落旧内容的已删作品",
+              pt: "抖音",
+              group: "G1",
+              videoLink: "https://www.douyin.com/video/hist_fb",
+              publishStatus: "success",
+              lastPublishAt: ts("2026-11-10", 11, 0),
+            },
+            {
+              id: "hist-late-rec",
+              filePath: "C:\\v\\hist_late.mp4",
+              title: "较晚日期被删目标",
+              pt: "抖音",
+              group: "G1",
+              publishStatus: "success",
+              lastPublishAt: ts("2026-11-18", 10, 0),
+            },
+          ],
+          readLinkOverrides: () => overrides,
+        };
+
+        // 在最新日期（2026-11-20）按真实删除流程生成快照
+        const { snapshotByKey } = resolveDeleteContentSnapshots([lateTargetKey], overrides, histDeps);
+        const snap = snapshotByKey.get(lateTargetKey);
+        assert.strictEqual(snap.title, "较晚日期被删目标");
+        assert.deepStrictEqual(snap.pwKeys, ["抖音|W_HIST_FALLBACK", "抖音|W_HIST_UNL"]);
+        overrides = {
+          ...overrides,
+          deletedContents: {
+            [lateTargetKey]: { deletedAt: ts("2026-11-20", 12, 5), title: snap.title, pwKeys: snap.pwKeys },
+          },
+        };
+
+        // 按更早截止日期 2026-11-12 查询/导出：lateTargetKey 被日期裁掉，W_HIST_UNL / W_HIST_FALLBACK 均不得漏出
+        const sumHist = buildContentSummaryData({ date: "2026-11-12" }, histDeps);
+        assert.deepStrictEqual(sumHist.rows.map((r) => r.contentKey), [keepKey]);
+        assert.strictEqual(sumHist.counts.works, 1);
+        assert.strictEqual(sumHist.counts.unlinkedWorks, 0);
+        assert.strictEqual(
+          sumHist.rows.some((r) => r.contentKey === earlyAutoKey),
+          false,
+          "Rule 3: 所有作品均被隐藏且变为 0 平台的内容行在历史汇总中也应隐藏"
+        );
+        assert.strictEqual(buildContentTrendData({ contentKey: "unlinked:抖音:W_HIST_UNL", to: "2026-11-12" }, histDeps).found, false);
+        assert.strictEqual(buildContentIntradayData({ contentKey: "unlinked:抖音:W_HIST_UNL", to: "2026-11-12" }, histDeps).found, false);
+
+        const analysisHist = buildStatsAnalysisData({ period: 7, to: "2026-11-12" }, histDeps);
+        assert.deepStrictEqual(analysisHist.rankings.byPlay.top.map((x) => x.contentKey), [keepKey]);
+        assert.strictEqual(analysisHist.overview.metrics.play.current, 120, "仅计 W_HIST_KEEP 日增 +120");
+
+        const wbHist = buildStatsWorkbookData({ from: "2026-11-11", to: "2026-11-12" }, histDeps);
+        assert.deepStrictEqual(wbHist.sheets["作品跨平台汇总"].slice(1).map((r) => r[0]), [keepKey]);
+        assert.deepStrictEqual(wbHist.sheets["作品日明细"].slice(1).map((r) => r[6]), ["W_HIST_KEEP", "W_HIST_KEEP"]);
+        assert.deepStrictEqual(wbHist.sheets["作品时段明细"].slice(1).map((r) => r[7]), ["W_HIST_KEEP"]);
+        assert.strictEqual(wbHist.counts.works, 1);
+        assert.strictEqual(wbHist.counts.unlinkedWorks, 0);
+
+        const cliHistOut = path.join(tmpRoot, "s13-r1-hist-cli.xlsx");
+        const cliHist = await captureConsole(() =>
+          runStatsCli({
+            action: "export",
+            out: cliHistOut,
+            from: "2026-11-11",
+            to: "2026-11-12",
+            deps: histDeps,
+          })
+        );
+        assert.strictEqual(cliHist.res, 0);
+        const cliHistJson = JSON.parse(cliHist.logs.join("\n"));
+        assert.strictEqual(cliHistJson.counts.works, 1);
+        assert.strictEqual(cliHistJson.counts.unlinkedWorks, 0);
+        const histWbDisk = xlsx.readFile(cliHistOut);
+        for (const sName of histWbDisk.SheetNames) {
+          const txt = JSON.stringify(xlsx.utils.sheet_to_json(histWbDisk.Sheets[sName], { header: 1 }));
+          assert.strictEqual(txt.includes("W_HIST_UNL"), false, `${sName} 不得漏出历史已删作品 W_HIST_UNL`);
+          assert.strictEqual(txt.includes("W_HIST_FALLBACK"), false, `${sName} 不得漏出历史已删作品 W_HIST_FALLBACK`);
+        }
+      }
+
+      // 2) P2 #2：删除双平台自动聚类后第三平台加入使成员哈希变化，原两平台作品在汇总/日明细/时段明细/分析/导出中仍保持隐藏
+      {
+        let hasThirdPlatform = false;
+        let overrides = {
+          version: 1,
+          updatedAt: ts("2026-11-20", 12, 0),
+          contents: {},
+          excludedAuto: {},
+          deletedContents: {},
+          overrides: {},
+        };
+        const autoDeps = {
+          now: ts("2026-11-20", 15, 0),
+          listAccounts: () =>
+            hasThirdPlatform
+              ? [
+                  { group: "G1", platform: "抖音" },
+                  { group: "G1", platform: "快手" },
+                  { group: "G1", platform: "小红书" },
+                ]
+              : [
+                  { group: "G1", platform: "抖音" },
+                  { group: "G1", platform: "快手" },
+                ],
+          readWorks: (_g, p) => {
+            if (p === "抖音") {
+              return [{ workId: "AUTO_DY", title: "秋季徒步登山装备推荐清单完整版", publishTime: ts("2026-11-18", 10, 0) }];
+            }
+            if (p === "快手") {
+              return [{ workId: "AUTO_KS", title: "秋季徒步登山装备推荐清单完整版", publishTime: ts("2026-11-18", 11, 0) }];
+            }
+            return [{ workId: "AUTO_XHS", title: "秋季徒步登山装备推荐清单完整版", publishTime: ts("2026-11-19", 10, 0) }];
+          },
+          readWorksDaily: (_g, p) => {
+            if (p === "抖音") return { AUTO_DY: { "2026-11-19": { play: 1000 }, "2026-11-20": { play: 1500 } } };
+            if (p === "快手") return { AUTO_KS: { "2026-11-19": { play: 2000 }, "2026-11-20": { play: 2600 } } };
+            return { AUTO_XHS: { "2026-11-20": { play: 300 } } };
+          },
+          readWorksIntraday: (_g, p) => {
+            if (p === "抖音") return { AUTO_DY: [{ date: "2026-11-20", slot: "10:00", collectedAt: ts("2026-11-20", 10, 0), play: 1500 }] };
+            if (p === "快手") return { AUTO_KS: [{ date: "2026-11-20", slot: "10:00", collectedAt: ts("2026-11-20", 10, 0), play: 2600 }] };
+            return { AUTO_XHS: [{ date: "2026-11-20", slot: "10:00", collectedAt: ts("2026-11-20", 10, 0), play: 300 }] };
+          },
+          readDaily: () => ({}),
+          readPushRecords: () => [],
+          readLinkOverrides: () => overrides,
+        };
+
+        const sum2p = buildContentSummaryData({ date: "2026-11-20" }, autoDeps);
+        assert.strictEqual(sum2p.rows.length, 1);
+        const autoOldKey = sum2p.rows[0].contentKey;
+        assert.ok(autoOldKey.startsWith("auto:"));
+
+        const { snapshotByKey } = resolveDeleteContentSnapshots([autoOldKey], overrides, autoDeps);
+        const autoSnap = snapshotByKey.get(autoOldKey);
+        assert.deepStrictEqual(autoSnap.pwKeys, ["快手|AUTO_KS", "抖音|AUTO_DY"]);
+        overrides = {
+          ...overrides,
+          deletedContents: {
+            [autoOldKey]: { deletedAt: ts("2026-11-20", 12, 10), title: autoSnap.title, pwKeys: autoSnap.pwKeys },
+          },
+        };
+
+        // 采到第三平台小红书，成员哈希变化：只要任一成员作品 pwKey 命中删除快照 pwKeys，整行连同后来加入的小红书作品一律隐藏
+        hasThirdPlatform = true;
+        const sum3p = buildContentSummaryData({ date: "2026-11-20" }, autoDeps);
+        assert.strictEqual(
+          sum3p.rows.length,
+          0,
+          "S13-r2#1: 新平台加入已删除自动聚类后，整行（含小红书）必须一律隐藏"
+        );
+        assert.strictEqual(sum3p.counts.works, 0);
+        assert.strictEqual(sum3p.deletedRows[0].contentKey, autoOldKey);
+        assert.strictEqual(sum3p.deletedRows[0].workCount, 2);
+
+        // 计算三平台加入后的新 auto 键以校验趋势/分时段趋势均不可见
+        const all3pRows = buildContentSummaryData(
+          { date: "2026-11-20", linkOverrides: { version: 1, updatedAt: 0, contents: {}, excludedAuto: {}, deletedContents: {}, overrides: {} } },
+          autoDeps
+        );
+        assert.strictEqual(all3pRows.rows.length, 1);
+        const autoNewKey = all3pRows.rows[0].contentKey;
+        assert.notStrictEqual(autoNewKey, autoOldKey, "三平台后 auto contentKey 哈希必须变化");
+
+        const wb3p = buildStatsWorkbookData({ from: "2026-11-19", to: "2026-11-20" }, autoDeps);
+        assert.deepStrictEqual(wb3p.sheets["作品跨平台汇总"].slice(1), []);
+        assert.deepStrictEqual(wb3p.sheets["作品日明细"].slice(1), []);
+        assert.deepStrictEqual(wb3p.sheets["作品时段明细"].slice(1), []);
+        assert.deepStrictEqual(wb3p.sheets["平台日汇总"].slice(1), []);
+        assert.strictEqual(wb3p.counts.works, 0);
+        assert.strictEqual(buildContentTrendData({ contentKey: autoNewKey, to: "2026-11-20" }, autoDeps).found, false);
+        assert.strictEqual(buildContentIntradayData({ contentKey: autoNewKey, to: "2026-11-20" }, autoDeps).found, false);
+        assert.strictEqual(buildContentTrendData({ contentKey: autoOldKey, to: "2026-11-20" }, autoDeps).found, false);
+
+        const analysis3p = buildStatsAnalysisData({ period: 7, to: "2026-11-20" }, autoDeps);
+        assert.deepStrictEqual(analysis3p.rankings.byPlay.top, []);
+
+        // 恢复 autoOldKey 后三平台全部恢复出表
+        overrides = { ...overrides, deletedContents: {} };
+        const sum3pRestored = buildContentSummaryData({ date: "2026-11-20" }, autoDeps);
+        assert.strictEqual(sum3pRestored.rows.length, 1);
+        assert.strictEqual(sum3pRestored.rows[0].contentKey, autoNewKey);
+        assert.strictEqual(sum3pRestored.rows[0].platformCount, 3);
+        assert.strictEqual(sum3pRestored.rows[0].totalPlay, 4400);
+        const wb3pRestored = buildStatsWorkbookData({ from: "2026-11-19", to: "2026-11-20" }, autoDeps);
+        assert.deepStrictEqual(
+          [...new Set(wb3pRestored.sheets["作品日明细"].slice(1).map((r) => r[6]))].sort(),
+          ["AUTO_DY", "AUTO_KS", "AUTO_XHS"]
+        );
+      }
+
+      // 2b) S13-r2#1：非 auto 内容行（如 file:）只要有一个成员作品 pwKey 命中删除快照 pwKeys，整行及新平台作品同样一律隐藏
+      {
+        const sharedFileKey = "file:c:/v/shared_member_hit.mp4";
+        const overrides = {
+          version: 1,
+          updatedAt: ts("2026-11-20", 12, 0),
+          contents: {},
+          excludedAuto: {},
+          deletedContents: {
+            "unlinked:抖音:MEM_DEL": {
+              deletedAt: ts("2026-11-20", 12, 5),
+              title: "已删单平台作品",
+              pwKeys: ["抖音|MEM_DEL"],
+            },
+          },
+          overrides: {},
+        };
+        const memDeps = {
+          now: ts("2026-11-20", 15, 0),
+          listAccounts: () => [
+            { group: "G1", platform: "抖音" },
+            { group: "G1", platform: "小红书" },
+          ],
+          readWorks: (_g, p) =>
+            p === "抖音"
+              ? [{ workId: "MEM_DEL", title: "同一素材跨平台作品", publishTime: ts("2026-11-18", 10, 0) }]
+              : [{ workId: "MEM_NEW_XHS", title: "同一素材跨平台作品", publishTime: ts("2026-11-19", 10, 0) }],
+          readWorksDaily: (_g, p) =>
+            p === "抖音"
+              ? { MEM_DEL: { "2026-11-20": { play: 500 } } }
+              : { MEM_NEW_XHS: { "2026-11-20": { play: 900 } } },
+          readWorksIntraday: (_g, p) =>
+            p === "抖音"
+              ? { MEM_DEL: [{ date: "2026-11-20", slot: "10:00", collectedAt: ts("2026-11-20", 10, 0), play: 500 }] }
+              : { MEM_NEW_XHS: [{ date: "2026-11-20", slot: "10:00", collectedAt: ts("2026-11-20", 10, 0), play: 900 }] },
+          readDaily: () => ({}),
+          readPushRecords: () => [
+            { id: "m-dy", filePath: "C:\\v\\shared_member_hit.mp4", pt: "抖音", group: "G1", title: "同一素材跨平台作品", publishStatus: "success", date: "2026-11-18" },
+            { id: "m-xhs", filePath: "C:\\v\\shared_member_hit.mp4", pt: "小红书", group: "G1", title: "同一素材跨平台作品", publishStatus: "success", date: "2026-11-19" },
+          ],
+          readLinkOverrides: () => overrides,
+        };
+        const sumMem = buildContentSummaryData({ date: "2026-11-20" }, memDeps);
+        assert.deepStrictEqual(sumMem.rows, [], "file: 内容行有任一成员作品命中 deletedPwKeys 时整行必须隐藏");
+        const wbMem = buildStatsWorkbookData({ from: "2026-11-20", to: "2026-11-20" }, memDeps);
+        assert.deepStrictEqual(wbMem.sheets["作品跨平台汇总"].slice(1), []);
+        assert.deepStrictEqual(wbMem.sheets["作品日明细"].slice(1), []);
+        assert.deepStrictEqual(wbMem.sheets["作品时段明细"].slice(1), []);
+        assert.strictEqual(buildContentTrendData({ contentKey: sharedFileKey, to: "2026-11-20" }, memDeps).found, false);
+        assert.strictEqual(buildContentIntradayData({ contentKey: sharedFileKey, to: "2026-11-20" }, memDeps).found, false);
+        assert.deepStrictEqual(buildStatsAnalysisData({ period: 7, to: "2026-11-20" }, memDeps).rankings.byPlay.top, []);
+      }
+
+      // 3) P2 #3：旧发布记录位置键 record:pos:0 删除记录 A 后记录 B 接用同一位置键，记录 B 不得在任何链路被误隐藏
+      {
+        let pushRecs = [
+          { pt: "抖音", group: "G1", title: "无ID位置记录A", publishStatus: "success", date: "2026-11-18" },
+          { pt: "抖音", group: "G1", title: "无ID位置记录B", publishStatus: "success", date: "2026-11-18" },
+        ];
+        let overrides = {
+          version: 1,
+          updatedAt: ts("2026-11-20", 12, 0),
+          contents: {},
+          excludedAuto: {},
+          deletedContents: {},
+          overrides: {},
+        };
+        const posDeps = {
+          now: ts("2026-11-20", 15, 0),
+          listAccounts: () => [{ group: "G1", platform: "抖音" }],
+          readWorks: () => [
+            { workId: "POS_WA", title: "无ID位置记录A", publishTime: ts("2026-11-18", 10, 0) },
+            { workId: "POS_WB", title: "无ID位置记录B", publishTime: ts("2026-11-18", 11, 0) },
+          ],
+          readWorksDaily: () => ({
+            POS_WA: { "2026-11-19": { play: 700 }, "2026-11-20": { play: 900 } },
+            POS_WB: { "2026-11-19": { play: 300 }, "2026-11-20": { play: 450 } },
+          }),
+          readWorksIntraday: () => ({
+            POS_WA: [{ date: "2026-11-20", slot: "10:00", collectedAt: ts("2026-11-20", 10, 0), play: 900 }],
+            POS_WB: [{ date: "2026-11-20", slot: "10:00", collectedAt: ts("2026-11-20", 10, 0), play: 450 }],
+          }),
+          readDaily: () => ({}),
+          readPushRecords: () => pushRecs,
+          readLinkOverrides: () => overrides,
+        };
+
+        const { snapshotByKey } = resolveDeleteContentSnapshots(["record:pos:0"], overrides, posDeps);
+        const posSnap = snapshotByKey.get("record:pos:0");
+        assert.strictEqual(posSnap.title, "无ID位置记录A");
+        assert.deepStrictEqual(posSnap.pwKeys, ["抖音|POS_WA"]);
+        overrides = {
+          ...overrides,
+          deletedContents: {
+            "record:pos:0": { deletedAt: ts("2026-11-20", 12, 20), title: posSnap.title, pwKeys: posSnap.pwKeys },
+          },
+        };
+
+        // 删除记录 A 后，记录 B 接用 record:pos:0
+        pushRecs = [
+          { pt: "抖音", group: "G1", title: "无ID位置记录B", publishStatus: "success", date: "2026-11-18" },
+        ];
+        const sumPosShift = buildContentSummaryData({ date: "2026-11-20" }, posDeps);
+        assert.strictEqual(sumPosShift.rows.length, 1);
+        assert.strictEqual(sumPosShift.rows[0].contentKey, "record:pos:0");
+        assert.strictEqual(sumPosShift.rows[0].title, "无ID位置记录B");
+        assert.strictEqual(sumPosShift.rows[0].totalPlay, 450);
+        assert.strictEqual(sumPosShift.deletedRows[0].title, "无ID位置记录A");
+
+        const wbPosShift = buildStatsWorkbookData({ from: "2026-11-19", to: "2026-11-20" }, posDeps);
+        assert.deepStrictEqual(wbPosShift.sheets["作品跨平台汇总"].slice(1).map((r) => [r[0], r[1]]), [
+          ["record:pos:0", "无ID位置记录B"],
+        ]);
+        assert.deepStrictEqual(wbPosShift.sheets["作品日明细"].slice(1).map((r) => r[6]), ["POS_WB", "POS_WB"]);
+        assert.deepStrictEqual(wbPosShift.sheets["作品时段明细"].slice(1).map((r) => r[7]), ["POS_WB"]);
+        const analysisPosShift = buildStatsAnalysisData({ period: 7, to: "2026-11-20" }, posDeps);
+        assert.deepStrictEqual(analysisPosShift.rankings.byPlay.top.map((x) => x.title), ["无ID位置记录B"]);
+        assert.strictEqual(analysisPosShift.overview.metrics.play.current, 150, "仅计 POS_WB 日增 +150");
+        const trendPosB = buildContentTrendData({ contentKey: "record:pos:0", to: "2026-11-20" }, posDeps);
+        assert.strictEqual(trendPosB.found, true);
+        assert.strictEqual(trendPosB.title, "无ID位置记录B");
+
+        // 无 title 的旧格式 record:pos:0 条目也不得误隐藏记录 B
+        overrides = {
+          ...overrides,
+          deletedContents: {
+            "record:pos:0": { deletedAt: ts("2026-11-20", 12, 20) },
+          },
+        };
+        const sumLegacyPos = buildContentSummaryData({ date: "2026-11-20" }, posDeps);
+        assert.ok(
+          sumLegacyPos.rows.some((r) => r.contentKey === "record:pos:0" && r.title === "无ID位置记录B"),
+          "record:pos: 条目缺少 title 时不得误隐藏接用该位置键的内容"
+        );
+      }
+
+      // 4) S13-r2#2：同一素材展示标题变化不让稳定键（file:/record:id:）删除失效，后续关联进来的作品也保持隐藏
+      {
+        const stableFileKey = "file:c:/v/multi_title.mp4";
+        const stableRecIdKey = "record:id:stable-rec-1";
+        let pushRecs = [
+          {
+            id: "mt-1",
+            filePath: "C:\\v\\multi_title.mp4",
+            pt: "抖音",
+            group: "G1",
+            title: "最早平台旧标题",
+            publishStatus: "success",
+            date: "2026-11-17",
+          },
+          {
+            id: "mt-2",
+            filePath: "C:\\v\\multi_title.mp4",
+            pt: "快手",
+            group: "G1",
+            title: "第二平台新标题",
+            publishStatus: "success",
+            date: "2026-11-18",
+          },
+          {
+            id: "stable-rec-1",
+            pt: "抖音",
+            group: "G1",
+            title: "稳定记录原标题",
+            publishStatus: "success",
+            date: "2026-11-18",
+          },
+        ];
+        let worksByPt = { 抖音: [], 快手: [] };
+        let dailyByPt = { 抖音: {}, 快手: {} };
+        let intradayByPt = { 抖音: {}, 快手: {} };
+        let overrides = {
+          version: 1,
+          updatedAt: ts("2026-11-20", 12, 0),
+          contents: {},
+          excludedAuto: {},
+          deletedContents: {},
+          overrides: {},
+        };
+        const titleShiftDeps = {
+          now: ts("2026-11-20", 15, 0),
+          listAccounts: () => [
+            { group: "G1", platform: "抖音" },
+            { group: "G1", platform: "快手" },
+          ],
+          readWorks: (_g, p) => worksByPt[p] || [],
+          readWorksDaily: (_g, p) => dailyByPt[p] || {},
+          readWorksIntraday: (_g, p) => intradayByPt[p] || {},
+          readDaily: () => ({}),
+          readPushRecords: () => pushRecs,
+          readLinkOverrides: () => overrides,
+        };
+
+        // 初始均为空行并删除（快照记录旧标题）
+        const { snapshotByKey } = resolveDeleteContentSnapshots(
+          [stableFileKey, stableRecIdKey],
+          overrides,
+          titleShiftDeps
+        );
+        assert.strictEqual(snapshotByKey.get(stableFileKey).title, "最早平台旧标题");
+        assert.strictEqual(snapshotByKey.get(stableRecIdKey).title, "稳定记录原标题");
+        overrides = {
+          ...overrides,
+          deletedContents: {
+            [stableFileKey]: { deletedAt: ts("2026-11-20", 12, 30), title: "最早平台旧标题", pwKeys: [] },
+            [stableRecIdKey]: { deletedAt: ts("2026-11-20", 12, 31), title: "稳定记录原标题", pwKeys: [] },
+          },
+        };
+
+        // 移除最早一条发布记录，使 file: 行展示标题变为「第二平台新标题」，且随后快手作品关联进来
+        pushRecs = [
+          {
+            id: "mt-2",
+            filePath: "C:\\v\\multi_title.mp4",
+            pt: "快手",
+            group: "G1",
+            title: "第二平台新标题",
+            publishStatus: "success",
+            date: "2026-11-18",
+          },
+          {
+            id: "stable-rec-1",
+            pt: "抖音",
+            group: "G1",
+            title: "稳定记录改名后标题",
+            publishStatus: "success",
+            date: "2026-11-18",
+          },
+        ];
+        worksByPt = {
+          抖音: [{ workId: "W_REC_SHIFT", title: "稳定记录改名后标题", publishTime: ts("2026-11-18", 10, 0) }],
+          快手: [{ workId: "W_FILE_SHIFT", title: "第二平台新标题", publishTime: ts("2026-11-18", 11, 0) }],
+        };
+        dailyByPt = {
+          抖音: { W_REC_SHIFT: { "2026-11-19": { play: 100 }, "2026-11-20": { play: 200 } } },
+          快手: { W_FILE_SHIFT: { "2026-11-19": { play: 300 }, "2026-11-20": { play: 500 } } },
+        };
+        intradayByPt = {
+          抖音: { W_REC_SHIFT: [{ date: "2026-11-20", slot: "10:00", collectedAt: ts("2026-11-20", 10, 0), play: 200 }] },
+          快手: { W_FILE_SHIFT: [{ date: "2026-11-20", slot: "10:00", collectedAt: ts("2026-11-20", 10, 0), play: 500 }] },
+        };
+
+        const sumShift = buildContentSummaryData({ date: "2026-11-20" }, titleShiftDeps);
+        assert.deepStrictEqual(
+          sumShift.rows,
+          [],
+          "S13-r2#2: file: 与 record:id: 展示标题变化后仍须按 contentKey 保持隐藏"
+        );
+        assert.strictEqual(sumShift.deletedRows.length, 2);
+        const wbShift = buildStatsWorkbookData({ from: "2026-11-19", to: "2026-11-20" }, titleShiftDeps);
+        assert.deepStrictEqual(wbShift.sheets["作品跨平台汇总"].slice(1), []);
+        assert.deepStrictEqual(wbShift.sheets["作品日明细"].slice(1), []);
+        assert.deepStrictEqual(wbShift.sheets["作品时段明细"].slice(1), []);
+        assert.deepStrictEqual(wbShift.sheets["平台日汇总"].slice(1), []);
+        assert.strictEqual(buildContentTrendData({ contentKey: stableFileKey, to: "2026-11-20" }, titleShiftDeps).found, false);
+        assert.strictEqual(buildContentIntradayData({ contentKey: stableFileKey, to: "2026-11-20" }, titleShiftDeps).found, false);
+        assert.deepStrictEqual(buildStatsAnalysisData({ period: 7, to: "2026-11-20" }, titleShiftDeps).rankings.byPlay.top, []);
+
+        const cliShiftOut = path.join(tmpRoot, "s13-r2-title-shift-cli.xlsx");
+        const cliShift = await captureConsole(() =>
+          runStatsCli({
+            action: "export",
+            out: cliShiftOut,
+            from: "2026-11-19",
+            to: "2026-11-20",
+            deps: titleShiftDeps,
+          })
+        );
+        assert.strictEqual(cliShift.res, 0);
+        const shiftBook = xlsx.readFile(cliShiftOut);
+        assert.deepStrictEqual(
+          xlsx.utils.sheet_to_json(shiftBook.Sheets["作品跨平台汇总"], { header: 1 }).slice(1),
+          []
+        );
+        assert.deepStrictEqual(
+          xlsx.utils.sheet_to_json(shiftBook.Sheets["作品日明细"], { header: 1 }).slice(1),
+          []
+        );
+      }
+
+      // 5) S13-r2#4：读 link-overrides.json 失败（EBUSY / 损坏 JSON / 非法结构，非 ENOENT）时，导出/汇总/分析/趋势/CLI 一律报错中止，不回退为空配置
+      {
+        const store = require(path.resolve(__dirname, "../src/main/services/dataStats/store.js"));
+        const ovPath = path.join(userDataDir, "data-stats", "link-overrides.json");
+        const r2FileKey = "file:c:/v/ebusy_guard.mp4";
+        const r2Deps = {
+          store,
+          now: ts("2026-11-20", 15, 0),
+          listAccounts: () => [{ group: "G1", platform: "抖音" }],
+          readWorks: () => [{ workId: "W_EBUSY_HIDE", title: "已删不得漏出", publishTime: ts("2026-11-19", 10, 0) }],
+          readWorksDaily: () => ({ W_EBUSY_HIDE: { "2026-11-19": { play: 100 }, "2026-11-20": { play: 250 } } }),
+          readWorksIntraday: () => ({
+            W_EBUSY_HIDE: [{ date: "2026-11-20", slot: "10:00", collectedAt: ts("2026-11-20", 10, 0), play: 250 }],
+          }),
+          readDaily: () => ({}),
+          readPushRecords: () => [
+            {
+              id: "eb-rec-1",
+              filePath: "C:\\v\\ebusy_guard.mp4",
+              pt: "抖音",
+              group: "G1",
+              title: "已删不得漏出",
+              publishStatus: "success",
+              date: "2026-11-19",
+            },
+          ],
+        };
+
+        // 5a) ENOENT（文件不存在）正常返回空配置，不报错
+        fs.rmSync(ovPath, { force: true });
+        assert.strictEqual(buildContentSummaryData({ date: "2026-11-20" }, r2Deps).rows.length, 1);
+        assert.strictEqual(buildStatsWorkbookData({ from: "2026-11-19", to: "2026-11-20" }, r2Deps).counts.works, 1);
+        assert.strictEqual(buildStatsAnalysisData({ period: 7, to: "2026-11-20" }, r2Deps).rankings.byPlay.top.length, 1);
+        assert.strictEqual(buildContentTrendData({ contentKey: r2FileKey, to: "2026-11-20" }, r2Deps).found, true);
+        assert.strictEqual(buildContentIntradayData({ contentKey: r2FileKey, to: "2026-11-20" }, r2Deps).found, true);
+
+        // 写入有效删除配置，确认正常隐藏
+        store.deleteContentsOverride(
+          [{ contentKey: r2FileKey, title: "已删不得漏出", pwKeys: ["抖音|W_EBUSY_HIDE"] }],
+          ts("2026-11-20", 12, 0)
+        );
+        assert.strictEqual(buildContentSummaryData({ date: "2026-11-20" }, r2Deps).rows.length, 0);
+
+        // 5b) 注入 EBUSY 临时读失败：所有读/导出路径（含 storeApi 与 readLinkOverrides: store.readLinkOverrides）报错中止，CLI 退出码 1 且不写 xlsx
+        const depsViaFn = { ...r2Deps, store: undefined, readLinkOverrides: store.readLinkOverrides };
+        const origReadFileSync = fs.readFileSync;
+        fs.readFileSync = function patchedEbusy(target, ...rest) {
+          if (path.resolve(String(target)) === path.resolve(ovPath)) {
+            const err = new Error("EBUSY: resource busy or locked");
+            err.code = "EBUSY";
+            throw err;
+          }
+          return origReadFileSync.call(this, target, ...rest);
+        };
+        const cliEbusyOut = path.join(tmpRoot, "s13-r2-ebusy-cli.xlsx");
+        try {
+          for (const d of [r2Deps, depsViaFn]) {
+            assert.throws(
+              () => buildStatsWorkbookData({ from: "2026-11-19", to: "2026-11-20" }, d),
+              (err) => err && err.code === "EBUSY" && err.isLinkOverridesReadError === true
+            );
+            assert.throws(
+              () => buildContentSummaryData({ date: "2026-11-20" }, d),
+              (err) => err && err.code === "EBUSY" && err.isLinkOverridesReadError === true
+            );
+            assert.throws(
+              () => buildStatsAnalysisData({ period: 7, to: "2026-11-20" }, d),
+              (err) => err && err.code === "EBUSY" && err.isLinkOverridesReadError === true
+            );
+            assert.throws(
+              () => buildContentTrendData({ contentKey: r2FileKey, to: "2026-11-20" }, d),
+              (err) => err && err.code === "EBUSY" && err.isLinkOverridesReadError === true
+            );
+            assert.throws(
+              () => buildContentIntradayData({ contentKey: r2FileKey, to: "2026-11-20" }, d),
+              (err) => err && err.code === "EBUSY" && err.isLinkOverridesReadError === true
+            );
+          }
+          const cliBusy = await captureConsole(() =>
+            runStatsCli({
+              action: "export",
+              out: cliEbusyOut,
+              from: "2026-11-19",
+              to: "2026-11-20",
+              deps: r2Deps,
+            })
+          );
+          assert.strictEqual(cliBusy.res, 1, "S13-r2#4: EBUSY 时 CLI stats-export 必须返回失败退出码 1");
+          const cliBusyJson = JSON.parse(cliBusy.logs.join("\n"));
+          assert.strictEqual(cliBusyJson.success, false);
+          assert.strictEqual(fs.existsSync(cliEbusyOut), false, "S13-r2#4: 读失败中止时不得写出 xlsx 文件");
+        } finally {
+          fs.readFileSync = origReadFileSync;
+        }
+
+        // 5c) JSON 损坏同样报错中止
+        fs.writeFileSync(ovPath, "{broken json", "utf8");
+        assert.throws(
+          () => buildStatsWorkbookData({ from: "2026-11-19", to: "2026-11-20" }, r2Deps),
+          (err) => err && err.code === "LINK_OVERRIDES_PARSE_ERROR" && err.isLinkOverridesReadError === true
+        );
+        assert.throws(
+          () => buildContentSummaryData({ date: "2026-11-20" }, r2Deps),
+          (err) => err && err.code === "LINK_OVERRIDES_PARSE_ERROR"
+        );
+        assert.throws(
+          () => buildStatsAnalysisData({ period: 7, to: "2026-11-20" }, r2Deps),
+          (err) => err && err.code === "LINK_OVERRIDES_PARSE_ERROR"
+        );
+        assert.throws(
+          () => buildContentTrendData({ contentKey: r2FileKey, to: "2026-11-20" }, r2Deps),
+          (err) => err && err.code === "LINK_OVERRIDES_PARSE_ERROR"
+        );
+        assert.throws(
+          () => buildContentIntradayData({ contentKey: r2FileKey, to: "2026-11-20" }, r2Deps),
+          (err) => err && err.code === "LINK_OVERRIDES_PARSE_ERROR"
+        );
+        fs.rmSync(ovPath, { force: true });
+      }
+
+      console.log("✓ S13-r1/r2 返修回归（历史截止导出/第三平台整行隐藏/稳定键标题变化/record:pos错位/读失败中止）全通过");
+    }
+
     // 恢复 require.cache
     if (origElectronCache) require.cache[electronId] = origElectronCache;
     else delete require.cache[electronId];

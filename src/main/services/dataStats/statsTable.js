@@ -12,6 +12,67 @@ const DELETED_WORK_TITLE = "(已删除或未匹配)";
 const DAY_MS = 86400000;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const DECIMAL_NUM_RE = /^[+-]?(?:\d+(?:\.\d+)?|\.\d+)$/;
+const UNSTABLE_RECORD_KEY_RE = /^record:(?:.*:)?pos:\d+$/;
+
+function isPosRecordKey(key) {
+  return (
+    typeof key === "string" &&
+    (key.startsWith("record:pos:") || UNSTABLE_RECORD_KEY_RE.test(key))
+  );
+}
+
+function isWorkHiddenByDeleted(
+  platformStr,
+  workId,
+  linkInfo,
+  workTitle,
+  deletedFilter,
+  deletedContentKeys
+) {
+  const pwKey = `${platformStr}|${workId}`;
+  if (deletedFilter && deletedFilter.active) {
+    if (deletedFilter.deletedPwKeys instanceof Set && deletedFilter.deletedPwKeys.has(pwKey)) {
+      return true;
+    }
+    const hasLinked = Boolean(linkInfo && linkInfo.contentKey != null);
+    const ck = hasLinked ? String(linkInfo.contentKey) : `unlinked:${platformStr}:${workId}`;
+    if (
+      hasLinked &&
+      deletedFilter.deletedRowKeysByPw instanceof Set &&
+      deletedFilter.deletedRowKeysByPw.has(ck)
+    ) {
+      return true;
+    }
+    const deletedContents = deletedFilter.deletedContents;
+    if (deletedContents instanceof Map && deletedContents.size > 0) {
+      const entry = deletedContents.get(ck);
+      if (entry) {
+        if (isPosRecordKey(ck)) {
+          const snapTitle = typeof entry.title === "string" ? entry.title.trim() : "";
+          const curTitle = hasLinked
+            ? deletedFilter.contentTitleByKey instanceof Map &&
+              typeof deletedFilter.contentTitleByKey.get(ck) === "string"
+              ? deletedFilter.contentTitleByKey.get(ck).trim()
+              : ""
+            : typeof workTitle === "string"
+            ? workTitle.trim()
+            : "";
+          if (snapTitle && snapTitle === curTitle) return true;
+        } else {
+          return true;
+        }
+      }
+    }
+  }
+  if (deletedContentKeys instanceof Set && deletedContentKeys.size > 0) {
+    const ck =
+      linkInfo && linkInfo.contentKey != null
+        ? String(linkInfo.contentKey)
+        : `unlinked:${platformStr}:${workId}`;
+    if (deletedContentKeys.has(ck)) return true;
+  }
+  return false;
+}
 
 /** 解析 YYYY-MM-DD 为 UTC 零点毫秒时间戳，非法日期返回 null */
 function parseDateDayMs(dateStr) {
@@ -74,7 +135,17 @@ function normalizeMetric(v) {
  * @param {Map} [params.link]                  可选，linkWorks 返回的 Map；传入时行增加 contentKey / matchedBy / matchScore
  * @returns {Array<object>}
  */
-function buildWorkDailyRows({ group, platform, works, worksDaily, from, to, link } = {}) {
+function buildWorkDailyRows({
+  group,
+  platform,
+  works,
+  worksDaily,
+  from,
+  to,
+  link,
+  deletedContentKeys,
+  deletedFilter,
+} = {}) {
   if (!worksDaily || typeof worksDaily !== "object" || Array.isArray(worksDaily)) {
     return [];
   }
@@ -84,6 +155,9 @@ function buildWorkDailyRows({ group, platform, works, worksDaily, from, to, link
   const fromStr = typeof from === "string" && from.trim() ? from.trim() : "";
   const toStr = typeof to === "string" && to.trim() ? to.trim() : "";
   const hasLink = link instanceof Map;
+  const hasDeletedFilter =
+    Boolean(deletedFilter && deletedFilter.active) ||
+    (deletedContentKeys instanceof Set && deletedContentKeys.size > 0);
 
   const workById = new Map();
   if (Array.isArray(works)) {
@@ -106,6 +180,12 @@ function buildWorkDailyRows({ group, platform, works, worksDaily, from, to, link
       : null;
     const meta = workById.get(workId);
     const title = meta ? meta.title || "(无标题)" : DELETED_WORK_TITLE;
+    if (
+      hasDeletedFilter &&
+      isWorkHiddenByDeleted(platformStr, workId, linkInfo, title, deletedFilter, deletedContentKeys)
+    ) {
+      continue;
+    }
     const url = meta ? meta.url || "" : "";
     const { ms: publishTimeMs, iso: publishTime } = meta
       ? parsePublishTime(meta.publishTime)
@@ -266,7 +346,17 @@ function normalizeCollectedAtMs(raw) {
  * @param {Map} [params.link]              可选，linkWorks 返回的 Map
  * @returns {Array<object>}
  */
-function buildWorkIntradayRows({ group, platform, works, worksIntraday, from, to, link } = {}) {
+function buildWorkIntradayRows({
+  group,
+  platform,
+  works,
+  worksIntraday,
+  from,
+  to,
+  link,
+  deletedContentKeys,
+  deletedFilter,
+} = {}) {
   if (!worksIntraday || typeof worksIntraday !== "object" || Array.isArray(worksIntraday)) {
     return [];
   }
@@ -278,6 +368,9 @@ function buildWorkIntradayRows({ group, platform, works, worksIntraday, from, to
   const fromStr = typeof from === "string" && from.trim() ? from.trim() : "";
   const toStr = typeof to === "string" && to.trim() ? to.trim() : "";
   const hasLink = link instanceof Map;
+  const hasDeletedFilter =
+    Boolean(deletedFilter && deletedFilter.active) ||
+    (deletedContentKeys instanceof Set && deletedContentKeys.size > 0);
 
   const workById = new Map();
   if (Array.isArray(works)) {
@@ -303,6 +396,12 @@ function buildWorkIntradayRows({ group, platform, works, worksIntraday, from, to
       : null;
     const meta = workById.get(workId);
     const title = meta ? meta.title || "(无标题)" : DELETED_WORK_TITLE;
+    if (
+      hasDeletedFilter &&
+      isWorkHiddenByDeleted(platformStr, workId, linkInfo, title, deletedFilter, deletedContentKeys)
+    ) {
+      continue;
+    }
     const { ms: publishTimeMs, iso: publishTime } = meta
       ? parsePublishTime(meta.publishTime)
       : { ms: 0, iso: "" };
