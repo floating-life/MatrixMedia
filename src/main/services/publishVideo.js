@@ -33,6 +33,17 @@ import { resolveTaskPartition } from "./accountLookup.js";
 import { resolvePublishCompletion } from "../../shared/publishResult.js";
 import { normalizeVideoMetadata } from "../../shared/videoMetadata.js";
 import { resolveCollectionOption } from "../../shared/videoLink.js";
+import {
+  DY_SYNC_TOUTIAO_CONFLICT_MESSAGE,
+  isDySyncToutiaoEnabled,
+  checkDySyncToutiaoConflict,
+} from "../cli/parsePublishArgs.js";
+
+export {
+  DY_SYNC_TOUTIAO_CONFLICT_MESSAGE,
+  isDySyncToutiaoEnabled,
+  checkDySyncToutiaoConflict,
+};
 
 /** 读取全部 pushData 记录（跨日期平铺），用于定时任务查重 */
 function listPushDataRecords() {
@@ -119,6 +130,16 @@ export async function runSingleFilePublish(
       } catch (_) {}
     }
   };
+
+  const dySyncConflict = checkDySyncToutiaoConflict([v]);
+  if (dySyncConflict) {
+    await releaseOwnReservation();
+    return {
+      exitCode: 2,
+      status: "failed",
+      message: dySyncConflict,
+    };
+  }
 
   const cfg = ptConfig[v.platform];
   if (!cfg) {
@@ -254,6 +275,11 @@ async function runSingleFilePublishInner(
       effectivePublishOptions.collection = resolvedCol.name;
     }
   }
+  if (v.platform === "抖音" && isDySyncToutiaoEnabled(v)) {
+    effectivePublishOptions.dySyncToutiao = true;
+  } else {
+    delete effectivePublishOptions.dySyncToutiao;
+  }
 
   const taskPayload = {
     taskId: Date.now() + Math.random(),
@@ -375,10 +401,13 @@ async function runSingleFilePublishInner(
         const requestedCollection =
           resolveCollectionOption(v.platform, effectivePublishOptions).name ||
           "";
+        const requestedDySyncToutiao =
+          effectivePublishOptions.dySyncToutiao === true;
         const conflictInfo = checkExistingScheduledCreativeConflict(
           existing,
           finalCreativeStatement,
-          requestedCollection
+          requestedCollection,
+          requestedDySyncToutiao
         );
         const existingPublishAt =
           existing.scheduledPublishAtText ||
@@ -386,7 +415,7 @@ async function runSingleFilePublishInner(
           scheduledRecord.scheduledPublishAtText;
         if (conflictInfo.conflict) {
           console.warn(
-            `[publish] 定时任务已存在（id=${existing.id}）但参数冲突: creative(stored=${conflictInfo.actualCreativeStatement}, requested=${conflictInfo.requestedCreativeStatement}), collection(stored=${conflictInfo.actualCollection || "无"}, requested=${conflictInfo.requestedCollection || "无"})`
+            `[publish] 定时任务已存在（id=${existing.id}）但参数冲突: creative(stored=${conflictInfo.actualCreativeStatement}, requested=${conflictInfo.requestedCreativeStatement}), collection(stored=${conflictInfo.actualCollection || "无"}, requested=${conflictInfo.requestedCollection || "无"}), dySyncToutiao(stored=${Boolean(conflictInfo.actualDySyncToutiao)}, requested=${Boolean(conflictInfo.requestedDySyncToutiao)})`
           );
           return {
             exitCode: 4,
@@ -401,6 +430,12 @@ async function runSingleFilePublishInner(
             requestedCreativeStatement: conflictInfo.requestedCreativeStatement,
             collection: conflictInfo.actualCollection,
             requestedCollection: conflictInfo.requestedCollection,
+            ...(conflictInfo.dySyncToutiaoConflict
+              ? {
+                  dySyncToutiao: conflictInfo.actualDySyncToutiao,
+                  requestedDySyncToutiao: conflictInfo.requestedDySyncToutiao,
+                }
+              : {}),
             throttled: false,
             throttleReason: "",
             reason: "",
@@ -423,6 +458,7 @@ async function runSingleFilePublishInner(
           ...(conflictInfo.actualCollection
             ? { collection: conflictInfo.actualCollection }
             : {}),
+          ...(conflictInfo.actualDySyncToutiao ? { dySyncToutiao: true } : {}),
           throttled: false,
           throttleReason: "",
           reason: "",
@@ -825,6 +861,45 @@ export async function runMultiPlatformPublish(parsedList) {
     };
   }
 
+  const dySyncConflict = checkDySyncToutiaoConflict(parsedList);
+  if (dySyncConflict) {
+    for (const item of parsedList) {
+      if (item && item.throttleReservationId) {
+        const resId = item.throttleReservationId;
+        item.throttleReservationId = null;
+        try {
+          await releaseThrottleReservation(resId);
+        } catch (_) {}
+      }
+    }
+    return {
+      success: false,
+      exitCode: 2,
+      status: "failed",
+      message: dySyncConflict,
+      total: parsedList.length,
+      succeeded: 0,
+      failed: parsedList.length,
+      results: parsedList.map((item) => ({
+        platform: item && item.platform ? item.platform : "",
+        phone: (item && item.phone) || "",
+        creativeStatement: (item && item.creativeStatement) || "none",
+        success: false,
+        exitCode: 2,
+        status: "failed",
+        message: dySyncConflict,
+        id: null,
+        publishAt: null,
+        plannedAtMs: null,
+        scheduled: false,
+        throttled: false,
+        throttleReason: "",
+        reason: "",
+        reasons: [],
+      })),
+    };
+  }
+
   if (parsedList.length === 1) {
     const result = await runSingleFilePublish(parsedList[0]);
     const finalCs =
@@ -860,6 +935,12 @@ export async function runMultiPlatformPublish(parsedList) {
       ...(result.requestedCollection !== undefined
         ? { requestedCollection: result.requestedCollection }
         : {}),
+      ...(result.dySyncToutiao !== undefined
+        ? { dySyncToutiao: result.dySyncToutiao }
+        : {}),
+      ...(result.requestedDySyncToutiao !== undefined
+        ? { requestedDySyncToutiao: result.requestedDySyncToutiao }
+        : {}),
       total: 1,
       succeeded: result.exitCode === 0 ? 1 : 0,
       failed: result.exitCode === 0 ? 0 : 1,
@@ -890,6 +971,12 @@ export async function runMultiPlatformPublish(parsedList) {
             : {}),
           ...(result.requestedCollection !== undefined
             ? { requestedCollection: result.requestedCollection }
+            : {}),
+          ...(result.dySyncToutiao !== undefined
+            ? { dySyncToutiao: result.dySyncToutiao }
+            : {}),
+          ...(result.requestedDySyncToutiao !== undefined
+            ? { requestedDySyncToutiao: result.requestedDySyncToutiao }
             : {}),
         },
       ],
@@ -1009,6 +1096,12 @@ export async function runMultiPlatformPublish(parsedList) {
           : {}),
         ...(result.requestedCollection !== undefined
           ? { requestedCollection: result.requestedCollection }
+          : {}),
+        ...(result.dySyncToutiao !== undefined
+          ? { dySyncToutiao: result.dySyncToutiao }
+          : {}),
+        ...(result.requestedDySyncToutiao !== undefined
+          ? { requestedDySyncToutiao: result.requestedDySyncToutiao }
           : {}),
       };
       if (

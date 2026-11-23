@@ -122,7 +122,7 @@ router.post("/publish", async function (req, res) {
   const acquiredReservationIds = [];
   const ownedReservationTargets = [];
   try {
-    const { parseMultiPublishRequest } = await import(
+    const { parseMultiPublishRequest, checkDySyncToutiaoConflict } = await import(
       "../../cli/parsePublishArgs.js"
     );
     const publishService = await import("../../services/publishVideo.js");
@@ -147,6 +147,56 @@ router.post("/publish", async function (req, res) {
         status: "failed",
         message: parsed.error,
       });
+    }
+
+    // 防重复冲突检查必须在任何历史查重 / 排期 / 节流之前对请求的完整目标列表执行，
+    // 防止头条目标先被历史查重或排期移除后仅剩抖音绕过冲突拦截。
+    const fullTargets = Array.isArray(parsed.value)
+      ? parsed.value
+      : [parsed.value];
+    const dySyncConflict = checkDySyncToutiaoConflict(fullTargets);
+    if (dySyncConflict) {
+      if (!parsed.multi) {
+        const singleTarget = fullTargets[0];
+        return res.status(400).json({
+          success: false,
+          status: "failed",
+          exitCode: 2,
+          creativeStatement:
+            (singleTarget && singleTarget.creativeStatement) || "none",
+          message: dySyncConflict,
+        });
+      }
+      const conflictResp = {
+        success: false,
+        status: "failed",
+        exitCode: 2,
+        total: fullTargets.length,
+        succeeded: 0,
+        failed: fullTargets.length,
+        message: dySyncConflict,
+        results: fullTargets.map((item) => ({
+          platform: (item && item.platform) || "",
+          phone: (item && item.phone) || "",
+          creativeStatement: (item && item.creativeStatement) || "none",
+          success: false,
+          exitCode: 2,
+          status: "failed",
+          message: dySyncConflict,
+          id: null,
+          publishAt: null,
+          plannedAtMs: null,
+          scheduled: false,
+          throttled: false,
+          throttleReason: "",
+          reason: "",
+          reasons: [],
+        })),
+      };
+      if (parsed.skipped && parsed.skipped.length > 0) {
+        conflictResp.skipped = parsed.skipped;
+      }
+      return res.status(400).json(conflictResp);
     }
 
     const rootAllowDuplicate = Boolean(

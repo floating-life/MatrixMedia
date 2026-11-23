@@ -5,6 +5,7 @@ import { resolveVideoLinkOption } from "../../../shared/videoLink.js";
 import {
   DY_PUBLISH_BUTTON_SELECTOR,
   DY_DRAFT_BUTTON_SELECTOR,
+  ALL_PLATFORM_SUBMIT_SELECTORS,
 } from "../../../shared/collectionShared.js";
 import { attachDyProductLink } from "./dyProductLink.js";
 import { selectPlatformCollection } from "./collection.js";
@@ -827,6 +828,1688 @@ async function verifyDyDescriptionBeforePublish(page, text, data) {
   await ensureDyTitleIntact(page, text.title, { context: "发布前复核重填后" });
 }
 
+export const DY_SYNC_TOUTIAO_SUBMIT_TEXTS = [
+  "发布",
+  "发表",
+  "立即发布",
+  "定时发布",
+  "存草稿",
+  "保存草稿",
+  "暂存离开",
+  "保存",
+  "提交",
+  "取消",
+  "取消发布",
+  "确认发布",
+];
+
+const DY_SYNC_TOUTIAO_DEFAULT_TIMEOUTS = {
+  locateTimeoutMs: 3000,
+  afterClickDelayMs: 500,
+  readbackTimeoutMs: 3000,
+  pollIntervalMs: 300,
+};
+
+export function isDySyncToutiaoRequested(data) {
+  if (!data || typeof data !== "object") return false;
+  return Boolean(
+    (data.publishOptions && data.publishOptions.dySyncToutiao === true) ||
+      data.dySyncToutiao === true ||
+      (data.data && data.data.dySyncToutiao === true)
+  );
+}
+
+/**
+ * 浏览器端自包含动作：定位抖音发布页「同步到今日头条」开关/复选框、读取状态、安全点击与回读。
+ * 严禁引用模块作用域闭包变量（会被 page.evaluate 序列化执行）。
+ */
+export function runDySyncToutiaoDomAction(payload) {
+  var action = String((payload && payload.action) || "");
+  var token = String((payload && payload.token) || "");
+  var submitSelectors = Array.isArray(payload && payload.submitSelectors)
+    ? payload.submitSelectors
+    : [];
+  var submitTextsRaw = Array.isArray(payload && payload.submitTexts)
+    ? payload.submitTexts
+    : [
+        "发布",
+        "发表",
+        "立即发布",
+        "定时发布",
+        "存草稿",
+        "保存草稿",
+        "暂存离开",
+        "保存",
+        "提交",
+        "取消",
+        "取消发布",
+        "确认发布",
+      ];
+
+  var norm = function (t) {
+    return String(t == null ? "" : t)
+      .replace(/[\uFEFF\u200B\u200C\u200D]/g, "")
+      .replace(/\s+/g, "")
+      .trim();
+  };
+  var clean = function (t) {
+    return String(t == null ? "" : t)
+      .replace(/[\uFEFF\u200B\u200C\u200D]/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  };
+  var getText = function (node) {
+    if (!node) return "";
+    if (node.textContent != null) return String(node.textContent);
+    if (node.innerText != null) return String(node.innerText);
+    return "";
+  };
+  var getClass = function (node) {
+    if (!node) return "";
+    if (typeof node.getAttribute === "function") {
+      var c = node.getAttribute("class");
+      if (c != null) return String(c);
+    }
+    return typeof node.className === "string" ? node.className : "";
+  };
+
+  var docRef = typeof document !== "undefined" ? document : null;
+  var root = (payload && payload.root) || docRef;
+  if (!root) return { found: false, reason: "no_document" };
+
+  var submitTextSet = {};
+  for (var sti = 0; sti < submitTextsRaw.length; sti++) {
+    var stNorm = norm(submitTextsRaw[sti]);
+    if (stNorm) submitTextSet[stNorm] = true;
+  }
+
+  var resolveById = function (id) {
+    if (!id) return null;
+    if (typeof root.getElementById === "function") {
+      try {
+        var found = root.getElementById(id);
+        if (found) return found;
+      } catch (_) {}
+    }
+    if (typeof root.querySelector === "function") {
+      try {
+        var esc = String(id).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+        return root.querySelector('[id="' + esc + '"]');
+      } catch (_) {}
+    }
+    return null;
+  };
+
+  var matchesAnySelector = function (node, selectors) {
+    if (!node || typeof node.matches !== "function") return false;
+    for (var i = 0; i < selectors.length; i++) {
+      try {
+        if (node.matches(selectors[i])) return true;
+      } catch (_) {}
+    }
+    return false;
+  };
+
+  var isVisible = function (el) {
+    if (!el || el.isConnected === false) return false;
+    var node = el;
+    while (node && node !== root && node.nodeType === 1) {
+      if (node.hidden === true) return false;
+      if (typeof node.getAttribute === "function") {
+        if (node.getAttribute("hidden") !== null) return false;
+        if (node.getAttribute("aria-hidden") === "true") return false;
+      }
+      if (typeof getComputedStyle === "function") {
+        try {
+          var style = getComputedStyle(node);
+          if (
+            style &&
+            (style.display === "none" ||
+              style.visibility === "hidden" ||
+              String(style.opacity) === "0")
+          ) {
+            return false;
+          }
+        } catch (_) {}
+      }
+      node = node.parentElement;
+    }
+    if (typeof el.getBoundingClientRect === "function") {
+      var rect = el.getBoundingClientRect();
+      if (rect && (rect.width <= 0 || rect.height <= 0)) return false;
+    }
+    return true;
+  };
+
+  var getSubmitRejectionReason = function (el) {
+    if (!el) return "empty_target";
+    var node = el;
+    for (var depth = 0; node && depth <= 8; depth++) {
+      if (
+        node === docRef ||
+        (docRef && (node === docRef.body || node === docRef.documentElement))
+      ) {
+        break;
+      }
+      if (node.nodeType === 1) {
+        if (matchesAnySelector(node, submitSelectors)) {
+          return "submit_selector_depth_" + depth;
+        }
+        var tag = String(node.tagName || "").toUpperCase();
+        if (tag === "BUTTON" || tag === "INPUT") {
+          var explicitType = String(
+            (typeof node.getAttribute === "function" &&
+              node.getAttribute("type")) ||
+              ""
+          )
+            .trim()
+            .toLowerCase();
+          if (explicitType === "submit" || explicitType === "reset") {
+            return "submit_control_depth_" + depth;
+          }
+        }
+        var parts = [];
+        var tNorm = norm(getText(node));
+        if (tNorm) parts.push(tNorm);
+        if (typeof node.getAttribute === "function") {
+          var al = norm(node.getAttribute("aria-label"));
+          if (al) parts.push(al);
+          var tt = norm(node.getAttribute("title"));
+          if (tt) parts.push(tt);
+          var av = norm(node.getAttribute("value"));
+          if (av) parts.push(av);
+          var alb = String(node.getAttribute("aria-labelledby") || "").trim();
+          if (alb) {
+            var lbIds = alb.split(/\s+/).filter(Boolean);
+            var lbStr = "";
+            for (var lbi = 0; lbi < lbIds.length; lbi++) {
+              var ref = resolveById(lbIds[lbi]);
+              if (ref) lbStr += norm(getText(ref));
+            }
+            if (lbStr) parts.push(lbStr);
+          }
+        }
+        for (var pi = 0; pi < parts.length; pi++) {
+          if (submitTextSet[parts[pi]]) {
+            return "submit_accessible_name_depth_" + depth;
+          }
+        }
+      }
+      if (node === root) break;
+      node = node.parentElement;
+    }
+    return "";
+  };
+
+  if (action === "cleanup") {
+    if (!token) return { ok: true };
+    try {
+      var m1 = root.querySelectorAll('[data-mm-dy-sync-tt="' + token + '"]');
+      for (var c1 = 0; c1 < m1.length; c1++) {
+        m1[c1].removeAttribute("data-mm-dy-sync-tt");
+      }
+      var m2 = root.querySelectorAll(
+        '[data-mm-dy-sync-tt-state="' + token + '"]'
+      );
+      for (var c2 = 0; c2 < m2.length; c2++) {
+        m2[c2].removeAttribute("data-mm-dy-sync-tt-state");
+      }
+    } catch (_) {}
+    return { ok: true };
+  }
+
+  if (action === "safe_click") {
+    var target =
+      (payload && payload.el) ||
+      (token ? root.querySelector('[data-mm-dy-sync-tt="' + token + '"]') : null);
+    if (!target) return { ok: false, reason: "marked_target_missing" };
+    var rej = getSubmitRejectionReason(target);
+    if (rej) {
+      return { ok: false, submitRejected: true, rejectReason: rej };
+    }
+    if (typeof target.scrollIntoView === "function") {
+      try {
+        target.scrollIntoView({ block: "center", inline: "center" });
+      } catch (_) {}
+    }
+    if (typeof target.click === "function") {
+      target.click();
+      return { ok: true };
+    }
+    return { ok: false, reason: "no_click_method" };
+  }
+
+  var isCheckboxInput = function (el) {
+    if (!el || el.nodeType !== 1) return false;
+    if (String(el.tagName || "").toUpperCase() !== "INPUT") return false;
+    var tp = String(
+      (typeof el.getAttribute === "function" && el.getAttribute("type")) ||
+        el.type ||
+        ""
+    ).toLowerCase();
+    return tp === "checkbox";
+  };
+
+  var isInsideModalOrPopup = function (el) {
+    if (!el || typeof el.closest !== "function") return false;
+    try {
+      return Boolean(
+        el.closest(
+          ".semi-modal, .semi-modal-content, .semi-modal-body, [role='dialog'], [role='listbox'], [role='menu'], .mix-dropdown, .semi-select-option-list"
+        )
+      );
+    } catch (_) {
+      return false;
+    }
+  };
+
+  var isDisabledToggle = function (el, innerInput) {
+    var targets = [];
+    if (el) targets.push(el);
+    if (innerInput && innerInput !== el) targets.push(innerInput);
+    for (var ti = 0; ti < targets.length; ti++) {
+      var node = targets[ti];
+      for (var d = 0; node && node !== root && d < 3; d++) {
+        if (node.disabled === true) return true;
+        if (typeof node.getAttribute === "function") {
+          if (
+            node.getAttribute("disabled") !== null ||
+            node.getAttribute("aria-disabled") === "true"
+          ) {
+            return true;
+          }
+        }
+        var cls = getClass(node);
+        if (
+          /\b(semi-switch-disabled|semi-checkbox-disabled|is-disabled|disabled)\b/.test(
+            cls
+          )
+        ) {
+          return true;
+        }
+        node = node.parentElement;
+      }
+    }
+    return false;
+  };
+
+  var hasCheckedOrActiveClass = function (el) {
+    if (!el) return false;
+    var cls = getClass(el);
+    if (!cls) return false;
+    var tokens = cls.split(/\s+/);
+    for (var i = 0; i < tokens.length; i++) {
+      var tk = tokens[i].toLowerCase();
+      if (!tk) continue;
+      if (/(?:un|in|not[-_]?|non[-_]?)(?:checked|active)/.test(tk)) continue;
+      if (/(?:^|[-_])(checked|active)(?:$|[-_])/.test(tk)) return true;
+    }
+    return false;
+  };
+
+  var readToggleState = function (stateEl, innerInput) {
+    var ariaCandidates = [];
+    if (stateEl) ariaCandidates.push(stateEl);
+    if (innerInput && innerInput !== stateEl) ariaCandidates.push(innerInput);
+    if (stateEl && typeof stateEl.querySelector === "function") {
+      try {
+        var roleSub = stateEl.querySelector(
+          "[role='switch'], [role='checkbox']"
+        );
+        if (roleSub && ariaCandidates.indexOf(roleSub) === -1) {
+          ariaCandidates.push(roleSub);
+        }
+      } catch (_) {}
+    }
+    for (var ai = 0; ai < ariaCandidates.length; ai++) {
+      var ac = ariaCandidates[ai];
+      if (!ac || typeof ac.getAttribute !== "function") continue;
+      var av = ac.getAttribute("aria-checked");
+      if (av === "true") return { checked: true, source: "aria-checked" };
+      if (av === "false") return { checked: false, source: "aria-checked" };
+    }
+    var inp = innerInput || (isCheckboxInput(stateEl) ? stateEl : null);
+    if (inp) {
+      if (typeof inp.checked === "boolean") {
+        return { checked: inp.checked, source: "input.checked" };
+      }
+      if (typeof inp.getAttribute === "function") {
+        var cAttr = inp.getAttribute("checked");
+        if (cAttr !== null && cAttr !== "false") {
+          return { checked: true, source: "attr:checked" };
+        }
+      }
+    }
+    if (hasCheckedOrActiveClass(stateEl)) {
+      return { checked: true, source: "class" };
+    }
+    if (stateEl && typeof stateEl.querySelector === "function") {
+      try {
+        var innerBox = stateEl.querySelector(
+          ".semi-checkbox-inner, .semi-checkbox-inner-display"
+        );
+        if (innerBox && hasCheckedOrActiveClass(innerBox)) {
+          return { checked: true, source: "inner-class" };
+        }
+      } catch (_) {}
+    }
+    return { checked: false, source: "default" };
+  };
+
+  var detectAuthBindModal = function () {
+    var modals = [];
+    try {
+      modals = Array.from(
+        root.querySelectorAll(
+          ".semi-modal, .semi-modal-content, .semi-modal-body, [role='dialog'], [class*='modal-content'], [class*='dialog']"
+        )
+      ).filter(isVisible);
+    } catch (_) {
+      modals = [];
+    }
+    var authRe =
+      /授权|绑定|未绑定|去绑定|前往绑定|立即绑定|账号绑定|绑定头条|同步授权|开通同步|扫码绑定/;
+    var ttActionRe = /扫码|登录|开通|确认|绑定|授权|去设置|前往/;
+    for (var mi = 0; mi < modals.length; mi++) {
+      var m = modals[mi];
+      var txt = clean(getText(m));
+      if (!txt) continue;
+      if (authRe.test(txt) || (txt.indexOf("头条") !== -1 && ttActionRe.test(txt))) {
+        var masked = txt
+          .replace(/\S*[A-Za-z0-9-]+\.[A-Za-z]{2,}\S*/g, "[url]")
+          .replace(/(https?:|blob:|data:)\S*/gi, "[url]")
+          .replace(/\d{5,}/g, "[n]")
+          .replace(/\S*@\S+/g, "[at]");
+        return {
+          detected: true,
+          snippet: masked.length > 24 ? masked.slice(0, 24) + "…" : masked,
+        };
+      }
+    }
+    return { detected: false, snippet: "" };
+  };
+
+  var isTier2SwitchCandidate = function (el) {
+    if (!el || el.nodeType !== 1 || !isVisible(el)) return false;
+    if (isInsideModalOrPopup(el)) return false;
+    var tag = String(el.tagName || "").toUpperCase();
+    if (tag === "SCRIPT" || tag === "STYLE" || tag === "SVG" || tag === "IMG") {
+      return false;
+    }
+    if (typeof el.getAttribute === "function") {
+      var ac = el.getAttribute("aria-checked");
+      if (ac === "true" || ac === "false") return true;
+    }
+    var cls = getClass(el);
+    if (!cls) return false;
+    var tokens = cls.split(/\s+/);
+    var matchedSwitchToken = false;
+    for (var i = 0; i < tokens.length; i++) {
+      var tk = tokens[i].toLowerCase();
+      if (!tk || tk.indexOf("switch") === -1) continue;
+      if (
+        /(?:wrap|wrapper|container|row|item|group|list|box|area|panel|card|section|label|title|text|desc|tip|knob|handle|icon|dot|inner|content|header|footer|modal|dialog)/.test(
+          tk
+        )
+      ) {
+        continue;
+      }
+      if (/(?:^|[-_])switch(?:$|[-_])/.test(tk)) {
+        matchedSwitchToken = true;
+        break;
+      }
+    }
+    if (!matchedSwitchToken) return false;
+    return norm(getText(el)).length <= 24;
+  };
+
+  var pickClickEl = function (stateEl, innerInput, fallbackLabel) {
+    if (stateEl && typeof stateEl.querySelector === "function") {
+      var hasLink = false;
+      try {
+        hasLink = Boolean(stateEl.querySelector("a"));
+      } catch (_) {}
+      if (hasLink) {
+        try {
+          var innerCtrl =
+            stateEl.querySelector(".semi-checkbox-inner") ||
+            (innerInput && isVisible(innerInput) ? innerInput : null);
+          if (innerCtrl && isVisible(innerCtrl)) return innerCtrl;
+        } catch (_) {}
+      }
+    }
+    if (stateEl && isVisible(stateEl)) return stateEl;
+    if (fallbackLabel && isVisible(fallbackLabel)) return fallbackLabel;
+    if (innerInput && isVisible(innerInput)) return innerInput;
+    return stateEl || fallbackLabel || innerInput;
+  };
+
+  var collectLogicalToggles = function (container) {
+    if (!container || typeof container.querySelectorAll !== "function") {
+      return [];
+    }
+    var rawWrappers = [];
+    var tier1Sel =
+      ".semi-switch, [role='switch'], .semi-checkbox, [role='checkbox']";
+    try {
+      rawWrappers = Array.from(container.querySelectorAll(tier1Sel)).filter(
+        function (el) {
+          return isVisible(el) && !isInsideModalOrPopup(el);
+        }
+      );
+    } catch (_) {
+      rawWrappers = [];
+    }
+    // 去重：若某 wrapper 嵌套在另一个 wrapper 内部，只保留外层语义控件
+    var wrappers = rawWrappers.filter(function (el) {
+      return !rawWrappers.some(function (other) {
+        return (
+          other !== el &&
+          typeof other.contains === "function" &&
+          other.contains(el)
+        );
+      });
+    });
+
+    var toggles = [];
+    for (var wi = 0; wi < wrappers.length; wi++) {
+      var w = wrappers[wi];
+      var innerInp = null;
+      if (isCheckboxInput(w)) {
+        innerInp = w;
+      } else if (typeof w.querySelector === "function") {
+        try {
+          innerInp = w.querySelector("input[type='checkbox']");
+        } catch (_) {}
+      }
+      toggles.push({
+        stateEl: w,
+        clickEl: pickClickEl(w, innerInp, null),
+        innerInput: innerInp,
+      });
+    }
+
+    var rawInputs = [];
+    try {
+      rawInputs = Array.from(
+        container.querySelectorAll("input[type='checkbox']")
+      ).filter(function (inp) {
+        return !isInsideModalOrPopup(inp);
+      });
+    } catch (_) {
+      rawInputs = [];
+    }
+    for (var ii = 0; ii < rawInputs.length; ii++) {
+      var inp = rawInputs[ii];
+      var covered = toggles.some(function (tg) {
+        return (
+          tg.innerInput === inp ||
+          tg.stateEl === inp ||
+          (tg.stateEl &&
+            typeof tg.stateEl.contains === "function" &&
+            tg.stateEl.contains(inp))
+        );
+      });
+      if (covered) continue;
+      if (isVisible(inp)) {
+        toggles.push({
+          stateEl: inp,
+          clickEl: inp,
+          innerInput: inp,
+        });
+      } else {
+        var wrapLabel =
+          typeof inp.closest === "function" ? inp.closest("label") : null;
+        if (!wrapLabel && typeof inp.getAttribute === "function") {
+          var inpId = inp.getAttribute("id");
+          if (inpId) {
+            try {
+              var escId = String(inpId).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+              wrapLabel = root.querySelector('label[for="' + escId + '"]');
+            } catch (_) {}
+          }
+        }
+        if (wrapLabel && isVisible(wrapLabel)) {
+          toggles.push({
+            stateEl: inp,
+            clickEl: pickClickEl(wrapLabel, inp, wrapLabel),
+            innerInput: inp,
+          });
+        }
+      }
+    }
+
+    if (toggles.length > 0) return toggles;
+
+    // Tier 2 兜底：自定义 switch 组件（带 aria-checked 或独立 switch 类名）
+    var fallbackRaw = [];
+    try {
+      fallbackRaw = Array.from(
+        container.querySelectorAll(
+          "[aria-checked], [class*='switch'], [class*='Switch']"
+        )
+      ).filter(isTier2SwitchCandidate);
+    } catch (_) {
+      fallbackRaw = [];
+    }
+    var fallbackTop = fallbackRaw.filter(function (el) {
+      return !fallbackRaw.some(function (other) {
+        return (
+          other !== el &&
+          typeof other.contains === "function" &&
+          other.contains(el)
+        );
+      });
+    });
+    for (var fi = 0; fi < fallbackTop.length; fi++) {
+      var fb = fallbackTop[fi];
+      toggles.push({
+        stateEl: fb,
+        clickEl: fb,
+        innerInput: null,
+      });
+    }
+    return toggles;
+  };
+
+  var isExplicitRowContainer = function (node) {
+    if (!node || node.nodeType !== 1 || typeof node.matches !== "function") {
+      return false;
+    }
+    var cls = getClass(node);
+    if (/(?:^|[\s_-])label(?:$|[\s_-])/i.test(cls)) return false;
+    return matchesAnySelector(node, [
+      "[class*='form-item']",
+      "[class*='setting-item']",
+      "[class*='form-row']",
+      "[class*='setting-row']",
+      "[class*='sync-item']",
+      "[class*='field']",
+    ]);
+  };
+
+  var isSyncGroupHeaderText = function (t) {
+    if (!t) return true;
+    var s = t.replace(/[:：*＊]+$/g, "");
+    return /^(?:同步|同步发布|同步设置|同步到|同步至|同时发布|同时发布到|多平台同步|发布设置|其他设置|更多设置|选填|可选|必填|建议|非必填)$/.test(
+      s
+    );
+  };
+
+  var isBenignStatusText = function (t) {
+    if (!t) return true;
+    var s = t.replace(/[:：*＊·•\-—]+$/g, "");
+    return /^(?:开|关|开启|关闭|已开启|未开启|开关|同步开关|同步|已同步|未同步|允许|不允许|选填|可选|必填|推荐|新|beta|new)$/i.test(
+      s
+    );
+  };
+
+  var OTHER_PLATFORM_OWN_RE =
+    /西瓜|抖音|火山|快手|小红书|视频号|哔哩哔哩|b站|百家号|懂车帝|皮皮虾|番茄/i;
+  var OTHER_PLATFORM_CONTAINER_RE =
+    /西瓜|抖音火山|抖音精选|抖音极速|火山版|快手|小红书|视频号|哔哩哔哩|b站|百家号|懂车帝|皮皮虾|番茄/i;
+
+  var hasToutiaoKeyword = function (text) {
+    var t = norm(text);
+    return t.indexOf("今日头条") !== -1 || t.indexOf("头条") !== -1;
+  };
+
+  var hasOtherPlatformOwnName = function (text) {
+    var t = norm(text);
+    if (!t) return false;
+    return OTHER_PLATFORM_OWN_RE.test(t);
+  };
+
+  var hasOtherPlatformContainerName = function (text) {
+    var t = norm(text);
+    if (!t) return false;
+    return OTHER_PLATFORM_CONTAINER_RE.test(t);
+  };
+
+  var getControlOwnLabels = function (toggle) {
+    var labels = [];
+    if (!toggle) return labels;
+    var pushLabel = function (raw) {
+      var s = norm(raw);
+      if (s && labels.indexOf(s) === -1) labels.push(s);
+    };
+    var nodes = [];
+    if (toggle.stateEl) nodes.push(toggle.stateEl);
+    if (toggle.clickEl && nodes.indexOf(toggle.clickEl) === -1) {
+      nodes.push(toggle.clickEl);
+    }
+    if (toggle.innerInput && nodes.indexOf(toggle.innerInput) === -1) {
+      nodes.push(toggle.innerInput);
+    }
+    for (var ni = 0; ni < nodes.length; ni++) {
+      var node = nodes[ni];
+      if (!node || node.nodeType !== 1) continue;
+      if (!isCheckboxInput(node)) {
+        pushLabel(getText(node));
+      }
+      if (typeof node.getAttribute === "function") {
+        pushLabel(node.getAttribute("aria-label"));
+        pushLabel(node.getAttribute("title"));
+        var alb = String(node.getAttribute("aria-labelledby") || "").trim();
+        if (alb) {
+          var lbIds = alb.split(/\s+/).filter(Boolean);
+          var lbCombined = "";
+          for (var li = 0; li < lbIds.length; li++) {
+            var refEl = resolveById(lbIds[li]);
+            if (refEl) lbCombined += norm(getText(refEl));
+          }
+          pushLabel(lbCombined);
+        }
+        var nodeId = node.getAttribute("id");
+        if (nodeId && typeof root.querySelectorAll === "function") {
+          try {
+            var escId = String(nodeId)
+              .replace(/\\/g, "\\\\")
+              .replace(/"/g, '\\"');
+            var forLabels = root.querySelectorAll('label[for="' + escId + '"]');
+            for (var fli = 0; fli < forLabels.length; fli++) {
+              if (isVisible(forLabels[fli])) {
+                pushLabel(getText(forLabels[fli]));
+              }
+            }
+          } catch (_) {}
+        }
+      }
+      if (typeof node.closest === "function") {
+        try {
+          var encLabel = node.closest("label");
+          if (encLabel && isVisible(encLabel)) {
+            pushLabel(getText(encLabel));
+          }
+        } catch (_) {}
+      }
+    }
+    return labels;
+  };
+
+  var validateCandidateToggle = function (toggle, minimalContainer) {
+    if (!toggle || !toggle.stateEl) return false;
+    var ownLabels = getControlOwnLabels(toggle);
+    var ownHasToutiao = false;
+    for (var i = 0; i < ownLabels.length; i++) {
+      var lt = ownLabels[i].replace(/[:：*＊]+$/g, "");
+      if (!lt) continue;
+      // 控件自身标签含「西瓜」「抖音」等其它平台名一律排除
+      if (hasOtherPlatformOwnName(lt)) return false;
+      if (hasToutiaoKeyword(lt)) {
+        ownHasToutiao = true;
+        continue;
+      }
+      if (!isBenignStatusText(lt) && !isSyncGroupHeaderText(lt)) {
+        return false;
+      }
+    }
+    var containerText = minimalContainer ? norm(getText(minimalContainer)) : "";
+    if (containerText) {
+      if (containerText.indexOf("西瓜") !== -1) return false;
+      if (hasOtherPlatformContainerName(containerText)) return false;
+    }
+    var containerHasToutiao = hasToutiaoKeyword(containerText);
+    return ownHasToutiao || containerHasToutiao;
+  };
+
+  var isUnboundEntryText = function (rawText) {
+    var t = norm(rawText);
+    if (!t) return false;
+    var stripped = t.replace(/已绑定|已授权/g, "");
+    return /(?:去绑定|立即绑定|前往绑定|未绑定|请绑定|账号绑定|绑定头条|绑定|去授权|立即授权|前往授权|未授权|请授权|授权)/.test(
+      stripped
+    );
+  };
+
+  var detectToutiaoUnboundEntry = function (anchors) {
+    if (!Array.isArray(anchors) || anchors.length === 0) return false;
+    for (var ai = 0; ai < anchors.length; ai++) {
+      var anchor = anchors[ai];
+      if (!anchor) continue;
+      if (isUnboundEntryText(getText(anchor))) return true;
+      var parent = anchor.parentElement;
+      if (parent && parent.children && parent.children.length > 0) {
+        var sibs = Array.from(parent.children);
+        var idx = sibs.indexOf(anchor);
+        var scanDirs = [
+          [idx + 1, idx + 2],
+          [idx - 1],
+        ];
+        for (var di = 0; di < scanDirs.length; di++) {
+          var indices = scanDirs[di];
+          for (var si = 0; si < indices.length; si++) {
+            var pos = indices[si];
+            if (pos < 0 || pos >= sibs.length) continue;
+            var sib = sibs[pos];
+            if (!isVisible(sib)) continue;
+            var sibText = norm(getText(sib));
+            if (hasOtherPlatformOwnName(sibText)) break;
+            if (
+              matchesAnySelector(sib, [
+                ".semi-switch",
+                "[role='switch']",
+                ".semi-checkbox",
+                "[role='checkbox']",
+                "input[type='checkbox']",
+              ])
+            ) {
+              break;
+            }
+            if (sibText && sibText.length <= 24 && isUnboundEntryText(sibText)) {
+              return true;
+            }
+          }
+        }
+      }
+      var cur = parent;
+      for (var d = 0; cur && d < 3; d++) {
+        if (
+          cur === root ||
+          cur === docRef ||
+          (docRef && (cur === docRef.body || cur === docRef.documentElement))
+        ) {
+          break;
+        }
+        var cTag = String(cur.tagName || "").toUpperCase();
+        if (
+          cTag === "FORM" ||
+          cTag === "MAIN" ||
+          cTag === "BODY" ||
+          cTag === "HTML"
+        ) {
+          break;
+        }
+        var curText = norm(getText(cur));
+        if (
+          !curText ||
+          curText.length > 80 ||
+          curText.indexOf("西瓜") !== -1 ||
+          hasOtherPlatformContainerName(curText)
+        ) {
+          break;
+        }
+        if (isUnboundEntryText(curText)) return true;
+        if (isExplicitRowContainer(cur)) break;
+        cur = cur.parentElement;
+      }
+    }
+    return false;
+  };
+
+  var isInteractiveToggleOrControl = function (el) {
+    if (!el || el.nodeType !== 1) return false;
+    var tag = String(el.tagName || "").toUpperCase();
+    if (
+      tag === "INPUT" ||
+      tag === "BUTTON" ||
+      tag === "SELECT" ||
+      tag === "TEXTAREA" ||
+      tag === "A"
+    ) {
+      return true;
+    }
+    if (typeof el.getAttribute === "function") {
+      var r = String(el.getAttribute("role") || "").toLowerCase();
+      if (
+        r === "switch" ||
+        r === "checkbox" ||
+        r === "radio" ||
+        r === "button" ||
+        r === "combobox"
+      ) {
+        return true;
+      }
+    }
+    return matchesAnySelector(el, [
+      ".semi-switch",
+      ".semi-checkbox",
+      ".semi-select",
+    ]);
+  };
+
+  var branchHasUnrelatedLabel = function (branch) {
+    if (!branch) return false;
+    var nodes = [branch];
+    try {
+      nodes = nodes.concat(Array.from(branch.querySelectorAll("*")));
+    } catch (_) {}
+    for (var ni = 0; ni < nodes.length; ni++) {
+      var n = nodes[ni];
+      if (!isVisible(n)) continue;
+      if (n.children && n.children.length > 0) continue;
+      var tag = String(n.tagName || "").toUpperCase();
+      if (
+        tag === "SVG" ||
+        tag === "PATH" ||
+        tag === "IMG" ||
+        tag === "I" ||
+        tag === "INPUT"
+      ) {
+        continue;
+      }
+      var nt = norm(getText(n)).replace(/[:：*＊]+$/g, "");
+      if (!nt) continue;
+      if (hasOtherPlatformOwnName(nt)) return true;
+      if (hasToutiaoKeyword(nt)) continue;
+      if (nt.length <= 18 && !isBenignStatusText(nt)) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  var containerViolatesCrossRow = function (container, anchor, toggle) {
+    if (
+      !container ||
+      container === root ||
+      container === docRef ||
+      (docRef &&
+        (container === docRef.body || container === docRef.documentElement))
+    ) {
+      return true;
+    }
+    var tag = String(container.tagName || "").toUpperCase();
+    if (tag === "FORM" || tag === "MAIN" || tag === "BODY" || tag === "HTML") {
+      return true;
+    }
+    if (norm(getText(container)).length > 220) return true;
+
+    // 1. 容器内包含 >= 2 个互不包含的显式行容器 → 多行父容器
+    var nestedRows = [];
+    try {
+      nestedRows = Array.from(
+        container.querySelectorAll(
+          "[class*='form-item'], [class*='setting-item'], [class*='form-row'], [class*='setting-row'], [class*='sync-item'], [class*='field']"
+        )
+      ).filter(function (r) {
+        return r !== container && isVisible(r) && isExplicitRowContainer(r);
+      });
+    } catch (_) {
+      nestedRows = [];
+    }
+    var disjointRows = nestedRows.filter(function (r) {
+      return !nestedRows.some(function (other) {
+        return (
+          other !== r &&
+          typeof other.contains === "function" &&
+          other.contains(r)
+        );
+      });
+    });
+    if (disjointRows.length >= 2) return true;
+
+    // 2. 容器内有其他 <label> 或 label 类名节点（含候选复选框自身 label）指向非同步/非今日头条字段
+    var labelLikes = [];
+    try {
+      labelLikes = Array.from(
+        container.querySelectorAll("label, [class*='label']")
+      );
+    } catch (_) {
+      labelLikes = [];
+    }
+    for (var li = 0; li < labelLikes.length; li++) {
+      var ol = labelLikes[li];
+      if (!isVisible(ol) || ol === anchor) continue;
+      if (ol.tagName !== "LABEL" && !/(?:^|[\s_-])label(?:$|[\s_-])/i.test(getClass(ol))) {
+        continue;
+      }
+      if (typeof anchor.contains === "function" && anchor.contains(ol)) continue;
+      if (typeof ol.contains === "function" && ol.contains(anchor)) continue;
+      var olText = norm(getText(ol)).replace(/[:：*＊]+$/g, "");
+      if (olText) {
+        if (hasOtherPlatformOwnName(olText)) return true;
+        if (
+          !hasToutiaoKeyword(olText) &&
+          !isSyncGroupHeaderText(olText) &&
+          !isBenignStatusText(olText)
+        ) {
+          return true;
+        }
+      }
+    }
+
+    // 3. 控件所在子分支与文本锚点不同时，该子分支不得自带独立表单标签（防止跨行误点相邻行/相邻平台开关）
+    if (toggle && toggle.stateEl && container.children) {
+      var directKids = Array.from(container.children);
+      var anchorBranch = null;
+      var toggleBranch = null;
+      for (var dki = 0; dki < directKids.length; dki++) {
+        var dk = directKids[dki];
+        if (
+          dk === anchor ||
+          (typeof dk.contains === "function" && dk.contains(anchor))
+        ) {
+          anchorBranch = dk;
+        }
+        if (
+          dk === toggle.stateEl ||
+          (typeof dk.contains === "function" && dk.contains(toggle.stateEl))
+        ) {
+          toggleBranch = dk;
+        }
+      }
+      if (
+        toggleBranch &&
+        toggleBranch !== anchorBranch &&
+        branchHasUnrelatedLabel(toggleBranch)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  var findToutiaoToggle = function () {
+    var scope = (docRef && docRef.body) || root;
+    var allEls = [];
+    try {
+      allEls = Array.from(scope.querySelectorAll("*")).filter(function (el) {
+        if (!isVisible(el)) return false;
+        var tag = String(el.tagName || "").toUpperCase();
+        if (tag === "SCRIPT" || tag === "STYLE" || tag === "SVG" || tag === "IMG") {
+          return false;
+        }
+        if (typeof el.closest === "function") {
+          try {
+            if (el.closest("nav, aside, header")) return false;
+          } catch (_) {}
+        }
+        if (isInsideModalOrPopup(el)) return false;
+        return true;
+      });
+    } catch (_) {
+      allEls = [];
+    }
+
+    var anchors = allEls.filter(function (el) {
+      var t = norm(getText(el));
+      if (!t || t.length > 60 || t.indexOf("今日头条") === -1) return false;
+      var kids = el.children ? Array.from(el.children) : [];
+      for (var k = 0; k < kids.length; k++) {
+        if (isVisible(kids[k]) && norm(getText(kids[k])).indexOf("今日头条") !== -1) {
+          return false;
+        }
+      }
+      return true;
+    });
+
+    var tightRe =
+      /^(?:同步发布到|同时发布到|同步到|同步至|同步发到)?今日头条$/;
+    anchors.sort(function (a, b) {
+      var ta = norm(getText(a));
+      var tb = norm(getText(b));
+      var ra = tightRe.test(ta) ? 0 : ta.length <= 16 ? 1 : 2;
+      var rb = tightRe.test(tb) ? 0 : tb.length <= 16 ? 1 : 2;
+      if (ra !== rb) return ra - rb;
+      return ta.length - tb.length;
+    });
+
+    for (var ai = 0; ai < anchors.length; ai++) {
+      var anchor = anchors[ai];
+      var anchorText = clean(getText(anchor)).slice(0, 40);
+
+      // 优先 1：锚点自身就是开关/复选框，或与开关在同一 label / .semi-checkbox 容器内
+      if (
+        matchesAnySelector(anchor, [
+          ".semi-switch",
+          "[role='switch']",
+          ".semi-checkbox",
+          "[role='checkbox']",
+          "input[type='checkbox']",
+        ])
+      ) {
+        var selfInp = isCheckboxInput(anchor)
+          ? anchor
+          : typeof anchor.querySelector === "function"
+          ? anchor.querySelector("input[type='checkbox']")
+          : null;
+        var selfToggle = {
+          stateEl: anchor,
+          clickEl: pickClickEl(anchor, selfInp, null),
+          innerInput: selfInp,
+        };
+        if (validateCandidateToggle(selfToggle, anchor)) {
+          return {
+            found: true,
+            strategy: "self",
+            anchorText: anchorText,
+            toggle: selfToggle,
+          };
+        }
+      }
+
+      var curLabel = anchor;
+      for (var ld = 0; curLabel && ld < 4; ld++) {
+        var lTag = String(curLabel.tagName || "").toUpperCase();
+        var isLabelOrCheck =
+          lTag === "LABEL" ||
+          matchesAnySelector(curLabel, [
+            ".semi-checkbox",
+            "[role='checkbox']",
+            ".semi-switch",
+            "[role='switch']",
+          ]);
+        if (isLabelOrCheck && isVisible(curLabel) && !isInsideModalOrPopup(curLabel)) {
+          if (lTag === "LABEL" && typeof curLabel.getAttribute === "function") {
+            var forId = curLabel.getAttribute("for");
+            if (forId) {
+              var forTarget = resolveById(forId);
+              if (
+                forTarget &&
+                (isCheckboxInput(forTarget) ||
+                  matchesAnySelector(forTarget, [
+                    ".semi-switch",
+                    "[role='switch']",
+                    ".semi-checkbox",
+                    "[role='checkbox']",
+                  ]))
+              ) {
+                var forToggle = {
+                  stateEl: forTarget,
+                  clickEl: pickClickEl(forTarget, isCheckboxInput(forTarget) ? forTarget : null, curLabel),
+                  innerInput: isCheckboxInput(forTarget) ? forTarget : null,
+                };
+                if (validateCandidateToggle(forToggle, curLabel)) {
+                  return {
+                    found: true,
+                    strategy: "label_for",
+                    anchorText: anchorText,
+                    toggle: forToggle,
+                  };
+                }
+              }
+            }
+          }
+          if (
+            matchesAnySelector(curLabel, [
+              ".semi-checkbox",
+              "[role='checkbox']",
+              ".semi-switch",
+              "[role='switch']",
+            ])
+          ) {
+            var innerI =
+              typeof curLabel.querySelector === "function"
+                ? curLabel.querySelector("input[type='checkbox']")
+                : null;
+            var wrapToggle = {
+              stateEl: curLabel,
+              clickEl: pickClickEl(curLabel, innerI, null),
+              innerInput: innerI,
+            };
+            if (validateCandidateToggle(wrapToggle, curLabel)) {
+              return {
+                found: true,
+                strategy: "same_label_wrapper",
+                anchorText: anchorText,
+                toggle: wrapToggle,
+              };
+            }
+          }
+          var inLabelToggles = collectLogicalToggles(curLabel);
+          if (
+            inLabelToggles.length === 1 &&
+            validateCandidateToggle(inLabelToggles[0], curLabel)
+          ) {
+            return {
+              found: true,
+              strategy: "same_label",
+              anchorText: anchorText,
+              toggle: inLabelToggles[0],
+            };
+          }
+          break;
+        }
+        curLabel = curLabel.parentElement;
+      }
+
+      // 优先 2：向上最多 4 层查找同一行容器，严格跨行保护 + 与「今日头条」可验证关联校验
+      var container = anchor.parentElement;
+      for (var depth = 0; container && depth < 4; depth++) {
+        if (
+          container === root ||
+          container === docRef ||
+          (docRef &&
+            (container === docRef.body ||
+              container === docRef.documentElement))
+        ) {
+          break;
+        }
+        var cToggles = collectLogicalToggles(container);
+        if (cToggles.length > 1) {
+          // 同容器出现多个开关：属于多选项/多行父容器，禁止猜测
+          break;
+        }
+        if (cToggles.length === 1) {
+          if (
+            containerViolatesCrossRow(container, anchor, cToggles[0]) ||
+            !validateCandidateToggle(cToggles[0], container)
+          ) {
+            break;
+          }
+          return {
+            found: true,
+            strategy: "same_row",
+            anchorText: anchorText,
+            toggle: cToggles[0],
+          };
+        }
+        if (isExplicitRowContainer(container)) {
+          break;
+        }
+        container = container.parentElement;
+      }
+    }
+
+    var unbound = anchors.length > 0 && detectToutiaoUnboundEntry(anchors);
+    return {
+      found: false,
+      hasToutiaoText: anchors.length > 0,
+      unbound: unbound,
+      anchorCount: anchors.length,
+    };
+  };
+
+  if (action === "readback") {
+    var modalInfo = detectAuthBindModal();
+    if (modalInfo.detected) {
+      return {
+        found: true,
+        checked: false,
+        authModal: true,
+        modalSnippet: modalInfo.snippet,
+      };
+    }
+    var markedStateEl = token
+      ? root.querySelector('[data-mm-dy-sync-tt-state="' + token + '"]')
+      : null;
+    if (markedStateEl && markedStateEl.isConnected !== false) {
+      var markedInnerInp = isCheckboxInput(markedStateEl)
+        ? markedStateEl
+        : typeof markedStateEl.querySelector === "function"
+        ? markedStateEl.querySelector("input[type='checkbox']")
+        : null;
+      var stMarked = readToggleState(markedStateEl, markedInnerInp);
+      return {
+        found: true,
+        checked: stMarked.checked,
+        stateSource: stMarked.source,
+        disabled: isDisabledToggle(markedStateEl, markedInnerInp),
+        authModal: false,
+      };
+    }
+    var relocated = findToutiaoToggle();
+    if (!relocated.found) {
+      return {
+        found: false,
+        checked: false,
+        authModal: false,
+        hasToutiaoText: relocated.hasToutiaoText,
+      };
+    }
+    var stReloc = readToggleState(
+      relocated.toggle.stateEl,
+      relocated.toggle.innerInput
+    );
+    return {
+      found: true,
+      checked: stReloc.checked,
+      stateSource: stReloc.source,
+      disabled: isDisabledToggle(
+        relocated.toggle.stateEl,
+        relocated.toggle.innerInput
+      ),
+      authModal: false,
+    };
+  }
+
+  if (action === "inspect_and_mark") {
+    var located = findToutiaoToggle();
+    if (!located.found) {
+      return {
+        found: false,
+        hasToutiaoText: located.hasToutiaoText,
+        unbound: Boolean(located.unbound),
+        anchorCount: located.anchorCount,
+      };
+    }
+    var tg = located.toggle;
+    var rejectClick = getSubmitRejectionReason(tg.clickEl);
+    var rejectState = getSubmitRejectionReason(tg.stateEl);
+    if (rejectClick || rejectState) {
+      return {
+        found: true,
+        submitRejected: true,
+        rejectReason: rejectClick || rejectState,
+        strategy: located.strategy,
+        anchorText: located.anchorText,
+      };
+    }
+    var disabled = isDisabledToggle(tg.stateEl, tg.innerInput);
+    var st = readToggleState(tg.stateEl, tg.innerInput);
+    if (token) {
+      if (tg.stateEl && typeof tg.stateEl.setAttribute === "function") {
+        tg.stateEl.setAttribute("data-mm-dy-sync-tt-state", token);
+      }
+      if (!st.checked && !disabled && tg.clickEl) {
+        if (typeof tg.clickEl.setAttribute === "function") {
+          tg.clickEl.setAttribute("data-mm-dy-sync-tt", token);
+        }
+        if (typeof tg.clickEl.scrollIntoView === "function") {
+          try {
+            tg.clickEl.scrollIntoView({ block: "center", inline: "center" });
+          } catch (_) {}
+        }
+      }
+    }
+    return {
+      found: true,
+      checked: st.checked,
+      stateSource: st.source,
+      disabled: disabled,
+      strategy: located.strategy,
+      anchorText: located.anchorText,
+      markedForClick: !st.checked && !disabled && Boolean(token && tg.clickEl),
+    };
+  }
+
+  return { found: false, reason: "unknown_action" };
+}
+
+/**
+ * 失败诊断：输出同步今日头条区域的脱敏 DOM 轮廓（只保留 ≤12 字的 UI 文字，长文本打 [t:N]），
+ * 便于真机校准选择器。浏览器端自包含函数，严禁引用模块作用域变量。
+ */
+export function collectDySyncToutiaoDomOutline(args) {
+  var needles =
+    (args && Array.isArray(args.needles) && args.needles.length > 0
+      ? args.needles
+      : ["今日头条", "同步", "同时发布", "发布设置"]);
+  var budget = 3500;
+  var docRef = typeof document !== "undefined" ? document : null;
+  if (!docRef) return "";
+
+  function visible(el) {
+    if (!el || el.isConnected === false) return false;
+    try {
+      if (el.hidden === true) return false;
+      if (typeof getComputedStyle === "function") {
+        var cs = getComputedStyle(el);
+        if (cs && (cs.display === "none" || cs.visibility === "hidden")) {
+          return false;
+        }
+      }
+      if (typeof el.getBoundingClientRect === "function") {
+        var r = el.getBoundingClientRect();
+        if (r && (r.width <= 0 || r.height <= 0)) return false;
+      }
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function ownText(el) {
+    if (!el) return "";
+    if (el.childNodes && el.childNodes.length) {
+      var t = "";
+      for (var i = 0; i < el.childNodes.length; i++) {
+        var n = el.childNodes[i];
+        if (n && n.nodeType === 3) t += String(n.nodeValue || "");
+      }
+      return t.replace(/\s+/g, " ").trim();
+    }
+    if (typeof el._text === "string") {
+      return el._text.replace(/\s+/g, " ").trim();
+    }
+    if (!el.children || el.children.length === 0) {
+      return String(el.textContent || "").replace(/\s+/g, " ").trim();
+    }
+    return "";
+  }
+
+  function cls(el) {
+    var c =
+      (typeof el.getAttribute === "function" && el.getAttribute("class")) ||
+      (typeof el.className === "string" ? el.className : "");
+    return String(c || "")
+      .split(/\s+/)
+      .filter(function (x) {
+        return x && !/[\/:?=]/.test(x);
+      })
+      .slice(0, 3)
+      .map(function (x) {
+        return "." + x;
+      })
+      .join("");
+  }
+
+  function safeAttrs(el) {
+    if (!el || typeof el.getAttribute !== "function") return "";
+    var out = [];
+    var role = el.getAttribute("role");
+    if (role) out.push("[role=" + role + "]");
+    var ac = el.getAttribute("aria-checked");
+    if (ac !== null) out.push("[aria-checked=" + ac + "]");
+    var tp = el.getAttribute("type");
+    if (tp === "checkbox") out.push("[type=checkbox]");
+    if (typeof el.checked === "boolean" && tp === "checkbox") {
+      out.push("[checked=" + el.checked + "]");
+    }
+    if (el.disabled === true || el.getAttribute("aria-disabled") === "true") {
+      out.push("[disabled]");
+    }
+    return out.join("");
+  }
+
+  function maskText(raw) {
+    if (!raw) return "";
+    var len = Array.from(raw).length;
+    if (len > 12) return "[t:" + len + "]";
+    return raw
+      .replace(/(https?:|blob:|data:)\S*/gi, "[url]")
+      .replace(/\S*[A-Za-z0-9-]+\.[A-Za-z]{2,}\S*/g, "[url]")
+      .replace(/\S*@\S+/g, "[at]")
+      .replace(/\d{5,}/g, "[n]");
+  }
+
+  function dump(el, depth, lines) {
+    if (depth > 7 || lines.length > 80) return;
+    if (!visible(el)) return;
+    var tag = String(el.tagName || "").toLowerCase();
+    if (tag === "script" || tag === "style" || tag === "svg" || tag === "img") {
+      return;
+    }
+    var t = maskText(ownText(el));
+    lines.push(
+      new Array(depth + 1).join("  ") +
+        tag +
+        cls(el) +
+        safeAttrs(el) +
+        (t ? ' "' + t + '"' : "")
+    );
+    var kids = el.children || [];
+    for (var i = 0; i < kids.length && i < 15; i++) {
+      dump(kids[i], depth + 1, lines);
+    }
+  }
+
+  var roots = [];
+  var pushRoot = function (r) {
+    if (!r || roots.length >= 4) return;
+    for (var j = 0; j < roots.length; j++) {
+      if (
+        roots[j] === r ||
+        (typeof roots[j].contains === "function" && roots[j].contains(r))
+      ) {
+        return;
+      }
+    }
+    roots.push(r);
+  };
+
+  var body = docRef.body || docRef;
+  var all = [];
+  try {
+    all = Array.from(body.querySelectorAll("*"));
+  } catch (_) {
+    all = [];
+  }
+
+  for (var ni = 0; ni < needles.length && roots.length < 4; ni++) {
+    var needle = needles[ni];
+    if (!needle) continue;
+    for (var i = 0; i < all.length && roots.length < 4; i++) {
+      var el = all[i];
+      var ot = ownText(el);
+      if (!ot || ot.indexOf(needle) === -1 || !visible(el)) continue;
+      if (typeof el.closest === "function" && el.closest("nav,aside,header")) {
+        continue;
+      }
+      var rNode = el;
+      for (
+        var up = 0;
+        up < 4 && rNode.parentElement && rNode.parentElement !== body;
+        up++
+      ) {
+        rNode = rNode.parentElement;
+      }
+      pushRoot(rNode);
+    }
+    // 命中「今日头条」就优先只输出相关区域，不再泛扫后续回退词
+    if (ni === 0 && roots.length > 0) break;
+  }
+
+  // 若存在可见弹窗，也一并输出脱敏轮廓
+  try {
+    var modals = Array.from(
+      body.querySelectorAll(".semi-modal, [role='dialog']")
+    ).filter(visible);
+    for (var mi = 0; mi < modals.length && roots.length < 4; mi++) {
+      pushRoot(modals[mi]);
+    }
+  } catch (_) {}
+
+  var sections = [];
+  for (var ri = 0; ri < roots.length; ri++) {
+    var lines = [];
+    dump(roots[ri], 0, lines);
+    if (lines.length) {
+      sections.push("#" + (ri + 1) + "\n" + lines.join("\n"));
+    }
+  }
+  var text = sections.join("\n");
+  return text.length > budget ? text.slice(0, budget) + "…(截断)" : text;
+}
+
+function waitSyncToutiaoMs(page, ms) {
+  if (ms <= 0) return Promise.resolve();
+  if (page && typeof page.waitForTimeout === "function") {
+    return page.waitForTimeout(ms).catch(() => {});
+  }
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function logDySyncToutiaoDomOutline(page) {
+  let timer = null;
+  try {
+    const outline = await Promise.race([
+      page.evaluate(collectDySyncToutiaoDomOutline, {
+        needles: ["今日头条", "同步", "同时发布", "发布设置"],
+      }),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(""), 3000);
+        if (timer && typeof timer.unref === "function") timer.unref();
+      }),
+    ]);
+    if (outline) {
+      console.log(`[dy] 同步今日头条区域脱敏 DOM 轮廓:\n${outline}`);
+    }
+  } catch (_) {
+    // 诊断日志采集失败不覆盖主错误
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * 抖音发布页开启「同步到今日头条」并回读确认。
+ * - 已开启：直接回读确认，不点击；
+ * - 未开启：点一次（安全校验后走 page.click 或 safeClick），再回读确认；
+ * - 找不到控件 / 遇授权绑定弹窗 / 回读仍未开：输出脱敏 DOM 轮廓并抛错中止发布（中止前未点发布，属可重试错误）；
+ * - 草稿模式同样执行开关步骤（便于真机草稿 e2e 校准选择器），并在日志注明草稿不会触发同步。
+ */
+export async function ensureDySyncToutiao(page, options = {}) {
+  const isDraftMode = Boolean(options && options.isDraftMode);
+  const timeouts = {
+    ...DY_SYNC_TOUTIAO_DEFAULT_TIMEOUTS,
+    ...((options && options.timeouts) || {}),
+  };
+  const preferPageClick = !(options && options.preferPageClick === false);
+  const token = `dytt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+  if (isDraftMode) {
+    console.log(
+      "[dy] 草稿模式：仍执行同步今日头条开关步骤以便校准选择器（注意：存草稿不会触发同步发布到今日头条）"
+    );
+  }
+
+  const abortWithOutline = async (reason) => {
+    await logDySyncToutiaoDomOutline(page);
+    throw new Error(`抖音同步到今日头条未能开启（原因：${reason}），已中止，未发布`);
+  };
+
+  try {
+    // 1. 定位并读取当前状态
+    let inspected = null;
+    const locateDeadline = Date.now() + Math.max(0, timeouts.locateTimeoutMs);
+    do {
+      try {
+        inspected = await page.evaluate(runDySyncToutiaoDomAction, {
+          action: "inspect_and_mark",
+          token,
+          submitSelectors: ALL_PLATFORM_SUBMIT_SELECTORS,
+          submitTexts: DY_SYNC_TOUTIAO_SUBMIT_TEXTS,
+        });
+      } catch (evalErr) {
+        inspected = {
+          found: false,
+          error: (evalErr && evalErr.message) || String(evalErr),
+        };
+      }
+      if (inspected && (inspected.found || inspected.unbound)) break;
+      if (Date.now() < locateDeadline) {
+        await waitSyncToutiaoMs(page, timeouts.pollIntervalMs);
+      }
+    } while (Date.now() < locateDeadline);
+
+    if (!inspected || !inspected.found) {
+      const reason =
+        inspected && inspected.error
+          ? `页面脚本异常：${inspected.error}`
+          : inspected && inspected.unbound
+          ? "今日头条未绑定"
+          : inspected && inspected.hasToutiaoText
+          ? "找到「今日头条」文案但附近未找到可交互开关"
+          : "页面未找到「今日头条」同步开关";
+      await abortWithOutline(reason);
+    }
+
+    if (inspected.submitRejected) {
+      await abortWithOutline("目标控件疑似提交按钮，已拒绝点击");
+    }
+
+    if (inspected.disabled) {
+      await abortWithOutline("同步开关处于禁用状态");
+    }
+
+    if (inspected.checked === true) {
+      console.log(
+        `[dy] 同步今日头条当前已开启（策略=${inspected.strategy || "unknown"}，来源=${
+          inspected.stateSource || "unknown"
+        }），跳过点击`
+      );
+      console.log("[dy] 同步今日头条已开启并回读确认");
+      return {
+        ok: true,
+        alreadyEnabled: true,
+        clicked: false,
+        isDraftMode,
+        strategy: inspected.strategy || "",
+      };
+    }
+
+    // 2. 未开启：只点一次
+    const markedSelector = `[data-mm-dy-sync-tt="${token}"]`;
+    if (preferPageClick && typeof page.click === "function") {
+      try {
+        await page.click(markedSelector);
+      } catch (clickErr) {
+        await abortWithOutline(
+          `点击开关失败：${(clickErr && clickErr.message) || String(clickErr)}`
+        );
+      }
+    } else {
+      let clickRes = null;
+      try {
+        clickRes = await page.evaluate(runDySyncToutiaoDomAction, {
+          action: "safe_click",
+          token,
+          submitSelectors: ALL_PLATFORM_SUBMIT_SELECTORS,
+          submitTexts: DY_SYNC_TOUTIAO_SUBMIT_TEXTS,
+        });
+      } catch (clickErr) {
+        await abortWithOutline(
+          `点击开关失败：${(clickErr && clickErr.message) || String(clickErr)}`
+        );
+      }
+      if (!clickRes || !clickRes.ok) {
+        const reason =
+          clickRes && clickRes.submitRejected
+            ? "目标控件疑似提交按钮，已拒绝点击"
+            : `点击开关失败（${(clickRes && clickRes.reason) || "unknown"}）`;
+        await abortWithOutline(reason);
+      }
+    }
+
+    // 3. 等待状态更新并回读确认
+    await waitSyncToutiaoMs(page, timeouts.afterClickDelayMs);
+
+    let readback = null;
+    const readbackDeadline =
+      Date.now() + Math.max(0, timeouts.readbackTimeoutMs);
+    do {
+      try {
+        readback = await page.evaluate(runDySyncToutiaoDomAction, {
+          action: "readback",
+          token,
+          submitSelectors: ALL_PLATFORM_SUBMIT_SELECTORS,
+          submitTexts: DY_SYNC_TOUTIAO_SUBMIT_TEXTS,
+        });
+      } catch (rbErr) {
+        readback = {
+          found: false,
+          checked: false,
+          error: (rbErr && rbErr.message) || String(rbErr),
+        };
+      }
+      if (readback && readback.authModal) {
+        const tip = readback.modalSnippet ? `「${readback.modalSnippet}」` : "";
+        await abortWithOutline(`出现授权/绑定弹窗${tip}`);
+      }
+      if (readback && readback.found && readback.checked === true) {
+        console.log("[dy] 同步今日头条已开启并回读确认");
+        return {
+          ok: true,
+          alreadyEnabled: false,
+          clicked: true,
+          isDraftMode,
+          strategy: inspected.strategy || "",
+        };
+      }
+      if (Date.now() < readbackDeadline) {
+        await waitSyncToutiaoMs(page, timeouts.pollIntervalMs);
+      }
+    } while (Date.now() < readbackDeadline);
+
+    const failReason =
+      readback && readback.error
+        ? `回读异常：${readback.error}`
+        : readback && !readback.found
+        ? "点击后回读未找到同步开关"
+        : "点击开关后回读仍为未开启状态";
+    await abortWithOutline(failReason);
+  } finally {
+    await page
+      .evaluate(runDySyncToutiaoDomAction, {
+        action: "cleanup",
+        token,
+      })
+      .catch(() => {});
+  }
+}
+
 export default async function (page, data, window, event) {
   const isDraftMode =
     data.publishMode === "draft" || data.publishToDraft === true;
@@ -1001,6 +2684,11 @@ export default async function (page, data, window, event) {
       data,
       window,
     });
+
+    // 同步发布到今日头条（可选：dySyncToutiao=true 时开启并回读确认；失败中止本次抖音发布）
+    if (isDySyncToutiaoRequested(data)) {
+      await ensureDySyncToutiao(page, { isDraftMode });
+    }
 
     // 发布前最后一道闸：复核简介未重复/未残缺（中间步骤可能动过编辑器状态），
     // 复核不过自动重填一轮，仍不过则中止——绝不带重复/空简介点发布

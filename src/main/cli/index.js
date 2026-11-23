@@ -8,7 +8,11 @@ import {
   resolveCreativeStatementForPlatform,
 } from "../../shared/creativeStatement.js";
 import { getCliSubArgv, isCliMode } from "./detectArgv";
-import { parsePublishArgs, publishHelpText } from "./parsePublishArgs";
+import {
+  parsePublishArgs,
+  publishHelpText,
+  checkDySyncToutiaoConflict,
+} from "./parsePublishArgs";
 import {
   parsePublishArticleArgs,
   publishArticleHelpText,
@@ -428,6 +432,11 @@ function isSameArticleRecord(record, target) {
  * @returns {Promise<number>} exit code: 0=all success, 1=partial failure, 2=all failed
  */
 async function runBatchDirPublish(v, cfg) {
+  const dySyncConflict = checkDySyncToutiaoConflict([v]);
+  if (dySyncConflict) {
+    console.error(dySyncConflict);
+    return 2;
+  }
   const resolvedDir = path.resolve(v.dir);
   if (!fs.existsSync(resolvedDir) || !fs.statSync(resolvedDir).isDirectory()) {
     console.error("目录不存在或不是有效目录: " + resolvedDir);
@@ -566,6 +575,14 @@ async function runBatchDirPublish(v, cfg) {
       rowPublishOptions.collection = resolvedRowCol.name;
     } else {
       delete rowPublishOptions.collection;
+    }
+    if (
+      v.platform === "抖音" &&
+      (v.dySyncToutiao === true || rowPublishOptions.dySyncToutiao === true)
+    ) {
+      rowPublishOptions.dySyncToutiao = true;
+    } else {
+      delete rowPublishOptions.dySyncToutiao;
     }
     const metadata = normalizeVideoMetadata(
       {
@@ -743,10 +760,12 @@ async function runBatchDirPublish(v, cfg) {
         const requestedRowCollection =
           (resolvedRowCol && resolvedRowCol.enabled && resolvedRowCol.name) ||
           "";
+        const requestedRowDySync = rowPublishOptions.dySyncToutiao === true;
         const conflictInfo = checkExistingScheduledCreativeConflict(
           existing,
           cs,
-          requestedRowCollection
+          requestedRowCollection,
+          requestedRowDySync
         );
         const existingPublishAt =
           existing.scheduledPublishAtText ||
@@ -765,6 +784,13 @@ async function runBatchDirPublish(v, cfg) {
                 conflictInfo.requestedCreativeStatement,
               collection: conflictInfo.actualCollection,
               requestedCollection: conflictInfo.requestedCollection,
+              ...(conflictInfo.dySyncToutiaoConflict
+                ? {
+                    dySyncToutiao: conflictInfo.actualDySyncToutiao,
+                    requestedDySyncToutiao:
+                      conflictInfo.requestedDySyncToutiao,
+                  }
+                : {}),
               status: "needs_attention",
               needsAttention: true,
               duplicate: true,
@@ -784,6 +810,9 @@ async function runBatchDirPublish(v, cfg) {
               creativeStatement: conflictInfo.actualCreativeStatement,
               ...(conflictInfo.actualCollection
                 ? { collection: conflictInfo.actualCollection }
+                : {}),
+              ...(conflictInfo.actualDySyncToutiao
+                ? { dySyncToutiao: true }
                 : {}),
               status: "scheduled",
               scheduled: true,
@@ -1281,6 +1310,13 @@ export async function runCliMain(argv = process.argv) {
       return 2;
     }
 
+    // 防重复冲突检查须在任何历史查重 / 排期 / 节流之前执行
+    const dySyncConflict = checkDySyncToutiaoConflict([v]);
+    if (dySyncConflict) {
+      console.error(dySyncConflict);
+      return 2;
+    }
+
     // Batch directory publish mode
     if (v.dir) {
       return await runBatchDirPublish(v, cfg);
@@ -1448,6 +1484,12 @@ export async function runCliMain(argv = process.argv) {
               : {}),
             ...(result.requestedCollection !== undefined
               ? { requestedCollection: result.requestedCollection }
+              : {}),
+            ...(result.dySyncToutiao !== undefined
+              ? { dySyncToutiao: result.dySyncToutiao }
+              : {}),
+            ...(result.requestedDySyncToutiao !== undefined
+              ? { requestedDySyncToutiao: result.requestedDySyncToutiao }
               : {}),
             message: result.message,
           })

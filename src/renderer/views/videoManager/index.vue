@@ -237,6 +237,64 @@ import {
 } from "../../../shared/accountIdentity.js";
 import { buildPublishHistoryCsv } from "../../../shared/publishHistoryCsv.js";
 
+function readRecordDySyncToutiao(record) {
+  if (!record || typeof record !== "object") return undefined;
+  if (
+    record.publishOptions &&
+    typeof record.publishOptions.dySyncToutiao === "boolean"
+  ) {
+    return record.publishOptions.dySyncToutiao;
+  }
+  if (typeof record.dySyncToutiao === "boolean") {
+    return record.dySyncToutiao;
+  }
+  if (record.data && typeof record.data.dySyncToutiao === "boolean") {
+    return record.data.dySyncToutiao;
+  }
+  return undefined;
+}
+
+function republishRecordIdentityKey(target) {
+  const pt = String((target && target.pt) || "").trim();
+  if (target && target.partition) {
+    return `p__${String(target.partition)}`;
+  }
+  const acctKey =
+    (target && target.accountKey) ||
+    (typeof recordAccountKeyOf === "function"
+      ? recordAccountKeyOf(target || {})
+      : "") ||
+    (target && target.phone) ||
+    "";
+  return `k__${String(acctKey)}__${pt}`;
+}
+
+function resolveRepublishDySyncToutiao(records = [], failedTargets = []) {
+  const list = Array.isArray(records) ? records.filter(Boolean) : [];
+  if (list.length === 0) return false;
+  const dyRecords = list.filter((r) =>
+    String((r && r.pt) || "").includes("抖音")
+  );
+  let candidates = dyRecords.length > 0 ? dyRecords : list;
+  if (
+    dyRecords.length > 0 &&
+    Array.isArray(failedTargets) &&
+    failedTargets.length > 0
+  ) {
+    const failedKeySet = new Set(
+      failedTargets.map((t) => republishRecordIdentityKey(t))
+    );
+    const failedDy = dyRecords.filter((r) =>
+      failedKeySet.has(republishRecordIdentityKey(r))
+    );
+    if (failedDy.length > 0) {
+      candidates = failedDy;
+    }
+  }
+  // 合并行里若有记录未开启同步（含缺字段），保守按 false：宁可漏同步，不误同步到头条
+  return candidates.every((rec) => readRecordDySyncToutiao(rec) === true);
+}
+
 export default {
   name: "VideoManager",
   components: {
@@ -672,6 +730,10 @@ export default {
         partition: v.partition,
         accountKey: recordAccountKeyOf(v),
       }));
+      const dySyncToutiao = resolveRepublishDySyncToutiao(
+        details,
+        failedTargets
+      );
 
       const ok = this.$refs.localPublishRef.openRepublish({
         filePath,
@@ -686,6 +748,7 @@ export default {
           creativeStatement: sample.creativeStatement,
           coverPath: sample.coverPath || "",
           noDownload: sample.noDownload === true,
+          dySyncToutiao,
         },
         records: normalizedDetails.map(({ record, metadata }) => ({
           id: record.id,
@@ -697,6 +760,10 @@ export default {
           description: metadata.description,
           shortTitle: metadata.shortTitle,
           tags: metadata.tags,
+          // 只透传同步头条开关，不复制整份 publishOptions（避免重发时回填旧商品/合集）
+          ...(typeof readRecordDySyncToutiao(record) === "boolean"
+            ? { dySyncToutiao: readRecordDySyncToutiao(record) }
+            : {}),
           publishAttemptCount: Number(record.publishAttemptCount) || 1,
           republishCount: Number(record.republishCount),
         })),

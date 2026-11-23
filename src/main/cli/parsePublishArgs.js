@@ -27,6 +27,37 @@ import {
 
 export { PLATFORM_ALIASES, VIDEO_PUBLISH_CANONICAL, resolvePublishPlatform };
 
+export const DY_SYNC_TOUTIAO_CONFLICT_MESSAGE =
+  "已勾选头条账号，又开启抖音同步头条，会重复发布，请二选一";
+
+export function isDySyncToutiaoEnabled(item) {
+  if (!item || typeof item !== "object") return false;
+  return Boolean(
+    item.dySyncToutiao === true ||
+      (item.publishOptions && item.publishOptions.dySyncToutiao === true) ||
+      (item.data && item.data.dySyncToutiao === true)
+  );
+}
+
+/**
+ * 防重复校验：同一次发布任务里同时包含头条账号且开启 dySyncToutiao=true 时拒绝。
+ * 应在查重、排期与节流之前对请求的完整目标列表执行。
+ * @param {object|object[]} targets
+ * @returns {string} 冲突文案，无冲突返回空串
+ */
+export function checkDySyncToutiaoConflict(targets) {
+  const list = Array.isArray(targets) ? targets : targets ? [targets] : [];
+  if (list.length === 0) return "";
+  const hasToutiao = list.some((item) => {
+    const pt = String((item && (item.platform || item.pt)) || "").trim();
+    const lower = pt.toLowerCase();
+    return pt.includes("头条") || lower === "tt" || lower === "toutiao";
+  });
+  if (!hasToutiao) return "";
+  const hasDySync = list.some((item) => isDySyncToutiaoEnabled(item));
+  return hasDySync ? DY_SYNC_TOUTIAO_CONFLICT_MESSAGE : "";
+}
+
 /**
  * 解析器全部无值布尔开关的单一真源（与解析循环分支同源）：
  * - 正文类取值参数仅在下一个 token 恰好命中此集合时才报缺值，避免把字面文案（如 `--开场--`）误判为选项，
@@ -52,6 +83,12 @@ const PUBLISH_BOOLEAN_SWITCHES = Object.freeze({
   },
   "--no-download": (out) => {
     out.noDownload = true;
+  },
+  "--dy-sync-toutiao": (out) => {
+    out.dySyncToutiao = true;
+  },
+  "--dySyncToutiao": (out) => {
+    out.dySyncToutiao = true;
   },
 });
 
@@ -111,6 +148,7 @@ export function parsePublishArgs(subArgv) {
     allowDuplicate: false,
     noThrottle: false,
     noDownload: false,
+    dySyncToutiao: false,
     collection: "",
     sphLinkType: null,
     sphLinkValue: null,
@@ -477,6 +515,11 @@ export function parsePublishArgs(subArgv) {
     out.publishOptions = { ...(out.publishOptions || {}), allowDuplicate: true };
   }
 
+  // dySyncToutiao 透传进 publishOptions（保留给 publishVideo.js 做防重复校验及抖音发布页开关执行）
+  if (out.dySyncToutiao) {
+    out.publishOptions = { ...(out.publishOptions || {}), dySyncToutiao: true };
+  }
+
   // 合集名称（仅抖音 / 快手 / 视频号生效；留空或非支持平台忽略，不污染 publishOptions）
   out.collection = normalizeCollectionName(out.collection);
   if (out.collection && platformSupportsCollection(out.platform)) {
@@ -598,6 +641,25 @@ export function publishBodyToArgv(body) {
     argv.push("--no-throttle");
   if (body.noDownload === true || body["no-download"] === true)
     argv.push("--no-download");
+  const explicitDySync =
+    body.dySyncToutiao !== undefined
+      ? body.dySyncToutiao
+      : body["dy-sync-toutiao"];
+  const resolvedBodyPt = resolvePublishPlatform(body.platform || body.p || "");
+  const dyPlatformOptSync =
+    resolvedBodyPt === "抖音" &&
+    body.platformOptions &&
+    typeof body.platformOptions === "object"
+      ? (body.platformOptions.dy && body.platformOptions.dy.dySyncToutiao) ??
+        (body.platformOptions["抖音"] &&
+          body.platformOptions["抖音"].dySyncToutiao)
+      : undefined;
+  if (
+    explicitDySync === true ||
+    (explicitDySync !== false && dyPlatformOptSync === true)
+  ) {
+    argv.push("--dy-sync-toutiao");
+  }
 
   return argv;
 }
@@ -653,6 +715,8 @@ const SHARED_PUBLISH_BODY_KEYS = [
   "no-throttle",
   "noDownload",
   "no-download",
+  "dySyncToutiao",
+  "dy-sync-toutiao",
   "platformOptions",
   "sphLink",
   "sphProductId",
@@ -1056,6 +1120,8 @@ export function publishHelpText() {
       --no-throttle     绕过发布节流与错峰排期（不自动顺延为定时任务；即使传了 --publish-at 也不顺延）
       --no-download     快手专用：取消勾选「允许下载此作品」并校验终态（其它平台忽略；
                             取消未确认会中止发布，宁可不发不可漏禁下载红线）
+      --dy-sync-toutiao 抖音专用（同 --dySyncToutiao / HTTP dySyncToutiao）：开启抖音发布页「同步到今日头条」
+                            并回读确认（未开启/遇授权弹窗则中止本次抖音发布；不可与头条账号同时勾选）
       --sph-product-id <id>   视频号商品上架（快捷参数，等价于 product + 商品编号）
       --sph-drama-id <name>   视频号挂载小程序短剧。值为短剧「名称」而非编号（发布页按名称搜索），
                                 如 --sph-drama-id 泳陷错恋；传数字编号会搜不到。

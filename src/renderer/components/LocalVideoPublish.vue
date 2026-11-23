@@ -219,6 +219,13 @@
             >禁止下载此作品（仅快手生效：取消勾选「允许下载此作品」并校验终态，未确认会中止发布）</el-checkbox
           >
         </el-form-item>
+        <el-form-item label="同步发布">
+          <el-checkbox
+            v-model="form.dySyncToutiao"
+            @change="saveDySyncToutiaoPreference"
+            >抖音同步发布到今日头条（仅抖音生效）</el-checkbox
+          >
+        </el-form-item>
       </el-form>
 
       <el-divider content-position="left">账号平台选择</el-divider>
@@ -883,6 +890,101 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const DY_SYNC_TOUTIAO_STORAGE_KEY = "matrixmedia.publish.dySyncToutiao";
+const DY_SYNC_TOUTIAO_CONFLICT_MESSAGE =
+  "已勾选头条账号，又开启抖音同步头条，会重复发布，请二选一";
+
+function readDySyncToutiaoPreference() {
+  try {
+    if (typeof localStorage === "undefined" || !localStorage) return false;
+    return localStorage.getItem(DY_SYNC_TOUTIAO_STORAGE_KEY) === "true";
+  } catch (_) {
+    return false;
+  }
+}
+
+function writeDySyncToutiaoPreference(enabled) {
+  try {
+    if (typeof localStorage === "undefined" || !localStorage) return;
+    localStorage.setItem(
+      DY_SYNC_TOUTIAO_STORAGE_KEY,
+      enabled === true ? "true" : "false"
+    );
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+function readRecordDySyncToutiao(record) {
+  if (!record || typeof record !== "object") return undefined;
+  if (
+    record.publishOptions &&
+    typeof record.publishOptions.dySyncToutiao === "boolean"
+  ) {
+    return record.publishOptions.dySyncToutiao;
+  }
+  if (typeof record.dySyncToutiao === "boolean") {
+    return record.dySyncToutiao;
+  }
+  if (record.data && typeof record.data.dySyncToutiao === "boolean") {
+    return record.data.dySyncToutiao;
+  }
+  return undefined;
+}
+
+function republishRecordIdentityKey(target) {
+  const pt = String((target && target.pt) || "").trim();
+  if (target && target.partition) {
+    return `p__${String(target.partition)}`;
+  }
+  const acctKey =
+    (target && target.accountKey) ||
+    (typeof recordAccountKeyOf === "function"
+      ? recordAccountKeyOf(target || {})
+      : "") ||
+    (target && target.phone) ||
+    "";
+  return `k__${String(acctKey)}__${pt}`;
+}
+
+/**
+ * 历史重发专用：仅以原任务记录（或显式 form.dySyncToutiao）为准预填，
+ * 原记录没有该字段（含旧任务与未开启同步的任务）一律按 false，
+ * 绝不读取也不覆盖 localStorage 中的默认偏好。
+ */
+function resolveRepublishDySyncToutiao(
+  form = {},
+  records = [],
+  failedTargets = []
+) {
+  if (form && typeof form.dySyncToutiao === "boolean") {
+    return form.dySyncToutiao === true;
+  }
+  const list = Array.isArray(records) ? records.filter(Boolean) : [];
+  if (list.length === 0) return false;
+  const dyRecords = list.filter((r) =>
+    String((r && r.pt) || "").includes("抖音")
+  );
+  let candidates = dyRecords.length > 0 ? dyRecords : list;
+  if (
+    dyRecords.length > 0 &&
+    Array.isArray(failedTargets) &&
+    failedTargets.length > 0
+  ) {
+    const failedKeySet = new Set(
+      failedTargets.map((t) => republishRecordIdentityKey(t))
+    );
+    const failedDy = dyRecords.filter((r) =>
+      failedKeySet.has(republishRecordIdentityKey(r))
+    );
+    if (failedDy.length > 0) {
+      candidates = failedDy;
+    }
+  }
+  // 合并行里若有记录未开启同步（含缺字段），保守按 false：宁可漏同步，不误同步到头条
+  return candidates.every((rec) => readRecordDySyncToutiao(rec) === true);
+}
+
 export default {
   name: "LocalVideoPublish",
   components: { AiGenerateButton },
@@ -930,6 +1032,7 @@ export default {
         // 自定义封面图片绝对路径（发布第一步选图；重发时从历史记录带入）
         coverPath: "",
         noDownload: false,
+        dySyncToutiao: readDySyncToutiaoPreference(),
       },
       thisShow: false,
       closeWindow: true,
@@ -1178,6 +1281,7 @@ export default {
         shortTitle: "",
         coverPath: "",
         noDownload: false,
+        dySyncToutiao: readDySyncToutiaoPreference(),
       };
       this.thisShow = false;
       this.closeWindow = true;
@@ -1216,6 +1320,11 @@ export default {
       this.localFilePath = filePath;
       const defaultTitle = fileStem(filePath);
       const form = payload.form || {};
+      const dySyncToutiao = resolveRepublishDySyncToutiao(
+        form,
+        payload.records,
+        payload.failedTargets
+      );
       this.form = {
         title: (form.title || defaultTitle || "").trim(),
         bt1: (form.bt1 || "").trim(),
@@ -1223,6 +1332,7 @@ export default {
         shortTitle: (form.shortTitle || form.bt2Filled || "").trim(),
         coverPath: (form.coverPath || "").trim(),
         noDownload: form.noDownload === true,
+        dySyncToutiao,
       };
       this.bqTags = parseBqToTags(form.tags || form.bq);
       this.loadPublishThrottleDefaults();
@@ -1769,17 +1879,33 @@ export default {
         platformNode.id,
         platformNode.pt
       );
+      const dySyncToutiao =
+        String((platformNode && platformNode.pt) || "").includes("抖音") &&
+        Boolean(this.form && this.form.dySyncToutiao === true);
       return {
         ...baseVideo,
         publishOptions: {
           link: link.value,
           ...(collection ? { collection } : {}),
+          ...(dySyncToutiao ? { dySyncToutiao: true } : {}),
         },
         data: {
           ...baseVideo.data,
           creativeStatement: this.getPlatformStatement(platformNode.id),
         },
       };
+    },
+    saveDySyncToutiaoPreference(val) {
+      // 历史重发会话中仅调整当次重发，不覆盖 localStorage 默认偏好
+      if (this.republishContext) return;
+      writeDySyncToutiaoPreference(val === true);
+    },
+    validateDySyncToutiaoConflict(platforms = []) {
+      if (!(this.form && this.form.dySyncToutiao === true)) return "";
+      const hasToutiao = (platforms || []).some((p) =>
+        String((p && p.pt) || "").includes("头条")
+      );
+      return hasToutiao ? DY_SYNC_TOUTIAO_CONFLICT_MESSAGE : "";
     },
     resetPlatformCollections() {
       this.batchCollection = "";
@@ -2423,6 +2549,11 @@ export default {
         this.$message.warning("请至少选择一个平台");
         return;
       }
+      const dySyncConflict = this.validateDySyncToutiaoConflict(platforms);
+      if (dySyncConflict) {
+        this.$message.warning(dySyncConflict);
+        return;
+      }
       // 先打开第 3 步，再关第 2 步，避免 platform close 误触发 resetState
       this.attrsVisible = true;
       this.platformVisible = false;
@@ -2472,6 +2603,8 @@ export default {
         description: "",
         shortTitle: "",
         coverPath: "",
+        noDownload: false,
+        dySyncToutiao: readDySyncToutiaoPreference(),
       };
       this.thisShow = false;
       this.closeWindow = true;
@@ -2479,7 +2612,6 @@ export default {
       this.publishAt = "";
       this.republishContext = null;
       this.republishTextOtherName = "";
-      this.form.noDownload = false;
       this.dirBatchFiles = [];
       this.attrsVisible = false;
     },
@@ -2635,6 +2767,11 @@ export default {
       const platforms = checked.filter((item) => item.url);
       if (platforms.length === 0) {
         this.$message.warning("请至少选择一个平台");
+        return;
+      }
+      const dySyncConflict = this.validateDySyncToutiaoConflict(platforms);
+      if (dySyncConflict) {
+        this.$message.warning(dySyncConflict);
         return;
       }
       const linkError = this.validatePlatformVideoLinks(platforms);
@@ -3046,8 +3183,13 @@ export default {
       this.dirPath = "";
       this.dirXlsxRows = [];
       this.dirXlsxError = "";
+      this.republishContext = null;
+      this.republishTextOtherName = "";
       this.resetPlatformVideoLinks();
       this.resetPlatformCollections();
+      if (this.form) {
+        this.form.dySyncToutiao = readDySyncToutiaoPreference();
+      }
       this.scheduledPublish = false;
       this.publishAt = "";
       this.dirPublishVisible = true;
@@ -3217,6 +3359,11 @@ export default {
         this.$message.warning("请至少选择一个平台");
         return;
       }
+      const dySyncConflict = this.validateDySyncToutiaoConflict(platforms);
+      if (dySyncConflict) {
+        this.$message.warning(dySyncConflict);
+        return;
+      }
       // 目录批量尚未传递账号级挂车参数，显式阻断，不能静默丢弃后裸发。
       if (platforms.some((row) =>
         /抖音|快手/.test(String(row.pt || "")) &&
@@ -3383,9 +3530,13 @@ export default {
             p.pt,
             fileRow && fileRow.collection
           );
-          const dirPublishOptions = dirCollection
-            ? { collection: dirCollection }
-            : {};
+          const dirDySyncToutiao =
+            String(p.pt || "").includes("抖音") &&
+            Boolean(this.form && this.form.dySyncToutiao === true);
+          const dirPublishOptions = {
+            ...(dirCollection ? { collection: dirCollection } : {}),
+            ...(dirDySyncToutiao ? { dySyncToutiao: true } : {}),
+          };
           const effectiveMode = resolveEffectivePublishMode(isDraftMode, p);
 
           // Format bq for this platform

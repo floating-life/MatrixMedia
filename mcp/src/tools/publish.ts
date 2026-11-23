@@ -83,6 +83,11 @@ export const publishVideoTool: Tool = {
         description:
           "Kuaishou (ks) only: uncheck 允许下载此作品 (disallow downloads for this work) and verify the final checkbox state before submitting; the publish aborts if it cannot be confirmed. Ignored on other platforms.",
       },
+      dySyncToutiao: {
+        type: "boolean",
+        description:
+          "Douyin (dy) only: enable 同步到今日头条 (sync publish to Toutiao) on the Douyin publish page and verify readback before submitting (forwards --dy-sync-toutiao to CLI). Effective for Douyin (dy) only; mutually exclusive with publishing to a Toutiao (tt) account.",
+      },
       creativeStatement: {
         type: "string",
         description:
@@ -156,6 +161,7 @@ export async function handlePublishVideo(
   const allowDuplicate = args.allowDuplicate === true;
   const noThrottle = args.noThrottle === true;
   const noDownload = args.noDownload === true;
+  const dySyncToutiao = args.dySyncToutiao === true;
   const creativeStatement =
     args.creativeStatement == null ? "" : String(args.creativeStatement).trim();
   const cover = args.cover == null ? "" : String(args.cover).trim();
@@ -245,6 +251,7 @@ export async function handlePublishVideo(
     ...(allowDuplicate ? ["--allow-duplicate"] : []),
     ...(noThrottle ? ["--no-throttle"] : []),
     ...(noDownload ? ["--no-download"] : []),
+    ...(dySyncToutiao ? ["--dy-sync-toutiao"] : []),
     ...(creativeStatement ? ["--creative-statement", creativeStatement] : []),
     ...(cover ? ["--cover", cover] : []),
     ...(collection ? ["--collection", collection] : []),
@@ -338,6 +345,12 @@ export async function handlePublishVideo(
           : {}),
         ...(lastJson.requestedCollection !== undefined
           ? { requestedCollection: lastJson.requestedCollection }
+          : {}),
+        ...(lastJson.dySyncToutiao !== undefined
+          ? { dySyncToutiao: lastJson.dySyncToutiao }
+          : {}),
+        ...(lastJson.requestedDySyncToutiao !== undefined
+          ? { requestedDySyncToutiao: lastJson.requestedDySyncToutiao }
           : {}),
         message:
           (lastJson.message as string) ??

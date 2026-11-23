@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { handlePublishVideo } from '../dist/tools/publish.js';
+import { publishVideoTool, handlePublishVideo } from '../dist/tools/publish.js';
 import { handleListAccounts } from '../dist/tools/accounts.js';
 import { defaultInstallLocations } from '../dist/runner.js';
 import { existsSync } from 'node:fs';
@@ -55,6 +55,74 @@ console.log(JSON.stringify({ resultStatus: 'success', message: 'ok' }));
       const i = argv.indexOf('--phone');
       assert.ok(i > 0 && argv[i + 1] === '13800138000');
       assert.ok(!argv.includes('--partition'));
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('publish_video exposes dySyncToutiao schema and forwards --dy-sync-toutiao only when true', async () => {
+  const prop = publishVideoTool.inputSchema.properties?.dySyncToutiao;
+  assert.ok(prop, 'publish_video schema must include dySyncToutiao');
+  assert.equal(prop.type, 'boolean');
+  assert.ok(
+    !(publishVideoTool.inputSchema.required || []).includes('dySyncToutiao'),
+    'dySyncToutiao must be optional'
+  );
+  assert.match(String(prop.description || ''), /Douyin|dy/i);
+  assert.match(String(prop.description || ''), /Toutiao|tt/i);
+
+  const dir = await mkdtemp(path.join(tmpdir(), 'mm-dy-sync-'));
+  const bin = path.join(dir, 'fake-matrixmedia');
+  const argsLog = path.join(dir, 'args.json');
+  await writeFile(
+    bin,
+    `#!/usr/bin/env node
+require('fs').writeFileSync(${JSON.stringify(argsLog)}, JSON.stringify(process.argv.slice(2)));
+console.log(JSON.stringify({ resultStatus: 'success', message: 'ok' }));
+`,
+    'utf8'
+  );
+  await chmod(bin, 0o755);
+  try {
+    await withEnv({ MATRIXMEDIA_BIN: bin }, async () => {
+      await handlePublishVideo({
+        platform: 'dy',
+        phone: '13800138000',
+        file: '/tmp/v.mp4',
+        title: 't',
+        dySyncToutiao: true,
+      });
+      const argvTrue = JSON.parse(await readFile(argsLog, 'utf8'));
+      assert.ok(
+        argvTrue.includes('--dy-sync-toutiao'),
+        `expected --dy-sync-toutiao in ${JSON.stringify(argvTrue)}`
+      );
+
+      await handlePublishVideo({
+        platform: 'dy',
+        phone: '13800138000',
+        file: '/tmp/v.mp4',
+        title: 't',
+        dySyncToutiao: false,
+      });
+      const argvFalse = JSON.parse(await readFile(argsLog, 'utf8'));
+      assert.ok(
+        !argvFalse.includes('--dy-sync-toutiao'),
+        `did not expect --dy-sync-toutiao when false: ${JSON.stringify(argvFalse)}`
+      );
+
+      await handlePublishVideo({
+        platform: 'dy',
+        phone: '13800138000',
+        file: '/tmp/v.mp4',
+        title: 't',
+      });
+      const argvOmitted = JSON.parse(await readFile(argsLog, 'utf8'));
+      assert.ok(
+        !argvOmitted.includes('--dy-sync-toutiao'),
+        `did not expect --dy-sync-toutiao when omitted: ${JSON.stringify(argvOmitted)}`
+      );
     });
   } finally {
     await rm(dir, { recursive: true, force: true });

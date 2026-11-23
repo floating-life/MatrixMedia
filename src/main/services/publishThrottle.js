@@ -2292,12 +2292,11 @@ function registerPublishThrottleIpc(ipcMain, deps = {}) {
             if (reservationId) {
               await releaseThrottleReservation(reservationId, deps);
             }
-            const conflictInfo =
-              sharedThrottle.checkExistingScheduledCreativeConflict(
-                existing,
-                scheduledRecord.creativeStatement,
-                scheduledRecord
-              );
+            const conflictInfo = checkExistingScheduledCreativeConflict(
+              existing,
+              scheduledRecord.creativeStatement,
+              scheduledRecord
+            );
             const existingPublishAt =
               existing.scheduledPublishAtText ||
               sharedThrottle.formatUtc8DateTime(existing.scheduledPublishAt) ||
@@ -2315,6 +2314,13 @@ function registerPublishThrottleIpc(ipcMain, deps = {}) {
                   conflictInfo.requestedCreativeStatement,
                 collection: conflictInfo.actualCollection,
                 requestedCollection: conflictInfo.requestedCollection,
+                ...(conflictInfo.dySyncToutiaoConflict
+                  ? {
+                      dySyncToutiao: conflictInfo.actualDySyncToutiao,
+                      requestedDySyncToutiao:
+                        conflictInfo.requestedDySyncToutiao,
+                    }
+                  : {}),
                 message: conflictInfo.message,
               };
             }
@@ -2326,6 +2332,9 @@ function registerPublishThrottleIpc(ipcMain, deps = {}) {
               creativeStatement: conflictInfo.actualCreativeStatement,
               ...(conflictInfo.actualCollection
                 ? { collection: conflictInfo.actualCollection }
+                : {}),
+              ...(conflictInfo.actualDySyncToutiao
+                ? { dySyncToutiao: true }
                 : {}),
               message: conflictInfo.message,
             };
@@ -2426,8 +2435,108 @@ function registerPublishThrottleIpc(ipcMain, deps = {}) {
   );
 }
 
+function isDouyinPlatformForScheduled(platformHint) {
+  const p = String(platformHint || "").trim();
+  const lower = p.toLowerCase();
+  return p.includes("抖音") || lower === "dy" || lower === "douyin";
+}
+
+function extractScheduledDySyncToutiao(recordOrValue, platformHint = "") {
+  const pt =
+    platformHint ||
+    (recordOrValue &&
+      typeof recordOrValue === "object" &&
+      (recordOrValue.pt || recordOrValue.platform)) ||
+    "";
+  if (pt && !isDouyinPlatformForScheduled(pt)) return false;
+  if (typeof recordOrValue === "boolean") return recordOrValue;
+  if (!recordOrValue || typeof recordOrValue !== "object") return false;
+  return Boolean(
+    recordOrValue.dySyncToutiao === true ||
+      (recordOrValue.publishOptions &&
+        recordOrValue.publishOptions.dySyncToutiao === true) ||
+      (recordOrValue.data && recordOrValue.data.dySyncToutiao === true)
+  );
+}
+
+/**
+ * 校验复用既有定时任务时的参数冲突（创作声明 + 合集 + 抖音同步头条开关）：
+ * - dySyncToutiao 缺省视为 false（仅抖音平台参与比较）；
+ * - 若任意一项与既有任务不一致，返回 conflict: true 与清晰提示，拒绝静默复用。
+ */
+function checkExistingScheduledCreativeConflict(
+  existing,
+  requestedCreativeStatement,
+  requestedCollection = undefined,
+  requestedDySyncToutiao = undefined
+) {
+  const base = sharedThrottle.checkExistingScheduledCreativeConflict(
+    existing,
+    requestedCreativeStatement,
+    requestedCollection
+  );
+  const platformHint =
+    (existing && (existing.pt || existing.platform)) ||
+    (requestedCollection &&
+      typeof requestedCollection === "object" &&
+      (requestedCollection.pt || requestedCollection.platform)) ||
+    "";
+  const actualDySyncToutiao = extractScheduledDySyncToutiao(
+    existing,
+    platformHint
+  );
+  const requestedDySyncSource =
+    requestedDySyncToutiao !== undefined
+      ? requestedDySyncToutiao
+      : requestedCollection && typeof requestedCollection === "object"
+      ? requestedCollection
+      : false;
+  const requestedDySyncToutiaoNorm = extractScheduledDySyncToutiao(
+    requestedDySyncSource,
+    platformHint
+  );
+  const dySyncToutiaoConflict =
+    actualDySyncToutiao !== requestedDySyncToutiaoNorm;
+  const conflict = Boolean(base.conflict || dySyncToutiaoConflict);
+
+  let message = base.message;
+  if (dySyncToutiaoConflict) {
+    const actualParts = [];
+    const requestedParts = [];
+    if (base.creativeConflict) {
+      actualParts.push(`创作声明为「${base.actualCreativeStatement}」`);
+      requestedParts.push(`创作声明「${base.requestedCreativeStatement}」`);
+    }
+    if (base.collectionConflict) {
+      actualParts.push(`合集为「${base.actualCollection || "无"}」`);
+      requestedParts.push(`合集「${base.requestedCollection || "无"}」`);
+    }
+    actualParts.push(
+      `抖音同步头条为「${actualDySyncToutiao ? "开启" : "关闭"}」`
+    );
+    requestedParts.push(
+      `抖音同步头条「${requestedDySyncToutiaoNorm ? "开启" : "关闭"}」`
+    );
+    const existingId = (existing && existing.id) || "";
+    message = `同一视频在该时间点的定时任务已存在（id=${existingId}），但既有任务${actualParts.join(
+      "、"
+    )}，与本次请求${requestedParts.join("、")}不一致，未覆盖原任务，请核对后处理`;
+  }
+
+  return {
+    ...base,
+    conflict,
+    dySyncToutiaoConflict,
+    actualDySyncToutiao,
+    requestedDySyncToutiao: requestedDySyncToutiaoNorm,
+    message,
+  };
+}
+
 module.exports = {
   ...sharedThrottle,
+  extractScheduledDySyncToutiao,
+  checkExistingScheduledCreativeConflict,
   SETTINGS_FILE_NAME,
   LEDGER_FILE_NAME,
   RESERVED_STALE_TTL_MS,
