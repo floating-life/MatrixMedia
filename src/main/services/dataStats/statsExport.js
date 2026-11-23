@@ -296,7 +296,8 @@ function rawTimestampToUtc8Date(raw) {
 /** 文本单元格规范化：空串/null 返回 null（空单元格）；防公式注入前置单引号 */
 function sanitizeTextCell(value) {
   if (value == null) return null;
-  const text = String(value);
+  // 平台返回的文案常带 \r\n（如快手描述），xlsx 会把 \r 写成字面量 _x000d_：统一成 \n
+  const text = String(value).replace(/\r\n?/g, "\n");
   if (text === "") return null;
   if (/^\s*[=+\-@]/.test(text) || /^[\t\r\n]/.test(text)) {
     return "'" + text;

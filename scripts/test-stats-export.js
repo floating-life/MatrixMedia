@@ -181,7 +181,9 @@ async function main() {
       assert.strictEqual(sanitizeTextCell("@user"), "'@user");
       assert.strictEqual(sanitizeTextCell("  =1+1"), "'  =1+1");
       assert.strictEqual(sanitizeTextCell("\tformula"), "'\tformula");
-      assert.strictEqual(sanitizeTextCell("\rformula"), "'\rformula");
+      // \r 统一为 \n（避免 xlsx 写出字面量 _x000d_），仍保留防注入前缀
+      assert.strictEqual(sanitizeTextCell("\rformula"), "'\nformula");
+      assert.strictEqual(sanitizeTextCell("标题\r\n正文"), "标题\n正文");
       assert.strictEqual(sanitizeTextCell("普通标题"), "普通标题");
       assert.strictEqual(sanitizeTextCell("2026-11-19"), "2026-11-19");
       assert.strictEqual(sanitizeTextCell(""), null);

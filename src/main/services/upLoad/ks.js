@@ -260,12 +260,12 @@ async function uploadKsCustomCover(page, coverPath) {
   });
   if (!confirmed) throw new Error("快手封面弹窗内未找到「确认」按钮");
 
-  // 校验（2026-11-22 真机：自定义封面应用后，槽位 img 仍是视频帧 blob，不再变化；
-  // 平台会弹「封面应用成功」）。成功判据：弹窗已关闭 且（出现「封面应用成功」或槽位图片变化）。
-  // 提示约 3 秒消失，所以点确认后立刻轮询，不再先固定等待。
+  // 校验（严格）：只认「弹窗已关闭 且 封面槽位图片确实变了」。
+  // 2026-11-24 真机：快手会弹「封面应用成功」但槽位仍是视频截帧、发出去的封面也是截帧，
+  // 所以成功提示不能单独作为依据（-26 的放宽已撤回）。确认不了就中止本次快手发布。
   let toastOk = false;
-  let state = { src: "", modalOpen: true, toast: "" };
-  const deadline = Date.now() + 10000;
+  let state = { src: "", modalOpen: true, toast: "", coverImgs: [] };
+  const deadline = Date.now() + 20000;
   while (Date.now() < deadline) {
     state = await page.evaluate(() => {
       const img = document.querySelector('[class*="_default-cover"] img');
@@ -278,17 +278,28 @@ async function uploadKsCustomCover(page, coverPath) {
       )
         .map((el) => el.innerText || el.textContent || "")
         .join(" ");
-      return { src: img ? img.src : "", modalOpen: modal, toast: msgs.slice(0, 120) };
+      // 诊断：封面设置区所有图片（类名 + src 前缀），便于真机定位自定义封面实际落在哪
+      const coverImgs = Array.from(document.querySelectorAll('[class*="cover"] img'))
+        .slice(0, 12)
+        .map((el) => {
+          const p = el.closest('[class*="cover"]');
+          const cls = p ? String(p.className || "").slice(0, 60) : "";
+          return `${cls} => ${String(el.src || "").slice(0, 70)}`;
+        });
+      return { src: img ? img.src : "", modalOpen: modal, toast: msgs.slice(0, 120), coverImgs };
     });
     if (/封面应用成功/.test(state.toast)) toastOk = true;
-    const srcChanged = !!state.src && state.src !== slotSrcBefore;
-    if (!state.modalOpen && (toastOk || srcChanged)) break;
-    await page.waitForTimeout(300);
+    const changed = !!state.src && state.src !== slotSrcBefore;
+    if (!state.modalOpen && changed) break;
+    await page.waitForTimeout(500);
   }
   const srcChanged = !!state.src && state.src !== slotSrcBefore;
-  if (state.modalOpen || !(toastOk || srcChanged)) {
+  console.log(
+    `[ks] 封面确认后状态：弹窗仍开=${state.modalOpen}，成功提示=${toastOk}，槽位图片变化=${srcChanged}；封面区图片=${JSON.stringify(state.coverImgs)}`
+  );
+  if (state.modalOpen || !srcChanged) {
     throw new Error(
-      `快手封面设置未确认成功（弹窗仍开=${state.modalOpen}，成功提示=${toastOk}，槽位图片变化=${srcChanged}，提示文本=${JSON.stringify(state.toast)}）`
+      `快手自定义封面未能确认生效（弹窗仍开=${state.modalOpen}，成功提示=${toastOk}，槽位图片变化=${srcChanged}），已中止本条快手发布，未发布`
     );
   }
   console.log(
