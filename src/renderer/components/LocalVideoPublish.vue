@@ -1011,6 +1011,7 @@ import { normalizeVideoMetadata } from "../../shared/videoMetadata.js";
 import {
   PLATFORM_RULES,
   applyPlatformPublishRules,
+  createAppliedRuleSnapshot,
   getPlatformRule,
   normalizePlatformTextMap,
   previewPlatformPublishAdjustments,
@@ -1093,6 +1094,14 @@ function safePreviewPlatformRules(platforms, input) {
     if (Array.isArray(res)) return res;
   }
   return [];
+}
+
+function safeCreateAppliedRuleSnapshot(ruled) {
+  if (typeof createAppliedRuleSnapshot === "function") {
+    const snap = createAppliedRuleSnapshot(ruled);
+    if (snap && typeof snap === "object") return snap;
+  }
+  return null;
 }
 
 function fileBaseName(p) {
@@ -2350,6 +2359,7 @@ export default {
         const nextBq = hashtagPlatforms.has(platformNode.pt)
           ? formatBqFromTags(ruled.tags)
           : ruled.tags.map((t) => String(t).replace(/^#/, "")).join(",");
+        const appliedSnapshot = safeCreateAppliedRuleSnapshot(ruled);
         nextData = {
           ...nextData,
           title: meta.title,
@@ -2358,6 +2368,7 @@ export default {
           tags: meta.tags,
           ...meta.legacy,
           bq: nextBq,
+          ...(appliedSnapshot ? { platformRulesApplied: appliedSnapshot } : {}),
           ...(ruled.adjusted
             ? {
                 ruleAdjustments: ruled.adjustments,
@@ -2365,6 +2376,8 @@ export default {
               }
             : {}),
         };
+        delete nextData.titleByPlatform;
+        delete nextData.descByPlatform;
       }
       if (coverPathH) {
         nextData.coverPathH = coverPathH;
@@ -4148,6 +4161,7 @@ export default {
             dirRuled && dirRuled.adjusted ? dirRuled.adjustments : [];
           const dirRuleSummary =
             dirRuled && dirRuled.adjusted ? dirRuled.summary : "";
+          const dirAppliedSnapshot = safeCreateAppliedRuleSnapshot(dirRuled);
 
           // Format bq for this platform
           const hashtagPlatforms = new Set(["视频号", "抖音", "快手"]);
@@ -4387,6 +4401,9 @@ export default {
               creativeStatement,
               coverPath: fileRow.coverResolved || "",
               ...(dirCoverPathH ? { coverPathH: dirCoverPathH } : {}),
+              ...(dirAppliedSnapshot
+                ? { platformRulesApplied: dirAppliedSnapshot }
+                : {}),
               ...(dirRuleAdjustments.length > 0
                 ? {
                     ruleAdjustments: dirRuleAdjustments,

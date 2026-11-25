@@ -61,6 +61,7 @@ import { ensureAccountRecordsMigrated } from "../services/accountMigration.js";
 import { normalizeVideoMetadata } from "../../shared/videoMetadata.js";
 import {
   applyPlatformPublishRules,
+  createAppliedRuleSnapshot,
   formatRuleAdjustmentsSummary,
   mergeRuleAdjustments,
   resolvePlatformOverrideValue,
@@ -1035,6 +1036,7 @@ async function runBatchDirPublish(v, cfg) {
         creativeStatement: cs,
         coverPath,
         coverPathH,
+        ...(ruled ? { platformRulesApplied: createAppliedRuleSnapshot(ruled) } : {}),
         ...rowRulePatch,
       },
       ...rowRulePatch,

@@ -34,6 +34,7 @@ import { resolvePublishCompletion } from "../../shared/publishResult.js";
 import { normalizeVideoMetadata } from "../../shared/videoMetadata.js";
 import {
   applyPlatformPublishRules,
+  createAppliedRuleSnapshot,
   formatRuleAdjustmentsSummary,
   mergeRuleAdjustments,
 } from "../../shared/platformRules.js";
@@ -205,6 +206,7 @@ export async function runSingleFilePublish(
   };
   const ruleAdjustments = ruled.adjustments || [];
   const ruleAdjustmentsSummary = ruled.summary || "";
+  const platformRulesApplied = createAppliedRuleSnapshot(ruled);
   const bookName = (v.bookName && String(v.bookName).trim()) || stem;
 
   // 封面文件在组装参数时就校验（存在性 / 视频号 jpg|png），失败早于视频下载与上传
@@ -257,6 +259,7 @@ export async function runSingleFilePublish(
         coverPathH,
         ruleAdjustments,
         ruleAdjustmentsSummary,
+        platformRulesApplied,
       },
       options
     );
@@ -278,6 +281,7 @@ async function runSingleFilePublishInner(
     coverPathH = "",
     ruleAdjustments = [],
     ruleAdjustmentsSummary = "",
+    platformRulesApplied = null,
   },
   options = {}
 ) {
@@ -380,6 +384,7 @@ async function runSingleFilePublishInner(
       coverPath,
       coverPathH,
       noDownload: v.noDownload === true,
+      ...(platformRulesApplied ? { platformRulesApplied } : {}),
       ...ruleAdjustmentsPatch,
     },
     ...ruleAdjustmentsPatch,

@@ -7,12 +7,18 @@ import {
 import {
   PLATFORM_RULES,
   applyPlatformPublishRules,
+  createAppliedRuleSnapshot,
   formatRuleAdjustmentsSummary,
   getPlatformRule,
   mergeRuleAdjustments,
+  resolvePlatformRuleKey,
 } from "./platformRules.js";
 
-export { formatRuleAdjustmentsSummary, mergeRuleAdjustments };
+export {
+  createAppliedRuleSnapshot,
+  formatRuleAdjustmentsSummary,
+  mergeRuleAdjustments,
+};
 
 function firstText(...values) {
   return values.map((value) => sanitizeTitle(value)).find(Boolean) || "";
@@ -77,7 +83,79 @@ export function formatTagsForPlatform(platform, tags) {
   return normalized.map((tag) => `${prefix}${tag}`).join(" ");
 }
 
+function hasNonEmptyOverrideMap(rawMap) {
+  return Boolean(
+    rawMap &&
+      typeof rawMap === "object" &&
+      !Array.isArray(rawMap) &&
+      Object.keys(rawMap).length > 0
+  );
+}
+
+/**
+ * 识别上游（publishVideo / CLI / GUI）已通过 applyPlatformPublishRules 处理并附带快照的文案。
+ * 只有当平台一致、未新增分平台覆盖映射、且当前 title/description/shortTitle/tags 与快照完全吻合时才直接复用；
+ * 否则回退到 applyPlatformPublishRules 正常执行（其本身同样严格幂等）。
+ */
+function matchAppliedRuleSnapshot(platform, metadata) {
+  const snap = metadata && metadata.platformRulesApplied;
+  if (!snap || typeof snap !== "object") return null;
+  const canonical =
+    resolvePlatformRuleKey(platform) || String(platform || "").trim();
+  if (!canonical || snap.platform !== canonical) return null;
+  if (
+    hasNonEmptyOverrideMap(metadata.titleByPlatform) ||
+    hasNonEmptyOverrideMap(metadata.descByPlatform)
+  ) {
+    return null;
+  }
+
+  const curTitle = firstText(metadata.title, metadata.bt1);
+  const curDesc = firstDescriptionText(metadata.description, metadata.bdText);
+  const curShortTitle =
+    canonical === "视频号"
+      ? firstText(metadata.shortTitle, metadata.bt2Filled)
+      : "";
+  if (
+    curTitle !== snap.title ||
+    curDesc !== snap.bodyDescription ||
+    curShortTitle !== snap.shortTitle
+  ) {
+    return null;
+  }
+
+  const snapTags = Array.isArray(snap.tags) ? snap.tags : [];
+  const rule = getPlatformRule(canonical);
+  const isHashtagPlatform = Boolean(rule && rule.usesCombinedDescription);
+  const rawTags = metadata.tags !== undefined ? metadata.tags : metadata.bq;
+  const curTags = isHashtagPlatform
+    ? splitHashtagTags(rawTags)
+    : splitAndSanitizeTags(rawTags);
+  if (
+    curTags.length !== snapTags.length ||
+    curTags.some((t, idx) => t !== snapTags[idx])
+  ) {
+    return null;
+  }
+
+  return {
+    title: snap.title,
+    description: snap.combinedDescription,
+    bodyDescription: snap.bodyDescription,
+    ksFillText: snap.ksFillText,
+    shortTitle: snap.shortTitle,
+    tags: snapTags.slice(),
+    tagsText: snap.tagsText,
+    adjusted: false,
+    adjustments: [],
+    summary: "",
+  };
+}
+
 export function buildPlatformVideoTextDetailed(platform, metadata = {}) {
+  const matched = matchAppliedRuleSnapshot(platform, metadata);
+  if (matched) return matched;
+
   const applied = applyPlatformPublishRules(
     platform,
     {

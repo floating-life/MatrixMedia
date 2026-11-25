@@ -293,8 +293,47 @@ export function truncateTextByPunctuation(text, maxLen) {
 }
 
 /**
- * 从简介正文中拆出内联 #话题（如「正文内容 #话题1 #话题2」）。
- * 仅识别位于开头或空白后的 #xxx（避免误拆 URL 里的锚点 https://a.com#top）。
+ * 话题词终止字符集合：空白、下一个 `#`、中英文标点与常见分隔符。
+ * 涵盖 ，。！？、；：,.!?;:「」『』“”‘’'"（）()【】[]{}〔〕《》〈〉〖〗｛｝…—–―｜|/\~～·•・@＠<>
+ */
+const HASHTAG_STOP_CLASS =
+  "\\s#，。！？、；：,.!?;:「」『』“”‘’'\"（）()【】\\[\\]{}〔〕《》〈〉〖〗｛｝…—–―｜|/\\\\~～·•・@＠<>";
+const INLINE_HASHTAG_RE = new RegExp(
+  `#(?!\\uFE0F?\\u20E3)([^${HASHTAG_STOP_CLASS}]+)(?:\\[话题\\]#)?`,
+  "g"
+);
+const HASHTAG_STOP_CHAR_RE = new RegExp(`[${HASHTAG_STOP_CLASS}]`);
+const LEADING_ORPHAN_SEP_RE = /^[ \t]*[,，、；;：:。！？.!?]+[ \t]*/;
+const TRAILING_SEP_CHAR_RE = /[,，、；;：:。！？.!?]$/;
+const LEADING_JOIN_PUNCT_RE = /^[，。！？、；：,.!?;:）」』”’】\]）)》〉〕〗｝}]/;
+
+function joinBodyChunks(left, right) {
+  if (!right) return left;
+  if (!left) return right;
+  let l = left;
+  let r = right;
+
+  // 若移除话题前是孤立 `#`（如 `a##b[话题]#c`）且后文首字非终止符，插空格防止粘连成新话题
+  if (l.endsWith("#") && !HASHTAG_STOP_CHAR_RE.test(r[0])) {
+    return `${l} ${r}`;
+  }
+  // 移除话题后左侧尾随水平空格紧邻标点（如 `探店记录 #美食，环境很好` → `探店记录，环境很好`）
+  if (/[ \t]+$/.test(l) && LEADING_JOIN_PUNCT_RE.test(r)) {
+    l = l.replace(/[ \t]+$/, "");
+  }
+  // 左侧已以分隔标点收尾且右侧紧跟孤立逗号/顿号/分号（如 `今天练腿，#减脂，深蹲`）
+  if (TRAILING_SEP_CHAR_RE.test(l) && /^[,，、；;]/.test(r)) {
+    r = r.replace(/^[,，、；;]+/, "");
+  }
+  return `${l}${r}`;
+}
+
+/**
+ * 从简介正文中拆出内联 #话题：
+ * - `#` 出现在任意位置都视为话题起点（支持 `。#减脂`、`正文#话题`、`#减脂#健身#干货` 连写）；
+ * - 话题词在遇到空白、下一个 `#` 或中英文标点时结束；
+ * - 兼容平台话题胶囊式写法 `#话题[话题]#`；
+ * - 空话题（单独 `#` 或 `#` 后紧跟空白/标点/`#`）不算话题。
  *
  * @param {string} description
  * @returns {{ body: string, inlineTags: string[] }}
@@ -304,28 +343,140 @@ export function extractInlineHashtags(description) {
   if (!src || !src.includes("#")) {
     return { body: src, inlineTags: [] };
   }
+
+  const matches = [];
+  INLINE_HASHTAG_RE.lastIndex = 0;
+  let m;
+  while ((m = INLINE_HASHTAG_RE.exec(src)) !== null) {
+    const tagBody = String(m[1] || "").trim();
+    if (!tagBody) continue;
+    matches.push({
+      start: m.index,
+      end: m.index + m[0].length,
+      tag: tagBody,
+    });
+  }
+
+  if (matches.length === 0) {
+    return { body: src, inlineTags: [] };
+  }
+
   const inlineTags = [];
   const seen = new Set();
-  const body = src
-    .replace(/(^|[\s])((?:#[^\s#]+)+)/g, (match, lead, cluster) => {
-      const parts = String(cluster || "")
-        .split("#")
-        .map((s) => s.trim())
-        .filter(Boolean);
-      if (!parts.length) return match;
-      for (const tagBody of parts) {
-        if (!seen.has(tagBody)) {
-          seen.add(tagBody);
-          inlineTags.push(tagBody);
-        }
+  for (const item of matches) {
+    if (!seen.has(item.tag)) {
+      seen.add(item.tag);
+      inlineTags.push(item.tag);
+    }
+  }
+
+  let out = "";
+  let cursor = 0;
+  let removedAtStart = false;
+
+  for (const item of matches) {
+    const leftChunk = src.slice(cursor, item.start);
+    if (cursor === 0) {
+      if (leftChunk.trim() === "") {
+        removedAtStart = true;
       }
-      return lead === "\n" ? "\n" : "";
-    })
+      out += leftChunk;
+    } else {
+      let piece = leftChunk;
+      if (removedAtStart && out.trim() === "") {
+        piece = piece.replace(LEADING_ORPHAN_SEP_RE, "");
+      }
+      out = joinBodyChunks(out, piece);
+    }
+    cursor = item.end;
+  }
+
+  let tail = src.slice(cursor);
+  if (removedAtStart && out.trim() === "") {
+    tail = tail.replace(LEADING_ORPHAN_SEP_RE, "");
+  }
+  out = joinBodyChunks(out, tail);
+
+  const body = out
     .replace(/[ \t]{2,}/g, " ")
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+
   return { body, inlineTags };
+}
+
+/**
+ * 正文最小保底字数：只要原文含正文，截断或话题保留绝不能把正文挤成空串。
+ * - bodyLen === 0 → 0
+ * - bodyLen > 0   → min(bodyLen, max(1, floor(descLimit * 0.1)))
+ */
+function calcMinBodyReserve(bodyLen, descLimit) {
+  if (bodyLen <= 0 || descLimit == null || descLimit <= 0) return 0;
+  return Math.min(bodyLen, Math.max(1, Math.floor(descLimit * 0.1)));
+}
+
+/**
+ * 按顺序筛选话题标签：
+ * - 单个或累计长度超出 maxTagsBudget（含 `#` 与分隔空格）的话题丢弃，不吞正文且不误伤其后的短话题；
+ * - 超出 tagMax 个数上限的话题丢弃。
+ */
+function selectTagsWithinBudget(
+  allTagNames,
+  { tagMax = null, maxTagsBudget = null } = {}
+) {
+  const kept = [];
+  const droppedByLength = [];
+  const droppedByLimit = [];
+  let usedLen = 0;
+
+  for (const tag of allTagNames) {
+    if (tagMax != null && kept.length >= tagMax) {
+      droppedByLimit.push(tag);
+      continue;
+    }
+    const tagLen = 1 + countChars(tag);
+    const nextLen = kept.length === 0 ? tagLen : usedLen + 1 + tagLen;
+    if (maxTagsBudget != null && nextLen > maxTagsBudget) {
+      droppedByLength.push(tag);
+      continue;
+    }
+    kept.push(tag);
+    usedLen = nextLen;
+  }
+
+  return { kept, droppedByLength, droppedByLimit, usedLen };
+}
+
+/**
+ * 生成已处理文案的快照标记，供上游（publishVideo / CLI / GUI）附到任务 payload 上，
+ * 让上传器（buildPlatformVideoTextDetailed）识别已处理过的文本、避免重复解析与二次变更。
+ *
+ * @param {object|null|undefined} ruled applyPlatformPublishRules 返回值
+ */
+export function createAppliedRuleSnapshot(ruled) {
+  if (!ruled || typeof ruled !== "object") return null;
+  const bodyDesc =
+    ruled.bodyDescription !== undefined
+      ? String(ruled.bodyDescription)
+      : String(ruled.description || "");
+  const combinedDesc =
+    ruled.combinedDescription !== undefined
+      ? String(ruled.combinedDescription)
+      : bodyDesc;
+  const ksFill =
+    ruled.ksFillText !== undefined ? String(ruled.ksFillText) : combinedDesc;
+  return {
+    platform: String(ruled.platform || ""),
+    title: String(ruled.title || ""),
+    description: bodyDesc,
+    bodyDescription: bodyDesc,
+    combinedDescription: combinedDesc,
+    ksFillText: ksFill,
+    shortTitle: String(ruled.shortTitle || ""),
+    tags: Array.isArray(ruled.tags) ? ruled.tags.slice() : [],
+    tagsText: String(ruled.tagsText || ""),
+  };
 }
 
 /**
@@ -551,7 +702,7 @@ export function applyPlatformPublishRules(platform, input = {}, options = {}) {
     // 抖音 / 视频号 / 快手 / 小红书：#话题 与正文共享简介/描述上限
     // 检查简介内嵌 #话题（如用户在正文里手写了 #xxx）
     const extracted = extractInlineHashtags(description);
-    const hasInlineTags = extracted.inlineTags.length > 0;
+    const inlineSet = new Set(extracted.inlineTags);
 
     // 合并所有待保留的标签（去重保序）：先内联 #xxx 再独立 tags
     const allTagNames = [];
@@ -563,58 +714,25 @@ export function applyPlatformPublishRules(platform, input = {}, options = {}) {
     }
 
     const totalOriginalTagCount = allTagNames.length;
-    let workingTags = allTagNames.slice();
-    let droppedByLimit = [];
-
-    // 3a. 先按 tagMax 裁个数（快手 4 / 抖音 4）
-    if (rule.tagMax != null && workingTags.length > rule.tagMax) {
-      droppedByLimit = workingTags.slice(rule.tagMax);
-      workingTags = workingTags.slice(0, rule.tagMax);
-    }
-
-    // 决定正文基文本：若内联话题被 tagMax 裁过，或整体将超过 descMax，
-    // 则把内联话题统一抽离到尾部标签区一起保序保留；否则原样保留内联位置！
     const formatTagsStr = (list) => list.map((t) => `#${t}`).join(" ");
     const tagSep = canonical === "小红书" ? "\n" : " ";
 
-    const calcNaturalCombined = () => {
-      if (hasInlineTags && droppedByLimit.length === 0) {
-        // 仅追加不在内联里的独立标签
-        const inlineSet = new Set(extracted.inlineTags);
-        const extraTags = workingTags.filter((t) => !inlineSet.has(t));
-        const extraStr = formatTagsStr(extraTags);
-        return [description, extraStr].filter(Boolean).join(" ");
-      }
-      const tagsStr = formatTagsStr(workingTags);
-      return [extracted.body, tagsStr].filter(Boolean).join(" ");
-    };
-
     const ksTitleAlreadyInDesc =
       rule.combinesTitleIntoDescription &&
-      title &&
-      description &&
+      Boolean(title) &&
+      Boolean(description) &&
       collapseText(description).startsWith(collapseText(title));
 
-    const calcKsPrefixLen = (t) => {
-      if (!rule.combinesTitleIntoDescription || !t || ksTitleAlreadyInDesc) {
-        return 0;
-      }
-      return countChars(t);
-    };
+    const extraTagsNatural = allTagNames.filter((t) => !inlineSet.has(t));
+    const extraTagsNaturalStr = formatTagsStr(extraTagsNatural);
+    const naturalCombined = [description, extraTagsNaturalStr]
+      .filter(Boolean)
+      .join(" ");
 
-    const naturalCombined = calcNaturalCombined();
     const naturalTotalLen = (() => {
       if (canonical === "小红书") {
-        const bodyLen = countChars(
-          hasInlineTags && droppedByLimit.length === 0 ? description : extracted.body
-        );
-        const tagsPart =
-          hasInlineTags && droppedByLimit.length === 0
-            ? formatTagsStr(
-                workingTags.filter((t) => !new Set(extracted.inlineTags).has(t))
-              )
-            : formatTagsStr(workingTags);
-        const tagsLen = countChars(tagsPart);
+        const bodyLen = countChars(description);
+        const tagsLen = countChars(extraTagsNaturalStr);
         return bodyLen + (bodyLen > 0 && tagsLen > 0 ? 1 : 0) + tagsLen;
       }
       if (rule.combinesTitleIntoDescription && title && !ksTitleAlreadyInDesc) {
@@ -624,37 +742,64 @@ export function applyPlatformPublishRules(platform, input = {}, options = {}) {
       return countChars(naturalCombined);
     })();
 
-    const exceedsDescMax = rule.descMax != null && naturalTotalLen > rule.descMax;
+    const exceedsTagMax =
+      rule.tagMax != null && allTagNames.length > rule.tagMax;
+    const exceedsDescMax =
+      rule.descMax != null && naturalTotalLen > rule.descMax;
 
-    if (!exceedsDescMax && droppedByLimit.length === 0) {
-      // 未超字数且未超标签数：保持原文与标签位置完全不动
+    let ksTitleIncluded = ksTitleAlreadyInDesc;
+
+    if (!exceedsDescMax && !exceedsTagMax) {
+      // 未超字数且未超标签数：保持原文与内联话题位置完全不动
       if (canonical === "小红书") {
-        const inlineSet = new Set(extracted.inlineTags);
         bodyDescription = description;
-        keptTags = workingTags.filter((t) => !inlineSet.has(t));
-        combinedDescription = [description, formatTagsStr(keptTags)]
-          .filter(Boolean)
-          .join(" ");
+        keptTags = extraTagsNatural;
+        combinedDescription = naturalCombined;
       } else {
         bodyDescription = description;
-        keptTags = workingTags;
+        keptTags = allTagNames;
         combinedDescription = naturalCombined;
       }
     } else {
-      // 需要裁标签或截正文：所有话题标签（内联 + 追加）集中优先保留在尾部，只截正文
+      // 需要裁标签或截正文：所有话题标签（内联 + 追加）集中优先保留在尾部，只截正文；
+      // 且单个/累计话题过长时丢弃超长话题而不是吞掉正文，任何情况下有正文时绝不清空正文。
       const descLimit = rule.descMax;
       const bodySource = extracted.body;
-      let droppedByLength = [];
+      const bodyLen = countChars(bodySource);
 
-      // 若标签串自身就超出 descMax，按尾部减少标签直到 <= descMax
-      if (descLimit != null) {
-        while (
-          workingTags.length > 0 &&
-          countChars(formatTagsStr(workingTags)) > descLimit
-        ) {
-          droppedByLength.unshift(workingTags.pop());
-        }
-      }
+      const ksTitleAlreadyInBody =
+        rule.combinesTitleIntoDescription &&
+        Boolean(title) &&
+        Boolean(bodySource) &&
+        collapseText(bodySource).startsWith(collapseText(title));
+      ksTitleIncluded = ksTitleAlreadyInBody;
+
+      const hasKsTitlePrefix =
+        rule.combinesTitleIntoDescription &&
+        Boolean(title) &&
+        !ksTitleAlreadyInBody;
+
+      const minBodyReserve = calcMinBodyReserve(bodyLen, descLimit);
+      const titleReserve =
+        descLimit != null && hasKsTitlePrefix
+          ? Math.min(countChars(title), Math.floor(descLimit * 0.5)) + 1
+          : 0;
+      const maxTagsBudget =
+        descLimit != null
+          ? Math.max(
+              0,
+              descLimit - titleReserve - minBodyReserve - (bodyLen > 0 ? 1 : 0)
+            )
+          : null;
+
+      const {
+        kept: workingTags,
+        droppedByLength,
+        droppedByLimit,
+      } = selectTagsWithinBudget(allTagNames, {
+        tagMax: rule.tagMax,
+        maxTagsBudget,
+      });
 
       const allDropped = [...droppedByLength, ...droppedByLimit];
       if (allDropped.length > 0) {
@@ -683,50 +828,71 @@ export function applyPlatformPublishRules(platform, input = {}, options = {}) {
       keptTags = workingTags;
 
       if (descLimit != null) {
-        // 为标签预留长度（若有正文且有标签，留 1 个分隔符）
+        // 为标签预留长度（若有正文或有快手独立标题前缀，且有标签，留 1 个分隔符）
         const totalAvailForText =
-          finalTagsLen > 0 ? Math.max(0, descLimit - finalTagsLen - 1) : descLimit;
+          finalTagsLen > 0
+            ? bodyLen > 0 || hasKsTitlePrefix
+              ? Math.max(0, descLimit - finalTagsLen - 1)
+              : 0
+            : descLimit;
 
-        if (rule.combinesTitleIntoDescription && title && !ksTitleAlreadyInDesc) {
+        if (hasKsTitlePrefix) {
           // 快手把 title + "\n" + body + " " + tags 合并进同一编辑器
-          const origCombinedBody = [title, bodySource].filter(Boolean).join("\n");
-          const origTitleLen = countChars(title);
-          if (origTitleLen > totalAvailForText) {
-            const titleTrunc = truncateTextByPunctuation(title, totalAvailForText);
-            if (titleTrunc.truncated) {
-              adjustments.push(
-                makeAdjustment({
-                  platform: canonical,
-                  field: "title",
-                  action: "truncate",
-                  limit: totalAvailForText,
-                  originalLength: titleTrunc.originalLength,
-                  finalLength: titleTrunc.finalLength,
-                  originalPreview: previewText(title, 18),
-                  finalPreview: previewText(titleTrunc.text, 18),
-                })
+          if (bodyLen === 0) {
+            const origTitleLen = countChars(title);
+            if (origTitleLen > totalAvailForText) {
+              const titleTrunc = truncateTextByPunctuation(
+                title,
+                totalAvailForText
               );
-              title = titleTrunc.text;
-            }
-            if (bodySource) {
-              adjustments.push(
-                makeAdjustment({
-                  platform: canonical,
-                  field: "description",
-                  action: "truncate",
-                  limit: descLimit,
-                  originalLength: countChars(origCombinedBody),
-                  finalLength: countChars(title),
-                  originalPreview: previewText(bodySource, 18),
-                  finalPreview: "",
-                })
-              );
+              if (titleTrunc.truncated) {
+                adjustments.push(
+                  makeAdjustment({
+                    platform: canonical,
+                    field: "title",
+                    action: "truncate",
+                    limit: totalAvailForText,
+                    originalLength: titleTrunc.originalLength,
+                    finalLength: titleTrunc.finalLength,
+                    originalPreview: previewText(title, 18),
+                    finalPreview: previewText(titleTrunc.text, 18),
+                  })
+                );
+                title = titleTrunc.text;
+              }
             }
             bodyDescription = "";
           } else {
+            // 有正文时为正文保留至少 minBodyReserve + 1(\n)，绝不因标题过长把正文清空只剩标题
+            const maxTitleForKs = Math.max(
+              0,
+              totalAvailForText - minBodyReserve - 1
+            );
+            if (countChars(title) > maxTitleForKs) {
+              const titleTrunc = truncateTextByPunctuation(
+                title,
+                maxTitleForKs
+              );
+              if (titleTrunc.truncated) {
+                adjustments.push(
+                  makeAdjustment({
+                    platform: canonical,
+                    field: "title",
+                    action: "truncate",
+                    limit: maxTitleForKs,
+                    originalLength: titleTrunc.originalLength,
+                    finalLength: titleTrunc.finalLength,
+                    originalPreview: previewText(title, 18),
+                    finalPreview: previewText(titleTrunc.text, 18),
+                  })
+                );
+                title = titleTrunc.text;
+              }
+            }
+            const curTitleLen = countChars(title);
             const bodyBudget = Math.max(
               0,
-              totalAvailForText - origTitleLen - (bodySource ? 1 : 0)
+              totalAvailForText - curTitleLen - (curTitleLen > 0 ? 1 : 0)
             );
             const bodyRes = truncateTextByPunctuation(bodySource, bodyBudget);
             if (bodyRes.truncated) {
@@ -750,11 +916,15 @@ export function applyPlatformPublishRules(platform, input = {}, options = {}) {
             bodyDescription = bodyRes.text;
           }
         } else {
-          // 抖音 / 视频号 / 小红书 / 快手(无独立标题前缀)
-          const bodyRes = truncateTextByPunctuation(bodySource, totalAvailForText);
+          // 抖音 / 视频号 / 小红书 / 快手(无独立标题前缀或标题已在正文开头)
+          const bodyRes = truncateTextByPunctuation(
+            bodySource,
+            totalAvailForText
+          );
           if (bodyRes.truncated) {
             const sepLen = bodySource && finalTagsLen > 0 ? countChars(tagSep) : 0;
-            const newSepLen = bodyRes.text && finalTagsLen > 0 ? countChars(tagSep) : 0;
+            const newSepLen =
+              bodyRes.text && finalTagsLen > 0 ? countChars(tagSep) : 0;
             adjustments.push(
               makeAdjustment({
                 platform: canonical,
@@ -769,6 +939,16 @@ export function applyPlatformPublishRules(platform, input = {}, options = {}) {
             );
           }
           bodyDescription = bodyRes.text;
+
+          // 快手标题原在正文开头：若正文截得比标题更短，同步收窄标题，保持二次调用幂等
+          if (
+            ksTitleAlreadyInBody &&
+            title &&
+            bodyDescription &&
+            !collapseText(bodyDescription).startsWith(collapseText(title))
+          ) {
+            title = bodyDescription;
+          }
         }
       } else {
         bodyDescription = bodySource;
@@ -783,7 +963,7 @@ export function applyPlatformPublishRules(platform, input = {}, options = {}) {
     if (rule.combinesTitleIntoDescription) {
       const t = String(title || "").trim();
       const d = String(combinedDescription || "").trim();
-      if (ksTitleAlreadyInDesc) ksFillText = d;
+      if (ksTitleIncluded) ksFillText = d;
       else if (!t) ksFillText = d;
       else if (!d) ksFillText = t;
       else if (collapseText(d).startsWith(collapseText(t))) ksFillText = d;
@@ -794,22 +974,85 @@ export function applyPlatformPublishRules(platform, input = {}, options = {}) {
   } else {
     // 非拼接标签平台（哔哩哔哩 / 百家号 / 头条 / 番茄视频）
     if (rule.descMax != null && description) {
-      const descRes = truncateTextByPunctuation(description, rule.descMax);
-      if (descRes.truncated) {
-        adjustments.push(
-          makeAdjustment({
-            platform: canonical,
-            field: "description",
-            action: "truncate",
-            limit: rule.descMax,
-            originalLength: descRes.originalLength,
-            finalLength: descRes.finalLength,
-            originalPreview: previewText(description, 18),
-            finalPreview: previewText(descRes.text, 18),
-          })
-        );
-        bodyDescription = descRes.text;
-        combinedDescription = descRes.text;
+      const origDescLen = countChars(description);
+      if (origDescLen > rule.descMax) {
+        const extracted = extractInlineHashtags(description);
+        if (extracted.inlineTags.length > 0) {
+          // 简介内含 #话题 时同样优先保留话题、仅截正文，单个话题过长则丢弃该话题不吞正文
+          const bodySource = extracted.body;
+          const bodyLen = countChars(bodySource);
+          const minBodyReserve = calcMinBodyReserve(bodyLen, rule.descMax);
+          const maxInlineTagsBudget = Math.max(
+            0,
+            rule.descMax - minBodyReserve - (bodyLen > 0 ? 1 : 0)
+          );
+          const { kept: keptInlineTags, droppedByLength: droppedInlineTags } =
+            selectTagsWithinBudget(extracted.inlineTags, {
+              tagMax: null,
+              maxTagsBudget: maxInlineTagsBudget,
+            });
+          const inlineTagsStr = keptInlineTags.map((t) => `#${t}`).join(" ");
+          const inlineTagsLen = countChars(inlineTagsStr);
+          const bodyBudget =
+            inlineTagsLen > 0
+              ? bodyLen > 0
+                ? Math.max(0, rule.descMax - inlineTagsLen - 1)
+                : 0
+              : rule.descMax;
+          const bodyRes = truncateTextByPunctuation(bodySource, bodyBudget);
+          const finalDesc = [bodyRes.text, inlineTagsStr]
+            .filter(Boolean)
+            .join(" ");
+
+          if (droppedInlineTags.length > 0) {
+            adjustments.push(
+              makeAdjustment({
+                platform: canonical,
+                field: "tags",
+                action: "trim_tags",
+                limit: rule.descMax,
+                originalLength: extracted.inlineTags.length,
+                finalLength: keptInlineTags.length,
+                droppedTags: droppedInlineTags,
+                reason: `简介内联话题超出简介上限 ${rule.descMax} 字`,
+              })
+            );
+          }
+          adjustments.push(
+            makeAdjustment({
+              platform: canonical,
+              field: "description",
+              action: "truncate",
+              limit: rule.descMax,
+              originalLength: origDescLen,
+              finalLength: countChars(finalDesc),
+              originalPreview: previewText(description, 18),
+              finalPreview: previewText(finalDesc, 18),
+            })
+          );
+          bodyDescription = finalDesc;
+          combinedDescription = finalDesc;
+          ksFillText = finalDesc;
+        } else {
+          const descRes = truncateTextByPunctuation(description, rule.descMax);
+          if (descRes.truncated) {
+            adjustments.push(
+              makeAdjustment({
+                platform: canonical,
+                field: "description",
+                action: "truncate",
+                limit: rule.descMax,
+                originalLength: descRes.originalLength,
+                finalLength: descRes.finalLength,
+                originalPreview: previewText(description, 18),
+                finalPreview: previewText(descRes.text, 18),
+              })
+            );
+            bodyDescription = descRes.text;
+            combinedDescription = descRes.text;
+            ksFillText = descRes.text;
+          }
+        }
       }
     }
     if (rule.tagMax != null && keptTags.length > rule.tagMax) {

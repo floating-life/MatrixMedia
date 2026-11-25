@@ -386,6 +386,469 @@ function testApplyPlatformRulesFull() {
 }
 
 /* ------------------------------------------------------------------ *
+ * 3.5 S17 返修第 1 轮：话题识别、不丢正文、全平台幂等、B 站保话题与 Grok 三组实测用例
+ * ------------------------------------------------------------------ */
+function testS17ReworkCases() {
+  const {
+    PLATFORM_RULES,
+    applyPlatformPublishRules,
+    createAppliedRuleSnapshot,
+    extractInlineHashtags,
+    countChars,
+  } = platformRules;
+
+  // A. extractInlineHashtags 话题识别：任意位置 #、中英文标点截断、连写、胶囊、空话题
+  assert.deepStrictEqual(extractInlineHashtags("正文。#减脂"), {
+    body: "正文。",
+    inlineTags: ["减脂"],
+  });
+  assert.deepStrictEqual(extractInlineHashtags("正文#话题"), {
+    body: "正文",
+    inlineTags: ["话题"],
+  });
+  assert.deepStrictEqual(extractInlineHashtags("#减脂#健身#干货"), {
+    body: "",
+    inlineTags: ["减脂", "健身", "干货"],
+  });
+  assert.deepStrictEqual(extractInlineHashtags("前面内容。#减脂#健身#干货"), {
+    body: "前面内容。",
+    inlineTags: ["减脂", "健身", "干货"],
+  });
+  assert.deepStrictEqual(
+    extractInlineHashtags("探店记录 #美食，环境很好，推荐尝试"),
+    {
+      body: "探店记录，环境很好，推荐尝试",
+      inlineTags: ["美食"],
+    }
+  );
+  assert.deepStrictEqual(
+    extractInlineHashtags("#减脂，今天分享在家深蹲"),
+    {
+      body: "今天分享在家深蹲",
+      inlineTags: ["减脂"],
+    }
+  );
+  // 中英文标点终止：，。！？、；：,.!?;:「」“”（）()【】[]
+  assert.deepStrictEqual(
+    extractInlineHashtags(
+      "「#美食」“#探店”（#干货）(#vlog)【#精选】[#daily]#a，#b。#c！#d？#e、#f；#g：#h,#i.#j!#k?#l;#m:"
+    ).inlineTags,
+    [
+      "美食",
+      "探店",
+      "干货",
+      "vlog",
+      "精选",
+      "daily",
+      "a",
+      "b",
+      "c",
+      "d",
+      "e",
+      "f",
+      "g",
+      "h",
+      "i",
+      "j",
+      "k",
+      "l",
+      "m",
+    ]
+  );
+  // 平台话题胶囊写法 `#话题[话题]#` 兼容
+  assert.deepStrictEqual(
+    extractInlineHashtags("看这里 #美食[话题]##探店[话题]# 很好吃"),
+    {
+      body: "看这里 很好吃",
+      inlineTags: ["美食", "探店"],
+    }
+  );
+  assert.deepStrictEqual(
+    extractInlineHashtags("#减脂[话题]#，今天分享深蹲"),
+    {
+      body: "今天分享深蹲",
+      inlineTags: ["减脂"],
+    }
+  );
+  // 空话题（单独 # / 紧跟标点 / 连续 # / 键帽 emoji）不算话题
+  for (const emptyHashCase of [
+    "#",
+    "##",
+    "单独的 # 符号",
+    "价格#，优惠#。",
+    "结尾#",
+    "#[话题]#",
+    "#️⃣ 排名第一",
+  ]) {
+    const ext = extractInlineHashtags(emptyHashCase);
+    assert.deepStrictEqual(
+      ext.inlineTags,
+      [],
+      `空话题不应被识别: ${emptyHashCase}`
+    );
+    assert.strictEqual(ext.body, emptyHashCase);
+  }
+  // 防止残留孤立 # 与后文粘连生成新话题
+  const coalesced = extractInlineHashtags("前面##美食[话题]#后面");
+  assert.deepStrictEqual(coalesced.inlineTags, ["美食"]);
+  assert.deepStrictEqual(extractInlineHashtags(coalesced.body).inlineTags, []);
+
+  // B. Grok 实测用例 1：704 字、以 `#减脂，` 开头且中间无空格的简介 + 话题「健身」，快手标题「在家减脂」
+  {
+    const baseSentence = "今天分享在家就能做的无器械深蹲训练动作要领与呼吸节奏";
+    const body700 = Array.from(baseSentence.repeat(30)).slice(0, 700).join("");
+    const desc704 = `#减脂，${body700}`;
+    assert.strictEqual(countChars(desc704), 704);
+    const r1 = applyPlatformPublishRules("快手", {
+      title: "在家减脂",
+      description: desc704,
+      tags: ["健身"],
+    });
+    assert.strictEqual(r1.adjusted, true);
+    assert.strictEqual(r1.title, "在家减脂");
+    assert.ok(
+      countChars(r1.ksFillText) <= 500,
+      `快手超 500: ${countChars(r1.ksFillText)}`
+    );
+    assert.ok(r1.ksFillText.startsWith("在家减脂\n"));
+    assert.ok(r1.bodyDescription.includes("深蹲"), "正文深蹲内容不能丢");
+    // 500 - title(4) - \n(1) - space(1) - `#减脂 #健身`(7) = 487 字最大可用正文
+    assert.strictEqual(
+      countChars(r1.bodyDescription),
+      487,
+      `正文应保留到上限允许的最大长度 487，实际 ${countChars(r1.bodyDescription)}`
+    );
+    assert.deepStrictEqual(r1.tags, ["减脂", "健身"]);
+    assert.ok(r1.ksFillText.includes("#减脂 #健身"));
+    // 幂等验证
+    const r2 = applyPlatformPublishRules("快手", r1);
+    assert.strictEqual(r2.adjusted, false);
+    assert.strictEqual(r2.ksFillText, r1.ksFillText);
+    assert.strictEqual(r2.bodyDescription, r1.bodyDescription);
+    assert.deepStrictEqual(r2.tags, r1.tags);
+  }
+
+  // C. Grok 实测用例 2：「探店记录 #美食，环境很好，推荐尝试」+ 话题「探店」跑两遍（含 GUI/CLI normalize + 上传器二次调用）
+  {
+    const srcDesc = "探店记录 #美食，环境很好，推荐尝试";
+    for (const pt of ["抖音", "快手", "视频号", "小红书"]) {
+      const r1 = applyPlatformPublishRules(pt, {
+        title: "探店标题",
+        description: srcDesc,
+        tags: ["探店"],
+      });
+      assert.strictEqual(r1.adjusted, false, `${pt} 未超限不应触发调整`);
+      assert.ok(r1.combinedDescription.includes("#美食"));
+      assert.ok(r1.combinedDescription.includes("#探店"), `${pt} 第一遍必须保留「探店」`);
+      assert.ok(!r1.combinedDescription.includes("#环境很好"));
+      assert.ok(!r1.combinedDescription.includes("#推荐尝试"));
+
+      // 模拟 GUI/CLI：normalizeVideoMetadata → 上传器 buildPlatformVideoTextDetailed（无快照 + 有快照两条路都验）
+      const norm = videoMetadata.normalizeVideoMetadata(
+        {
+          title: r1.title,
+          description: r1.bodyDescription,
+          shortTitle: r1.shortTitle,
+          tags: r1.tags,
+        },
+        pt
+      );
+      const secondNoSnap = videoMetadata.buildPlatformVideoTextDetailed(pt, {
+        title: norm.title,
+        description: norm.description,
+        shortTitle: norm.shortTitle,
+        tags: norm.tags,
+        ...norm.legacy,
+      });
+      assert.strictEqual(secondNoSnap.adjusted, false);
+      assert.strictEqual(
+        secondNoSnap.description,
+        r1.combinedDescription,
+        `${pt} 无快照二次调用必须完全不变`
+      );
+      assert.strictEqual(secondNoSnap.ksFillText, r1.ksFillText);
+      assert.deepStrictEqual(secondNoSnap.tags, r1.tags);
+      assert.ok(secondNoSnap.description.includes("#探店"), `${pt} 第二遍绝不能挤掉「探店」`);
+      assert.ok(!secondNoSnap.description.includes("#环境很好"));
+      assert.ok(!secondNoSnap.description.includes("#推荐尝试"));
+
+      const secondWithSnap = videoMetadata.buildPlatformVideoTextDetailed(pt, {
+        title: norm.title,
+        description: norm.description,
+        shortTitle: norm.shortTitle,
+        tags: norm.tags,
+        ...norm.legacy,
+        platformRulesApplied: createAppliedRuleSnapshot(r1),
+      });
+      assert.strictEqual(secondWithSnap.adjusted, false);
+      assert.strictEqual(secondWithSnap.description, r1.combinedDescription);
+      assert.strictEqual(secondWithSnap.ksFillText, r1.ksFillText);
+      assert.deepStrictEqual(secondWithSnap.tags, r1.tags);
+    }
+
+    // P2 专项：视频号「探店记录 #美食，环境很好，推荐尝试」+ 4 个话题跑两遍不得追加拆出的逗号伪话题
+    const sphFour1 = applyPlatformPublishRules("视频号", {
+      title: "探店",
+      description: srcDesc,
+      tags: ["探店", "周末", "打卡", "日常"],
+    });
+    const sphFourNorm = videoMetadata.normalizeVideoMetadata(
+      {
+        title: sphFour1.title,
+        description: sphFour1.bodyDescription,
+        shortTitle: sphFour1.shortTitle,
+        tags: sphFour1.tags,
+      },
+      "视频号"
+    );
+    const sphFour2 = videoMetadata.buildPlatformVideoTextDetailed("视频号", {
+      ...sphFourNorm,
+      ...sphFourNorm.legacy,
+    });
+    assert.strictEqual(sphFour2.description, sphFour1.combinedDescription);
+    assert.strictEqual(
+      sphFour2.description,
+      "探店记录 #美食，环境很好，推荐尝试 #探店 #周末 #打卡 #日常"
+    );
+    assert.ok(!sphFour2.description.includes("#环境很好"));
+    assert.ok(!sphFour2.description.includes("#推荐尝试"));
+  }
+
+  // D. Grok 实测用例 3（含 P3 B 站）：句号后直接写 `#减脂#健身#干货` + 独立话题「日常」超限截断
+  {
+    const makeEndedWithTags = (targetTotalLen) => {
+      const suffix = "。#减脂#健身#干货";
+      const need = targetTotalLen - countChars(suffix);
+      const unit = "这是一段干货满满的居家训练记录，动作标准很关键。";
+      let body = "";
+      while (countChars(body) < need) body += unit;
+      return Array.from(body).slice(0, need).join("") + suffix;
+    };
+
+    const cases = [
+      { pt: "快手", totalLen: 580, maxLen: 500, checkField: "ksFillText" },
+      { pt: "抖音", totalLen: 1150, maxLen: 1000, checkField: "combinedDescription" },
+      { pt: "视频号", totalLen: 1150, maxLen: 1000, checkField: "combinedDescription" },
+      { pt: "小红书", totalLen: 1150, maxLen: 1000, checkField: "combinedDescription" },
+      { pt: "哔哩哔哩", totalLen: 2290, maxLen: 2000, checkField: "combinedDescription" },
+    ];
+    for (const c of cases) {
+      const desc = makeEndedWithTags(c.totalLen);
+      assert.strictEqual(countChars(desc), c.totalLen);
+      const r1 = applyPlatformPublishRules(c.pt, {
+        title: "居家训练",
+        description: desc,
+        tags: ["日常"],
+      });
+      assert.strictEqual(r1.adjusted, true, `${c.pt} 应触发截断`);
+      const outText = r1[c.checkField];
+      assert.ok(
+        countChars(outText) <= c.maxLen,
+        `${c.pt} 截断后超出上限 ${c.maxLen}: ${countChars(outText)}`
+      );
+      assert.ok(r1.bodyDescription.length > 0, `${c.pt} 正文不得为空`);
+      assert.ok(outText.includes("#减脂"), `${c.pt} 应保留 #减脂`);
+      assert.ok(outText.includes("#健身"), `${c.pt} 应保留 #健身`);
+      assert.ok(outText.includes("#干货"), `${c.pt} 应保留 #干货`);
+      if (c.pt === "哔哩哔哩") {
+        // B 站独立标签栏保留「日常」，简介保留内联 #减脂 #健身 #干货
+        assert.deepStrictEqual(r1.tags, ["日常"]);
+        assert.ok(r1.description.includes("#减脂 #健身 #干货"));
+        assert.ok(countChars(r1.description) <= 2000);
+      } else {
+        assert.ok(outText.includes("#日常"), `${c.pt} 应保留独立话题 #日常`);
+        assert.deepStrictEqual(r1.tags, ["减脂", "健身", "干货", "日常"]);
+      }
+      // 二次调用完全不变
+      const r2 = applyPlatformPublishRules(c.pt, r1);
+      assert.strictEqual(r2.adjusted, false, `${c.pt} 二次调用不应再调整`);
+      assert.strictEqual(r2[c.checkField], outText);
+      assert.deepStrictEqual(r2.tags, r1.tags);
+    }
+  }
+
+  // E. 不丢正文专项：单话题过长丢弃该话题不吞正文；快手超长标题也不得把正文清空只剩标题
+  {
+    const longBodyNoPunct = "深蹲训练".repeat(150); // 600 chars
+    // E1. 单个超长话题（500 字）+ 正常短话题「健身」→ 丢超长话题，保留「健身」与最大长度正文
+    const ksOversized = applyPlatformPublishRules("快手", {
+      title: "在家减脂",
+      description: longBodyNoPunct,
+      tags: ["超".repeat(500), "健身"],
+    });
+    assert.strictEqual(ksOversized.adjusted, true);
+    assert.deepStrictEqual(ksOversized.tags, ["健身"]);
+    assert.strictEqual(countChars(ksOversized.bodyDescription), 491); // 500 - 4 - 1 - 1 - 3
+    assert.strictEqual(countChars(ksOversized.ksFillText), 500);
+    assert.ok(ksOversized.ksFillText.includes("深蹲训练"));
+
+    // E2. 单话题接近上限（499 字）+ 10 字短正文 → 丢超长话题，10 字正文完整保留
+    const ksNearLimitTag = applyPlatformPublishRules("快手", {
+      title: "减脂",
+      description: "十个字的正文绝不能丢",
+      tags: ["甲".repeat(499)],
+    });
+    assert.strictEqual(ksNearLimitTag.bodyDescription, "十个字的正文绝不能丢");
+    assert.deepStrictEqual(ksNearLimitTag.tags, []);
+    assert.ok(countChars(ksNearLimitTag.ksFillText) <= 500);
+
+    // E3. 快手标题本身超 500 字 + 200 字正文 + 话题「健身」→ 不允许清空正文只剩标题
+    const ksHugeTitle = applyPlatformPublishRules("快手", {
+      title: "标".repeat(520),
+      description: "正".repeat(200),
+      tags: ["健身"],
+    });
+    assert.ok(countChars(ksHugeTitle.ksFillText) <= 500);
+    assert.ok(ksHugeTitle.title.length > 0, "标题应保留");
+    assert.ok(ksHugeTitle.bodyDescription.length >= 50, "正文绝不能被超长标题清空");
+    assert.deepStrictEqual(ksHugeTitle.tags, ["健身"]);
+
+    // E4. B 站简介内单个超长内联话题 + 短正文 → 丢超长内联话题，保留正文与独立标签栏
+    const blblOversizedInline = applyPlatformPublishRules("哔哩哔哩", {
+      title: "B站测试",
+      description: `这是不能丢的正文 #${"长".repeat(2100)} #短话题`,
+      tags: ["独立标签"],
+    });
+    assert.ok(countChars(blblOversizedInline.description) <= 2000);
+    assert.ok(blblOversizedInline.description.includes("这是不能丢的正文"));
+    assert.ok(blblOversizedInline.description.includes("#短话题"));
+    assert.deepStrictEqual(blblOversizedInline.tags, ["独立标签"]);
+  }
+
+  // F. 严格幂等覆盖全部 8 个平台：apply(apply(x)) === apply(x)
+  {
+    const allPlatforms = Object.keys(PLATFORM_RULES);
+    assert.strictEqual(allPlatforms.length, 8);
+
+    const sampleInputs = [
+      {
+        name: "短文案+逗号紧邻内联话题+独立标签",
+        input: {
+          title: "短标题",
+          description: "探店记录 #美食，环境很好，推荐尝试",
+          shortTitle: "探店记录短标",
+          tags: ["探店", "周末", "打卡", "日常", "美食"],
+        },
+      },
+      {
+        name: "连写话题+胶囊话题+独立标签超限",
+        input: {
+          title: "超长标题测试".repeat(20),
+          description: `${"居家无器械深蹲教程，坚持每天打卡有效。".repeat(130)}#减脂#健身#干货 #胶囊[话题]#`,
+          shortTitle: "居家深蹲教程",
+          tags: ["日常", "运动", "健康", "打卡", "新手", "居家"],
+        },
+      },
+      {
+        name: "开头逗号内联话题+无空格长正文",
+        input: {
+          title: "在家减脂",
+          description: `#减脂，${"无器械深蹲训练计划".repeat(260)}`,
+          shortTitle: "在家减脂计划",
+          tags: ["健身"],
+        },
+      },
+      {
+        name: "单个超长话题+短话题+正文",
+        input: {
+          title: "正常标题",
+          description: "核心正文内容绝对不能被超长话题吞掉".repeat(30),
+          tags: ["超".repeat(600), "短一", "短二"],
+        },
+      },
+      {
+        name: "超长标题+前缀重合+超长正文",
+        input: {
+          title: "前缀标题".repeat(120),
+          description: `${"前缀标题".repeat(120)}，补充描述内容超过限制`.repeat(2),
+          tags: ["甲".repeat(80), "乙".repeat(80)],
+        },
+      },
+      {
+        name: "纯话题无正文+空井号混合",
+        input: {
+          title: "纯话题",
+          description: "# #减脂#健身",
+          tags: ["干货", "日常", "多余"],
+        },
+      },
+      {
+        name: "分平台覆盖超长值",
+        input: {
+          title: "通用标题",
+          description: "通用简介",
+          titleByPlatform: {
+            dy: "抖音覆盖超长标题".repeat(8),
+            bjh: "百家号覆盖超长标题".repeat(8),
+            xhs: "小红书覆盖超长标题".repeat(8),
+            tt: "头条覆盖超长标题".repeat(8),
+            blbl: "B站覆盖超长标题".repeat(20),
+            ks: "快手覆盖标题".repeat(90),
+          },
+          descByPlatform: {
+            dy: `${"抖音覆盖超长简介。".repeat(130)}#覆一#覆二`,
+            ks: `${"快手覆盖超长简介。".repeat(70)}#覆一#覆二`,
+            sph: `${"视频号覆盖超长简介。".repeat(130)}#覆一#覆二`,
+            xhs: `${"小红书覆盖超长简介。".repeat(130)}#覆一#覆二`,
+            blbl: `${"B站覆盖超长简介。".repeat(240)}#覆一#覆二`,
+          },
+          tags: ["一", "二", "三", "四", "五"],
+        },
+      },
+    ];
+
+    for (const pt of allPlatforms) {
+      for (const sample of sampleInputs) {
+        const r1 = applyPlatformPublishRules(pt, sample.input);
+        const r2 = applyPlatformPublishRules(pt, r1);
+        const ctx = `[${pt}][${sample.name}]`;
+        assert.strictEqual(r2.title, r1.title, `${ctx} title 不幂等`);
+        assert.strictEqual(r2.description, r1.description, `${ctx} description 不幂等`);
+        assert.strictEqual(r2.bodyDescription, r1.bodyDescription, `${ctx} bodyDescription 不幂等`);
+        assert.strictEqual(
+          r2.combinedDescription,
+          r1.combinedDescription,
+          `${ctx} combinedDescription 不幂等`
+        );
+        assert.strictEqual(r2.ksFillText, r1.ksFillText, `${ctx} ksFillText 不幂等`);
+        assert.strictEqual(r2.shortTitle, r1.shortTitle, `${ctx} shortTitle 不幂等`);
+        assert.deepStrictEqual(r2.tags, r1.tags, `${ctx} tags 不幂等`);
+        assert.strictEqual(r2.tagsText, r1.tagsText, `${ctx} tagsText 不幂等`);
+        assert.strictEqual(r2.adjusted, false, `${ctx} 第二遍不应再触发调整`);
+        assert.strictEqual(r2.adjustments.length, 0, `${ctx} 第二遍 adjustments 应为空`);
+        assert.strictEqual(r2.summary, "", `${ctx} 第二遍 summary 应为空`);
+
+        // 同步验证 buildPlatformVideoTextDetailed 带快照与修改字段后的安全回退
+        const snap = createAppliedRuleSnapshot(r1);
+        const viaSnap = videoMetadata.buildPlatformVideoTextDetailed(pt, {
+          title: r1.title,
+          description: r1.bodyDescription,
+          shortTitle: r1.shortTitle,
+          tags: r1.tags,
+          platformRulesApplied: snap,
+        });
+        assert.strictEqual(viaSnap.title, r1.title, `${ctx} snapshot title 不一致`);
+        assert.strictEqual(viaSnap.description, r1.combinedDescription, `${ctx} snapshot description 不一致`);
+        assert.strictEqual(viaSnap.ksFillText, r1.ksFillText, `${ctx} snapshot ksFillText 不一致`);
+        assert.deepStrictEqual(viaSnap.tags, r1.tags, `${ctx} snapshot tags 不一致`);
+        assert.strictEqual(viaSnap.adjusted, false);
+      }
+    }
+
+    // 修改字段后快照自动失效并重新应用规则
+    const baseR1 = applyPlatformPublishRules("百家号", { title: "短标题" });
+    const mutated = videoMetadata.buildPlatformVideoTextDetailed("百家号", {
+      title: "事后被改成了超过二十个字的百家号长标题需要重新截断",
+      platformRulesApplied: createAppliedRuleSnapshot(baseR1),
+    });
+    assert.strictEqual(mutated.adjusted, true);
+    assert.ok(countChars(mutated.title) <= 20);
+  }
+
+  console.log("✓ 3.5 S17 返修用例（话题识别/不丢正文/全平台幂等/B站保话题/Grok三组用例）通过");
+}
+
+/* ------------------------------------------------------------------ *
  * 4. CLI & HTTP 参数解析、覆盖优先级与回归
  * ------------------------------------------------------------------ */
 function testCliAndHttpArgs() {
@@ -651,6 +1114,11 @@ function testGuiLocalVideoPublish() {
   const bjhPayload = state.buildPlatformVideoPayload(bjhNode, baseVideo);
   assert.strictEqual(bjhPayload.data.title, "百家号合规短标题");
   assert.strictEqual(bjhPayload.data.ruleAdjustments, undefined);
+  assert.strictEqual(bjhPayload.data.titleByPlatform, undefined);
+  assert.ok(
+    bjhPayload.data.platformRulesApplied &&
+      bjhPayload.data.platformRulesApplied.platform === "百家号"
+  );
   assert.strictEqual(
     Object.prototype.hasOwnProperty.call(bjhPayload.publishOptions, "coverPathH"),
     false
@@ -1133,6 +1601,10 @@ async function testPublishVideoAndMcpIntegration() {
     assert.deepStrictEqual(lastTaskPayload.data.tags, ["一", "二", "三", "四"]);
     assert.strictEqual(lastTaskPayload.data.description, "快手专属覆盖简介");
     assert.strictEqual(lastTaskPayload.data.coverPathH, coverHFile);
+    assert.ok(
+      lastTaskPayload.data.platformRulesApplied &&
+        lastTaskPayload.data.platformRulesApplied.platform === "快手"
+    );
 
     // 8b. 缺字段且未超限 → 回归原行为（回执干净，无 ruleAdjustments，message === "上传成功"）
     const resPlain = await publishVideoMod.runSingleFilePublish({
@@ -1231,6 +1703,7 @@ process.exit(0);
   testRuleTable();
   testTruncationRules();
   testApplyPlatformRulesFull();
+  testS17ReworkCases();
   testCliAndHttpArgs();
   testXlsxColumns();
   testGuiLocalVideoPublish();
