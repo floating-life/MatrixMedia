@@ -19,6 +19,125 @@ import {
   pollPageUntil,
 } from "./uploadTimeouts.js";
 
+/**
+ * 快手发布页「AI 自动章节」选择器与候选文案集中配置【未经真机校准，待真机存草稿核对】。
+ * 找不到入口或短视频不支持时告警并继续发布，回执写「章节：不支持」；
+ * 点选后回读未选中时重试一次，仍失败则告警继续，回执写「章节：失败」。
+ *
+ * 注：不新增顶层静态 import，沿用 collection.js 的按需 dynamic import 模式以兼容离线挂车单测（test-ks-product-link.js）。
+ */
+export const KS_AI_CHAPTERS_SELECTORS = Object.freeze({
+  wujieHost: "",
+  sectionKeywords: [
+    "章节",
+    "视频章节",
+    "智能章节",
+    "内容章节",
+    "添加章节",
+    "章节信息",
+  ],
+  aiOptionKeywords: [
+    "AI自动添加章节",
+    "AI自动生成章节",
+    "AI智能生成章节",
+    "智能生成章节",
+    "自动生成章节",
+    "自动添加章节",
+    "AI章节",
+    "智能章节",
+    "AI智能章节",
+  ],
+  entryButtonKeywords: ["添加章节", "设置章节", "视频章节", "编辑章节"],
+  unsupportedPatterns: [
+    "不支持章节",
+    "暂不支持",
+    "时长不足",
+    "视频过短",
+    "无法生成章节",
+    "不支持添加章节",
+    "不支持自动章节",
+    "暂无法生成章节",
+    "小于",
+    "不足",
+  ],
+  toggleSelectors: [
+    ".ant-switch",
+    ".ant-checkbox-wrapper",
+    ".ant-radio-wrapper",
+    "[role='switch']",
+    "[role='checkbox']",
+    "[role='radio']",
+    "label",
+    "input[type='checkbox']",
+    "input[type='radio']",
+  ],
+  dialogSelectors: [".ant-modal", ".ant-modal-content", "[role='dialog']"],
+  confirmButtonTexts: ["确定", "确认", "完成", "应用"],
+  submitSelectors: [
+    "#setting-tours + div button",
+    "#popover-tip-container",
+    "#popover-tip-container+button",
+    ".form-btns>div:first-child button",
+    ".form-btns>div:last-child button",
+  ],
+  submitTexts: [
+    "发布",
+    "发表",
+    "立即发布",
+    "定时发布",
+    "存草稿",
+    "保存草稿",
+    "暂存离开",
+    "保存",
+    "提交",
+    "取消",
+    "取消发布",
+    "确认发布",
+  ],
+  dispatchMouseEvents: true,
+  diagSelectors: [
+    "[class*='chapter']",
+    "[class*='Chapter']",
+    "#setting-tours",
+  ],
+  diagKeywords: ["章节", "AI", "智能生成", "自动添加"],
+});
+
+function isKsAiChaptersEnabled(task) {
+  if (!task || typeof task !== "object") return false;
+  if (task.data && typeof task.data === "object" && typeof task.data.aiChapters === "boolean") {
+    return task.data.aiChapters === true;
+  }
+  if (
+    task.publishOptions &&
+    typeof task.publishOptions === "object" &&
+    typeof task.publishOptions.aiChapters === "boolean"
+  ) {
+    return task.publishOptions.aiChapters === true;
+  }
+  return task.aiChapters === true;
+}
+
+export async function applyKsAiChapters(
+  page,
+  { data, window, timeouts } = {}
+) {
+  const [{ executeAiChaptersFlow }, { capturePublishFailureScreenshot }] =
+    await Promise.all([
+      import(/* webpackMode: "eager" */ "../../../shared/publishExtrasDom.js"),
+      import(/* webpackMode: "eager" */ "./failureScreenshot.js"),
+    ]);
+  return executeAiChaptersFlow(page, {
+    platformTag: "ks",
+    platformLabel: "快手",
+    cfg: KS_AI_CHAPTERS_SELECTORS,
+    data,
+    window,
+    captureScreenshot: capturePublishFailureScreenshot,
+    timeouts,
+  });
+}
+
 export const KS_DESCRIPTION_SELECTOR = "#work-description-edit";
 
 function collapseText(t) {
@@ -726,6 +845,13 @@ export default async function (page, data, window, event) {
         window,
       });
     }
+
+    // AI 自动章节（默认开启，关闭时不触碰页面；不支持或失败告警继续，不中止发布）
+    let aiChaptersResult = null;
+    if (isKsAiChaptersEnabled(data)) {
+      aiChaptersResult = await applyKsAiChapters(page, { data, window });
+    }
+
     await page.waitForFunction(
       (text) => {
         const bar = document.querySelector("#setting-tours + div");
@@ -793,6 +919,15 @@ export default async function (page, data, window, event) {
     const ksBaseSuccessMsg = isDraftMode
       ? "已点击取消发布/存草稿入口（快手网页端无草稿箱，无法核验）"
       : "上传成功";
+    const ksMsgWithAdj = ksAdjSummary
+      ? `${ksBaseSuccessMsg}（规则调整：${ksAdjSummary}）`
+      : ksBaseSuccessMsg;
+    const ksFinalSuccessMsg =
+      aiChaptersResult &&
+      aiChaptersResult.receiptText &&
+      !String(ksMsgWithAdj || "").includes(aiChaptersResult.receiptText)
+        ? `${ksMsgWithAdj}（${aiChaptersResult.receiptText}）`
+        : ksMsgWithAdj;
     await replyPublishOutcome({
       page,
       data,
@@ -802,11 +937,15 @@ export default async function (page, data, window, event) {
       isDraftMode,
       // 快手编辑页视频上传完常驻「上传成功」，发布模式不能把它当发布成功信号
       excludeSuccessToasts: ["上传成功", "草稿已保存"],
-      successMessage: ksAdjSummary
-        ? `${ksBaseSuccessMsg}（规则调整：${ksAdjSummary}）`
-        : ksBaseSuccessMsg,
+      successMessage: ksFinalSuccessMsg,
       extraPayload: {
         ...(isDraftMode ? { draftUnverified: true } : {}),
+        ...(aiChaptersResult
+          ? {
+              aiChaptersStatus: aiChaptersResult.status,
+              aiChaptersReceipt: aiChaptersResult.receiptText,
+            }
+          : {}),
         ...(ksRuleAdjustments.length > 0
           ? {
               ruleAdjustments: ksRuleAdjustments,

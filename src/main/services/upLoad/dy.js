@@ -35,6 +35,107 @@ import {
   normalizeForCompare,
   replaceAllText,
 } from "./textReadback.js";
+import {
+  isAiChaptersRequested,
+  appendPublishReceiptNote,
+} from "../../../shared/publishExtras.js";
+import { executeAiChaptersFlow } from "../../../shared/publishExtrasDom.js";
+
+/**
+ * 抖音发布页「AI 自动章节」选择器与候选文案集中配置【未经真机校准，待真机存草稿核对】。
+ * 找不到入口或短视频不支持时告警并继续发布，回执写「章节：不支持」；
+ * 点选后回读未选中时重试一次，仍失败则告警继续，回执写「章节：失败」。
+ */
+export const DY_AI_CHAPTERS_SELECTORS = Object.freeze({
+  wujieHost: "",
+  sectionKeywords: [
+    "章节",
+    "视频章节",
+    "智能章节",
+    "内容章节",
+    "添加章节",
+    "章节信息",
+  ],
+  aiOptionKeywords: [
+    "AI自动添加章节",
+    "AI自动生成章节",
+    "AI智能生成章节",
+    "智能生成章节",
+    "自动生成章节",
+    "自动添加章节",
+    "AI章节",
+    "智能章节",
+    "AI智能章节",
+  ],
+  entryButtonKeywords: ["添加章节", "设置章节", "视频章节", "编辑章节"],
+  unsupportedPatterns: [
+    "不支持章节",
+    "暂不支持",
+    "时长不足",
+    "视频过短",
+    "无法生成章节",
+    "不支持添加章节",
+    "不支持自动章节",
+    "暂无法生成章节",
+    "小于",
+    "不足",
+  ],
+  toggleSelectors: [
+    ".semi-switch",
+    ".semi-checkbox",
+    ".semi-radio",
+    "[role='switch']",
+    "[role='checkbox']",
+    "[role='radio']",
+    "label",
+    "input[type='checkbox']",
+    "input[type='radio']",
+  ],
+  dialogSelectors: [
+    ".semi-modal",
+    ".semi-modal-content",
+    ".dy-creator-content-modal-wrap",
+    "[role='dialog']",
+  ],
+  confirmButtonTexts: ["确定", "确认", "完成", "应用"],
+  submitSelectors: ALL_PLATFORM_SUBMIT_SELECTORS,
+  submitTexts: [
+    "发布",
+    "发表",
+    "立即发布",
+    "定时发布",
+    "存草稿",
+    "保存草稿",
+    "暂存离开",
+    "保存",
+    "提交",
+    "取消",
+    "取消发布",
+    "确认发布",
+  ],
+  dispatchMouseEvents: false,
+  diagSelectors: [
+    "[class*='chapter']",
+    "[class*='Chapter']",
+    "[class*='section']",
+  ],
+  diagKeywords: ["章节", "AI", "智能生成", "自动添加"],
+});
+
+export async function applyDyAiChapters(
+  page,
+  { data, window, timeouts } = {}
+) {
+  return executeAiChaptersFlow(page, {
+    platformTag: "dy",
+    platformLabel: "抖音",
+    cfg: DY_AI_CHAPTERS_SELECTORS,
+    data,
+    window,
+    captureScreenshot: capturePublishFailureScreenshot,
+    timeouts,
+  });
+}
 
 async function dismissDyGuideModals(page) {
   const closed = await page.evaluate(() => {
@@ -3173,6 +3274,12 @@ export default async function (page, data, window, event) {
     // 自主声明入口在视频转码完成后才出现，必须在点击发布前完成
     await selectDyCreativeStatementWithRetry(page, data);
 
+    // AI 自动章节（默认开启，关闭时不触碰页面；不支持或失败告警继续，不中止发布）
+    let aiChaptersResult = null;
+    if (isAiChaptersRequested(data)) {
+      aiChaptersResult = await applyDyAiChapters(page, { data, window });
+    }
+
     // 挂车未确认成功时必须进入同一失败分支，不能继续发布无商品的视频。
     const productLink = resolveVideoLinkOption("抖音", data.publishOptions);
     if (productLink.enabled) await attachDyProductLink(page, productLink);
@@ -3203,6 +3310,13 @@ export default async function (page, data, window, event) {
     const dyBaseSuccessMsg = isDraftMode
       ? "已点击存草稿（抖音网页端无草稿箱，无法核验）"
       : "上传成功";
+    const dyMsgWithAdj = dyAdjSummary
+      ? `${dyBaseSuccessMsg}（规则调整：${dyAdjSummary}）`
+      : dyBaseSuccessMsg;
+    const dyFinalSuccessMsg =
+      aiChaptersResult && aiChaptersResult.receiptText
+        ? appendPublishReceiptNote(dyMsgWithAdj, aiChaptersResult.receiptText)
+        : dyMsgWithAdj;
     await replyPublishOutcome({
       page,
       data,
@@ -3212,11 +3326,15 @@ export default async function (page, data, window, event) {
       isDraftMode,
       // 抖音编辑页视频上传完常驻「上传成功」，发布模式不能把它当发布成功信号
       excludeSuccessToasts: ["上传成功", "草稿已保存"],
-      successMessage: dyAdjSummary
-        ? `${dyBaseSuccessMsg}（规则调整：${dyAdjSummary}）`
-        : dyBaseSuccessMsg,
+      successMessage: dyFinalSuccessMsg,
       extraPayload: {
         ...(isDraftMode ? { draftUnverified: true } : {}),
+        ...(aiChaptersResult
+          ? {
+              aiChaptersStatus: aiChaptersResult.status,
+              aiChaptersReceipt: aiChaptersResult.receiptText,
+            }
+          : {}),
         ...(dyRuleAdjustments.length > 0
           ? {
               ruleAdjustments: dyRuleAdjustments,

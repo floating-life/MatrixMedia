@@ -109,6 +109,21 @@
                       :title="sub.throttleReason || sub.lastPublishMessage || ''"
                       >{{ publishStatusText(sub.publishStatus) }}</el-tag
                     >
+                    <el-tag
+                      v-if="hasCreativeStatementDisplay(sub)"
+                      size="mini"
+                      type="info"
+                      effect="plain"
+                      >创作声明：{{ formatCreativeStatementBadge(sub) }}</el-tag
+                    >
+                    <el-tag
+                      v-for="extraTag in getHistoryExtrasTags(sub)"
+                      :key="extraTag.key"
+                      size="mini"
+                      :type="extraTag.tone"
+                      effect="plain"
+                      >{{ extraTag.label }}：{{ extraTag.value }}</el-tag
+                    >
                     <span
                       v-if="sub.publishStatus === 'scheduled' && sub.scheduledPublishAtText"
                       class="progress-count"
@@ -236,6 +251,15 @@ import {
   recordGroupOf,
 } from "../../../shared/accountIdentity.js";
 import { buildPublishHistoryCsv } from "../../../shared/publishHistoryCsv.js";
+import {
+  getCreativeStatementShortLabel,
+  isCreativeStatementNone,
+} from "../../../shared/creativeStatement.js";
+import {
+  buildHistoryExtrasDisplay,
+  readTaskAiChapters,
+  readTaskOriginalStatement,
+} from "../../../shared/publishExtras.js";
 
 function readRecordDySyncToutiao(record) {
   if (!record || typeof record !== "object") return undefined;
@@ -565,6 +589,16 @@ export default {
       if (status === "login_required") return "需重新登录";
       return "发布中";
     },
+    hasCreativeStatementDisplay(sub) {
+      return Boolean(sub && !isCreativeStatementNone(sub.creativeStatement));
+    },
+    formatCreativeStatementBadge(sub) {
+      if (!sub) return "";
+      return getCreativeStatementShortLabel(sub.creativeStatement, sub.pt);
+    },
+    getHistoryExtrasTags(sub) {
+      return buildHistoryExtrasDisplay(sub);
+    },
     isPublishFailed(row) {
       if (!row) return false;
       if (
@@ -760,9 +794,15 @@ export default {
           description: metadata.description,
           shortTitle: metadata.shortTitle,
           tags: metadata.tags,
-          // 只透传同步头条开关，不复制整份 publishOptions（避免重发时回填旧商品/合集）
+          // 只透传同步头条 / AI章节 / 原创声明开关，不复制整份 publishOptions（避免重发时回填旧商品/合集）
           ...(typeof readRecordDySyncToutiao(record) === "boolean"
             ? { dySyncToutiao: readRecordDySyncToutiao(record) }
+            : {}),
+          ...(typeof readTaskAiChapters(record) === "boolean"
+            ? { aiChapters: readTaskAiChapters(record) }
+            : {}),
+          ...(typeof readTaskOriginalStatement(record) === "boolean"
+            ? { originalStatement: readTaskOriginalStatement(record) }
             : {}),
           publishAttemptCount: Number(record.publishAttemptCount) || 1,
           republishCount: Number(record.republishCount),
@@ -960,6 +1000,16 @@ export default {
       const abnormal = success && donePayload.publishAbnormal === true;
       // 主进程在失败/异常瞬间截了发布页的图，这里存进记录，之后可以直接回看
       const failScreenshot = this.pickFailScreenshot(donePayload, row);
+      const extrasStatusPatch = {
+        ...(typeof donePayload.aiChaptersStatus === "string" &&
+        donePayload.aiChaptersStatus
+          ? { aiChaptersStatus: donePayload.aiChaptersStatus }
+          : {}),
+        ...(typeof donePayload.originalStatementStatus === "string" &&
+        donePayload.originalStatementStatus
+          ? { originalStatementStatus: donePayload.originalStatementStatus }
+          : {}),
+      };
       if (abnormal) {
         await dataRequest({
           type: "update",
@@ -970,6 +1020,7 @@ export default {
             publishAbnormalCount:
               this.normalizeCount(row.publishAbnormalCount) + 1,
             publishStatus: "abnormal",
+            ...extrasStatusPatch,
             ...(failScreenshot ? { failScreenshot } : {}),
             lastPublishMessage:
               donePayload.message ||
@@ -1006,6 +1057,7 @@ export default {
               ? "draft"
               : "success"
             : "failed",
+          ...extrasStatusPatch,
           // 成功/存草稿时清掉旧截图，避免把上一次失败的画面留在成功记录上
           failScreenshot: success ? "" : failScreenshot,
           lastPublishMessage:

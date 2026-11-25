@@ -132,7 +132,10 @@ router.post("/publish", async function (req, res) {
     const { registerPublishDedupeBypass } = await import(
       "../../services/puppeteerFile.js"
     );
-    const { resolveAccountPublishMode } = await import(
+    const {
+      resolveAccountPublishMode,
+      findAccountPublishSettings,
+    } = await import(
       "../../services/accountPublishSettingsResolver.js"
     );
     const { applyPlatformPublishRules } = await import(
@@ -143,6 +146,14 @@ router.post("/publish", async function (req, res) {
     const sanitizedBody = sanitizePublishPayloadObject(req.body || {});
     const parsed = parseMultiPublishRequest(sanitizedBody, {
       defaultCreativeStatement: throttleSettings.defaultCreativeStatement,
+      defaultAiChapters: throttleSettings.defaultAiChapters,
+      defaultOriginalStatement: throttleSettings.defaultOriginalStatement,
+      resolveAccountSettings: ({ phone, pt, partition }) =>
+        findAccountPublishSettings({
+          phone,
+          pt,
+          partition: resolveTaskPartition({ partition, phone, pt }),
+        }),
     });
     if (!parsed.ok) {
       return res.status(400).json({

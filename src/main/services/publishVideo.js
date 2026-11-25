@@ -14,21 +14,29 @@ import {
   notifyScheduledPublishChanged,
 } from "./scheduledPublish";
 import { findExistingScheduled } from "./scheduledDedupe.js";
-import {
+import * as publishThrottleService from "./publishThrottle.js";
+const {
   getDefaultCreativeStatement,
   confirmThrottleReservation,
   recordThrottleEntryDirect,
   releaseThrottleReservation,
   checkExistingScheduledCreativeConflict,
   formatUtc8DateTime,
-} from "./publishThrottle.js";
+} = publishThrottleService;
 import { CLI_PUBLISH_TIMEOUT_MS } from "./upLoad/uploadTimeouts.js";
 import {
   isRemotePublishFile,
   resolvePublishFile,
   guessFileNameFromUrl,
 } from "./resolvePublishFile";
-import { resolveAccountPublishMode } from "./accountPublishSettingsResolver.js";
+import * as accountPublishSettingsResolver from "./accountPublishSettingsResolver.js";
+const { resolveAccountPublishMode } = accountPublishSettingsResolver;
+import {
+  resolvePublishExtrasForPlatform,
+  buildPlatformExtrasPatch,
+  formatAiChaptersReceipt,
+  appendPublishReceiptNote,
+} from "../../shared/publishExtras.js";
 import { resolveTaskPartition } from "./accountLookup.js";
 import { resolvePublishCompletion } from "../../shared/publishResult.js";
 import { normalizeVideoMetadata } from "../../shared/videoMetadata.js";
@@ -314,6 +322,10 @@ async function runSingleFilePublishInner(
 
   // 创作声明：显式传入优先，未传时套用发布设置里的默认声明（默认 ai_generated），
   // 平台不支持该声明时按现有规则自动回退为 none。
+  const throttleSettings =
+    typeof publishThrottleService.readPublishThrottleSettings === "function"
+      ? publishThrottleService.readPublishThrottleSettings()
+      : {};
   const rawCreativeStatement =
     v.creativeStatement != null && String(v.creativeStatement).trim() !== ""
       ? v.creativeStatement
@@ -322,6 +334,39 @@ async function runSingleFilePublishInner(
     rawCreativeStatement,
     v.platform
   );
+
+  // AI 自动章节（抖音/快手/小红书）与原创声明（小红书/视频号）：与创作声明独立存取，
+  // 优先级：单次显式值 > 账号发布设置 > 全局发布设置 > true；未支持平台忽略不写入。
+  const requestAiChapters = Object.prototype.hasOwnProperty.call(
+    v,
+    "explicitAiChapters"
+  )
+    ? v.explicitAiChapters
+    : v.aiChapters;
+  const requestOriginalStatement = Object.prototype.hasOwnProperty.call(
+    v,
+    "explicitOriginalStatement"
+  )
+    ? v.explicitOriginalStatement
+    : v.originalStatement;
+  const resolvedExtras =
+    typeof accountPublishSettingsResolver.resolveAccountPublishExtras ===
+    "function"
+      ? accountPublishSettingsResolver.resolveAccountPublishExtras({
+          phone: derivePhoneForRecord(v),
+          pt: v.platform,
+          partition: v.partition,
+          requestAiChapters,
+          requestOriginalStatement,
+          globalSettings: throttleSettings,
+        })
+      : resolvePublishExtrasForPlatform(v.platform, {
+          explicitAiChapters: requestAiChapters,
+          explicitOriginalStatement: requestOriginalStatement,
+          globalSettings: throttleSettings,
+        });
+  const extrasPatch = buildPlatformExtrasPatch(v.platform, resolvedExtras);
+
   const throttleReason = String(v.throttleReason || "").trim();
   const throttleReasons = Array.isArray(v.throttleReasons)
     ? v.throttleReasons
@@ -334,6 +379,9 @@ async function runSingleFilePublishInner(
     v.publishOptions && typeof v.publishOptions === "object"
       ? { ...v.publishOptions }
       : {};
+  delete effectivePublishOptions.aiChapters;
+  delete effectivePublishOptions.originalStatement;
+  Object.assign(effectivePublishOptions, extrasPatch);
   if (
     !Object.prototype.hasOwnProperty.call(
       effectivePublishOptions,
@@ -381,6 +429,7 @@ async function runSingleFilePublishInner(
       tags: metadata.tags,
       ...metadata.legacy,
       creativeStatement: normalizeCreativeStatement(finalCreativeStatement),
+      ...extrasPatch,
       coverPath,
       coverPathH,
       noDownload: v.noDownload === true,
@@ -421,6 +470,7 @@ async function runSingleFilePublishInner(
     tags: metadata.tags,
     ...metadata.legacy,
     creativeStatement: normalizeCreativeStatement(finalCreativeStatement),
+    ...extrasPatch,
     ...(throttleReason ? { throttleReason } : {}),
     ...(activeReservationId ? { throttleReservationId: activeReservationId } : {}),
     coverPath,
@@ -651,6 +701,7 @@ async function runSingleFilePublishInner(
         publishAt: scheduledRecord.scheduledPublishAtText,
         plannedAtMs: scheduledRecord.scheduledPublishAt,
         creativeStatement: finalCreativeStatement,
+        ...extrasPatch,
         ...ruleAdjustmentsPatch,
         throttled: isThrottled,
         throttleReason,
@@ -789,7 +840,7 @@ async function runSingleFilePublishInner(
     return releaseThrottleReservation(activeReservationId).catch(() => {});
   };
 
-  const updateRecord = (status, message) => {
+  const updateRecord = (status, message, extraFields = {}) => {
     if (!recordId) return;
     try {
       changeData({
@@ -809,6 +860,7 @@ async function runSingleFilePublishInner(
           publishAbnormalCount: status === "abnormal" ? 1 : 0,
           lastPublishMessage: message || "",
           lastPublishAt: Date.now(),
+          ...(extraFields && typeof extraFields === "object" ? extraFields : {}),
         },
       });
     } catch (e) {
@@ -877,11 +929,31 @@ async function runSingleFilePublishInner(
             payload && payload.ruleAdjustments
           );
           const mergedSummary = formatRuleAdjustmentsSummary(mergedAdj);
+          const aiChaptersStatus =
+            payload && typeof payload.aiChaptersStatus === "string"
+              ? payload.aiChaptersStatus
+              : "";
+          const originalStatementStatus =
+            payload && typeof payload.originalStatementStatus === "string"
+              ? payload.originalStatementStatus
+              : "";
+          const chaptersReceipt =
+            (payload &&
+              typeof payload.aiChaptersReceipt === "string" &&
+              payload.aiChaptersReceipt) ||
+            formatAiChaptersReceipt(aiChaptersStatus);
+          const msgWithChapters = chaptersReceipt
+            ? appendPublishReceiptNote(completion.message, chaptersReceipt)
+            : completion.message;
           const finalMessage =
-            mergedSummary && !String(completion.message || "").includes(mergedSummary)
-              ? `${completion.message}（规则调整：${mergedSummary}）`
-              : completion.message;
-          updateRecord(completion.recordStatus, finalMessage);
+            mergedSummary && !String(msgWithChapters || "").includes(mergedSummary)
+              ? `${msgWithChapters}（规则调整：${mergedSummary}）`
+              : msgWithChapters;
+          const extrasStatusPatch = {
+            ...(aiChaptersStatus ? { aiChaptersStatus } : {}),
+            ...(originalStatementStatus ? { originalStatementStatus } : {}),
+          };
+          updateRecord(completion.recordStatus, finalMessage, extrasStatusPatch);
           settleImmediateLedger(completion.recordStatus, {
             savedAsDraft: completion.savedAsDraft,
           }).finally(() => {
@@ -891,6 +963,8 @@ async function runSingleFilePublishInner(
               message: finalMessage,
               id: recordId,
               creativeStatement: finalCreativeStatement,
+              ...extrasPatch,
+              ...extrasStatusPatch,
               ...(mergedAdj.length > 0
                 ? {
                     ruleAdjustments: mergedAdj,
@@ -938,6 +1012,7 @@ async function runSingleFilePublishInner(
           : "已提交发布任务",
         id: recordId,
         creativeStatement: finalCreativeStatement,
+        ...extrasPatch,
         ...ruleAdjustmentsPatch,
       });
     }
@@ -1036,6 +1111,18 @@ export async function runMultiPlatformPublish(parsedList) {
       reason: throttleReason,
       reasons: throttleReasons,
       creativeStatement: finalCs,
+      ...(result.aiChapters !== undefined
+        ? { aiChapters: result.aiChapters }
+        : {}),
+      ...(result.aiChaptersStatus !== undefined
+        ? { aiChaptersStatus: result.aiChaptersStatus }
+        : {}),
+      ...(result.originalStatement !== undefined
+        ? { originalStatement: result.originalStatement }
+        : {}),
+      ...(result.originalStatementStatus !== undefined
+        ? { originalStatementStatus: result.originalStatementStatus }
+        : {}),
       ...(Array.isArray(result.ruleAdjustments) && result.ruleAdjustments.length > 0
         ? {
             ruleAdjustments: result.ruleAdjustments,
@@ -1067,6 +1154,18 @@ export async function runMultiPlatformPublish(parsedList) {
           platform: parsedList[0].platform,
           phone: parsedList[0].phone || "",
           creativeStatement: finalCs,
+          ...(result.aiChapters !== undefined
+            ? { aiChapters: result.aiChapters }
+            : {}),
+          ...(result.aiChaptersStatus !== undefined
+            ? { aiChaptersStatus: result.aiChaptersStatus }
+            : {}),
+          ...(result.originalStatement !== undefined
+            ? { originalStatement: result.originalStatement }
+            : {}),
+          ...(result.originalStatementStatus !== undefined
+            ? { originalStatementStatus: result.originalStatementStatus }
+            : {}),
           success: result.exitCode === 0,
           exitCode: result.exitCode,
           status: result.status,
@@ -1199,6 +1298,18 @@ export async function runMultiPlatformPublish(parsedList) {
         phone: item.phone || "",
         creativeStatement:
           result.creativeStatement || item.creativeStatement || "none",
+        ...(result.aiChapters !== undefined
+          ? { aiChapters: result.aiChapters }
+          : {}),
+        ...(result.aiChaptersStatus !== undefined
+          ? { aiChaptersStatus: result.aiChaptersStatus }
+          : {}),
+        ...(result.originalStatement !== undefined
+          ? { originalStatement: result.originalStatement }
+          : {}),
+        ...(result.originalStatementStatus !== undefined
+          ? { originalStatementStatus: result.originalStatementStatus }
+          : {}),
         success: result.exitCode === 0,
         exitCode: result.exitCode,
         status: result.status,

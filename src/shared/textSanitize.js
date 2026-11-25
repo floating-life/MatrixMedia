@@ -234,12 +234,67 @@ function parsePlatformOverrideHeader(cleanedLowerKey) {
 }
 
 /**
+ * 解析批量 xlsx 布尔可选列（「AI章节」「原创声明」等）：
+ * - 空单元格返回 null（未显式指定，交由调用方回退发布设置默认值）
+ * - 支持 是/否、开启/关闭、开/关、true/false、yes/no、1/0
+ * - 无法识别的非空值返回 null（不崩溃，回退默认值）
+ * @param {unknown} raw
+ * @returns {boolean | null}
+ */
+function parseExcelOptionalBoolean(raw) {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw === "boolean") return raw;
+  if (typeof raw === "number") {
+    if (raw === 1) return true;
+    if (raw === 0) return false;
+    return null;
+  }
+  const cleaned = cleanExcelMetaCell(raw);
+  if (!cleaned) return null;
+  const lower = cleaned.toLowerCase();
+  if (
+    cleaned === "是" ||
+    cleaned === "开" ||
+    cleaned === "开启" ||
+    cleaned === "启用" ||
+    cleaned === "打开" ||
+    cleaned === "勾选" ||
+    cleaned === "声明" ||
+    lower === "true" ||
+    lower === "yes" ||
+    lower === "y" ||
+    lower === "on" ||
+    lower === "1"
+  ) {
+    return true;
+  }
+  if (
+    cleaned === "否" ||
+    cleaned === "关" ||
+    cleaned === "关闭" ||
+    cleaned === "禁用" ||
+    cleaned === "不勾选" ||
+    cleaned === "不声明" ||
+    cleaned === "不开启" ||
+    cleaned === "无" ||
+    lower === "false" ||
+    lower === "no" ||
+    lower === "n" ||
+    lower === "off" ||
+    lower === "0"
+  ) {
+    return false;
+  }
+  return null;
+}
+
+/**
  * GUI（dialog:openBatchXlsx）与 CLI（parseXlsxRows）共用的批量 Excel 行归一化函数。
  * 保证两条 Excel 导入链路对 title / description / shortTitle / tags / coverPathH /
- * 分平台覆盖（titleByPlatform / descByPlatform）的清洗结果完全一致。
+ * 分平台覆盖（titleByPlatform / descByPlatform）/ aiChapters / originalStatement 的清洗结果完全一致。
  *
  * @param {Array<Record<string, unknown>>} rows xlsx.utils.sheet_to_json 产出的原始行
- * @returns {Array<{fileName: string, title: string, description: string, shortTitle: string, tags: string, coverPath: string, coverPathH: string, creativeStatement: string, collection: string, titleByPlatform: Record<string, string>, descByPlatform: Record<string, string>}>}
+ * @returns {Array<{fileName: string, title: string, description: string, shortTitle: string, tags: string, coverPath: string, coverPathH: string, creativeStatement: string, collection: string, aiChapters: boolean|null, originalStatement: boolean|null, titleByPlatform: Record<string, string>, descByPlatform: Record<string, string>}>}
  */
 function normalizeBatchXlsxRows(rows) {
   if (!Array.isArray(rows)) return [];
@@ -310,6 +365,33 @@ function normalizeBatchXlsxRows(rows) {
           : map["cover_h"] != null && String(map["cover_h"]).trim() !== ""
           ? map["cover_h"]
           : map["cover-h"] || "";
+      const pickFirstCell = (keys) => {
+        for (let i = 0; i < keys.length; i++) {
+          const val = map[keys[i]];
+          if (val !== undefined && val !== null && String(val).trim() !== "") {
+            return val;
+          }
+        }
+        return null;
+      };
+      const aiChaptersRaw = pickFirstCell([
+        "ai章节",
+        "ai自动章节",
+        "自动章节",
+        "智能章节",
+        "aichapters",
+        "ai_chapters",
+        "ai-chapters",
+      ]);
+      const originalStatementRaw = pickFirstCell([
+        "原创声明",
+        "声明原创",
+        "原创",
+        "originalstatement",
+        "original_statement",
+        "original-statement",
+        "original",
+      ]);
       return {
         fileName: cleanExcelMetaCell(
           map["文件名"] != null
@@ -356,6 +438,8 @@ function normalizeBatchXlsxRows(rows) {
             ? map["collection"]
             : ""
         ),
+        aiChapters: parseExcelOptionalBoolean(aiChaptersRaw),
+        originalStatement: parseExcelOptionalBoolean(originalStatementRaw),
         titleByPlatform: { ...titleAlias, ...titleCanonical },
         descByPlatform: { ...descAlias, ...descCanonical },
       };

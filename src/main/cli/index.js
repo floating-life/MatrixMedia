@@ -55,7 +55,14 @@ import {
 } from "../services/publishThrottle.js";
 import { resolvePublishCompletion } from "../../shared/publishResult.js";
 import { CLI_PUBLISH_TIMEOUT_MS } from "../services/upLoad/uploadTimeouts.js";
-import { resolveAccountPublishMode } from "../services/accountPublishSettingsResolver.js";
+import * as accountPublishSettingsResolver from "../services/accountPublishSettingsResolver.js";
+const { resolveAccountPublishMode } = accountPublishSettingsResolver;
+import {
+  resolvePublishExtrasForPlatform,
+  buildPlatformExtrasPatch,
+  formatAiChaptersReceipt,
+  appendPublishReceiptNote,
+} from "../../shared/publishExtras.js";
 import { resolveTaskPartition } from "../services/accountLookup.js";
 import { ensureAccountRecordsMigrated } from "../services/accountMigration.js";
 import { normalizeVideoMetadata } from "../../shared/videoMetadata.js";
@@ -724,6 +731,35 @@ async function runBatchDirPublish(v, cfg) {
     });
     const isDraftRow = effectivePublishMode.publishToDraft === true;
 
+    const rowExplicitAi =
+      row.aiChapters !== null && row.aiChapters !== undefined
+        ? row.aiChapters
+        : v.aiChapters;
+    const rowExplicitOrig =
+      row.originalStatement !== null && row.originalStatement !== undefined
+        ? row.originalStatement
+        : v.originalStatement;
+    const rowExtras =
+      typeof accountPublishSettingsResolver.resolveAccountPublishExtras ===
+      "function"
+        ? accountPublishSettingsResolver.resolveAccountPublishExtras({
+            phone: derivePhoneForRecord(v),
+            pt: v.platform,
+            partition: v.partition,
+            requestAiChapters: rowExplicitAi,
+            requestOriginalStatement: rowExplicitOrig,
+            globalSettings: throttleSettings,
+          })
+        : resolvePublishExtrasForPlatform(v.platform, {
+            explicitAiChapters: rowExplicitAi,
+            explicitOriginalStatement: rowExplicitOrig,
+            globalSettings: throttleSettings,
+          });
+    const rowExtrasPatch = buildPlatformExtrasPatch(v.platform, rowExtras);
+    delete rowPublishOptions.aiChapters;
+    delete rowPublishOptions.originalStatement;
+    Object.assign(rowPublishOptions, rowExtrasPatch);
+
     const rowNowMs = Date.now();
     const rowPlanRes = await planAndReservePublishTimes({
       targets: [
@@ -775,6 +811,7 @@ async function runBatchDirPublish(v, cfg) {
       tags: metadata.tags,
       ...metadata.legacy,
       creativeStatement: cs,
+      ...rowExtrasPatch,
       ...(rowReservationId ? { throttleReservationId: rowReservationId } : {}),
       coverPath,
       ...(coverPathH ? { coverPathH } : {}),
@@ -1003,6 +1040,7 @@ async function runBatchDirPublish(v, cfg) {
         platform: v.platform,
         phone: v.phone || "",
         creativeStatement: cs,
+        ...rowExtrasPatch,
         status: "scheduled",
         scheduled: true,
         id: recordId,
@@ -1034,6 +1072,7 @@ async function runBatchDirPublish(v, cfg) {
         tags: metadata.tags,
         ...metadata.legacy,
         creativeStatement: cs,
+        ...rowExtrasPatch,
         coverPath,
         coverPathH,
         ...(ruled ? { platformRulesApplied: createAppliedRuleSnapshot(ruled) } : {}),
@@ -1149,7 +1188,7 @@ async function runBatchDirPublish(v, cfg) {
       return releaseThrottleReservation(rowReservationId).catch(() => {});
     };
 
-    const updateRecord = (status, message) => {
+    const updateRecord = (status, message, extraFields = {}) => {
       if (!recordId) return;
       try {
         changeData({
@@ -1166,6 +1205,9 @@ async function runBatchDirPublish(v, cfg) {
             publishAbnormalCount: status === "abnormal" ? 1 : 0,
             lastPublishMessage: message || "",
             lastPublishAt: Date.now(),
+            ...(extraFields && typeof extraFields === "object"
+              ? extraFields
+              : {}),
           },
         });
       } catch (e) {
@@ -1191,11 +1233,11 @@ async function runBatchDirPublish(v, cfg) {
 
     const taskResult = await new Promise((resolve) => {
       let settled = false;
-      const finish = (ok, message) => {
+      const finish = (ok, message, extra = {}) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        resolve({ ok, message });
+        resolve({ ok, message, ...extra });
       };
 
       const timer = setTimeout(() => {
@@ -1232,16 +1274,36 @@ async function runBatchDirPublish(v, cfg) {
               payload && payload.ruleAdjustments
             );
             const mergedSummary = formatRuleAdjustmentsSummary(mergedAdj);
+            const aiChaptersStatus =
+              payload && typeof payload.aiChaptersStatus === "string"
+                ? payload.aiChaptersStatus
+                : "";
+            const originalStatementStatus =
+              payload && typeof payload.originalStatementStatus === "string"
+                ? payload.originalStatementStatus
+                : "";
+            const chaptersReceipt =
+              (payload &&
+                typeof payload.aiChaptersReceipt === "string" &&
+                payload.aiChaptersReceipt) ||
+              formatAiChaptersReceipt(aiChaptersStatus);
+            const msgWithChapters = chaptersReceipt
+              ? appendPublishReceiptNote(completion.message, chaptersReceipt)
+              : completion.message;
             const msgWithAdj =
               mergedSummary &&
-              !String(completion.message || "").includes(mergedSummary)
-                ? `${completion.message}（规则调整：${mergedSummary}）`
-                : completion.message;
-            updateRecord(completion.recordStatus, msgWithAdj);
+              !String(msgWithChapters || "").includes(mergedSummary)
+                ? `${msgWithChapters}（规则调整：${mergedSummary}）`
+                : msgWithChapters;
+            const extrasStatusPatch = {
+              ...(aiChaptersStatus ? { aiChaptersStatus } : {}),
+              ...(originalStatementStatus ? { originalStatementStatus } : {}),
+            };
+            updateRecord(completion.recordStatus, msgWithAdj, extrasStatusPatch);
             settleRowLedger(completion.recordStatus, {
               savedAsDraft: completion.savedAsDraft,
             }).finally(() =>
-              finish(completion.exitCode === 0, msgWithAdj)
+              finish(completion.exitCode === 0, msgWithAdj, extrasStatusPatch)
             );
           } else if (channel === "puppeteer-noLogin") {
             if (payload && payload.taskId != null && payload.taskId !== taskId)
@@ -1268,6 +1330,13 @@ async function runBatchDirPublish(v, cfg) {
       platform: v.platform,
       phone: v.phone || "",
       creativeStatement: cs,
+      ...rowExtrasPatch,
+      ...(taskResult.aiChaptersStatus
+        ? { aiChaptersStatus: taskResult.aiChaptersStatus }
+        : {}),
+      ...(taskResult.originalStatementStatus
+        ? { originalStatementStatus: taskResult.originalStatementStatus }
+        : {}),
       ...rowRulePatch,
       status: taskResult.ok ? "success" : "failed",
       message: taskResult.message,
@@ -1445,6 +1514,26 @@ export async function runCliMain(argv = process.argv) {
       requestDraftMode: Boolean(v.draft),
     });
     const isDraftSingle = effectivePublishMode.publishToDraft === true;
+    v.explicitAiChapters = v.aiChapters;
+    v.explicitOriginalStatement = v.originalStatement;
+    const singleExtras =
+      typeof accountPublishSettingsResolver.resolveAccountPublishExtras ===
+      "function"
+        ? accountPublishSettingsResolver.resolveAccountPublishExtras({
+            phone: resolvedPhone,
+            pt: v.platform,
+            partition: resolvedPartition,
+            requestAiChapters: v.explicitAiChapters,
+            requestOriginalStatement: v.explicitOriginalStatement,
+            globalSettings: throttleSettings,
+          })
+        : resolvePublishExtrasForPlatform(v.platform, {
+            explicitAiChapters: v.explicitAiChapters,
+            explicitOriginalStatement: v.explicitOriginalStatement,
+            globalSettings: throttleSettings,
+          });
+    const singleExtrasPatch = buildPlatformExtrasPatch(v.platform, singleExtras);
+    Object.assign(v, singleExtrasPatch);
     const rawCandTitle = sanitizeTitle(v.title) || fileStem(v.file);
     const candTitle =
       applyPlatformPublishRules(v.platform, {
@@ -1569,6 +1658,22 @@ export async function runCliMain(argv = process.argv) {
       throw err;
     }
     const finalCs = result.creativeStatement || v.creativeStatement || "none";
+    const cliExtrasPatch = {
+      ...buildPlatformExtrasPatch(v.platform, {
+        aiChapters:
+          result.aiChapters !== undefined ? result.aiChapters : v.aiChapters,
+        originalStatement:
+          result.originalStatement !== undefined
+            ? result.originalStatement
+            : v.originalStatement,
+      }),
+      ...(result.aiChaptersStatus
+        ? { aiChaptersStatus: result.aiChaptersStatus }
+        : {}),
+      ...(result.originalStatementStatus
+        ? { originalStatementStatus: result.originalStatementStatus }
+        : {}),
+    };
     const cliRulePatch =
       Array.isArray(result.ruleAdjustments) && result.ruleAdjustments.length > 0
         ? {
@@ -1590,6 +1695,7 @@ export async function runCliMain(argv = process.argv) {
             publishAt: result.publishAt ?? null,
             plannedAtMs: result.plannedAtMs ?? null,
             creativeStatement: finalCs,
+            ...cliExtrasPatch,
             ...cliRulePatch,
             ...(result.requestedCreativeStatement !== undefined
               ? { requestedCreativeStatement: result.requestedCreativeStatement }
@@ -1617,6 +1723,7 @@ export async function runCliMain(argv = process.argv) {
             resultStatus: result.status,
             publishMode: result.publishMode,
             creativeStatement: finalCs,
+            ...cliExtrasPatch,
             ...cliRulePatch,
             outcome: result.outcome,
             needsAttention: true,
@@ -1649,6 +1756,7 @@ export async function runCliMain(argv = process.argv) {
             ? { plannedAtMs: result.plannedAtMs }
             : {}),
           creativeStatement: finalCs,
+          ...cliExtrasPatch,
           ...cliRulePatch,
           throttled: Boolean(result.throttled || v.throttled),
           ...(throttleReason ? { throttleReason, reason: throttleReason } : {}),
@@ -1664,6 +1772,7 @@ export async function runCliMain(argv = process.argv) {
           resultStatus: result.status,
           publishMode: result.publishMode,
           creativeStatement: finalCs,
+          ...cliExtrasPatch,
           ...cliRulePatch,
           // 草稿模式的保存结果校验字段（#42），老版本 App 无这两个字段
           ...(result.draftVerified !== undefined

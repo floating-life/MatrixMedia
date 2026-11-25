@@ -49,6 +49,7 @@ module.exports = { changeData, __setStore: setStore };
   const {
     findAccountPublishSettings,
     resolveAccountPublishMode,
+    resolveAccountPublishExtras,
   } = require(resolverBundle);
   const { __setStore } = require(mockUtilsPath);
 
@@ -58,11 +59,20 @@ module.exports = { changeData, __setStore: setStore };
         phone: "13800138000",
         pt: "小红书",
         defaultPublishToDraft: true,
+        aiChapters: false,
+        originalStatement: false,
       },
       {
         phone: "13900139000",
         pt: "抖音",
         defaultPublishToDraft: false,
+        aiChapters: true,
+      },
+      {
+        phone: "13900139000",
+        pt: "视频号",
+        defaultPublishToDraft: false,
+        originalStatement: false,
       },
     ],
   });
@@ -116,6 +126,42 @@ module.exports = { changeData, __setStore: setStore };
   });
   assert.deepStrictEqual(m5, { publishMode: "draft", publishToDraft: true });
 
+  // AI 章节与原创声明解析：请求显式 > 账号设置 > 全局设置 > true；未支持平台忽略
+  const exXhsAcc = resolveAccountPublishExtras({
+    phone: "13800138000",
+    pt: "小红书",
+    globalSettings: { defaultAiChapters: true, defaultOriginalStatement: true },
+  });
+  assert.strictEqual(exXhsAcc.aiChapters, false);
+  assert.strictEqual(exXhsAcc.originalStatement, false);
+
+  const exXhsReq = resolveAccountPublishExtras({
+    phone: "13800138000",
+    pt: "小红书",
+    requestAiChapters: true,
+    requestOriginalStatement: true,
+    globalSettings: { defaultAiChapters: false, defaultOriginalStatement: false },
+  });
+  assert.strictEqual(exXhsReq.aiChapters, true);
+  assert.strictEqual(exXhsReq.originalStatement, true);
+
+  const exSphAcc = resolveAccountPublishExtras({
+    phone: "13900139000",
+    pt: "视频号",
+    globalSettings: { defaultOriginalStatement: true },
+  });
+  assert.strictEqual(exSphAcc.aiChapters, undefined);
+  assert.strictEqual(exSphAcc.originalStatement, false);
+
+  const exBjh = resolveAccountPublishExtras({
+    phone: "13900139000",
+    pt: "百家号",
+    requestAiChapters: true,
+    requestOriginalStatement: true,
+  });
+  assert.strictEqual(exBjh.aiChapters, undefined);
+  assert.strictEqual(exBjh.originalStatement, undefined);
+
   __setStore({});
   const m6 = resolveAccountPublishMode({
     phone: "13800138000",
@@ -123,6 +169,13 @@ module.exports = { changeData, __setStore: setStore };
     requestDraftMode: false,
   });
   assert.deepStrictEqual(m6, { publishMode: "publish", publishToDraft: false });
+
+  const exDefault = resolveAccountPublishExtras({
+    phone: "13800138000",
+    pt: "小红书",
+  });
+  assert.strictEqual(exDefault.aiChapters, true);
+  assert.strictEqual(exDefault.originalStatement, true);
 
   console.log("test-account-publish-settings-resolver passed");
 })().catch((e) => {

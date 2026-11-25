@@ -1,10 +1,27 @@
 "use strict";
 
+import {
+  legacyPhoneGroup,
+  recordAccountKeyOf,
+} from "./accountIdentity.js";
+import {
+  platformSupportsAiChapters,
+  platformSupportsOriginalStatement,
+  resolvePublishExtrasForPlatform,
+} from "./publishExtras.js";
+
 export function normalizeAccountPublishSettings(settings = {}) {
-  return {
+  const out = {
     defaultPublishToDraft: Boolean(settings.defaultPublishToDraft),
     useRealBrowser: Boolean(settings.useRealBrowser),
   };
+  if (typeof settings.aiChapters === "boolean") {
+    out.aiChapters = settings.aiChapters;
+  }
+  if (typeof settings.originalStatement === "boolean") {
+    out.originalStatement = settings.originalStatement;
+  }
+  return out;
 }
 
 export function isDefaultPublishToDraftEnabled(account = {}) {
@@ -22,10 +39,26 @@ export function resolveEffectivePublishMode(requestDraftMode, account = {}) {
   };
 }
 
-import {
-  legacyPhoneGroup,
-  recordAccountKeyOf,
-} from "./accountIdentity.js";
+/**
+ * 结合「单次显式值」+「账号发布设置」+「全局发布设置」算出平台生效的 AI 章节与原创声明开关。
+ * 不支持的平台对应字段返回 undefined。
+ */
+export function resolveEffectiveAccountPublishExtras(
+  pt,
+  {
+    explicitAiChapters,
+    explicitOriginalStatement,
+    account = {},
+    globalSettings = {},
+  } = {}
+) {
+  return resolvePublishExtrasForPlatform(pt, {
+    explicitAiChapters,
+    explicitOriginalStatement,
+    accountSettings: account || {},
+    globalSettings: globalSettings || {},
+  });
+}
 
 export function updateAccountTreePublishSettings(accountTree = {}, patch = {}) {
   const targetPt = String(patch.pt || "");
@@ -38,6 +71,9 @@ export function updateAccountTreePublishSettings(accountTree = {}, patch = {}) {
     ? String(patch.accountKey)
     : legacyPhoneGroup(patch.phone);
   if (!targetKey) return nextTree;
+
+  const supportsAi = platformSupportsAiChapters(targetPt);
+  const supportsOriginal = platformSupportsOriginalStatement(targetPt);
 
   Object.keys(nextTree).forEach((phoneKey) => {
     const group = nextTree[phoneKey];
@@ -54,6 +90,12 @@ export function updateAccountTreePublishSettings(accountTree = {}, patch = {}) {
         child.meta.defaultPublishToDraft = Boolean(patch.defaultPublishToDraft);
         if (typeof patch.useRealBrowser === "boolean") {
           child.meta.useRealBrowser = patch.useRealBrowser;
+        }
+        if (supportsAi && typeof patch.aiChapters === "boolean") {
+          child.meta.aiChapters = patch.aiChapters;
+        }
+        if (supportsOriginal && typeof patch.originalStatement === "boolean") {
+          child.meta.originalStatement = patch.originalStatement;
         }
       }
     });

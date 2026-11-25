@@ -28,6 +28,14 @@ import {
   normalizePlatformTextMap,
   resolvePlatformOverrideValue,
 } from "../../shared/platformRules.js";
+import {
+  DEFAULT_AI_CHAPTERS,
+  DEFAULT_ORIGINAL_STATEMENT,
+  platformSupportsAiChapters,
+  platformSupportsOriginalStatement,
+  parsePublishExtraBoolean,
+  resolvePublishExtrasForPlatform,
+} from "../../shared/publishExtras.js";
 
 export { PLATFORM_ALIASES, VIDEO_PUBLISH_CANONICAL, resolvePublishPlatform };
 
@@ -94,6 +102,39 @@ const PUBLISH_BOOLEAN_SWITCHES = Object.freeze({
   "--dySyncToutiao": (out) => {
     out.dySyncToutiao = true;
   },
+  "--ai-chapters": (out) => {
+    out.aiChapters = true;
+  },
+  "--aiChapters": (out) => {
+    out.aiChapters = true;
+  },
+  "--no-ai-chapters": (out) => {
+    out.aiChapters = false;
+  },
+  "--noAiChapters": (out) => {
+    out.aiChapters = false;
+  },
+  "--original": (out) => {
+    out.originalStatement = true;
+  },
+  "--original-statement": (out) => {
+    out.originalStatement = true;
+  },
+  "--originalStatement": (out) => {
+    out.originalStatement = true;
+  },
+  "--no-original": (out) => {
+    out.originalStatement = false;
+  },
+  "--no-original-statement": (out) => {
+    out.originalStatement = false;
+  },
+  "--noOriginal": (out) => {
+    out.originalStatement = false;
+  },
+  "--noOriginalStatement": (out) => {
+    out.originalStatement = false;
+  },
 });
 
 export const KNOWN_PUBLISH_SWITCHES = new Set(
@@ -154,6 +195,8 @@ export function parsePublishArgs(subArgv) {
     cover: null,
     coverPathH: null,
     creativeStatement: null,
+    aiChapters: null,
+    originalStatement: null,
     draft: false,
     allowDuplicate: false,
     noThrottle: false,
@@ -609,6 +652,14 @@ export function parsePublishArgs(subArgv) {
     out.collection = "";
   }
 
+  // AI 自动章节（仅抖音 / 快手 / 小红书生效）与原创声明（仅小红书 / 视频号生效）：非支持平台忽略
+  if (!platformSupportsAiChapters(out.platform)) {
+    out.aiChapters = null;
+  }
+  if (!platformSupportsOriginalStatement(out.platform)) {
+    out.originalStatement = null;
+  }
+
   return { ok: true, value: out };
 }
 
@@ -766,7 +817,149 @@ export function publishBodyToArgv(body) {
     argv.push("--dy-sync-toutiao");
   }
 
+  const explicitAiChapters = extractExplicitHttpPublishExtra(
+    body,
+    resolvedBodyPt,
+    body,
+    AI_CHAPTERS_BODY_KEYS
+  );
+  if (explicitAiChapters.specified && explicitAiChapters.valid) {
+    argv.push(explicitAiChapters.value ? "--ai-chapters" : "--no-ai-chapters");
+  }
+  const explicitOriginal = extractExplicitHttpPublishExtra(
+    body,
+    resolvedBodyPt,
+    body,
+    ORIGINAL_STATEMENT_BODY_KEYS
+  );
+  if (explicitOriginal.specified && explicitOriginal.valid) {
+    argv.push(explicitOriginal.value ? "--original" : "--no-original");
+  }
+
   return argv;
+}
+
+const AI_CHAPTERS_BODY_KEYS = ["aiChapters", "ai-chapters"];
+const ORIGINAL_STATEMENT_BODY_KEYS = [
+  "originalStatement",
+  "original-statement",
+  "original",
+];
+
+function pickExtraValueFromObject(obj, keys) {
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
+    return { specified: false, valid: true, value: null };
+  }
+  for (const key of keys) {
+    if (hasOwnKey(obj, key)) {
+      const parsed = parsePublishExtraBoolean(obj[key]);
+      if (parsed.specified) return parsed;
+    }
+  }
+  return { specified: false, valid: true, value: null };
+}
+
+function pickExtraValueFromPlatformOptions(platformOptions, platformPt, keys) {
+  if (
+    !platformOptions ||
+    typeof platformOptions !== "object" ||
+    Array.isArray(platformOptions) ||
+    !platformPt
+  ) {
+    return { specified: false, valid: true, value: null };
+  }
+  const canonical = resolvePublishPlatform(platformPt);
+  const candidateKeys = new Set([platformPt, canonical]);
+  for (const [alias, targetPt] of Object.entries(PLATFORM_ALIASES)) {
+    if (targetPt === canonical) candidateKeys.add(alias);
+  }
+  for (const [optKey, optVal] of Object.entries(platformOptions)) {
+    if (
+      !optVal ||
+      typeof optVal !== "object" ||
+      Array.isArray(optVal)
+    ) {
+      continue;
+    }
+    if (
+      candidateKeys.has(optKey) ||
+      candidateKeys.has(String(optKey).toLowerCase()) ||
+      resolvePublishPlatform(optKey) === canonical
+    ) {
+      const hit = pickExtraValueFromObject(optVal, keys);
+      if (hit.specified) return hit;
+    }
+  }
+  return { specified: false, valid: true, value: null };
+}
+
+function extractExplicitHttpPublishExtra(body, platformPt, target, keys) {
+  const rootBody = body && typeof body === "object" ? body : {};
+  const tgt = target && typeof target === "object" ? target : {};
+  if (tgt !== rootBody) {
+    const fromTarget = pickExtraValueFromObject(tgt, keys);
+    if (fromTarget.specified) return fromTarget;
+    const fromTargetPlat = pickExtraValueFromPlatformOptions(
+      tgt.platformOptions,
+      platformPt,
+      keys
+    );
+    if (fromTargetPlat.specified) return fromTargetPlat;
+  }
+  const fromRootPlat = pickExtraValueFromPlatformOptions(
+    rootBody.platformOptions,
+    platformPt,
+    keys
+  );
+  if (fromRootPlat.specified) return fromRootPlat;
+  return pickExtraValueFromObject(rootBody, keys);
+}
+
+function validateHttpPublishExtrasInput(obj) {
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return "";
+  for (const key of AI_CHAPTERS_BODY_KEYS) {
+    if (hasOwnKey(obj, key)) {
+      const parsed = parsePublishExtraBoolean(obj[key]);
+      if (parsed.specified && !parsed.valid) {
+        return `${key} 必须是布尔值（true/false 或 是/否）`;
+      }
+    }
+  }
+  for (const key of ORIGINAL_STATEMENT_BODY_KEYS) {
+    if (hasOwnKey(obj, key)) {
+      const parsed = parsePublishExtraBoolean(obj[key]);
+      if (parsed.specified && !parsed.valid) {
+        return `${key} 必须是布尔值（true/false 或 是/否）`;
+      }
+    }
+  }
+  if (
+    hasOwnKey(obj, "platformOptions") &&
+    obj.platformOptions &&
+    typeof obj.platformOptions === "object" &&
+    !Array.isArray(obj.platformOptions)
+  ) {
+    for (const [ptKey, opts] of Object.entries(obj.platformOptions)) {
+      if (!opts || typeof opts !== "object" || Array.isArray(opts)) continue;
+      for (const key of AI_CHAPTERS_BODY_KEYS) {
+        if (hasOwnKey(opts, key)) {
+          const parsed = parsePublishExtraBoolean(opts[key]);
+          if (parsed.specified && !parsed.valid) {
+            return `platformOptions.${ptKey}.${key} 必须是布尔值（true/false 或 是/否）`;
+          }
+        }
+      }
+      for (const key of ORIGINAL_STATEMENT_BODY_KEYS) {
+        if (hasOwnKey(opts, key)) {
+          const parsed = parsePublishExtraBoolean(opts[key]);
+          if (parsed.specified && !parsed.valid) {
+            return `platformOptions.${ptKey}.${key} 必须是布尔值（true/false 或 是/否）`;
+          }
+        }
+      }
+    }
+  }
+  return "";
 }
 
 function validateHttpPlatformTextMaps(obj) {
@@ -800,6 +993,8 @@ export function parsePublishRequest(body) {
   if (mapErr) return { ok: false, error: mapErr };
   const err = validateHttpCollectionInput(body);
   if (err) return { ok: false, error: err };
+  const extrasErr = validateHttpPublishExtrasInput(body);
+  if (extrasErr) return { ok: false, error: extrasErr };
   const parsed = parsePublishArgs(publishBodyToArgv(body));
   if (!parsed.ok) return parsed;
   return {
@@ -835,6 +1030,11 @@ const SHARED_PUBLISH_BODY_KEYS = [
   "creativeStatement",
   "creative-statement",
   "cs",
+  "aiChapters",
+  "ai-chapters",
+  "originalStatement",
+  "original-statement",
+  "original",
   "cover",
   "coverPath",
   "cover-path",
@@ -1116,13 +1316,88 @@ function applyHttpCollection(body, parsedValue, target = {}) {
   };
 }
 
+/**
+ * HTTP AI 自动章节与原创声明解析（与创作声明完全独立）：
+ * 优先级：target 显式值 > target.platformOptions[平台] > body.platformOptions[平台] > body 显式值 >
+ *        账号发布设置（accountSettings）> 全局发布设置（defaultAiChapters/defaultOriginalStatement）> true。
+ * 不支持的平台对应字段返回 undefined（忽略）。
+ */
+export function resolveHttpPublishExtras(
+  body,
+  platformPt,
+  target,
+  options = {}
+) {
+  const explicitAi = extractExplicitHttpPublishExtra(
+    body,
+    platformPt,
+    target,
+    AI_CHAPTERS_BODY_KEYS
+  );
+  const explicitOrig = extractExplicitHttpPublishExtra(
+    body,
+    platformPt,
+    target,
+    ORIGINAL_STATEMENT_BODY_KEYS
+  );
+  const accountSettings =
+    options && typeof options.resolveAccountSettings === "function"
+      ? options.resolveAccountSettings({
+          phone:
+            options.phone ||
+            (target && target.phone) ||
+            (body && body.phone) ||
+            "",
+          pt: platformPt,
+          partition:
+            options.partition ||
+            (target && target.partition) ||
+            (body && body.partition) ||
+            "",
+        })
+      : (options && options.accountSettings) || {};
+  const globalSettings = {
+    defaultAiChapters:
+      options && options.defaultAiChapters !== undefined
+        ? options.defaultAiChapters
+        : options && options.globalSettings
+        ? options.globalSettings.defaultAiChapters
+        : DEFAULT_AI_CHAPTERS,
+    defaultOriginalStatement:
+      options && options.defaultOriginalStatement !== undefined
+        ? options.defaultOriginalStatement
+        : options && options.globalSettings
+        ? options.globalSettings.defaultOriginalStatement
+        : DEFAULT_ORIGINAL_STATEMENT,
+  };
+  const resolved = resolvePublishExtrasForPlatform(platformPt, {
+    explicitAiChapters: explicitAi.specified ? explicitAi.value : undefined,
+    explicitOriginalStatement: explicitOrig.specified
+      ? explicitOrig.value
+      : undefined,
+    accountSettings,
+    globalSettings,
+  });
+  return {
+    ...resolved,
+    explicitAiChapters:
+      resolved.aiChaptersSupported && explicitAi.specified
+        ? explicitAi.value
+        : null,
+    explicitOriginalStatement:
+      resolved.originalStatementSupported && explicitOrig.specified
+        ? explicitOrig.value
+        : null,
+  };
+}
+
 function applyHttpCreativeStatements(
   body,
   parsedValue,
   target = {},
   options = {}
 ) {
-  return applyHttpCollection(
+  const withCollection = applyHttpCollection(
     body,
     {
       ...parsedValue,
@@ -1135,6 +1410,32 @@ function applyHttpCreativeStatements(
     },
     target
   );
+  const resolvedExtras = resolveHttpPublishExtras(
+    body,
+    withCollection.platform,
+    target,
+    {
+      ...options,
+      phone: withCollection.phone,
+      partition: withCollection.partition,
+    }
+  );
+  const next = {
+    ...withCollection,
+    explicitAiChapters: resolvedExtras.explicitAiChapters,
+    explicitOriginalStatement: resolvedExtras.explicitOriginalStatement,
+  };
+  if (resolvedExtras.aiChaptersSupported) {
+    next.aiChapters = resolvedExtras.aiChapters;
+  } else {
+    delete next.aiChapters;
+  }
+  if (resolvedExtras.originalStatementSupported) {
+    next.originalStatement = resolvedExtras.originalStatement;
+  } else {
+    delete next.originalStatement;
+  }
+  return next;
 }
 
 /**
@@ -1155,6 +1456,10 @@ export function parseMultiPublishRequest(body, options = {}) {
   const rootCollectionErr = validateHttpCollectionInput(body);
   if (rootCollectionErr) {
     return { ok: false, error: rootCollectionErr };
+  }
+  const rootExtrasErr = validateHttpPublishExtrasInput(body);
+  if (rootExtrasErr) {
+    return { ok: false, error: rootExtrasErr };
   }
 
   const targets = normalizePublishTargets(body);
@@ -1191,6 +1496,12 @@ export function parseMultiPublishRequest(body, options = {}) {
       const label =
         targets[i].platform != null ? String(targets[i].platform) : `#${i + 1}`;
       return { ok: false, error: `平台 ${label}: ${targetCollectionErr}` };
+    }
+    const targetExtrasErr = validateHttpPublishExtrasInput(targets[i]);
+    if (targetExtrasErr) {
+      const label =
+        targets[i].platform != null ? String(targets[i].platform) : `#${i + 1}`;
+      return { ok: false, error: `平台 ${label}: ${targetExtrasErr}` };
     }
     const merged = mergePublishBody(shared, targets[i]);
     const item = parsePublishRequest(merged);
@@ -1259,10 +1570,14 @@ export function publishHelpText() {
   -p, --platform <id>   平台：dy|抖音、tt|头条、ks|快手、blbl|哔哩哔哩、bjh|百家号、sph|视频号、xhs|小红书、fqsp|番茄视频
   -f, --file <path>     本地视频文件路径，或 http(s) 远程视频 URL（远程会先下载到临时目录，发布结束后自动删除）
       --dir <path>          [batch] video directory path; must be paired with --config
-      --config <path>       [batch] xlsx 声明文件（列：文件名/标题/简介/标签/视频号短标题/封面/横版封面/创作声明/合集，另支持可选分平台列「<平台中文名>标题」「<平台中文名>简介」如 抖音标题、百家号标题、快手简介）
+      --config <path>       [batch] xlsx 声明文件（列：文件名/标题/简介/标签/视频号短标题/封面/横版封面/创作声明/合集/AI章节/原创声明，另支持可选分平台列「<平台中文名>标题」「<平台中文名>简介」如 抖音标题、百家号标题、快手简介；AI章节 与 原创声明 填 是/否，留空按发布设置默认开启）
       --cs, --creative-statement <val>  creative statement value for single-file mode.
                             Valid values: none | ai_generated | fiction | marketing | personal_opinion | repost | self_made_no_repost
                             (self_made_no_repost is blbl-only). Default: configured setting (default ai_generated; unsupported platforms fall back to none).
+      --ai-chapters / --no-ai-chapters  开启/关闭 AI 自动章节（仅抖音/快手/小红书生效，默认按发布设置开启；
+                            其他平台忽略；找不到入口或短视频不支持时告警继续，回执写「章节：已开启/不支持/失败」）
+      --original / --no-original        开启/关闭原创声明（仅小红书/视频号生效，默认按发布设置开启，
+                            与 --creative-statement 独立并存；其他平台忽略；开启时设置失败或无原创资格会中止本条发布）
       --cover <path>    自定义竖版封面图片路径（3:4，抖音/快手/视频号生效；自动归一为 1080×1440 JPEG；
                             视频号仅收 jpg/png）。未传 --cover-h 时，抖音/视频号将基于竖封面自动生成 1440×1080（4:3 居中+模糊背景）横版封面。
                             单文件模式传绝对路径；--dir 批量模式下全局覆盖 xlsx「封面」列，

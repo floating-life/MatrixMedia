@@ -114,6 +114,8 @@ MCP Server 按以下顺序寻找 MatrixMedia：环境变量 `MATRIXMEDIA_BIN`（
 | `cover`             | 否   | 自定义竖版封面图片路径（3:4 最佳；抖音 / 快手 / 视频号；视频号仅收 jpg/png） |
 | `coverPathH`        | 否   | 自定义横版封面(4:3)路径（仅抖音 / 视频号生效；居中裁切为 1440×1080 JPEG；未传但有 `cover` 时自动由竖封面居中+模糊补边生成 4:3） |
 | `creativeStatement` | 否   | 创作声明 / 视频号视频标注                                     |
+| `aiChapters`        | 否   | 布尔值；AI 自动章节开关（仅 `dy` / `ks` / `xhs` 生效，其他平台忽略；未传时按发布设置默认开启；透传 `--ai-chapters` / `--no-ai-chapters`；不支持或重试后失败不中止发布，回执附带「`章节：已开启/不支持/失败`」） |
+| `originalStatement` | 否   | 布尔值；原创声明开关（仅 `xhs` / `sph` 生效，其他平台忽略；与 `creativeStatement` 独立并存；未传时按发布设置默认开启；透传 `--original` / `--no-original`；开启时失败或无原创资格中止本条发布） |
 | `sphProductId`      | 否   | 视频号商品上架编号（推荐） |
 | `sphDramaId`        | 否   | 视频号小程序短剧挂载（**短剧名称**，如 `泳陷错恋`）                          |
 | `sphSeriesId`       | 否   | 视频号剧集挂载（**剧集名称**，视频号原生剧集）                          |

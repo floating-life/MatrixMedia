@@ -78,6 +78,28 @@
         </span>
       </el-form-item>
 
+      <el-form-item label="默认 AI 自动章节">
+        <el-switch
+          v-model="form.defaultAiChapters"
+          active-text="开启（默认）"
+          inactive-text="关闭"
+        />
+        <span class="field-hint">
+          仅抖音 / 快手 / 小红书生效，账号发布设置或单条发布可覆盖；短视频不支持时告警继续，不中止发布
+        </span>
+      </el-form-item>
+
+      <el-form-item label="默认原创声明">
+        <el-switch
+          v-model="form.defaultOriginalStatement"
+          active-text="开启（默认）"
+          inactive-text="关闭"
+        />
+        <span class="field-hint">
+          仅小红书 / 视频号生效，与创作声明独立并存；无原创资格的账号可在对应账号的「发布设置」里单独关闭
+        </span>
+      </el-form-item>
+
       <el-form-item label="各平台节流与错峰">
         <el-table :data="platformRows" border size="mini" class="platform-table">
           <el-table-column prop="platform" label="平台" width="110">

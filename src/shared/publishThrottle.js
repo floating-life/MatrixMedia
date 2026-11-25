@@ -30,6 +30,8 @@ const PREVIEW_BASE_MAX_AGE_MS = 10 * 60 * 1000;
 const GUI_DRIFT_TIME_TOLERANCE_MS = 60 * 1000;
 
 const DEFAULT_CREATIVE_STATEMENT_VALUE = "ai_generated";
+const DEFAULT_AI_CHAPTERS = true;
+const DEFAULT_ORIGINAL_STATEMENT = true;
 
 const VALID_CREATIVE_STATEMENT_VALUES = new Set([
   "none",
@@ -116,6 +118,8 @@ function createDefaultPublishThrottleSettings() {
       end: DEFAULT_ALLOWED_WINDOW.end,
     },
     defaultCreativeStatement: DEFAULT_CREATIVE_STATEMENT_VALUE,
+    defaultAiChapters: DEFAULT_AI_CHAPTERS,
+    defaultOriginalStatement: DEFAULT_ORIGINAL_STATEMENT,
     platforms: createDefaultPlatformRules(),
   };
 }
@@ -324,6 +328,14 @@ function normalizePublishThrottleSettings(raw) {
     raw.defaultCreativeStatement,
     defaults.defaultCreativeStatement
   );
+  const defaultAiChapters =
+    typeof raw.defaultAiChapters === "boolean"
+      ? raw.defaultAiChapters
+      : defaults.defaultAiChapters;
+  const defaultOriginalStatement =
+    typeof raw.defaultOriginalStatement === "boolean"
+      ? raw.defaultOriginalStatement
+      : defaults.defaultOriginalStatement;
 
   const platforms = createDefaultPlatformRules();
   const rawPlatforms =
@@ -360,6 +372,8 @@ function normalizePublishThrottleSettings(raw) {
     enabled,
     allowedWindow,
     defaultCreativeStatement,
+    defaultAiChapters,
+    defaultOriginalStatement,
     platforms,
   };
 }
@@ -396,6 +410,18 @@ function validatePublishThrottleSettings(raw) {
     ) {
       return { ok: false, error: `不支持的默认创作声明：${s}` };
     }
+  }
+  if (
+    raw.defaultAiChapters !== undefined &&
+    typeof raw.defaultAiChapters !== "boolean"
+  ) {
+    return { ok: false, error: "默认 AI 自动章节开关必须为布尔值" };
+  }
+  if (
+    raw.defaultOriginalStatement !== undefined &&
+    typeof raw.defaultOriginalStatement !== "boolean"
+  ) {
+    return { ok: false, error: "默认原创声明开关必须为布尔值" };
   }
   if (raw.platforms && typeof raw.platforms === "object") {
     for (const [k, v] of Object.entries(raw.platforms)) {
@@ -1235,6 +1261,8 @@ module.exports = {
   PREVIEW_BASE_MAX_AGE_MS,
   GUI_DRIFT_TIME_TOLERANCE_MS,
   DEFAULT_CREATIVE_STATEMENT_VALUE,
+  DEFAULT_AI_CHAPTERS,
+  DEFAULT_ORIGINAL_STATEMENT,
   THROTTLE_PLATFORMS,
   DEFAULT_ALLOWED_WINDOW,
   DEFAULT_THROTTLE_SETTINGS,

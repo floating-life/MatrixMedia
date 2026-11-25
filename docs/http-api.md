@@ -146,6 +146,8 @@
 | `platformOptions`    | 否     | 平台专属参数容器；视频号商品可用 `platformOptions.sph.link`，各平台合集亦可用 `platformOptions.<dy\|ks\|sph>.collection` 覆盖 |
 | `creativeStatement`  | 否     | 全局创作声明，等同 GUI「批量设置创作声明」；未传时套用发布设置里的默认声明（出厂默认 `ai_generated`，可在 GUI「发布节流设置」修改为 `none` 等）；支持 value、中文 label 或平台页面原文案（如 `内容由AI生成`） |
 | `creativeStatements` | 否     | 按平台覆盖声明，key 用 code 或中文名，如 `{ "dy": "ai_generated", "blbl": "fiction" }`；某平台不支持所选值时回退 `none`                  |
+| `aiChapters`         | 否     | **AI 自动章节**开关（布尔或 `是`/`否`，仅抖音 / 快手 / 小红书生效，其他平台忽略）；未传时按账号发布设置 → 全局发布设置 → 默认开启（`true`）；支持 `platforms[].aiChapters` 或 `platformOptions.<dy\|ks\|xhs>.aiChapters` 按平台覆盖。短视频不支持或点选重试失败时告警继续，回执写「`章节：已开启`/`不支持`/`失败`」 |
+| `originalStatement`  | 否     | **原创声明**开关（布尔或 `是`/`否`，别名 `original`，仅小红书 / 视频号生效，其他平台忽略；与 `creativeStatement` 独立并存）；未传时按账号发布设置 → 全局发布设置 → 默认开启（`true`）；支持 `platforms[].originalStatement` 或 `platformOptions.<xhs\|sph>.originalStatement` 按平台覆盖。开启时设置失败或账号无原创资格（报错含「`账号无原创资格，可在发布设置关闭原创声明`」）会中止该平台本条发布 |
 | `allowDuplicate`     | 否     | 默认 `false`；7 天内同平台+同账号+清洗后同标题已有成功/进行中记录时默认拦截，传 `true` 才放行（亦可在多平台 `platforms[]` 子对象内按平台单独指定） |
 | `noThrottle`         | 否     | 默认 `false`；开启发布节流时同账号间隔不足、超出允许发布时段（默认 06:00–23:30 UTC+8）、达当日上限或配置了平台错峰延迟会自动顺延为定时任务（显式 `publishAt` 同样只顺延不提前），传 `true` 可绕过（支持顶层或 `platforms[]` 单平台覆盖） |
 
@@ -169,6 +171,8 @@
 | `duplicate`                      | 触发 7 天内重复发布拦截时为 `true`                   |
 | `lastPublishAt` / `lastPublishAtText` | 触发重复发布拦截时返回上次匹配记录的时间戳（ms）与 UTC+8 时间文本 |
 | `creativeStatement`              | 单平台响应写出最终生效的创作声明（多平台写在每个 `results[]` 条目中） |
+| `aiChapters` / `aiChaptersStatus` | 受支持平台（抖音 / 快手 / 小红书）返回生效开关与执行状态（`enabled` / `unsupported` / `failed`），`message` 同步附带「`章节：已开启/不支持/失败`」 |
+| `originalStatement` / `originalStatementStatus` | 受支持平台（小红书 / 视频号）返回生效开关与执行状态（`enabled` / `failed` / `no_qualification`），与 `creativeStatement` 独立存储展示 |
 | `ruleAdjustments` / `ruleAdjustmentsSummary` | 触发平台字数截断或标签裁剪时返回结构化明细数组（平台、字段、原长→新长、前后预览或移除标签）与可读摘要（未触发时不返回） |
 | `throttled` / `throttleReason` / `reason` / `reasons` | 触发节流顺延为定时任务时返回 `throttled: true`、顺延原因文案及结构化原因数组 `reasons` |
 | `message`                        | 结果说明（重复拦截时含上次发布时间；节流排期时含计划时间与原因） |

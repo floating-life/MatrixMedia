@@ -125,6 +125,8 @@ matrixmedia.exe cli publish -p dy --phone 13800138000 -f C:\video.mp4 -t "标题
 | `--allow-duplicate`        | 允许重复发布；默认同平台+同账号+清洗归一后同标题在 7 天内已有成功/进行中记录时拒绝并返回退出码 `6`（`status: "duplicate"`，message 含上次时间），显式传本参数才放行 |
 | `--no-throttle`            | 绕过发布节流与错峰排期；默认与 GUI / HTTP 共用主进程持久化节流配置（同账号最小间隔 抖音 6h/其余 4h、每日上限 3 条、允许时段 06:00–23:30 UTC+8、平台相对首发延迟默认 0 / 百家号可设 10h），超限时自动转为定时任务并返回 `status: "scheduled"`、`publishAt` 与原因（显式 `--publish-at` 同样只顺延不提前），传 `--no-throttle` 可跳过 |
 | `--cs` / `--creative-statement` | 创作声明（`none` / `ai_generated` / `fiction` / `marketing` / `personal_opinion` / `repost` / `self_shot` / `self_made_no_repost`）；省略时套用发布设置里的默认声明（出厂默认 `ai_generated`，平台不支持时回退 `none`），JSON 输出会返回最终生效的 `creativeStatement` |
+| `--ai-chapters` / `--no-ai-chapters` | 开启 / 关闭 **AI 自动章节**（仅抖音 / 快手 / 小红书生效，其他平台忽略）；未传时按账号发布设置 → 全局发布设置 → 默认开启（`true`）。短视频不支持或找不到入口时告警继续，回执写「`章节：不支持`」；点选后回读未选中重试一次，仍失败告警继续并写「`章节：失败`」；成功写「`章节：已开启`」。批量目录 xlsx 支持可选列 `AI章节`（填 `是`/`否`，留空按默认） |
+| `--original` / `--no-original` | 开启 / 关闭 **原创声明**（仅小红书 / 视频号生效，其他平台忽略；与 `--creative-statement` 独立并存、互不覆盖）；未传时按账号发布设置 → 全局发布设置 → 默认开启（`true`）。开启时若勾选/确认弹窗失败或账号无原创资格（页面提示无资格/入口置灰），会中止本平台本条发布（退出码 `3`，无资格提示含「`账号无原创资格，可在发布设置关闭原创声明`」）。批量目录 xlsx 支持可选列 `原创声明`（填 `是`/`否`，留空按默认） |
 
 完整说明请执行：
 
@@ -198,6 +200,10 @@ electron . cli publish -p dy --phone 13800138000 -f /path/to/video.mp4 -t "新�
 
 # 绕过节流并显式关闭创作声明
 electron . cli publish -p dy --phone 13800138000 -f /path/to/video.mp4 -t "紧急视频" --no-throttle --cs none
+
+# 抖音关闭 AI 自动章节 / 视频号关闭原创声明（无原创资格账号）
+electron . cli publish -p dy --phone 13800138000 -f /path/to/video.mp4 -t "短视频" --no-ai-chapters
+electron . cli publish -p sph --phone 13800138000 -f /path/to/video.mp4 -t "普通视频" --no-original
 ```
 7. **Linux 打包**：使用 `yarn build:linux` 生成 AppImage（需在本机构建环境安装相应依赖）。
 

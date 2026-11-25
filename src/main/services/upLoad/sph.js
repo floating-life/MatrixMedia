@@ -8,11 +8,22 @@ import { resolveVideoLinkOption } from "../../../shared/videoLink.js";
 import {
   SPH_DRAFT_BUTTON_SELECTOR,
   SPH_PUBLISH_BUTTON_SELECTOR,
+  ALL_PLATFORM_SUBMIT_SELECTORS,
 } from "../../../shared/collectionShared.js";
 import {
   isCreativeStatementNone,
   resolveSphCreativeStatementLabel,
 } from "../../../shared/creativeStatement.js";
+import {
+  isOriginalStatementRequested,
+  createNoOriginalQualificationError,
+  createOriginalStatementError,
+} from "../../../shared/publishExtras.js";
+import {
+  executeOriginalStatementFlow,
+  runOriginalStatementDomAction,
+  dumpExtrasDiagnostics,
+} from "../../../shared/publishExtrasDom.js";
 import { attachSphVideoLink } from "./sphLink.js";
 import { selectPlatformCollection } from "./collection.js";
 
@@ -96,73 +107,192 @@ async function clickSphShadow(
 }
 
 /**
- * 声明原创：部分账号/版本无入口或已默认处理，失败不影响后续发布。
+ * 视频号发布页「原创声明」选择器与候选文案集中配置（wujie shadowRoot 内执行）。
+ * 主选择器沿用真机验证的 .declare-original-checkbox / .weui-desktop-dialog / .declare-original-dialog；
+ * 兜底候选文案与无资格提示匹配【未经真机校准，待真机存草稿核对】。
+ *
+ * 策略（S18）：
+ * - originalStatement=false 或未请求时，完全不触碰原创声明入口。
+ * - originalStatement=true 时，必须勾选并走完确认弹窗且回读选中；
+ *   任何失败或账号无原创资格（页面提示无资格/入口置灰）均中止本条视频号发布，不点发表/保存草稿。
  */
-async function tryDeclareOriginal(page) {
-  let clicked = false;
-  try {
-    clicked = await clickSphShadow(page, ".declare-original-checkbox .ant-checkbox-wrapper", {
-      timeout: 3000,
-    });
-  } catch (_) {
-    clicked = false;
-  }
-  if (!clicked) {
-    console.log("声明原创：未找到勾选入口，跳过");
-    return;
-  }
+export const SPH_ORIGINAL_STATEMENT_SELECTORS = Object.freeze({
+  wujieHost: "wujie-app.wujie_iframe",
+  entrySelectors: [
+    ".declare-original-checkbox .ant-checkbox-wrapper",
+    ".declare-original-checkbox input[type='checkbox']",
+    ".declare-original-checkbox",
+  ],
+  entryContainerSelectors: [
+    ".declare-original-checkbox",
+    "[class*='declare-original']",
+    "[class*='original']",
+  ],
+  entryKeywords: ["声明原创", "原创声明", "原创"],
+  toggleSelectors: [
+    ".ant-checkbox-wrapper",
+    ".ant-switch",
+    "[role='checkbox']",
+    "[role='switch']",
+    "input[type='checkbox']",
+    "label",
+  ],
+  dialogSelectors: [
+    ".declare-original-dialog .weui-desktop-dialog",
+    ".declare-original-dialog",
+    ".weui-desktop-dialog",
+    "[role='dialog']",
+  ],
+  dialogKeywords: ["声明原创", "原创声明", "原创", "原创权益", "协议", "条款"],
+  ignoreDialogPatterns: ["将此次编辑保留", "编辑封面", "更换封面"],
+  agreementSelectors: [
+    ".weui-desktop-dialog__bd .protocol-text",
+    ".protocol-text",
+    "label.ant-checkbox-wrapper",
+    "input[type='checkbox']",
+    "[role='checkbox']",
+    "label",
+  ],
+  agreementKeywords: ["我已阅读并同意", "阅读并同意", "同意", "协议", "条款", "须知"],
+  confirmButtonSelectors: [
+    "button.weui-desktop-btn_primary",
+    "button",
+    "[role='button']",
+  ],
+  confirmButtonTexts: ["声明原创", "确认声明", "同意并声明", "确定", "确认"],
+  noQualificationPatterns: [
+    "无原创资格",
+    "暂无原创资格",
+    "未开通原创",
+    "不满足原创",
+    "不符合原创",
+    "暂不支持原创",
+    "无资格",
+    "无法声明原创",
+    "暂无权限",
+    "暂未开放",
+    "条件未满足",
+    "未满足条件",
+    "未达到原创",
+    "粉丝数不足",
+  ],
+  submitSelectors: ALL_PLATFORM_SUBMIT_SELECTORS,
+  submitTexts: [
+    "发布",
+    "发表",
+    "立即发布",
+    "定时发布",
+    "存草稿",
+    "保存草稿",
+    "暂存离开",
+    "保存",
+    "取消",
+    "取消发布",
+    "确认发布",
+  ],
+  dispatchMouseEvents: false,
+  diagSelectors: [
+    ".declare-original-checkbox",
+    ".declare-original-dialog",
+    ".post-with-mark-tag",
+    ".weui-desktop-dialog",
+  ],
+  diagKeywords: ["声明原创", "原创", "视频标注", "无资格", "未开通"],
+});
 
-  try {
-    await clickSphShadow(
-      page,
-      ".weui-desktop-dialog__bd .protocol-text",
-      { timeout: 2500 }
-    );
-    await page.waitForTimeout(300);
-    const confirmed = await page.evaluate(() => {
-      const app = document.querySelector("wujie-app.wujie_iframe");
-      if (!app || !app.shadowRoot) return false;
-      const bodies = app.shadowRoot.querySelectorAll(
-        ".weui-desktop-dialog__bd"
+export async function applySphOriginalStatement(
+  page,
+  { data, window, timeouts } = {}
+) {
+  return executeOriginalStatementFlow(page, {
+    platformTag: "sph",
+    platformLabel: "视频号",
+    cfg: SPH_ORIGINAL_STATEMENT_SELECTORS,
+    data,
+    window,
+    captureScreenshot: capturePublishFailureScreenshot,
+    timeouts,
+  });
+}
+
+/**
+ * 统一复核视频号「视频标注（creativeStatement）」与「原创声明（originalStatement）」：
+ * 确保二者互不覆盖、确认弹窗已完全关闭；若视频标注被重置则补选一次并复核原创仍在勾选态。
+ */
+export async function verifySphDeclarations(
+  page,
+  { creativeStatement, originalStatement, data, window } = {}
+) {
+  const label = !isCreativeStatementNone(creativeStatement)
+    ? resolveSphCreativeStatementLabel(creativeStatement)
+    : "";
+  const wantCreative = Boolean(label && label !== "无标注" && label !== "无需标注");
+  if (wantCreative) {
+    const currentDisplay = await page
+      .evaluate(
+        "(function(){" +
+          "var app=document.querySelector('wujie-app.wujie_iframe');" +
+          "var root=app&&app.shadowRoot;" +
+          "if(!root)return '';" +
+          "var el=root.querySelector('.post-with-mark-tag .select-display');" +
+          "return el?String(el.textContent||'').replace(/\\s+/g,'').trim():'';" +
+          "})()"
+      )
+      .catch(() => "");
+    if (!currentDisplay || currentDisplay.indexOf(label.replace(/\s+/g, "")) === -1) {
+      console.warn(
+        `[sph][verify] 联合复核发现视频标注「${label}」未保持（当前=${currentDisplay || "空"}），尝试补选一次`
       );
-      for (const body of bodies) {
-        const dlg = body.closest(".weui-desktop-dialog") || body.parentElement;
-        const btns = (dlg || body).querySelectorAll(
-          "button.weui-desktop-btn_primary"
-        );
-        for (const btn of btns) {
-          if (
-            String(btn.textContent || "")
-              .trim()
-              .includes("声明原创")
-          ) {
-            btn.click();
-            return true;
-          }
-        }
+      try {
+        await applySphCreativeStatement(page, creativeStatement);
+      } catch (e) {
+        console.warn("[sph][verify] 补选视频标注异常:", (e && e.message) || e);
       }
-      return false;
-    });
-    if (confirmed) await page.waitForTimeout(800);
-  } catch (_) {
-    /* 非首次账号或协议弹窗未出现 */
+    }
   }
 
-  try {
-    const checked = await clickSphShadow(
-      page,
-      ".declare-original-dialog .weui-desktop-dialog label.ant-checkbox-wrapper",
-      { timeout: 3000 }
-    );
-    if (!checked) throw new Error("未出现");
-    const ok = await clickSphShadow(
-      page,
-      ".declare-original-dialog .weui-desktop-dialog button.weui-desktop-btn_primary",
-      { timeout: 3000 }
-    );
-    if (!ok) throw new Error("未出现");
-  } catch (_) {
-    console.log("声明原创：未出现后续确认框或已完成，跳过");
+  if (originalStatement === true) {
+    const check = await page.evaluate(runOriginalStatementDomAction, {
+      action: "inspect",
+      token: "",
+      cfg: SPH_ORIGINAL_STATEMENT_SELECTORS,
+    });
+    if (check && check.noQualification) {
+      await dumpExtrasDiagnostics(page, {
+        platformTag: "sph",
+        platformLabel: "视频号",
+        featureTag: "original-statement",
+        stage: "unified-verify-no-qual",
+        cfg: SPH_ORIGINAL_STATEMENT_SELECTORS,
+        data,
+        window,
+        captureScreenshot: capturePublishFailureScreenshot,
+      });
+      throw createNoOriginalQualificationError(
+        "视频号",
+        check.noQualificationText || ""
+      );
+    }
+    if (!check || !check.found || check.checked !== true || check.dialogOpen) {
+      await dumpExtrasDiagnostics(page, {
+        platformTag: "sph",
+        platformLabel: "视频号",
+        featureTag: "original-statement",
+        stage: "unified-verify-failed",
+        cfg: SPH_ORIGINAL_STATEMENT_SELECTORS,
+        data,
+        window,
+        captureScreenshot: capturePublishFailureScreenshot,
+      });
+      throw createOriginalStatementError(
+        "视频号",
+        "声明联检",
+        check && check.dialogOpen
+          ? "联合复核时原创声明确认弹窗仍未关闭"
+          : "联合复核时原创声明未处于已勾选状态"
+      );
+    }
+    console.log("[sph][verify] 视频标注与原创声明统一复核通过");
   }
 }
 
@@ -1107,6 +1237,9 @@ export default async function (page, data, window, event, onFinish) {
       }
     }
 
+    // 先等视频上传处理完成，再执行视频标注与原创声明（避免转码中控件置灰误判为无原创资格）
+    await waitSphUploadProcessing(page);
+
     try {
       await applySphCreativeStatement(
         page,
@@ -1119,8 +1252,20 @@ export default async function (page, data, window, event, onFinish) {
       );
     }
 
-    await tryDeclareOriginal(page);
-    await waitSphUploadProcessing(page);
+    // 原创声明（默认开启；关闭时不触碰页面；开启时失败或无资格中止本条发布，不点发表/保存草稿）
+    let originalStatementResult = null;
+    if (isOriginalStatementRequested(data)) {
+      originalStatementResult = await applySphOriginalStatement(page, {
+        data,
+        window,
+      });
+      await verifySphDeclarations(page, {
+        creativeStatement: data.data && data.data.creativeStatement,
+        originalStatement: true,
+        data,
+        window,
+      });
+    }
 
     // 自定义封面（双比例：竖 3:4 + 横 4:3）：
     // - 给了 coverPath：先设竖封面（1080×1440）
@@ -1232,6 +1377,9 @@ export default async function (page, data, window, event, onFinish) {
             };
       }
     }
+    if (originalStatementResult) {
+      extraPayload.originalStatementStatus = originalStatementResult.status;
+    }
     if (sphRuleAdjustments.length > 0) {
       extraPayload.ruleAdjustments = sphRuleAdjustments;
       extraPayload.ruleAdjustmentsSummary = sphAdjSummary;
@@ -1254,18 +1402,20 @@ export default async function (page, data, window, event, onFinish) {
     const detail =
       (err && err.message) || (typeof err === "string" ? err : String(err));
     const isCollectionError = Boolean(err && err.isCollectionError);
+    const isOriginalError = Boolean(err && err.originalStatementError);
     console.error("❌ 视频号发布失败:", err);
-    // 失败瞬间截图留证（登录过期 / 风控弹窗 / 元素改版都能一眼看出）
+    // 失败瞬间截图留证（登录过期 / 风控弹窗 / 元素改版 / 原创声明失败都能一眼看出）
     await replyPublishFailure({
       page,
       data,
       window,
       event,
-      message: isCollectionError
-        ? detail
-        : detail && detail.length > 400
-        ? `${detail.slice(0, 400)}…`
-        : detail || "上传失败",
+      message:
+        isCollectionError || isOriginalError
+          ? detail
+          : detail && detail.length > 400
+          ? `${detail.slice(0, 400)}…`
+          : detail || "上传失败",
       ...(isCollectionError
         ? {
             extraPayload: {
@@ -1274,6 +1424,16 @@ export default async function (page, data, window, event, onFinish) {
               ...(err.failScreenshot
                 ? { failScreenshot: err.failScreenshot }
                 : {}),
+            },
+          }
+        : isOriginalError
+        ? {
+            extraPayload: {
+              originalStatementStatus: err.noOriginalQualification
+                ? "no_qualification"
+                : "failed",
+              outcome: "original_statement_failed",
+              needsAttention: true,
             },
           }
         : {}),

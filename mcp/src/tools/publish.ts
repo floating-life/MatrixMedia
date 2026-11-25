@@ -105,6 +105,16 @@ export const publishVideoTool: Tool = {
         description:
           "Optional creative statement / mark tag. For Shipinhao supports values like none, ai_generated, fiction, or Chinese labels such as 含AI生成内容.",
       },
+      aiChapters: {
+        type: "boolean",
+        description:
+          "Optional AI auto-chapters toggle (effective for Douyin/dy, Kuaishou/ks and Xiaohongshu/xhs only; ignored on other platforms). Defaults to publish settings (enabled by default). When unsupported on short videos or click fails after 1 retry, logs a warning and continues publishing with receipt note 章节：已开启/不支持/失败. Independent of creativeStatement.",
+      },
+      originalStatement: {
+        type: "boolean",
+        description:
+          "Optional original declaration toggle (effective for Xiaohongshu/xhs and Shipinhao/sph only; ignored on other platforms). Defaults to publish settings (enabled by default). Independent of creativeStatement. When enabled, failure to declare original or lack of original qualification aborts the publish for this platform.",
+      },
       cover: {
         type: "string",
         description:
@@ -181,6 +191,12 @@ export async function handlePublishVideo(
   const dySyncToutiao = args.dySyncToutiao === true;
   const creativeStatement =
     args.creativeStatement == null ? "" : String(args.creativeStatement).trim();
+  const aiChapters =
+    typeof args.aiChapters === "boolean" ? args.aiChapters : undefined;
+  const originalStatement =
+    typeof args.originalStatement === "boolean"
+      ? args.originalStatement
+      : undefined;
   const cover = args.cover == null ? "" : String(args.cover).trim();
   const rawCoverH =
     args.coverPathH !== undefined ? args.coverPathH : args.coverH;
@@ -285,6 +301,16 @@ export async function handlePublishVideo(
     ...(noDownload ? ["--no-download"] : []),
     ...(dySyncToutiao ? ["--dy-sync-toutiao"] : []),
     ...(creativeStatement ? ["--creative-statement", creativeStatement] : []),
+    ...(aiChapters === true
+      ? ["--ai-chapters"]
+      : aiChapters === false
+      ? ["--no-ai-chapters"]
+      : []),
+    ...(originalStatement === true
+      ? ["--original"]
+      : originalStatement === false
+      ? ["--no-original"]
+      : []),
     ...(cover ? ["--cover", cover] : []),
     ...(coverPathH ? ["--cover-h", coverPathH] : []),
     ...(titleByPlatform && Object.keys(titleByPlatform).length > 0
@@ -327,6 +353,12 @@ export async function handlePublishVideo(
         ...(lastJson.creativeStatement !== undefined
           ? { creativeStatement: lastJson.creativeStatement }
           : {}),
+        ...(lastJson.aiChapters !== undefined
+          ? { aiChapters: lastJson.aiChapters }
+          : {}),
+        ...(lastJson.originalStatement !== undefined
+          ? { originalStatement: lastJson.originalStatement }
+          : {}),
         ...(lastJson.ruleAdjustments !== undefined
           ? { ruleAdjustments: lastJson.ruleAdjustments }
           : {}),
@@ -351,6 +383,18 @@ export async function handlePublishVideo(
       publishMode: lastJson?.publishMode,
       ...(lastJson?.creativeStatement !== undefined
         ? { creativeStatement: lastJson.creativeStatement }
+        : {}),
+      ...(lastJson?.aiChapters !== undefined
+        ? { aiChapters: lastJson.aiChapters }
+        : {}),
+      ...(lastJson?.aiChaptersStatus !== undefined
+        ? { aiChaptersStatus: lastJson.aiChaptersStatus }
+        : {}),
+      ...(lastJson?.originalStatement !== undefined
+        ? { originalStatement: lastJson.originalStatement }
+        : {}),
+      ...(lastJson?.originalStatementStatus !== undefined
+        ? { originalStatementStatus: lastJson.originalStatementStatus }
         : {}),
       ...(lastJson?.ruleAdjustments !== undefined
         ? { ruleAdjustments: lastJson.ruleAdjustments }
@@ -415,6 +459,18 @@ export async function handlePublishVideo(
       ...(lastJson.creativeStatement !== undefined
         ? { creativeStatement: lastJson.creativeStatement }
         : {}),
+      ...(lastJson.aiChapters !== undefined
+        ? { aiChapters: lastJson.aiChapters }
+        : {}),
+      ...(lastJson.aiChaptersStatus !== undefined
+        ? { aiChaptersStatus: lastJson.aiChaptersStatus }
+        : {}),
+      ...(lastJson.originalStatement !== undefined
+        ? { originalStatement: lastJson.originalStatement }
+        : {}),
+      ...(lastJson.originalStatementStatus !== undefined
+        ? { originalStatementStatus: lastJson.originalStatementStatus }
+        : {}),
       needsAttention: true,
       message:
         (lastJson.message as string) ?? "已转存草稿，请检查视频号链接",
@@ -444,9 +500,15 @@ export async function handlePublishVideo(
   }
 
   if (result.exitCode === 3) {
-    throw new Error(
-      (result.lastJson as any)?.message ?? "发布失败(登录态异常)"
-    );
+    const lastJson =
+      result.lastJson !== null && typeof result.lastJson === "object"
+        ? (result.lastJson as Record<string, unknown>)
+        : null;
+    const errMsg =
+      (typeof lastJson?.message === "string" && lastJson.message.trim()) ||
+      result.stderr.trim() ||
+      "发布失败(登录态异常)";
+    throw new Error(errMsg);
   }
 
   if (result.exitCode === 1) {

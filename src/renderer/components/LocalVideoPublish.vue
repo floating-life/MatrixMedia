@@ -399,12 +399,15 @@
             </div>
             <div
               v-if="
-                platformSupportsCreativeStatement(data.pt) &&
-                isPlatformNodeChecked(data.id)
+                isPlatformNodeChecked(data.id) &&
+                (platformSupportsCreativeStatement(data.pt) ||
+                  platformSupportsAiChapters(data.pt) ||
+                  platformSupportsOriginalStatement(data.pt))
               "
               class="platform-statement-row"
             >
               <el-select
+                v-if="platformSupportsCreativeStatement(data.pt)"
                 :value="getPlatformStatement(data.id)"
                 size="mini"
                 class="platform-statement-select"
@@ -419,6 +422,22 @@
                   :value="opt.value"
                 />
               </el-select>
+              <el-checkbox
+                v-if="platformSupportsAiChapters(data.pt)"
+                :value="getPlatformAiChapters(data)"
+                size="mini"
+                class="platform-extra-checkbox"
+                @input="setPlatformAiChapters(data.id, $event)"
+                >AI章节</el-checkbox
+              >
+              <el-checkbox
+                v-if="platformSupportsOriginalStatement(data.pt)"
+                :value="getPlatformOriginalStatement(data)"
+                size="mini"
+                class="platform-extra-checkbox"
+                @input="setPlatformOriginalStatement(data.id, $event)"
+                >原创声明</el-checkbox
+              >
             </div>
           </template>
         </span>
@@ -676,6 +695,26 @@
             <span v-else class="attrs-unsupported">暂不支持</span>
           </template>
         </el-table-column>
+        <el-table-column label="AI章节" width="90" align="center">
+          <template slot-scope="{ row }">
+            <el-switch
+              v-if="platformSupportsAiChapters(row.pt)"
+              :value="getPlatformAiChapters(row)"
+              @input="setPlatformAiChapters(row.id, $event)"
+            />
+            <span v-else class="attrs-unsupported">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="原创声明" width="90" align="center">
+          <template slot-scope="{ row }">
+            <el-switch
+              v-if="platformSupportsOriginalStatement(row.pt)"
+              :value="getPlatformOriginalStatement(row)"
+              @input="setPlatformOriginalStatement(row.id, $event)"
+            />
+            <span v-else class="attrs-unsupported">—</span>
+          </template>
+        </el-table-column>
       </el-table>
 
       <p v-if="attrsHasProductLink" class="bt2-tip">
@@ -761,7 +800,7 @@
         >
       </div>
       <p class="bt2-tip" style="margin-bottom: 12px">
-        声明文件支持列：文件名 / 标题 / 简介 / 标签 / 视频号短标题 / 封面 / 横版封面（选填，抖音与视频号 4:3 封面；路径无效会阻断发布）/ 合集 / 分平台覆盖列（如「抖音标题」「百家号标题」「百家号简介」「快手简介」，优先于通用标题/简介；百家号无独立标题，总作品描述≤50字）。
+        声明文件支持列：文件名 / 标题 / 简介 / 标签 / 视频号短标题 / 封面 / 横版封面（选填，抖音与视频号 4:3 封面；路径无效会阻断发布）/ 合集 / AI章节（选填，是/否，留空按发布设置默认开启；抖音/快手/小红书生效）/ 原创声明（选填，是/否，留空按发布设置默认开启；小红书/视频号生效）/ 分平台覆盖列（如「抖音标题」「百家号标题」「百家号简介」「快手简介」，优先于通用标题/简介；百家号无独立标题，总作品描述≤50字）。
       </p>
 
       <el-table
@@ -828,6 +867,16 @@
           min-width="120"
           show-overflow-tooltip
         />
+        <el-table-column label="AI章节" width="76">
+          <template slot-scope="{ row }">
+            <span>{{ formatOptionalExtraCell(row.aiChapters) }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="原创声明" width="84">
+          <template slot-scope="{ row }">
+            <span>{{ formatOptionalExtraCell(row.originalStatement) }}</span>
+          </template>
+        </el-table-column>
         <el-table-column label="文件状态" width="80">
           <template slot-scope="{ row }">
             <span
@@ -1023,6 +1072,16 @@ import {
   splitAndSanitizeTags,
 } from "../../shared/textSanitize.js";
 import { parsePublishAtUtc8 } from "../../shared/publishThrottle.js";
+import {
+  DEFAULT_AI_CHAPTERS,
+  DEFAULT_ORIGINAL_STATEMENT,
+  platformSupportsAiChapters,
+  platformSupportsOriginalStatement,
+  resolvePublishExtrasForPlatform,
+  buildPlatformExtrasPatch,
+  readTaskAiChapters,
+  readTaskOriginalStatement,
+} from "../../shared/publishExtras.js";
 import AiGenerateButton from "@/components/ai/AiGenerateButton.vue";
 
 const TITLE_OVERRIDE_PLATFORMS = [
@@ -1243,6 +1302,8 @@ export default {
       bqTags: [],
       bqComposing: false,
       platformStatements: {},
+      platformAiChapters: {},
+      platformOriginalStatements: {},
       platformVideoLinks: {},
       platformCollections: {},
       batchCollection: "",
@@ -1263,6 +1324,8 @@ export default {
       checkAllPlatforms: false,
       checkAllIndeterminate: false,
       defaultCreativeStatement: DEFAULT_PUBLISH_CREATIVE_STATEMENT,
+      defaultAiChapters: DEFAULT_AI_CHAPTERS,
+      defaultOriginalStatement: DEFAULT_ORIGINAL_STATEMENT,
       batchCreativeStatement: DEFAULT_PUBLISH_CREATIVE_STATEMENT,
       throttlePreviewVisible: false,
       throttlePreviewRows: [],
@@ -1457,6 +1520,105 @@ export default {
   },
   methods: {
     platformSupportsCreativeStatement,
+    platformSupportsAiChapters,
+    platformSupportsOriginalStatement,
+    formatOptionalExtraCell(val) {
+      if (val === true) return "是";
+      if (val === false) return "否";
+      return "默认";
+    },
+    resetPlatformExtrasState() {
+      this.platformAiChapters = {};
+      this.platformOriginalStatements = {};
+    },
+    getPlatformAiChapters(node) {
+      if (!node || !platformSupportsAiChapters(node.pt)) return undefined;
+      const map = this.platformAiChapters || {};
+      if (Object.prototype.hasOwnProperty.call(map, node.id)) {
+        return Boolean(map[node.id]);
+      }
+      return resolvePublishExtrasForPlatform(node.pt, {
+        accountSettings: node,
+        globalSettings: { defaultAiChapters: this.defaultAiChapters },
+      }).aiChapters;
+    },
+    setPlatformAiChapters(nodeId, value) {
+      if (!this.platformAiChapters) this.platformAiChapters = {};
+      this.$set(this.platformAiChapters, nodeId, Boolean(value));
+    },
+    getPlatformOriginalStatement(node) {
+      if (!node || !platformSupportsOriginalStatement(node.pt)) {
+        return undefined;
+      }
+      const map = this.platformOriginalStatements || {};
+      if (Object.prototype.hasOwnProperty.call(map, node.id)) {
+        return Boolean(map[node.id]);
+      }
+      return resolvePublishExtrasForPlatform(node.pt, {
+        accountSettings: node,
+        globalSettings: {
+          defaultOriginalStatement: this.defaultOriginalStatement,
+        },
+      }).originalStatement;
+    },
+    setPlatformOriginalStatement(nodeId, value) {
+      if (!this.platformOriginalStatements) {
+        this.platformOriginalStatements = {};
+      }
+      this.$set(this.platformOriginalStatements, nodeId, Boolean(value));
+    },
+    resolvePlatformExtrasForNode(node, rowOverrides = {}) {
+      if (!node || !node.pt) return {};
+      // 兼容 test-dy-ks-link-options.js 的 VM 隔离沙箱（无关 import 会被替成抛错 stub 函数）
+      if (typeof DEFAULT_AI_CHAPTERS !== "boolean") return {};
+      const aiMap = this.platformAiChapters || {};
+      const origMap = this.platformOriginalStatements || {};
+      const uiAi = Object.prototype.hasOwnProperty.call(aiMap, node.id)
+        ? Boolean(aiMap[node.id])
+        : undefined;
+      const uiOrig = Object.prototype.hasOwnProperty.call(origMap, node.id)
+        ? Boolean(origMap[node.id])
+        : undefined;
+      const explicitAi =
+        typeof rowOverrides.aiChapters === "boolean"
+          ? rowOverrides.aiChapters
+          : uiAi;
+      const explicitOrig =
+        typeof rowOverrides.originalStatement === "boolean"
+          ? rowOverrides.originalStatement
+          : uiOrig;
+      const resolved = resolvePublishExtrasForPlatform(node.pt, {
+        explicitAiChapters: explicitAi,
+        explicitOriginalStatement: explicitOrig,
+        accountSettings: node,
+        globalSettings: {
+          defaultAiChapters: this.defaultAiChapters,
+          defaultOriginalStatement: this.defaultOriginalStatement,
+        },
+      });
+      return buildPlatformExtrasPatch(node.pt, resolved);
+    },
+    applyRepublishPlatformExtras() {
+      const nextAi = { ...(this.platformAiChapters || {}) };
+      const nextOrig = { ...(this.platformOriginalStatements || {}) };
+      this.getAllPlatformLeafNodes().forEach((node) => {
+        const rec = this.findRepublishRecord(node.pt, node);
+        if (!rec) return;
+        const recAi = readTaskAiChapters(rec);
+        if (platformSupportsAiChapters(node.pt) && typeof recAi === "boolean") {
+          nextAi[node.id] = recAi;
+        }
+        const recOrig = readTaskOriginalStatement(rec);
+        if (
+          platformSupportsOriginalStatement(node.pt) &&
+          typeof recOrig === "boolean"
+        ) {
+          nextOrig[node.id] = recOrig;
+        }
+      });
+      this.platformAiChapters = nextAi;
+      this.platformOriginalStatements = nextOrig;
+    },
     /** AI 生成素材：名称（默认文件名）+ 已填的标题 / 简介 / 标签 */
     getAiContext() {
       return {
@@ -1667,6 +1829,7 @@ export default {
       this.bqComposing = false;
       this.loadPublishThrottleDefaults();
       this.resetPlatformStatementState();
+      this.resetPlatformExtrasState();
       this.resetPlatformVideoLinks();
       this.resetPlatformCollections();
       this.form = {
@@ -1736,6 +1899,7 @@ export default {
       this.bqTags = parseBqToTags(form.tags || form.bq);
       this.loadPublishThrottleDefaults();
       this.resetPlatformStatementState();
+      this.resetPlatformExtrasState();
       this.resetPlatformVideoLinks();
       this.resetPlatformCollections();
       this.thisShow = false;
@@ -1760,6 +1924,7 @@ export default {
           this.$refs.tree.setCheckedKeys(checkedKeys);
         }
         this.applyRepublishPlatformStatements(form.creativeStatement);
+        this.applyRepublishPlatformExtras();
         this.applyRepublishPlatformVideoLinks();
         this.applyRepublishPlatformCollections();
         this.onTreeCheck();
@@ -1915,10 +2080,16 @@ export default {
       }
       try {
         const res = await ipcRenderer.invoke("publish-throttle:get-settings");
-        const configured =
-          res && res.settings && res.settings.defaultCreativeStatement;
+        const settings = res && res.settings;
+        const configured = settings && settings.defaultCreativeStatement;
         if (configured) {
           this.defaultCreativeStatement = normalizeCreativeStatement(configured);
+        }
+        if (settings && typeof settings.defaultAiChapters === "boolean") {
+          this.defaultAiChapters = settings.defaultAiChapters;
+        }
+        if (settings && typeof settings.defaultOriginalStatement === "boolean") {
+          this.defaultOriginalStatement = settings.defaultOriginalStatement;
         }
       } catch (_) {
         /* 保持当前默认声明 */
@@ -2344,9 +2515,11 @@ export default {
       const ruled = this.resolvePlatformRulePayload(platformNode.pt, baseData, {
         log: true,
       });
+      const extrasPatch = this.resolvePlatformExtrasForNode(platformNode);
       let nextData = {
         ...baseData,
         creativeStatement: this.getPlatformStatement(platformNode.id),
+        ...extrasPatch,
       };
       if (ruled && typeof normalizeVideoMetadata === "function") {
         const meta = normalizeVideoMetadata(
@@ -2392,6 +2565,7 @@ export default {
           ...(collection ? { collection } : {}),
           ...(dySyncToutiao ? { dySyncToutiao: true } : {}),
           ...(coverPathH ? { coverPathH } : {}),
+          ...extrasPatch,
         },
         data: nextData,
       };
@@ -3096,6 +3270,7 @@ export default {
       this.bqTags = [];
       this.bqComposing = false;
       this.resetPlatformStatementState();
+      this.resetPlatformExtrasState();
       this.resetPlatformVideoLinks();
       this.resetPlatformCollections();
       this.form = {
@@ -3150,6 +3325,12 @@ export default {
             defaultPublishToDraft: Boolean(child.meta.defaultPublishToDraft),
             // 透传"使用真实浏览器"设置，让 puppeteerFile 走本地 Chrome 自动化
             useRealBrowser: Boolean(child.meta.useRealBrowser),
+            ...(typeof child.meta.aiChapters === "boolean"
+              ? { aiChapters: child.meta.aiChapters }
+              : {}),
+            ...(typeof child.meta.originalStatement === "boolean"
+              ? { originalStatement: child.meta.originalStatement }
+              : {}),
             proxyDisplay: getAccountProxyDisplay(child.meta.proxy),
             proxyEnabled: isAccountProxyEnabled(child.meta.proxy),
             loggedIn: (() => {
@@ -3445,6 +3626,7 @@ export default {
                 bdText: video.data.bdText,
                 bq: video.data.bq,
                 creativeStatement: video.data.creativeStatement,
+                ...buildPlatformExtrasPatch(p.pt, video.data),
                 noDownload: video.data.noDownload === true,
                 publishOptions: video.publishOptions,
                 coverPath: video.data.coverPath || "",
@@ -3523,6 +3705,7 @@ export default {
                 bdText: video.data.bdText,
                 bq: video.data.bq,
                 creativeStatement: video.data.creativeStatement,
+                ...buildPlatformExtrasPatch(p.pt, video.data),
                 noDownload: video.data.noDownload === true,
                 publishOptions: video.publishOptions,
                 coverPath: video.data.coverPath || "",
@@ -3571,6 +3754,7 @@ export default {
                 bdText: video.data.bdText,
                 bq: video.data.bq,
                 creativeStatement: video.data.creativeStatement,
+                ...buildPlatformExtrasPatch(p.pt, video.data),
                 noDownload: video.data.noDownload === true,
                 publishOptions: video.publishOptions,
                 coverPath: video.data.coverPath || "",
@@ -3734,6 +3918,7 @@ export default {
       this.dirXlsxError = "";
       this.republishContext = null;
       this.republishTextOtherName = "";
+      this.resetPlatformExtrasState();
       this.resetPlatformVideoLinks();
       this.resetPlatformCollections();
       if (this.form) {
@@ -4136,10 +4321,15 @@ export default {
             String(p.pt || "").includes("抖音") &&
             Boolean(this.form && this.form.dySyncToutiao === true);
           const dirCoverPathH = String(fileRow.coverHResolved || "").trim();
+          const dirExtrasPatch = this.resolvePlatformExtrasForNode(p, {
+            aiChapters: fileRow.aiChapters,
+            originalStatement: fileRow.originalStatement,
+          });
           const dirPublishOptions = {
             ...(dirCollection ? { collection: dirCollection } : {}),
             ...(dirDySyncToutiao ? { dySyncToutiao: true } : {}),
             ...(dirCoverPathH ? { coverPathH: dirCoverPathH } : {}),
+            ...dirExtrasPatch,
           };
           const effectiveMode = resolveEffectivePublishMode(isDraftMode, p);
 
@@ -4231,6 +4421,7 @@ export default {
                   ...metadata.legacy,
                   bq,
                   creativeStatement,
+                  ...dirExtrasPatch,
                   coverPath: fileRow.coverResolved || "",
                   ...(dirCoverPathH ? { coverPathH: dirCoverPathH } : {}),
                   ...(dirRuleAdjustments.length > 0
@@ -4299,6 +4490,7 @@ export default {
                 ...metadata.legacy,
                 bq,
                 creativeStatement,
+                ...dirExtrasPatch,
                 coverPath: fileRow.coverResolved || "",
                 ...(dirCoverPathH ? { coverPathH: dirCoverPathH } : {}),
                 ...(dirRuleAdjustments.length > 0
@@ -4402,6 +4594,7 @@ export default {
               ...metadata.legacy,
               bq,
               creativeStatement,
+              ...dirExtrasPatch,
               coverPath: fileRow.coverResolved || "",
               ...(dirCoverPathH ? { coverPathH: dirCoverPathH } : {}),
               ...(dirAppliedSnapshot
@@ -4560,6 +4753,9 @@ export default {
   align-items: center;
   flex-wrap: wrap;
   gap: 8px;
+}
+.platform-extra-checkbox {
+  margin-left: 8px;
 }
 .cover-name {
   font-size: 13px;

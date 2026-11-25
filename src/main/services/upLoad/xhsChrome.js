@@ -1,6 +1,10 @@
 "use strict";
 
 import xhsHandler from "./xhs.js";
+import {
+  readTaskAiChapters,
+  readTaskOriginalStatement,
+} from "../../../shared/publishExtras.js";
 
 /**
  * 小红书 + 真实 Chrome 浏览器的发布处理器。
@@ -17,7 +21,14 @@ import xhsHandler from "./xhs.js";
  * @param {object} event - transport 对象（支持 event.reply(channel, payload)）
  */
 export default async function xhsChromeHandler(page, data, browser, event) {
-  console.log("[xhs-chrome] 小红书真实浏览器发布开始:", data.partition || data.pt);
+  console.log(
+    "[xhs-chrome] 小红书真实浏览器发布开始:",
+    data.partition || data.pt,
+    "aiChapters=",
+    readTaskAiChapters(data),
+    "originalStatement=",
+    readTaskOriginalStatement(data)
+  );
 
   // 构造与 Electron BrowserWindow 兼容的 fakeWindow，
   // 让 xhs.js 内部的 maybeClosePublishWindow / closeWindow 调用能正常工作。

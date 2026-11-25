@@ -98,6 +98,27 @@
             </el-form-item>
           </template>
 
+          <el-form-item v-if="supportsAiChapters" label="AI 自动章节">
+            <el-switch
+              v-model="aiChapters"
+              active-text="开启"
+              inactive-text="关闭"
+            />
+            <span class="field-hint" style="margin-left: 10px; font-size: 12px; color: #909399;">
+              发布视频时自动勾选 AI 生成章节（短视频不支持时告警继续）
+            </span>
+          </el-form-item>
+          <el-form-item v-if="supportsOriginalStatement" label="原创声明">
+            <el-switch
+              v-model="originalStatement"
+              active-text="开启"
+              inactive-text="关闭"
+            />
+            <span class="field-hint" style="margin-left: 10px; font-size: 12px; color: #909399;">
+              与创作声明独立并存；若该账号无原创资格，请在此关闭原创声明
+            </span>
+          </el-form-item>
+
           <el-form-item>
             <el-button
               type="primary"
@@ -119,6 +140,26 @@
               active-text="开启"
               inactive-text="关闭"
             />
+          </el-form-item>
+          <el-form-item v-if="supportsAiChapters" label="AI 自动章节">
+            <el-switch
+              v-model="aiChapters"
+              active-text="开启"
+              inactive-text="关闭"
+            />
+            <span class="field-hint" style="margin-left: 10px; font-size: 12px; color: #909399;">
+              仅抖音 / 快手 / 小红书生效；短视频不支持时告警继续
+            </span>
+          </el-form-item>
+          <el-form-item v-if="supportsOriginalStatement" label="原创声明">
+            <el-switch
+              v-model="originalStatement"
+              active-text="开启"
+              inactive-text="关闭"
+            />
+            <span class="field-hint" style="margin-left: 10px; font-size: 12px; color: #909399;">
+              与创作声明独立并存；若该账号无原创资格，请在此关闭原创声明
+            </span>
           </el-form-item>
           <el-form-item>
             <el-button
@@ -226,6 +267,12 @@ import {
   recordAccountKeyOf,
 } from "../../../shared/accountIdentity.js";
 import { isXhsPlatform } from "../../../shared/xhsPublishPolicy.js";
+import {
+  DEFAULT_AI_CHAPTERS,
+  DEFAULT_ORIGINAL_STATEMENT,
+  platformSupportsAiChapters,
+  platformSupportsOriginalStatement,
+} from "../../../shared/publishExtras.js";
 
 export default {
   data() {
@@ -240,6 +287,10 @@ export default {
       savingProxy: false,
       defaultPublishToDraft: false,
       useRealBrowser: false,
+      aiChapters: DEFAULT_AI_CHAPTERS,
+      originalStatement: DEFAULT_ORIGINAL_STATEMENT,
+      globalDefaultAiChapters: DEFAULT_AI_CHAPTERS,
+      globalDefaultOriginalStatement: DEFAULT_ORIGINAL_STATEMENT,
       savingPublishSettings: false,
       // Chrome 路径配置
       chromePath: "",
@@ -252,6 +303,12 @@ export default {
   computed: {
     isXhsPlatform() {
       return isXhsPlatform(this.title);
+    },
+    supportsAiChapters() {
+      return platformSupportsAiChapters(this.title);
+    },
+    supportsOriginalStatement() {
+      return platformSupportsOriginalStatement(this.title);
     },
     proxyDisplay() {
       const display = getAccountProxyDisplay({ proxies: this.proxyList });
@@ -308,7 +365,35 @@ export default {
       const settings = normalizeAccountPublishSettings(this.urldata || {});
       this.defaultPublishToDraft = settings.defaultPublishToDraft;
       this.useRealBrowser = settings.useRealBrowser;
+      this.aiChapters =
+        typeof settings.aiChapters === "boolean"
+          ? settings.aiChapters
+          : this.globalDefaultAiChapters;
+      this.originalStatement =
+        typeof settings.originalStatement === "boolean"
+          ? settings.originalStatement
+          : this.globalDefaultOriginalStatement;
       this.chromeTestResult = null;
+      // 读取全局发布默认值（账号未显式覆盖时套用全局默认）
+      ipcRenderer
+        .invoke("publish-throttle:get-settings")
+        .then((res) => {
+          const s = res && res.settings;
+          if (!s) return;
+          if (typeof s.defaultAiChapters === "boolean") {
+            this.globalDefaultAiChapters = s.defaultAiChapters;
+            if (typeof settings.aiChapters !== "boolean") {
+              this.aiChapters = s.defaultAiChapters;
+            }
+          }
+          if (typeof s.defaultOriginalStatement === "boolean") {
+            this.globalDefaultOriginalStatement = s.defaultOriginalStatement;
+            if (typeof settings.originalStatement !== "boolean") {
+              this.originalStatement = s.defaultOriginalStatement;
+            }
+          }
+        })
+        .catch(() => {});
       // 异步加载全局 Chrome 路径配置
       ipcRenderer.invoke("chrome:getPath").then((res) => {
         this.chromePath = (res && res.path) || "";
@@ -331,10 +416,25 @@ export default {
         if (this.chromePath) {
           await ipcRenderer.invoke("chrome:setPath", this.chromePath);
         }
+        const extrasInput = {
+          ...(this.supportsAiChapters ? { aiChapters: this.aiChapters } : {}),
+          ...(this.supportsOriginalStatement
+            ? { originalStatement: this.originalStatement }
+            : {}),
+        };
         const settings = normalizeAccountPublishSettings({
           defaultPublishToDraft: this.defaultPublishToDraft,
           useRealBrowser: this.useRealBrowser,
+          ...extrasInput,
         });
+        const extrasPatch = {
+          ...(typeof settings.aiChapters === "boolean"
+            ? { aiChapters: settings.aiChapters }
+            : {}),
+          ...(typeof settings.originalStatement === "boolean"
+            ? { originalStatement: settings.originalStatement }
+            : {}),
+        };
         const res = await dataRequest({
           type: "update",
           fileName: "account",
@@ -343,6 +443,7 @@ export default {
             date: this.urldata.date,
             defaultPublishToDraft: settings.defaultPublishToDraft,
             useRealBrowser: settings.useRealBrowser,
+            ...extrasPatch,
           },
         });
         if (!res || res.success === false) {
@@ -351,14 +452,31 @@ export default {
         }
         this.defaultPublishToDraft = settings.defaultPublishToDraft;
         this.useRealBrowser = settings.useRealBrowser;
+        if (typeof settings.aiChapters === "boolean") {
+          this.aiChapters = settings.aiChapters;
+        }
+        if (typeof settings.originalStatement === "boolean") {
+          this.originalStatement = settings.originalStatement;
+        }
         this.urldata = {
           ...this.urldata,
           defaultPublishToDraft: settings.defaultPublishToDraft,
           useRealBrowser: settings.useRealBrowser,
+          ...extrasPatch,
         };
         this.$route.meta.defaultPublishToDraft = settings.defaultPublishToDraft;
         this.$route.meta.useRealBrowser = settings.useRealBrowser;
-        this.syncAccountTreePublishSettings(settings.defaultPublishToDraft, settings.useRealBrowser);
+        if (typeof settings.aiChapters === "boolean") {
+          this.$route.meta.aiChapters = settings.aiChapters;
+        }
+        if (typeof settings.originalStatement === "boolean") {
+          this.$route.meta.originalStatement = settings.originalStatement;
+        }
+        this.syncAccountTreePublishSettings(
+          settings.defaultPublishToDraft,
+          settings.useRealBrowser,
+          extrasPatch
+        );
         this.$message.success("发布设置已保存");
       } catch (e) {
         this.$message.error(
@@ -368,7 +486,11 @@ export default {
         this.savingPublishSettings = false;
       }
     },
-    syncAccountTreePublishSettings(defaultPublishToDraft, useRealBrowser) {
+    syncAccountTreePublishSettings(
+      defaultPublishToDraft,
+      useRealBrowser,
+      extrasPatch = {}
+    ) {
       try {
         const raw = localStorage.getItem("accountTree");
         const tree = raw ? JSON.parse(raw) : {};
@@ -378,6 +500,7 @@ export default {
           pt: this.title,
           defaultPublishToDraft,
           useRealBrowser,
+          ...extrasPatch,
         });
         localStorage.setItem("accountTree", JSON.stringify(nextTree));
       } catch (e) {

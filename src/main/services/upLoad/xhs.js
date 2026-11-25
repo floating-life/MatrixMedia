@@ -25,6 +25,333 @@ import {
   formatRuleAdjustmentsSummary,
   mergeRuleAdjustments,
 } from "../../../shared/platformRules.js";
+import { capturePublishFailureScreenshot } from "./failureScreenshot.js";
+import { ALL_PLATFORM_SUBMIT_SELECTORS } from "../../../shared/collectionShared.js";
+import {
+  isAiChaptersRequested,
+  isOriginalStatementRequested,
+  appendPublishReceiptNote,
+  createNoOriginalQualificationError,
+  createOriginalStatementError,
+} from "../../../shared/publishExtras.js";
+import {
+  executeAiChaptersFlow,
+  executeOriginalStatementFlow,
+  runOriginalStatementDomAction,
+  dumpExtrasDiagnostics,
+} from "../../../shared/publishExtrasDom.js";
+
+/**
+ * 小红书发布页「AI 自动章节」选择器与候选文案集中配置【未经真机校准，待真机存草稿核对】。
+ * 找不到入口或短视频不支持时告警并继续发布，回执写「章节：不支持」；
+ * 点选后回读未选中时重试一次，仍失败则告警继续，回执写「章节：失败」。
+ */
+export const XHS_AI_CHAPTERS_SELECTORS = Object.freeze({
+  wujieHost: "",
+  sectionKeywords: [
+    "章节",
+    "视频章节",
+    "智能章节",
+    "内容章节",
+    "添加章节",
+    "章节信息",
+  ],
+  aiOptionKeywords: [
+    "AI自动添加章节",
+    "AI自动生成章节",
+    "AI智能生成章节",
+    "智能生成章节",
+    "自动生成章节",
+    "自动添加章节",
+    "AI章节",
+    "智能章节",
+    "AI智能章节",
+  ],
+  entryButtonKeywords: ["添加章节", "设置章节", "视频章节", "编辑章节"],
+  unsupportedPatterns: [
+    "不支持章节",
+    "暂不支持",
+    "时长不足",
+    "视频过短",
+    "无法生成章节",
+    "不支持添加章节",
+    "不支持自动章节",
+    "暂无法生成章节",
+    "小于",
+    "不足",
+  ],
+  toggleSelectors: [
+    ".d-switch",
+    ".d-checkbox",
+    ".d-radio",
+    "[role='switch']",
+    "[role='checkbox']",
+    "[role='radio']",
+    "label",
+    "input[type='checkbox']",
+    "input[type='radio']",
+  ],
+  dialogSelectors: [
+    ".d-modal",
+    ".d-dialog",
+    "[role='dialog']",
+    "[class*='modal']",
+    "[class*='dialog']",
+  ],
+  confirmButtonTexts: ["确定", "确认", "完成", "应用"],
+  submitSelectors: [...ALL_PLATFORM_SUBMIT_SELECTORS, "xhs-publish-btn"],
+  submitTexts: [
+    "发布",
+    "发表",
+    "立即发布",
+    "定时发布",
+    "存草稿",
+    "保存草稿",
+    "暂存离开",
+    "保存",
+    "提交",
+    "取消",
+    "取消发布",
+    "确认发布",
+  ],
+  dispatchMouseEvents: true,
+  diagSelectors: [
+    "[class*='chapter']",
+    "[class*='Chapter']",
+    ".publish-page-content-base",
+  ],
+  diagKeywords: ["章节", "AI", "智能生成", "自动添加"],
+});
+
+/**
+ * 小红书发布页「原创声明」选择器与候选文案集中配置【未经真机校准，待真机存草稿核对】。
+ * 开启时设置失败或账号无原创资格（页面提示无资格/入口置灰）均中止本条发布。
+ */
+export const XHS_ORIGINAL_STATEMENT_SELECTORS = Object.freeze({
+  wujieHost: "",
+  entrySelectors: [
+    "[class*='original'] .d-switch",
+    "[class*='original'] .d-checkbox",
+    "[class*='original'] input[type='checkbox']",
+    "[class*='Original'] .d-switch",
+    "[class*='Original'] .d-checkbox",
+    "[class*='Original'] input[type='checkbox']",
+  ],
+  entryContainerSelectors: [
+    "[class*='original']",
+    "[class*='Original']",
+  ],
+  entryKeywords: ["原创声明", "声明原创", "申请原创", "原创保护", "标记原创"],
+  toggleSelectors: [
+    ".d-switch",
+    ".d-checkbox",
+    "[role='switch']",
+    "[role='checkbox']",
+    "label",
+    "input[type='checkbox']",
+  ],
+  dialogSelectors: [
+    ".d-modal",
+    ".d-dialog",
+    "[role='dialog']",
+    "[class*='modal']",
+    "[class*='dialog']",
+  ],
+  dialogKeywords: ["原创", "原创声明", "声明原创", "原创保护", "协议", "条款", "须知"],
+  ignoreDialogPatterns: ["将此次编辑保留"],
+  agreementSelectors: [
+    ".d-checkbox",
+    "[role='checkbox']",
+    "input[type='checkbox']",
+    "label",
+  ],
+  agreementKeywords: ["我已阅读并同意", "阅读并同意", "同意", "协议", "条款", "须知"],
+  confirmButtonSelectors: ["button", "[role='button']", ".d-button"],
+  confirmButtonTexts: [
+    "确认声明",
+    "声明原创",
+    "同意并声明",
+    "开启原创",
+    "确定",
+    "确认",
+  ],
+  noQualificationPatterns: [
+    "无原创资格",
+    "暂无原创资格",
+    "未开通原创",
+    "不满足原创",
+    "不符合原创",
+    "暂不支持原创",
+    "无资格",
+    "无法声明原创",
+    "暂无权限",
+    "暂未开放",
+    "条件未满足",
+    "未满足条件",
+    "未达到原创",
+    "粉丝数不足",
+  ],
+  submitSelectors: [...ALL_PLATFORM_SUBMIT_SELECTORS, "xhs-publish-btn"],
+  submitTexts: [
+    "发布",
+    "发表",
+    "立即发布",
+    "定时发布",
+    "存草稿",
+    "保存草稿",
+    "暂存离开",
+    "保存",
+    "取消",
+    "取消发布",
+    "确认发布",
+  ],
+  dispatchMouseEvents: true,
+  diagSelectors: [
+    "[class*='original']",
+    "[class*='Original']",
+    ".d-modal",
+    "[role='dialog']",
+  ],
+  diagKeywords: ["原创声明", "声明原创", "原创", "内容类型声明"],
+});
+
+export async function applyXhsAiChapters(
+  page,
+  { data, window, timeouts } = {}
+) {
+  return executeAiChaptersFlow(page, {
+    platformTag: "xhs",
+    platformLabel: "小红书",
+    cfg: XHS_AI_CHAPTERS_SELECTORS,
+    data,
+    window,
+    captureScreenshot: capturePublishFailureScreenshot,
+    timeouts,
+  });
+}
+
+export async function applyXhsOriginalStatement(
+  page,
+  { data, window, timeouts } = {}
+) {
+  return executeOriginalStatementFlow(page, {
+    platformTag: "xhs",
+    platformLabel: "小红书",
+    cfg: XHS_ORIGINAL_STATEMENT_SELECTORS,
+    data,
+    window,
+    captureScreenshot: capturePublishFailureScreenshot,
+    timeouts,
+  });
+}
+
+async function ensureXhsStatementDropdownClosed(page) {
+  try {
+    const open = await page.evaluate(
+      "(function(){" +
+        "var w=document.querySelector('.d-options-wrapper');" +
+        "if(!w)return false;" +
+        "var r=typeof w.getBoundingClientRect==='function'?w.getBoundingClientRect():{width:1,height:1};" +
+        "return !!(r&&r.width>0&&r.height>0);" +
+        "})()"
+    );
+    if (open && page.keyboard && typeof page.keyboard.press === "function") {
+      await page.keyboard.press("Escape").catch(() => {});
+      await page.waitForTimeout(200).catch(() => {});
+    }
+  } catch (_) {}
+}
+
+/**
+ * 统一复核小红书「内容类型声明（creativeStatement）」与「原创声明（originalStatement）」：
+ * 确认二者互不覆盖、未互相关闭或丢失状态；若创作声明被重置则补选一次并复核原创声明仍在勾选态。
+ */
+export async function verifyXhsDeclarations(
+  page,
+  { creativeStatement, originalStatement, data, window } = {}
+) {
+  await ensureXhsStatementDropdownClosed(page);
+
+  const wantCreative =
+    !isCreativeStatementNone(creativeStatement) &&
+    XHS_SUPPORTED_STATEMENT_LABELS.has(
+      resolveXhsCreativeStatementLabel(creativeStatement)
+    );
+  if (wantCreative) {
+    const expectedLabel = resolveXhsCreativeStatementLabel(creativeStatement);
+    const currentLabel = await page
+      .evaluate(
+        "(function(targetLabel){" +
+          "var norm=function(t){return String(t||'').replace(/\\s+/g,'').trim();};" +
+          "var wanted=norm(targetLabel);" +
+          "var sels=document.querySelectorAll('.d-select');" +
+          "for(var i=0;i<sels.length;i++){" +
+          "var t=norm(sels[i].textContent||'');" +
+          "if(t.indexOf(wanted)!==-1)return t;" +
+          "}" +
+          "return '';" +
+          "})(" +
+          JSON.stringify(expectedLabel) +
+          ")"
+      )
+      .catch(() => "");
+    if (!currentLabel) {
+      console.warn(
+        `[xhs][verify] 联合复核发现内容类型声明「${expectedLabel}」未保持，尝试补选一次`
+      );
+      try {
+        await selectXhsCreativeStatement(page, data || { data: { creativeStatement } });
+        await ensureXhsStatementDropdownClosed(page);
+      } catch (e) {
+        console.warn("[xhs][verify] 补选内容类型声明异常:", (e && e.message) || e);
+      }
+    }
+  }
+
+  if (originalStatement === true) {
+    const check = await page.evaluate(runOriginalStatementDomAction, {
+      action: "inspect",
+      token: "",
+      cfg: XHS_ORIGINAL_STATEMENT_SELECTORS,
+    });
+    if (check && check.noQualification) {
+      await dumpExtrasDiagnostics(page, {
+        platformTag: "xhs",
+        platformLabel: "小红书",
+        featureTag: "original-statement",
+        stage: "unified-verify-no-qual",
+        cfg: XHS_ORIGINAL_STATEMENT_SELECTORS,
+        data,
+        window,
+        captureScreenshot: capturePublishFailureScreenshot,
+      });
+      throw createNoOriginalQualificationError(
+        "小红书",
+        check.noQualificationText || ""
+      );
+    }
+    if (!check || !check.found || check.checked !== true || check.dialogOpen) {
+      await dumpExtrasDiagnostics(page, {
+        platformTag: "xhs",
+        platformLabel: "小红书",
+        featureTag: "original-statement",
+        stage: "unified-verify-failed",
+        cfg: XHS_ORIGINAL_STATEMENT_SELECTORS,
+        data,
+        window,
+        captureScreenshot: capturePublishFailureScreenshot,
+      });
+      throw createOriginalStatementError(
+        "小红书",
+        "声明联检",
+        check && check.dialogOpen
+          ? "联合复核时原创声明确认弹窗仍未关闭"
+          : "联合复核时原创声明未处于已勾选状态"
+      );
+    }
+    console.log("[xhs][verify] 内容类型声明与原创声明统一复核通过");
+  }
+}
 
 /**
  * 生成 [min, max] 范围内的随机整数，用于像素偏移、步数等非时间场景。
@@ -405,14 +732,35 @@ export default async function (page, data, window, event) {
     console.warn("小红书PK封面开关处理未完成:", err?.message || err);
   }
 
-  // 选择内容类型声明（无标注 / 不支持值会跳过）
+  // 选择内容类型声明（无标注 / 不支持值会跳过）；收起下拉避免与原创声明弹窗互相干扰
   try {
     await selectXhsCreativeStatement(page, data);
+    await ensureXhsStatementDropdownClosed(page);
   } catch (e) {
     console.warn("小红书内容类型声明选择未完成:", e?.message || e);
   }
 
+  let aiChaptersResult = null;
+  let originalStatementResult = null;
+  const wantOriginal = isOriginalStatementRequested(data);
+  const wantAiChapters = isAiChaptersRequested(data);
+
   try {
+    // 原创声明（默认开启；关闭时不触碰页面；开启时失败或无资格中止本条发布，绝不点击发布/暂存离开）
+    if (wantOriginal) {
+      originalStatementResult = await applyXhsOriginalStatement(page, {
+        data,
+        window,
+      });
+      // 与内容类型声明统一复核，确保互不覆盖且无残留弹窗
+      await verifyXhsDeclarations(page, {
+        creativeStatement: data.data && data.data.creativeStatement,
+        originalStatement: true,
+        data,
+        window,
+      });
+    }
+
     // 等视频上传完成：新版小红书在 .video-plugin-title-action 出现 "重新上传" 文案表示上传完成。
     // 老版兼容：找任何带 src 的 <video>。超时 2 分钟，到点不抛错继续。
     try {
@@ -438,6 +786,19 @@ export default async function (page, data, window, event) {
       console.log("[xhs] 视频上传完成（重新上传按钮已出现）");
     } catch (_) {
       console.log("[xhs] 视频上传等待超时，继续走发布流程");
+    }
+
+    // AI 自动章节（视频上传就绪后处理；默认开启，关闭时不触碰页面；不支持/失败告警继续）
+    if (wantAiChapters) {
+      aiChaptersResult = await applyXhsAiChapters(page, { data, window });
+      if (wantOriginal) {
+        await verifyXhsDeclarations(page, {
+          creativeStatement: data.data && data.data.creativeStatement,
+          originalStatement: true,
+          data,
+          window,
+        });
+      }
     }
 
     // 新版发布按钮在 <xhs-publish-btn> 的 closed shadow root 里，
@@ -546,6 +907,13 @@ export default async function (page, data, window, event) {
       isDraftMode ? "✅ 小红书视频已保存草稿" : "✅ 小红书视频上传成功"
     );
     const xhsBaseSuccessMsg = isDraftMode ? "保存草稿成功" : "上传成功";
+    const xhsMsgWithAdj = xhsAdjSummary
+      ? `${xhsBaseSuccessMsg}（规则调整：${xhsAdjSummary}）`
+      : xhsBaseSuccessMsg;
+    const xhsFinalSuccessMsg =
+      aiChaptersResult && aiChaptersResult.receiptText
+        ? appendPublishReceiptNote(xhsMsgWithAdj, aiChaptersResult.receiptText)
+        : xhsMsgWithAdj;
     await replyPublishOutcome({
       page,
       data,
@@ -553,16 +921,24 @@ export default async function (page, data, window, event) {
       event,
       urlBefore,
       isDraftMode,
-      successMessage: xhsAdjSummary
-        ? `${xhsBaseSuccessMsg}（规则调整：${xhsAdjSummary}）`
-        : xhsBaseSuccessMsg,
-      extraPayload:
-        xhsRuleAdjustments.length > 0
+      successMessage: xhsFinalSuccessMsg,
+      extraPayload: {
+        ...(aiChaptersResult
+          ? {
+              aiChaptersStatus: aiChaptersResult.status,
+              aiChaptersReceipt: aiChaptersResult.receiptText,
+            }
+          : {}),
+        ...(originalStatementResult
+          ? { originalStatementStatus: originalStatementResult.status }
+          : {}),
+        ...(xhsRuleAdjustments.length > 0
           ? {
               ruleAdjustments: xhsRuleAdjustments,
               ruleAdjustmentsSummary: xhsAdjSummary,
             }
-          : {},
+          : {}),
+      },
       // 草稿保存成功后用户需回到矩媒手动发布，web 窗口已无用，强制关闭；
       // 直接发布仍保留保守模式（closeWindowAfterPublish=false）让用户核对。
       closeWindowData: isDraftMode
@@ -570,13 +946,25 @@ export default async function (page, data, window, event) {
         : data,
     });
   } catch (err) {
-    // 失败瞬间截图留证：小红书风控弹窗（如「操作过于频繁」）只有截图能看出来
+    // 失败瞬间截图留证：小红书风控弹窗（如「操作过于频繁」）或原创声明失败只有截图能看出来
+    const isOriginalErr = Boolean(err && err.originalStatementError);
     await replyPublishFailure({
       page,
       data,
       window,
       event,
       message: err?.message || "上传失败",
+      ...(isOriginalErr
+        ? {
+            extraPayload: {
+              originalStatementStatus: err.noOriginalQualification
+                ? "no_qualification"
+                : "failed",
+              outcome: "original_statement_failed",
+              needsAttention: true,
+            },
+          }
+        : {}),
       closeWindow: data.closeWindowAfterPublish !== false,
     });
     console.error("❌ 小红书发布失败:", err);

@@ -1,11 +1,23 @@
 "use strict";
 
+import { getCreativeStatementLabel } from "./creativeStatement.js";
+import {
+  platformSupportsAiChapters,
+  platformSupportsOriginalStatement,
+  readTaskAiChapters,
+  readTaskOriginalStatement,
+  formatAiChaptersStatusLabel,
+  formatOriginalStatementStatusLabel,
+} from "./publishExtras.js";
+
 const HEADERS = ["日期", "标题", "平台", "发布分组", "发布状态", "尝试次数",
-  "重发次数", "成功次数", "失败次数", "异常次数", "最后消息", "最后更新时间"];
+  "重发次数", "成功次数", "失败次数", "异常次数", "创作声明", "AI章节", "原创声明",
+  "最后消息", "最后更新时间"];
 const STATUS_TEXT = {
   success: "成功", failed: "失败", fail: "失败", abnormal: "发布异常",
   publishing: "发布中", drafting: "保存草稿中", draft: "已保存草稿",
   scheduled: "等待定时发布", expired: "任务过期", skipped: "已跳过",
+  login_required: "需重新登录",
 };
 
 function csvCell(value) {
@@ -26,6 +38,27 @@ function timestamp(value) {
   return Number.isNaN(date.getTime()) ? "" : date.toISOString();
 }
 
+function formatCreativeStatementCell(item) {
+  const raw = item && item.creativeStatement;
+  if (!raw || raw === "none") return "";
+  return getCreativeStatementLabel(raw);
+}
+
+function formatAiChaptersCell(item) {
+  if (!item || !platformSupportsAiChapters(item.pt)) return "";
+  const enabled = readTaskAiChapters(item);
+  return formatAiChaptersStatusLabel(item.aiChaptersStatus, enabled);
+}
+
+function formatOriginalStatementCell(item) {
+  if (!item || !platformSupportsOriginalStatement(item.pt)) return "";
+  const enabled = readTaskOriginalStatement(item);
+  return formatOriginalStatementStatusLabel(
+    item.originalStatementStatus,
+    enabled
+  );
+}
+
 /** 导出当前加载的发布历史，一个平台一行，仅包含可见业务字段。 */
 export function buildPublishHistoryCsv(dataList = {}) {
   const lines = [HEADERS.map(csvCell).join(",")];
@@ -37,7 +70,11 @@ export function buildPublishHistoryCsv(dataList = {}) {
           item.pt, item.phone, STATUS_TEXT[item.publishStatus] || item.publishStatus || "未知",
           count(item.publishAttemptCount), count(item.republishCount),
           count(item.publishSuccessCount), count(item.publishFailCount),
-          count(item.publishAbnormalCount), item.lastPublishMessage,
+          count(item.publishAbnormalCount),
+          formatCreativeStatementCell(item),
+          formatAiChaptersCell(item),
+          formatOriginalStatementCell(item),
+          item.lastPublishMessage,
           timestamp(item.lastPublishAt)];
         lines.push(values.map(csvCell).join(","));
         recordCount++;
