@@ -17,6 +17,8 @@ const TEXT_FIELDS = [
   "pt",
   "group",
   "phone",
+  "partition",
+  "accountKey",
   "textType",
   "publishStatus",
   "title",

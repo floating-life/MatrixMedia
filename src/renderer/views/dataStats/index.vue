@@ -117,6 +117,60 @@
         采集越频繁越容易触发平台风控；部分平台作品数据本身每天才更新，分时段曲线可能是平的
       </div>
     </div>
+    <div v-if="statsGroupNames.length" class="group-start-date-bar">
+      <div class="group-start-date-head">
+        <span class="auto-collect-label">分组统计起点</span>
+        <span class="card-tip">
+          早于起点的历史作品不参与汇总、分析、趋势、导出与自动关联（账号日快照与缺发布时间作品不受影响）
+        </span>
+        <el-tag
+          v-if="excludedBeforeStartTotal > 0"
+          type="info"
+          size="mini"
+          class="excluded-before-start-tag"
+        >
+          已排除 {{ excludedBeforeStartTotal }} 条起点前作品
+        </el-tag>
+      </div>
+      <div class="group-start-date-list">
+        <div
+          v-for="group in statsGroupNames"
+          :key="group"
+          class="group-start-date-item"
+        >
+          <span class="group-start-date-name">{{ group }}</span>
+          <el-date-picker
+            :value="groupStartDates[group] || ''"
+            type="date"
+            size="mini"
+            class="group-start-date-picker"
+            value-format="yyyy-MM-dd"
+            :picker-options="analysisDatePickerOptions"
+            clearable
+            :editable="false"
+            :disabled="Boolean(savingGroupStartDate[group])"
+            placeholder="不限制"
+            @input="(val) => onGroupStartDateChange(group, val)"
+          />
+          <el-button
+            v-if="groupStartDates[group]"
+            type="text"
+            size="mini"
+            class="group-start-date-clear"
+            :disabled="Boolean(savingGroupStartDate[group])"
+            @click="clearGroupStartDate(group)"
+          >
+            清空
+          </el-button>
+          <span
+            v-if="excludedBeforeStartByGroup[group] > 0"
+            class="group-start-date-excluded"
+          >
+            已排除 {{ excludedBeforeStartByGroup[group] }} 条
+          </span>
+        </div>
+      </div>
+    </div>
     <el-tabs v-model="activeTab" class="stats-tabs">
       <el-tab-pane label="账号总览" name="overview">
         <el-alert
@@ -163,7 +217,7 @@
           <div class="card-head">
             <span class="card-title">作品跨平台汇总</span>
             <span class="card-tip">
-              共 {{ contentSummaryRows.length }} 条内容<template v-if="contentSummaryDate"> · 截至 {{ contentSummaryDate }}</template> · 点击行左侧箭头展开各平台明细与矫正操作
+              共 {{ contentSummaryRows.length }} 条内容<template v-if="contentSummaryDate"> · 截至 {{ contentSummaryDate }}</template><template v-if="excludedBeforeStartTotal > 0"> · 已排除 {{ excludedBeforeStartTotal }} 条起点前作品</template> · 点击行左侧箭头展开各平台明细与矫正操作
             </span>
           </div>
           <div class="works-filter-bar">
@@ -2085,6 +2139,10 @@ export default {
       logVisible: false,
       logs: [],
       autoCollect: normalizeAutoCollectView(loadAutoCollectSettings()),
+      groupStartDates: {},
+      excludedBeforeStartByGroup: {},
+      excludedBeforeStartTotal: 0,
+      savingGroupStartDate: {},
     };
   },
   computed: {
@@ -2098,6 +2156,21 @@ export default {
     },
     accounts() {
       return this.overview.accounts || [];
+    },
+    statsGroupNames() {
+      const set = new Set();
+      for (const acc of this.accounts) {
+        const g = acc && typeof acc.group === "string" ? acc.group.trim() : "";
+        if (g) set.add(g);
+      }
+      const saved = this.groupStartDates && typeof this.groupStartDates === "object"
+        ? this.groupStartDates
+        : {};
+      for (const g of Object.keys(saved)) {
+        const trimmed = typeof g === "string" ? g.trim() : "";
+        if (trimmed) set.add(trimmed);
+      }
+      return [...set].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
     },
     // 平台分布：各平台下所有分组账号的最新快照求和
     platformRows() {
@@ -2429,6 +2502,7 @@ export default {
   created() {
     this._mainRetentionDays = null;
     this.syncAutoSettingsFromMain();
+    this.loadGroupSettings();
     this.refresh();
     this._unsubProgress = onStatsProgress((p) => {
       this.progressText = `[${p.index + 1}/${p.total}] ${p.group} · ${p.platform} ${
@@ -2462,6 +2536,7 @@ export default {
     }
     this.autoCollect = view;
     this.syncAutoSettingsFromMain();
+    this.loadGroupSettings();
     if (this.activeTab === "analysis" && typeof this.$nextTick === "function") {
       this.$nextTick(() => this.resizeAnalysisCharts());
     }
@@ -2524,8 +2599,75 @@ export default {
           .catch(() => {});
       }
     },
+    async loadGroupSettings() {
+      if (!ipcRenderer || typeof ipcRenderer.invoke !== "function") return;
+      try {
+        const res = await ipcRenderer.invoke("stats:get-group-settings");
+        if (!res || !res.ok) return;
+        this.groupStartDates =
+          res.settings && typeof res.settings === "object" ? { ...res.settings } : {};
+        this.excludedBeforeStartByGroup =
+          res.excludedByGroup && typeof res.excludedByGroup === "object"
+            ? { ...res.excludedByGroup }
+            : {};
+        this.excludedBeforeStartTotal =
+          typeof res.excludedTotal === "number" && Number.isFinite(res.excludedTotal)
+            ? res.excludedTotal
+            : 0;
+      } catch (_) {}
+    },
+    async onGroupStartDateChange(group, rawVal) {
+      const g = typeof group === "string" ? group.trim() : "";
+      if (!g) return;
+      const nextVal = typeof rawVal === "string" ? rawVal.trim() : "";
+      const prevVal = (this.groupStartDates && this.groupStartDates[g]) || "";
+      if (nextVal === prevVal) return;
+      if (this.savingGroupStartDate && this.savingGroupStartDate[g]) return;
+      this.savingGroupStartDate = { ...(this.savingGroupStartDate || {}), [g]: true };
+      try {
+        const res = await ipcRenderer.invoke("stats:set-group-start-date", {
+          group: g,
+          statsStartDate: nextVal,
+        });
+        if (!res || !res.ok) {
+          this.$message.error((res && res.error) || "保存分组统计起点失败");
+          return;
+        }
+        this.groupStartDates =
+          res.settings && typeof res.settings === "object" ? { ...res.settings } : {};
+        this.excludedBeforeStartByGroup =
+          res.excludedByGroup && typeof res.excludedByGroup === "object"
+            ? { ...res.excludedByGroup }
+            : {};
+        this.excludedBeforeStartTotal =
+          typeof res.excludedTotal === "number" && Number.isFinite(res.excludedTotal)
+            ? res.excludedTotal
+            : 0;
+        this.$message.success(
+          nextVal
+            ? `已设置分组「${g}」统计起点为 ${nextVal}`
+            : `已清空分组「${g}」统计起点限制`
+        );
+        if (this.activeTab === "works" || this.contentSummaryRows.length > 0) {
+          await this.loadContentSummary();
+        }
+        if (this.activeTab === "analysis" || this.analysisData) {
+          await this.loadAnalysis();
+        }
+      } catch (err) {
+        this.$message.error(`保存分组统计起点失败：${(err && err.message) || err}`);
+      } finally {
+        const nextSaving = { ...(this.savingGroupStartDate || {}) };
+        delete nextSaving[g];
+        this.savingGroupStartDate = nextSaving;
+      }
+    },
+    clearGroupStartDate(group) {
+      return this.onGroupStartDateChange(group, "");
+    },
     async refresh() {
       this.overview = await getOverviewStats();
+      await this.loadGroupSettings();
       if (this.activeTab === "works") {
         await this.loadContentSummary();
       } else if (this.activeTab === "analysis") {
@@ -2895,6 +3037,12 @@ export default {
         this.contentSummaryRows = Array.isArray(res && res.rows) ? res.rows : [];
         this.deletedContentRows = Array.isArray(res && res.deletedRows) ? res.deletedRows : [];
         this.contentSummaryDate = (res && res.date) || "";
+        if (res && typeof res.excludedBeforeStartCount === "number") {
+          this.excludedBeforeStartTotal = res.excludedBeforeStartCount;
+        }
+        if (res && res.excludedBeforeStartByGroup && typeof res.excludedBeforeStartByGroup === "object") {
+          this.excludedBeforeStartByGroup = { ...res.excludedBeforeStartByGroup };
+        }
         this.selectedSummaryRows = [];
         this.selectedUnlinkedWorks = [];
         if (this.$refs && this.$refs.summaryTable && typeof this.$refs.summaryTable.clearSelection === "function") {
@@ -2952,6 +3100,7 @@ export default {
       }
       if (row.matchMethod === "link") return { label: "链接", type: "success" };
       if (row.matchMethod === "title") return { label: "标题", type: "info" };
+      if (row.matchMethod === "record_time") return { label: "发布记录", type: "success" };
       if (row.matchMethod === "fuzzy") {
         const pct = this.formatScorePct(row.matchScore);
         return { label: pct ? `模糊 ${pct}` : "模糊", type: "warning" };
@@ -2963,6 +3112,7 @@ export default {
       if (!item) return null;
       if (item.matchedBy === "link") return { label: "链接", type: "success" };
       if (item.matchedBy === "title") return { label: "标题", type: "info" };
+      if (item.matchedBy === "record_time") return { label: "发布记录", type: "success" };
       if (item.matchedBy === "fuzzy") {
         const pct = this.formatScorePct(item.score);
         return { label: pct ? `模糊 ${pct}` : "模糊", type: "warning" };
@@ -3583,6 +3733,59 @@ export default {
 }
 
 .auto-collect-last {
+  font-size: 12px;
+  color: #909399;
+}
+
+.group-start-date-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 10px;
+  padding: 8px 14px;
+  background: #ffffff;
+  border: 1px solid $borderColor;
+  border-radius: 8px;
+}
+
+.group-start-date-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.excluded-before-start-tag {
+  margin-left: auto;
+}
+
+.group-start-date-list {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.group-start-date-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.group-start-date-name {
+  font-size: 13px;
+  color: #606266;
+}
+
+.group-start-date-picker {
+  width: 136px;
+}
+
+.group-start-date-clear {
+  padding: 0 2px;
+}
+
+.group-start-date-excluded {
   font-size: 12px;
   color: #909399;
 }

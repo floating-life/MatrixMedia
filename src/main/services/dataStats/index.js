@@ -22,6 +22,10 @@
  * - stats:restore-contents     批量恢复已隐藏/删除的内容行（从 deletedContents 移除）
  * - stats:export-xlsx          导出统计 Excel 工作簿（含本地页面校验与保存对话框）
  * - stats:match-works          发布状态匹配（与采集共享 collecting 互斥锁）
+ * - stats:get-group-settings     读取各分组统计起点日期与被排除作品数
+ * - stats:set-group-start-date   设置或清空单个分组的统计起点日期（YYYY-MM-DD，UTC+8）
+ * - stats:rename-group           分组改名时合并迁移统计目录并更新 group-settings 键（与采集互斥）
+ * - stats:rollback-rename-group  账号更新失败时按 rollbackId 回滚刚执行的分组统计目录迁移
  *
  * 采集全程使用平台页面上下文 fetch（复用分组 partition 登录态），不做任何签名构造。
  */
@@ -33,6 +37,7 @@ const electron = require("electron");
 const { ipcMain } = electron;
 const { collectAccount } = require("./collector");
 const store = require("./store");
+const { renameStatsGroup, rollbackRenameStatsGroup } = require("./groupMigration");
 const { handleAccountCollectOutcome } = require("./collectAlert");
 const {
   normalizeStatusTitle,
@@ -84,6 +89,7 @@ const MAX_BATCH_CHART_IMAGES = 30;
 const BASE64_BODY_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 
 let collecting = false;
+let migrating = false;
 let cancelled = false;
 let collectedToday = { date: "", partitions: new Set() };
 // 每个分区最近一次成功采集时间戳（手动与自动共用，用于同槽 [槽开始, 下一槽开始) 跳重）
@@ -101,12 +107,58 @@ let lastRetentionDays = store.DEFAULT_INTRADAY_RETENTION_DAYS || 60;
 const autoRanInMemory = new Set();
 // link-overrides.json 串行写入队列：保证并发 set/merge/clear 顺序执行不丢写
 let overrideWriteChain = Promise.resolve();
+// group-settings.json 串行写入队列：保证并发设置/清空起点日期顺序执行不丢写
+let groupSettingsWriteChain = Promise.resolve();
+// 刚完成的分组改名迁移回滚上下文（以不透明 rollbackId 键控，不接受渲染进程传入任意路径；
+// 任意后续采集/起点写入/新迁移发生时立即失效，避免旧回滚覆盖新写入）
+const pendingRenameRollbacks = new Map();
+const MAX_PENDING_RENAME_ROLLBACKS = 5;
+
+function storeRenameRollbackPlan(plan) {
+  pendingRenameRollbacks.clear();
+  if (!plan || !plan.hasChanges) return "";
+  const id = crypto.randomBytes(12).toString("hex");
+  pendingRenameRollbacks.set(id, plan);
+  while (pendingRenameRollbacks.size > MAX_PENDING_RENAME_ROLLBACKS) {
+    const oldest = pendingRenameRollbacks.keys().next().value;
+    pendingRenameRollbacks.delete(oldest);
+  }
+  return id;
+}
+
+function clearPendingRenameRollbacks() {
+  pendingRenameRollbacks.clear();
+}
 
 function enqueueOverrideWrite(fn) {
   const run = () => Promise.resolve().then(fn);
   const next = overrideWriteChain.then(run, run);
   overrideWriteChain = next.catch(() => {});
   return next;
+}
+
+function enqueueGroupSettingsWrite(fn) {
+  const run = () => Promise.resolve().then(fn);
+  const next = groupSettingsWriteChain.then(run, run);
+  groupSettingsWriteChain = next.catch(() => {});
+  return next;
+}
+
+function toPlainStringMap(raw) {
+  const out = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const key of Object.keys(raw)) {
+    const desc = Object.getOwnPropertyDescriptor(raw, key);
+    if (desc && typeof desc.value === "string") {
+      Object.defineProperty(out, key, {
+        value: desc.value,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+    }
+  }
+  return out;
 }
 
 function toPlainOverrides(raw) {
@@ -1153,6 +1205,15 @@ function registerDataStatsIpc(options = {}) {
     }
   } catch (_) {}
 
+  // 首次启动默认值迁移：仅当 group-settings.json 不存在且对应分组存在时写入默认起点日期
+  try {
+    if (typeof store.migrateDefaultGroupSettings === "function") {
+      store.migrateDefaultGroupSettings();
+    }
+  } catch (err) {
+    console.warn("[dataStats] 初始化分组默认起点日期失败:", (err && err.message) || err);
+  }
+
   ipcMain.handle("stats:get-auto-settings", async (event) => {
     if (event && event.senderFrame && !isLocalFrameEvent(event)) {
       return { ok: false, error: "不允许外部页面读取自动采集设置" };
@@ -1214,8 +1275,11 @@ function registerDataStatsIpc(options = {}) {
   });
 
   ipcMain.handle("stats:collect", async (event, args) => {
-    if (collecting) {
-      return { results: [], error: "已有采集任务进行中" };
+    if (collecting || migrating) {
+      return {
+        results: [],
+        error: migrating ? "正在迁移分组统计目录，请稍后重试" : "已有采集任务进行中",
+      };
     }
     const accounts = Array.isArray(args && args.accounts) ? args.accounts : [];
     if (!accounts.length) return { results: [], error: "没有可采集的账号" };
@@ -1223,6 +1287,7 @@ function registerDataStatsIpc(options = {}) {
       args && VALID_TRIGGERS.has(args.trigger) ? args.trigger : undefined;
     collecting = true;
     cancelled = false;
+    clearPendingRenameRollbacks();
     try {
       const out = await collectAccounts(accounts, event && event.sender, {
         trigger,
@@ -1391,7 +1456,7 @@ function registerDataStatsIpc(options = {}) {
         };
       }
 
-      if (collecting) {
+      if (collecting || migrating) {
         return { status: "busy" };
       }
       const accounts = Array.isArray(args && args.accounts) ? args.accounts : [];
@@ -1411,6 +1476,7 @@ function registerDataStatsIpc(options = {}) {
       autoRanInMemory.add(slot);
       collecting = true;
       cancelled = false;
+      clearPendingRenameRollbacks();
       let initiatedAutoAt = 0;
       const initiatedAutoPartitions = Object.create(null);
       try {
@@ -1491,7 +1557,7 @@ function registerDataStatsIpc(options = {}) {
       autoRanInMemory.add(today);
       return { status: "already-ran", date: today };
     }
-    if (collecting) {
+    if (collecting || migrating) {
       return { status: "busy" };
     }
     const accounts = Array.isArray(args && args.accounts) ? args.accounts : [];
@@ -1508,6 +1574,7 @@ function registerDataStatsIpc(options = {}) {
     autoRanInMemory.add(today);
     collecting = true;
     cancelled = false;
+    clearPendingRenameRollbacks();
     try {
       const out = await collectAccounts(accounts, event && event.sender, {
         trigger: "auto",
@@ -1550,7 +1617,7 @@ function registerDataStatsIpc(options = {}) {
       if (args != null && (typeof args !== "object" || Array.isArray(args))) {
         return { rows: [], deletedRows: [], date: "", error: "查询参数无效" };
       }
-      await overrideWriteChain;
+      await Promise.all([overrideWriteChain, groupSettingsWriteChain]);
       const date = args && args.date !== undefined ? args.date : undefined;
       return buildContentSummaryData({ date }, exportDeps);
     } catch (err) {
@@ -1581,7 +1648,7 @@ function registerDataStatsIpc(options = {}) {
       if (!contentKey) {
         return { ok: false, error: "contentKey 不能为空" };
       }
-      await overrideWriteChain;
+      await Promise.all([overrideWriteChain, groupSettingsWriteChain]);
       const data = buildContentTrendData(
         {
           contentKey,
@@ -1618,7 +1685,7 @@ function registerDataStatsIpc(options = {}) {
       if (!contentKey) {
         return { ok: false, error: "contentKey 不能为空" };
       }
-      await overrideWriteChain;
+      await Promise.all([overrideWriteChain, groupSettingsWriteChain]);
       const data = buildContentIntradayData(
         {
           contentKey,
@@ -1651,7 +1718,7 @@ function registerDataStatsIpc(options = {}) {
       if (args != null && (typeof args !== "object" || Array.isArray(args))) {
         return { ok: false, error: "查询参数无效" };
       }
-      await overrideWriteChain;
+      await Promise.all([overrideWriteChain, groupSettingsWriteChain]);
       const payload = args || {};
       const period = payload.period !== undefined ? payload.period : 30;
       const to = payload.to !== undefined ? payload.to : undefined;
@@ -2197,7 +2264,7 @@ function registerDataStatsIpc(options = {}) {
       };
       if (exportMaxRows !== undefined) buildOpts.maxRows = exportMaxRows;
 
-      await overrideWriteChain;
+      await Promise.all([overrideWriteChain, groupSettingsWriteChain]);
       const data = buildStatsWorkbookData(buildOpts, exportDeps);
       // 原样使用对话框返回路径（不做 trim）
       writeStatsXlsx(
@@ -2236,11 +2303,186 @@ function registerDataStatsIpc(options = {}) {
    * @param {Array<{key, group, platform, partition, title}>} args.tasks
    * @returns {{ matches: Record<string, {found: boolean, url?: string, workId?: string}>, errors: Array, busy?: boolean }}
    */
+  ipcMain.handle("stats:get-group-settings", async (event) => {
+    try {
+      if (event && event.senderFrame && !isLocalFrameEvent(event)) {
+        return {
+          ok: false,
+          error: "不允许外部页面读取分组统计设置",
+          settings: {},
+          excludedByGroup: {},
+          excludedTotal: 0,
+        };
+      }
+      await groupSettingsWriteChain;
+      const settings =
+        typeof store.readGroupSettings === "function"
+          ? store.readGroupSettings()
+          : Object.create(null);
+      const { excludedByGroup, excludedTotal } =
+        typeof store.countExcludedWorksBeforeStartDate === "function"
+          ? store.countExcludedWorksBeforeStartDate(settings)
+          : { excludedByGroup: {}, excludedTotal: 0 };
+      return {
+        ok: true,
+        settings: toPlainStringMap(settings),
+        excludedByGroup,
+        excludedTotal,
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        error: (err && err.message) || "读取分组统计设置失败",
+        settings: {},
+        excludedByGroup: {},
+        excludedTotal: 0,
+      };
+    }
+  });
+
+  ipcMain.handle("stats:set-group-start-date", async (event, args) => {
+    try {
+      if (event && event.senderFrame && !isLocalFrameEvent(event)) {
+        return { ok: false, error: "不允许外部页面修改分组统计设置" };
+      }
+      if (!args || typeof args !== "object" || Array.isArray(args)) {
+        return { ok: false, error: "参数无效" };
+      }
+      const group = typeof args.group === "string" ? args.group.trim() : "";
+      if (!group) {
+        return { ok: false, error: "分组名称不能为空" };
+      }
+      const rawDate = Object.prototype.hasOwnProperty.call(args, "statsStartDate")
+        ? args.statsStartDate
+        : args.startDate;
+      const res = await enqueueGroupSettingsWrite(() => {
+        clearPendingRenameRollbacks();
+        const saved = store.setGroupStartDate(group, rawDate);
+        const counts =
+          typeof store.countExcludedWorksBeforeStartDate === "function"
+            ? store.countExcludedWorksBeforeStartDate(saved)
+            : { excludedByGroup: {}, excludedTotal: 0 };
+        return { saved, ...counts };
+      });
+      return {
+        ok: true,
+        group,
+        statsStartDate: res.saved[group] || "",
+        settings: toPlainStringMap(res.saved),
+        excludedByGroup: res.excludedByGroup,
+        excludedTotal: res.excludedTotal,
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        error: (err && err.message) || "保存分组起点日期失败",
+      };
+    }
+  });
+
+  ipcMain.handle("stats:rename-group", async (event, args) => {
+    try {
+      if (event && event.senderFrame && !isLocalFrameEvent(event)) {
+        return { ok: false, error: "不允许外部页面迁移分组统计目录" };
+      }
+      if (!args || typeof args !== "object" || Array.isArray(args)) {
+        return { ok: false, error: "参数无效" };
+      }
+      const oldGroup = typeof args.oldGroup === "string" ? args.oldGroup.trim() : "";
+      const newGroup = typeof args.newGroup === "string" ? args.newGroup.trim() : "";
+      if (!oldGroup || !newGroup) {
+        return { ok: false, error: "旧分组名与新分组名不能为空" };
+      }
+      if (collecting || migrating) {
+        return {
+          ok: false,
+          busy: true,
+          error: collecting
+            ? "当前正在采集数据，请稍后重试"
+            : "已有分组迁移任务进行中，请稍后重试",
+        };
+      }
+      migrating = true;
+      try {
+        await Promise.all([overrideWriteChain, groupSettingsWriteChain]);
+        const result = renameStatsGroup({
+          baseDir: store.baseDir(),
+          oldGroup,
+          newGroup,
+        });
+        const rollbackId = storeRenameRollbackPlan(result._rollbackPlan);
+        return {
+          ok: true,
+          ...result,
+          ...(rollbackId ? { rollbackId } : {}),
+        };
+      } finally {
+        migrating = false;
+      }
+    } catch (err) {
+      return {
+        ok: false,
+        error: (err && err.message) || "迁移分组统计目录失败",
+        ...(err && err.code ? { errorCode: err.code } : {}),
+      };
+    }
+  });
+
+  ipcMain.handle("stats:rollback-rename-group", async (event, args) => {
+    try {
+      if (event && event.senderFrame && !isLocalFrameEvent(event)) {
+        return { ok: false, error: "不允许外部页面回滚分组统计目录迁移" };
+      }
+      if (!args || typeof args !== "object" || Array.isArray(args)) {
+        return { ok: false, error: "参数无效" };
+      }
+      const rollbackId = typeof args.rollbackId === "string" ? args.rollbackId.trim() : "";
+      if (!rollbackId) {
+        return { ok: false, error: "rollbackId 不能为空" };
+      }
+      if (collecting || migrating) {
+        return {
+          ok: false,
+          busy: true,
+          error: collecting
+            ? "当前正在采集数据，无法回滚分组迁移"
+            : "已有分组迁移任务进行中，请稍后重试",
+        };
+      }
+      const plan = pendingRenameRollbacks.get(rollbackId);
+      if (!plan) {
+        return { ok: false, error: "迁移回滚记录已失效或不存在" };
+      }
+      migrating = true;
+      try {
+        await Promise.all([overrideWriteChain, groupSettingsWriteChain]);
+        const res = rollbackRenameStatsGroup(plan);
+        pendingRenameRollbacks.delete(rollbackId);
+        return {
+          ok: true,
+          ...res,
+        };
+      } finally {
+        migrating = false;
+      }
+    } catch (err) {
+      return {
+        ok: false,
+        error: (err && err.message) || "回滚分组统计目录迁移失败",
+        ...(err && err.code ? { errorCode: err.code } : {}),
+      };
+    }
+  });
+
   ipcMain.handle("stats:match-works", async (_event, args) => {
-    if (collecting) {
+    if (collecting || migrating) {
       return {
         matches: {},
-        errors: [{ error: "已有采集任务进行中" }],
+        errors: [
+          {
+            error: migrating ? "正在迁移分组统计目录，请稍后重试" : "已有采集任务进行中",
+          },
+        ],
         busy: true,
       };
     }
@@ -2265,6 +2507,7 @@ function registerDataStatsIpc(options = {}) {
     }
 
     collecting = true;
+    clearPendingRenameRollbacks();
     try {
       const entries = [...groupsMap.values()];
       for (let i = 0; i < entries.length; i++) {

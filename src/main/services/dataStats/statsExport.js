@@ -23,6 +23,8 @@ const {
   buildContentIndex,
   linkWorks,
   buildContentSummaryRows,
+  normalizeGroupStartDates,
+  isWorkBeforeGroupStartDate,
   normalizeUrl,
   isManagementUrl,
   isValidAutoContentKey,
@@ -97,7 +99,7 @@ const WORK_DELTA_KEYS = [
   "fansDeltaDelta",
 ];
 
-const VALID_EXPORT_MATCH_METHODS = new Set(["link", "title", "fuzzy", "manual"]);
+const VALID_EXPORT_MATCH_METHODS = new Set(["link", "title", "record_time", "fuzzy", "manual"]);
 
 const WORK_DAILY_HEADERS = [
   "日期",
@@ -469,6 +471,33 @@ function resolveIoDeps(options = {}, depsArg) {
             ? s.readLinkOverrides(readOpts)
             : emptyOverrides();
         },
+    readGroupSettings: isPlainObject(options.groupSettings)
+      ? () => options.groupSettings
+      : typeof injected.readGroupSettings === "function"
+      ? () => injected.readGroupSettings()
+      : storeApi && typeof storeApi.readGroupSettings === "function"
+      ? () => storeApi.readGroupSettings()
+      : hasInjectedDataSource
+      ? () => Object.create(null)
+      : () => {
+          const s = getStore();
+          return typeof s.readGroupSettings === "function"
+            ? s.readGroupSettings()
+            : Object.create(null);
+        },
+    listGroupPlatformAccounts:
+      typeof injected.listGroupPlatformAccounts === "function"
+        ? (g, p) => injected.listGroupPlatformAccounts(g, p)
+        : storeApi && typeof storeApi.listGroupPlatformAccountsFromDisk === "function"
+        ? (g, p) => storeApi.listGroupPlatformAccountsFromDisk(g, p)
+        : hasInjectedDataSource
+        ? () => []
+        : (g, p) => {
+            const s = getStore();
+            return typeof s.listGroupPlatformAccountsFromDisk === "function"
+              ? s.listGroupPlatformAccountsFromDisk(g, p)
+              : [];
+          },
     now: injected.now !== undefined ? injected.now : options.now,
     appVersion:
       injected.appVersion !== undefined ? injected.appVersion : options.appVersion,
@@ -496,6 +525,141 @@ function resolveRecordGroup(rec) {
   if (g) return g;
   const p = typeof rec.phone === "string" ? rec.phone : "";
   return p.split("-")[0].trim();
+}
+
+/**
+ * 按分组统计起点日期过滤单账号的作品列表与作品日快照（账号级 daily.json 不受影响）。
+ * - 未配置起点日期时原样返回，不访问作品标题等字段。
+ * - 发布时间缺失的作品视为不排除。
+ */
+function filterAccountWorksByStartDate(works, worksDaily, startDate) {
+  if (!startDate) {
+    return { works, worksDaily, excludedWorkIds: null };
+  }
+  const excludedWorkIds = new Set();
+  const filteredWorks = [];
+  for (let i = 0; i < works.length; i++) {
+    const w = works[i];
+    if (isPlainObject(w) && isWorkBeforeGroupStartDate(w, startDate)) {
+      const wid = w.workId == null ? "" : String(w.workId);
+      if (wid) excludedWorkIds.add(wid);
+      continue;
+    }
+    filteredWorks.push(w);
+  }
+  if (excludedWorkIds.size === 0) {
+    return { works, worksDaily, excludedWorkIds: null };
+  }
+  const filteredWorksDaily = Object.create(null);
+  if (isPlainObject(worksDaily)) {
+    const keys = Object.keys(worksDaily);
+    for (let i = 0; i < keys.length; i++) {
+      const wid = keys[i];
+      if (excludedWorkIds.has(wid)) continue;
+      filteredWorksDaily[wid] = safeOwnGet(worksDaily, wid);
+    }
+  }
+  return { works: filteredWorks, worksDaily: filteredWorksDaily, excludedWorkIds };
+}
+
+function filterWorksIntradayByExcluded(worksIntraday, excludedWorkIds) {
+  if (
+    !(excludedWorkIds instanceof Set) ||
+    excludedWorkIds.size === 0 ||
+    !isPlainObject(worksIntraday)
+  ) {
+    return worksIntraday;
+  }
+  const out = Object.create(null);
+  const keys = Object.keys(worksIntraday);
+  for (let i = 0; i < keys.length; i++) {
+    const wid = keys[i];
+    if (excludedWorkIds.has(wid)) continue;
+    out[wid] = safeOwnGet(worksIntraday, wid);
+  }
+  return out;
+}
+
+function buildAccountIdentityExtras(rawAcc, group, platform, io) {
+  const extras = {};
+  if (isPlainObject(rawAcc)) {
+    if (typeof rawAcc.partition === "string" && rawAcc.partition.trim()) {
+      extras.partition = rawAcc.partition;
+    }
+    if (typeof rawAcc.accountKey === "string" && rawAcc.accountKey.trim()) {
+      extras.accountKey = rawAcc.accountKey;
+    }
+    if (typeof rawAcc.phone === "string" && rawAcc.phone.trim()) {
+      extras.phone = rawAcc.phone;
+    }
+    if (Array.isArray(rawAcc.accountPartitions) && rawAcc.accountPartitions.length) {
+      extras.accountPartitions = rawAcc.accountPartitions;
+    }
+    if (Array.isArray(rawAcc.accountKeys) && rawAcc.accountKeys.length) {
+      extras.accountKeys = rawAcc.accountKeys;
+    }
+    if (isPlainObject(rawAcc.meta)) {
+      extras.meta = rawAcc.meta;
+    }
+  }
+  const hasExplicitIdentity = Boolean(
+    extras.partition ||
+      extras.accountKey ||
+      extras.phone ||
+      extras.accountPartitions ||
+      extras.accountKeys
+  );
+  if (!hasExplicitIdentity && io && typeof io.listGroupPlatformAccounts === "function") {
+    try {
+      const diskAccs = io.listGroupPlatformAccounts(group, platform);
+      if (Array.isArray(diskAccs) && diskAccs.length > 0) {
+        const parts = diskAccs
+          .map((a) => (a && typeof a.partition === "string" ? a.partition.trim() : ""))
+          .filter(Boolean);
+        if (parts.length > 0) {
+          extras.accountPartitions = parts;
+        }
+      }
+    } catch (_) {}
+  }
+  return extras;
+}
+
+function summarizeExcludedBeforeStart(accountsData, excludedWorkIdsByGp) {
+  const byGroup = {};
+  let total = 0;
+  if (!(excludedWorkIdsByGp instanceof Map) || excludedWorkIdsByGp.size === 0) {
+    return { excludedBeforeStartCount: 0, excludedBeforeStartByGroup: byGroup };
+  }
+  const seenByGroup = new Map();
+  for (const acc of Array.isArray(accountsData) ? accountsData : []) {
+    if (!isPlainObject(acc)) continue;
+    const gpKey = `${acc.group}|${acc.platform}`;
+    const excludedSet = excludedWorkIdsByGp.get(gpKey);
+    if (!excludedSet || excludedSet.size === 0) continue;
+    const g = String(acc.group || "").trim();
+    if (!g) continue;
+    let seen = seenByGroup.get(g);
+    if (!seen) {
+      seen = new Set();
+      seenByGroup.set(g, seen);
+    }
+    for (const wid of excludedSet) {
+      seen.add(`${acc.platform}|${wid}`);
+    }
+  }
+  for (const [g, set] of seenByGroup.entries()) {
+    if (set.size > 0) {
+      Object.defineProperty(byGroup, g, {
+        value: set.size,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+      total += set.size;
+    }
+  }
+  return { excludedBeforeStartCount: total, excludedBeforeStartByGroup: byGroup };
 }
 
 function reduceWorksDailyAsOf(rawWorksDaily, cutoffDate) {
@@ -597,7 +761,8 @@ function filterSummaryRowsByGroupScope(
   link,
   outputAccountsData,
   groupSet,
-  cutoffDate
+  cutoffDate,
+  startDateByGroup = null
 ) {
   if (!groupSet || groupSet.size === 0) return summaryRows;
 
@@ -614,6 +779,10 @@ function filterSummaryRowsByGroupScope(
         : rawTimestampToUtc8Date(t.lastPublishAt) || contentDate;
       if (cutoffDate && tDate && tDate > cutoffDate) continue;
       const g = typeof t.group === "string" ? t.group.trim() : "";
+      if (startDateByGroup instanceof Map && startDateByGroup.size > 0 && tDate) {
+        const gStart = startDateByGroup.get(g);
+        if (gStart && tDate < gStart) continue;
+      }
       if (groupSet.has(g)) {
         ownContentKeys.add(c.contentKey);
         break;
@@ -659,41 +828,87 @@ function loadRawDataset(options = {}, depsArg) {
       ? new Set(options.groups.map((g) => String(g)))
       : null;
 
+  const rawGroupSettings = io.readGroupSettings() || Object.create(null);
+  const startDateByGroup = normalizeGroupStartDates(rawGroupSettings);
+
   const rawAccounts = io.listAccounts() || [];
   const allAccountsData = [];
+  const unfilteredAllAccountsData = [];
   const allWorksDailyByGp = Object.create(null);
+  const excludedWorkIdsByGp = new Map();
 
   for (const acc of rawAccounts) {
     if (!isPlainObject(acc)) continue;
     const group = acc.group == null ? "" : String(acc.group);
     const platform = acc.platform == null ? "" : String(acc.platform);
+    const gpKey = `${group}|${platform}`;
     const inOutputScope = !groupSet || groupSet.has(group);
+    const groupStartDate = startDateByGroup.get(group.trim()) || "";
 
     const worksDoc = io.readWorks(group, platform);
-    const works =
+    const rawWorks =
       worksDoc && Array.isArray(worksDoc.works)
         ? worksDoc.works
         : Array.isArray(worksDoc)
         ? worksDoc
         : [];
     const rawWorksDaily = io.readWorksDaily(group, platform);
-    const worksDaily = isPlainObject(rawWorksDaily) ? rawWorksDaily : Object.create(null);
+    const baseWorksDaily = isPlainObject(rawWorksDaily) ? rawWorksDaily : Object.create(null);
+    const { works, worksDaily, excludedWorkIds } = filterAccountWorksByStartDate(
+      rawWorks,
+      baseWorksDaily,
+      groupStartDate
+    );
+    const hasExcluded = Boolean(excludedWorkIds && excludedWorkIds.size > 0);
+    if (hasExcluded) {
+      excludedWorkIdsByGp.set(gpKey, excludedWorkIds);
+    }
+
+    // 账号级快照（daily.json）不受分组统计起点日期影响
     const rawDaily = inOutputScope ? io.readDaily(group, platform) : {};
     const daily = isPlainObject(rawDaily) ? rawDaily : {};
+    const identityExtras = buildAccountIdentityExtras(acc, group, platform, io);
 
-    allAccountsData.push({ group, platform, works, worksDaily, daily });
-    allWorksDailyByGp[`${group}|${platform}`] = worksDaily;
+    const filteredAcc = { group, platform, ...identityExtras, works, worksDaily, daily };
+    allAccountsData.push(filteredAcc);
+    // 账号级异常判定与回填使用未受起点日期过滤的完整作品快照
+    unfilteredAllAccountsData.push(
+      hasExcluded
+        ? {
+            group,
+            platform,
+            ...identityExtras,
+            works: rawWorks,
+            worksDaily: baseWorksDaily,
+            daily,
+          }
+        : filteredAcc
+    );
+    allWorksDailyByGp[gpKey] = worksDaily;
   }
 
-  allAccountsData.sort((a, b) => {
+  const sortAccounts = (a, b) => {
     const pc = comparePlatform(a.platform, b.platform);
     if (pc !== 0) return pc;
     return compareText(a.group, b.group);
-  });
+  };
+  allAccountsData.sort(sortAccounts);
+  unfilteredAllAccountsData.sort(sortAccounts);
 
   const outputAccountsData = groupSet
     ? allAccountsData.filter((a) => groupSet.has(a.group))
     : allAccountsData;
+  const hasStartDateExclusions = excludedWorkIdsByGp.size > 0;
+  const unfilteredOutputAccountsData = hasStartDateExclusions
+    ? groupSet
+      ? unfilteredAllAccountsData.filter((a) => groupSet.has(a.group))
+      : unfilteredAllAccountsData
+    : outputAccountsData;
+
+  const { excludedBeforeStartCount, excludedBeforeStartByGroup } = summarizeExcludedBeforeStart(
+    outputAccountsData,
+    excludedWorkIdsByGp
+  );
 
   // 保留全量分组账号与发布记录用于全量作品身份归属裁决，输出阶段再按 groupSet 裁剪
   const allPushRecords = io.readPushRecords() || [];
@@ -703,9 +918,16 @@ function loadRawDataset(options = {}, depsArg) {
   return {
     io,
     groupSet,
+    groupSettings: rawGroupSettings,
+    startDateByGroup,
+    hasStartDateExclusions,
+    excludedWorkIdsByGp,
+    excludedBeforeStartCount,
+    excludedBeforeStartByGroup,
     allAccountsData,
     allWorksDailyByGp,
     outputAccountsData,
+    unfilteredOutputAccountsData,
     accountsData: outputAccountsData,
     worksDailyByGp: allWorksDailyByGp,
     allPushRecords,
@@ -728,17 +950,23 @@ function loadSummaryDataset(options = {}, depsArg, explicitCutoffDate = "") {
       ? new Set(options.groups.map((g) => String(g)))
       : null;
 
+  const rawGroupSettings = io.readGroupSettings() || Object.create(null);
+  const startDateByGroup = normalizeGroupStartDates(rawGroupSettings);
+
   const rawAccounts = io.listAccounts() || [];
   const allAccountsData = [];
   const allWorksDailyByGp = Object.create(null);
+  const excludedWorkIdsByGp = new Map();
 
   for (const acc of rawAccounts) {
     if (!isPlainObject(acc)) continue;
     const group = acc.group == null ? "" : String(acc.group);
     const platform = acc.platform == null ? "" : String(acc.platform);
+    const gpKey = `${group}|${platform}`;
+    const groupStartDate = startDateByGroup.get(group.trim()) || "";
 
     const worksDoc = io.readWorks(group, platform);
-    const works =
+    const rawWorks =
       worksDoc && Array.isArray(worksDoc.works)
         ? worksDoc.works
         : Array.isArray(worksDoc)
@@ -753,8 +981,19 @@ function loadSummaryDataset(options = {}, depsArg, explicitCutoffDate = "") {
       res = reduceWorksDailyAsOf(io.readWorksDaily(group, platform), explicitCutoffDate);
     }
 
-    allAccountsData.push({ group, platform, works, worksDaily: res.worksDaily, daily: {} });
-    allWorksDailyByGp[`${group}|${platform}`] = res.worksDaily;
+    const { works, worksDaily, excludedWorkIds } = filterAccountWorksByStartDate(
+      rawWorks,
+      res.worksDaily,
+      groupStartDate
+    );
+    if (excludedWorkIds && excludedWorkIds.size > 0) {
+      excludedWorkIdsByGp.set(gpKey, excludedWorkIds);
+    }
+
+    const identityExtras = buildAccountIdentityExtras(acc, group, platform, io);
+
+    allAccountsData.push({ group, platform, ...identityExtras, works, worksDaily, daily: {} });
+    allWorksDailyByGp[gpKey] = worksDaily;
   }
 
   allAccountsData.sort((a, b) => {
@@ -767,6 +1006,11 @@ function loadSummaryDataset(options = {}, depsArg, explicitCutoffDate = "") {
     ? allAccountsData.filter((a) => groupSet.has(a.group))
     : allAccountsData;
 
+  const { excludedBeforeStartCount, excludedBeforeStartByGroup } = summarizeExcludedBeforeStart(
+    outputAccountsData,
+    excludedWorkIdsByGp
+  );
+
   // 保留全量分组账号与发布记录用于全量作品身份归属裁决，输出阶段再按 groupSet 裁剪
   const allPushRecords = io.readPushRecords() || [];
   const latestDataDate = explicitCutoffDate
@@ -777,6 +1021,11 @@ function loadSummaryDataset(options = {}, depsArg, explicitCutoffDate = "") {
   return {
     io,
     groupSet,
+    groupSettings: rawGroupSettings,
+    startDateByGroup,
+    excludedWorkIdsByGp,
+    excludedBeforeStartCount,
+    excludedBeforeStartByGroup,
     allAccountsData,
     allWorksDailyByGp,
     outputAccountsData,
@@ -902,6 +1151,7 @@ function resolveDeleteContentSnapshots(contentKeys, currentOverrides, depsArg) {
     worksDaily: dataset.allWorksDailyByGp,
     date: cutoffDate || undefined,
     overrides: currentOverrides,
+    groupSettings: dataset.groupSettings,
   });
   const visibleRows = buildContentSummaryRows({
     contents: allContents,
@@ -910,6 +1160,7 @@ function resolveDeleteContentSnapshots(contentKeys, currentOverrides, depsArg) {
     worksDaily: dataset.allWorksDailyByGp,
     date: cutoffDate || undefined,
     overrides: currentOverrides,
+    groupSettings: dataset.groupSettings,
     includeDeleted: false,
   });
 
@@ -1039,7 +1290,7 @@ function countAccountDailyRows(accountsData, from, to) {
   return count;
 }
 
-function loadAccountsWorksIntraday(accountsData, io, range) {
+function loadAccountsWorksIntraday(accountsData, io, range, excludedWorkIdsByGp = null) {
   const entries = [];
   for (const acc of Array.isArray(accountsData) ? accountsData : []) {
     if (!isPlainObject(acc)) continue;
@@ -1047,7 +1298,12 @@ function loadAccountsWorksIntraday(accountsData, io, range) {
       io && typeof io.readWorksIntraday === "function"
         ? io.readWorksIntraday(acc.group, acc.platform, range || {})
         : null;
-    const worksIntraday = isPlainObject(raw) ? raw : Object.create(null);
+    const baseIntraday = isPlainObject(raw) ? raw : Object.create(null);
+    const excludedSet =
+      excludedWorkIdsByGp instanceof Map
+        ? excludedWorkIdsByGp.get(`${acc.group}|${acc.platform}`) || null
+        : null;
+    const worksIntraday = filterWorksIntradayByExcluded(baseIntraday, excludedSet);
     entries.push({ acc, worksIntraday });
   }
   return entries;
@@ -1101,18 +1357,23 @@ function countWorkIntradayRows(accountsWithIntraday, from, to, link, deletedFilt
   return count;
 }
 
-function loadLatestCollectedAtByPwKey(accountsData, io, cutoffDate) {
+function loadLatestCollectedAtByPwKey(accountsData, io, cutoffDate, excludedWorkIdsByGp = null) {
   const latestByPwKey = new Map();
   if (!Array.isArray(accountsData) || !accountsData.length || !io) return latestByPwKey;
   for (const acc of accountsData) {
     if (!isPlainObject(acc)) continue;
     const platform = acc.platform == null ? "" : String(acc.platform);
+    const excludedSet =
+      excludedWorkIdsByGp instanceof Map
+        ? excludedWorkIdsByGp.get(`${acc.group}|${acc.platform}`) || null
+        : null;
     let perWork = null;
     if (typeof io.readWorksIntradayLatestCollectedAt === "function") {
       perWork = io.readWorksIntradayLatestCollectedAt(acc.group, acc.platform, cutoffDate);
     }
     if (isPlainObject(perWork)) {
       for (const workId of Object.keys(perWork)) {
+        if (excludedSet && excludedSet.has(workId)) continue;
         const ts = safeOwnGet(perWork, workId);
         if (typeof ts !== "number" || !Number.isFinite(ts) || ts <= 0) continue;
         const pwKey = `${platform}|${workId}`;
@@ -1129,6 +1390,7 @@ function loadLatestCollectedAtByPwKey(accountsData, io, cutoffDate) {
     );
     if (!isPlainObject(intraday)) continue;
     for (const workId of Object.keys(intraday)) {
+      if (excludedSet && excludedSet.has(workId)) continue;
       const list = safeOwnGet(intraday, workId);
       if (!Array.isArray(list)) continue;
       const pwKey = `${platform}|${workId}`;
@@ -1285,6 +1547,7 @@ function buildContentSummaryData(options = {}, depsArg) {
     worksDaily: dataset.allWorksDailyByGp,
     date: cutoffDate || undefined,
     overrides: dataset.linkOverrides,
+    groupSettings: dataset.groupSettings,
   });
   const {
     contents: overrideContents,
@@ -1298,6 +1561,7 @@ function buildContentSummaryData(options = {}, depsArg) {
     date: cutoffDate || undefined,
     overrides: dataset.linkOverrides,
     groups: dataset.groupSet,
+    groupSettings: dataset.groupSettings,
     includeDeleted: false,
   });
   const deletedRows = [];
@@ -1310,6 +1574,7 @@ function buildContentSummaryData(options = {}, depsArg) {
       date: cutoffDate || undefined,
       overrides: dataset.linkOverrides,
       groups: dataset.groupSet,
+      groupSettings: dataset.groupSettings,
       includeDeleted: true,
     });
     const deletedRowByKey = new Map();
@@ -1366,13 +1631,15 @@ function buildContentSummaryData(options = {}, depsArg) {
       link,
       dataset.outputAccountsData,
       dataset.groupSet,
-      cutoffDate
+      cutoffDate,
+      dataset.startDateByGroup
     );
   }
   const latestCollectedByPwKey = loadLatestCollectedAtByPwKey(
     dataset.outputAccountsData,
     dataset.io,
-    cutoffDate
+    cutoffDate,
+    dataset.excludedWorkIdsByGp
   );
   enrichSummaryRowsLastCollectedAt(rows, latestCollectedByPwKey);
   const workCounts = computeWorkCountsFromSummaryRows(rows);
@@ -1381,6 +1648,8 @@ function buildContentSummaryData(options = {}, depsArg) {
     rows,
     deletedRows,
     date: cutoffDate,
+    excludedBeforeStartCount: dataset.excludedBeforeStartCount,
+    excludedBeforeStartByGroup: dataset.excludedBeforeStartByGroup,
     counts: {
       accounts: dataset.outputAccountsData.length,
       works: workCounts.works,
@@ -1435,6 +1704,11 @@ function resolveLinkValidationContext(options = {}, depsArg) {
         ? rawTDate
         : rawTimestampToUtc8Date(t.lastPublishAt) || contentDate;
       if (cutoffDate && tDate && tDate > cutoffDate) continue;
+      if (dataset.startDateByGroup && dataset.startDateByGroup.size > 0 && tDate) {
+        const tg = typeof t.group === "string" ? t.group.trim() : "";
+        const gStart = tg ? dataset.startDateByGroup.get(tg) : "";
+        if (gStart && tDate < gStart) continue;
+      }
       eligibleTargets++;
     }
     const eligible = hasTargets
@@ -1579,6 +1853,7 @@ function resolveLinkValidationContext(options = {}, depsArg) {
       worksDaily: dataset.allWorksDailyByGp,
       date: cutoffDate || undefined,
       overrides: overridesDoc,
+      groupSettings: dataset.groupSettings,
     });
     const meta = getLinkResultMeta(link);
     const byWorkIdentity =
@@ -2203,7 +2478,8 @@ function resolveAnalysisPublishTimes(
   link,
   cutoffTo,
   allPushRecords,
-  deletedFilter = null
+  deletedFilter = null,
+  startDateByGroup = null
 ) {
   if (!Array.isArray(summaryRows) || summaryRows.length === 0) {
     return { summaryRows: [], workFallbackByPwKey: new Map() };
@@ -2333,6 +2609,10 @@ function resolveAnalysisPublishTimes(
 
       const platform = typeof rec.pt === "string" ? rec.pt.trim() : "";
       const group = resolveRecordGroup(rec);
+      if (startDateByGroup instanceof Map && startDateByGroup.size > 0 && group && recTime.date) {
+        const gStart = startDateByGroup.get(group);
+        if (gStart && recTime.date < gStart) continue;
+      }
       let arr = recsByContent.get(ck);
       if (!arr) {
         arr = [];
@@ -3177,7 +3457,7 @@ function buildSchemaSheet(dynamicSchemaEntries) {
       "作品日明细",
       "关联方式",
       "matchedBy",
-      "跨平台关联依据：link（直链严格 1:1 匹配）、title（同组同平台唯一标题匹配）、fuzzy（标题模糊+时间窗自动匹配或无发布记录跨平台聚类；时间窗统一按 UTC+8 日历日相差 ≤2 天，缺时间时相似度门槛 +0.1）、manual（手工指定/合并/确认）；未关联为空。注意：模糊匹配可能合错，已手工确认的标 manual。",
+      "跨平台关联依据：link（直链严格 1:1 匹配）、title（同组同平台唯一标题匹配）、record_time（按发布记录同账号±3小时唯一时间窗自动匹配）、fuzzy（标题模糊+时间窗自动匹配或无发布记录跨平台聚类；时间窗统一按 UTC+8 日历日相差 ≤2 天，缺时间时相似度门槛 +0.1）、manual（手工指定/合并/确认）；未关联为空。注意：模糊匹配可能合错，已手工确认的标 manual。",
     ],
     [
       "作品日明细",
@@ -3329,7 +3609,7 @@ function buildSchemaSheet(dynamicSchemaEntries) {
       "作品时段明细",
       "关联方式",
       "matchedBy",
-      "跨平台关联依据：link / title / fuzzy / manual；未关联为空单元格。",
+      "跨平台关联依据：link / title / record_time / fuzzy / manual；未关联为空单元格。",
     ],
     [
       "作品时段明细",
@@ -3439,7 +3719,7 @@ function buildSchemaSheet(dynamicSchemaEntries) {
       "作品跨平台汇总",
       "匹配方式",
       "matchMethod",
-      "簇内跨平台关联方式汇总：有手工矫正或确认则标 manual，否则取簇内最弱的自动方式（fuzzy > title > link）；未关联或无已匹配作品为空。模糊匹配可能合错，已手工确认的标 manual。",
+      "簇内跨平台关联方式汇总：有手工矫正或确认则标 manual，否则取簇内最弱的自动方式（fuzzy > record_time > title > link）；未关联或无已匹配作品为空。模糊匹配可能合错，已手工确认的标 manual。",
     ],
     [
       "作品跨平台汇总",
@@ -3754,6 +4034,7 @@ function buildStatsAnalysisData(options = {}, depsArg) {
     worksDaily: latestWorksDailyByGp,
     date: resolvedTo,
     overrides: dataset.linkOverrides,
+    groupSettings: dataset.groupSettings,
   });
   let summaryRows = buildContentSummaryRows({
     contents: allContents,
@@ -3763,6 +4044,7 @@ function buildStatsAnalysisData(options = {}, depsArg) {
     date: resolvedTo,
     overrides: dataset.linkOverrides,
     groups: dataset.groupSet,
+    groupSettings: dataset.groupSettings,
   });
   if (dataset.groupSet) {
     summaryRows = filterSummaryRowsByGroupScope(
@@ -3771,7 +4053,8 @@ function buildStatsAnalysisData(options = {}, depsArg) {
       link,
       dataset.outputAccountsData,
       dataset.groupSet,
-      resolvedTo
+      resolvedTo,
+      dataset.startDateByGroup
     );
   }
 
@@ -3796,16 +4079,22 @@ function buildStatsAnalysisData(options = {}, depsArg) {
     link,
     resolvedTo,
     dataset.allPushRecords,
-    deletedFilter
+    deletedFilter,
+    dataset.startDateByGroup
   );
   applyWorkFallbackPublishTimes(analysisRows, workFallbackByPwKey);
 
   // 读取近 7 天分时段快照供「新作品前 24 小时」起量曲线分析
   const recent7From = shiftDateStr(resolvedTo, -(NEW_WORKS_FIRST_24H_DAYS - 1));
-  const intradayEntries = loadAccountsWorksIntraday(dataset.outputAccountsData, dataset.io, {
-    from: recent7From,
-    to: resolvedTo,
-  });
+  const intradayEntries = loadAccountsWorksIntraday(
+    dataset.outputAccountsData,
+    dataset.io,
+    {
+      from: recent7From,
+      to: resolvedTo,
+    },
+    dataset.excludedWorkIdsByGp
+  );
   const { analysisRows: intradayAnalysisRows } = collectWorkIntradayStructured(
     intradayEntries,
     link,
@@ -3819,8 +4108,17 @@ function buildStatsAnalysisData(options = {}, depsArg) {
   );
   applyWorkFallbackPublishTimes(intradayAnalysisRows, workFallbackByPwKey);
 
+  // 账号级异常判定（核对账号总播放骤降是否有对应作品级下降）必须使用未受起点日期过滤的完整作品数据
+  const accountWorkDailyRows = dataset.hasStartDateExclusions
+    ? collectWorkDailyStructured(dataset.unfilteredOutputAccountsData, null, {
+        needSheetRows: false,
+        needAnalysisRows: true,
+      }).analysisRows
+    : null;
+
   const analysis = buildStatsAnalysis({
     dailyRows: analysisRows,
+    accountWorkDailyRows,
     summaryRows: analysisSummaryRows,
     accountRows: accountDaily.allRows,
     intradayRows: intradayAnalysisRows,
@@ -3911,9 +4209,14 @@ function buildStatsWorkbookData(options = {}, deps) {
       throw createRowLimitError(estWorkDailyRows, maxRows, "作品日明细");
     }
   }
-  const outputIntradayEntries = loadAccountsWorksIntraday(dataset.outputAccountsData, dataset.io, {
-    to: resolvedTo,
-  });
+  const outputIntradayEntries = loadAccountsWorksIntraday(
+    dataset.outputAccountsData,
+    dataset.io,
+    {
+      to: resolvedTo,
+    },
+    dataset.excludedWorkIdsByGp
+  );
   if (!hasDeletedFilter) {
     const estWorkIntradayRows = countWorkIntradayRows(
       outputIntradayEntries,
@@ -3939,6 +4242,7 @@ function buildStatsWorkbookData(options = {}, deps) {
     worksDaily: latestWorksDailyByGp,
     date: resolvedTo,
     overrides: dataset.linkOverrides,
+    groupSettings: dataset.groupSettings,
   });
   const deletedFilter = hasDeletedFilter
     ? buildDeletedFilter(dataset.linkOverrides, { contents: allContents, link })
@@ -3973,6 +4277,7 @@ function buildStatsWorkbookData(options = {}, deps) {
     date: resolvedTo,
     overrides: dataset.linkOverrides,
     groups: dataset.groupSet,
+    groupSettings: dataset.groupSettings,
   });
   if (dataset.groupSet) {
     summaryRows = filterSummaryRowsByGroupScope(
@@ -3981,7 +4286,8 @@ function buildStatsWorkbookData(options = {}, deps) {
       link,
       dataset.outputAccountsData,
       dataset.groupSet,
-      resolvedTo
+      resolvedTo,
+      dataset.startDateByGroup
     );
   }
   if (summaryRows.length > maxRows) {
@@ -4028,12 +4334,21 @@ function buildStatsWorkbookData(options = {}, deps) {
     link,
     resolvedTo,
     dataset.allPushRecords,
-    deletedFilter
+    deletedFilter,
+    dataset.startDateByGroup
   );
   applyWorkFallbackPublishTimes(analysisRows, workFallbackByPwKey);
   applyWorkFallbackPublishTimes(intradayAnalysisRows, workFallbackByPwKey);
+  // 账号日快照异常判定与总播放/日增回填必须使用未受起点日期过滤的完整作品数据
+  const accountWorkDailyRows = dataset.hasStartDateExclusions
+    ? collectWorkDailyStructured(dataset.unfilteredOutputAccountsData, null, {
+        needSheetRows: false,
+        needAnalysisRows: true,
+      }).analysisRows
+    : null;
   const analysis = buildStatsAnalysis({
     dailyRows: analysisRows,
+    accountWorkDailyRows,
     summaryRows: analysisSummaryRows,
     accountRows: accountDaily.allRows,
     intradayRows: intradayAnalysisRows,
@@ -4212,6 +4527,7 @@ function buildContentTrendData(options = {}, depsArg) {
     worksDaily: latestWorksDailyByGp,
     date: cutoffDate || undefined,
     overrides: dataset.linkOverrides,
+    groupSettings: dataset.groupSettings,
   });
   let summaryRows = buildContentSummaryRows({
     contents: allContents,
@@ -4221,6 +4537,7 @@ function buildContentTrendData(options = {}, depsArg) {
     date: cutoffDate || undefined,
     overrides: dataset.linkOverrides,
     groups: dataset.groupSet,
+    groupSettings: dataset.groupSettings,
   });
   if (dataset.groupSet) {
     summaryRows = filterSummaryRowsByGroupScope(
@@ -4229,7 +4546,8 @@ function buildContentTrendData(options = {}, depsArg) {
       link,
       dataset.outputAccountsData,
       dataset.groupSet,
-      cutoffDate
+      cutoffDate,
+      dataset.startDateByGroup
     );
   }
 
@@ -4490,6 +4808,7 @@ function buildContentIntradayData(options = {}, depsArg) {
     worksDaily: dataset.allWorksDailyByGp,
     date: cutoffDate || undefined,
     overrides: dataset.linkOverrides,
+    groupSettings: dataset.groupSettings,
   });
   let summaryRows = buildContentSummaryRows({
     contents: allContents,
@@ -4499,6 +4818,7 @@ function buildContentIntradayData(options = {}, depsArg) {
     date: cutoffDate || undefined,
     overrides: dataset.linkOverrides,
     groups: dataset.groupSet,
+    groupSettings: dataset.groupSettings,
   });
   if (dataset.groupSet) {
     summaryRows = filterSummaryRowsByGroupScope(
@@ -4507,7 +4827,8 @@ function buildContentIntradayData(options = {}, depsArg) {
       link,
       dataset.outputAccountsData,
       dataset.groupSet,
-      cutoffDate
+      cutoffDate,
+      dataset.startDateByGroup
     );
   }
 
@@ -4573,8 +4894,13 @@ function buildContentIntradayData(options = {}, depsArg) {
         ? io.readWorksIntraday(acc.group, acc.platform, readRange)
         : null;
     if (!isPlainObject(intradayMap)) continue;
+    const excludedSet =
+      dataset.excludedWorkIdsByGp instanceof Map
+        ? dataset.excludedWorkIdsByGp.get(`${acc.group}|${acc.platform}`) || null
+        : null;
 
     for (const workId of Object.keys(intradayMap)) {
+      if (excludedSet && excludedSet.has(workId)) continue;
       const pwKey = `${platform}|${workId}`;
       if (!targetPwKeys.has(pwKey)) continue;
       const list = safeOwnGet(intradayMap, workId);

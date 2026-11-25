@@ -11,9 +11,16 @@
 
 const crypto = require("crypto");
 const { WORK_STAT_KEYS, DELETED_WORK_TITLE, normalizeMetric } = require("./statsTable");
+const {
+  resolveCanonicalPlatform,
+  canonicalizePartition,
+  deriveCanonicalPartition,
+} = require("../../../shared/publishDedupe");
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const DAY_MS = 86400000;
+const RECORD_TIME_WINDOW_MS = 3 * 3600 * 1000;
+const NAIVE_DATETIME_RE = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2}(?:\.\d+)?)?$/;
 const ZERO_WIDTH_RE = /[\u200B-\u200F\u2060\uFEFF\u00AD]/g;
 const FULLWIDTH_ASCII_RE = /[\uFF01-\uFF5E]/g;
 const TRACKING_PARAM_RE =
@@ -164,6 +171,139 @@ function parseValidTimestampMs(raw) {
 function toUtc8DateStr(raw) {
   const ms = parseValidTimestampMs(raw);
   return ms === null ? "" : new Date(ms + UTC8_MS).toISOString().slice(0, 10);
+}
+
+/**
+ * 解析精确到时分（非纯日期 YYYY-MM-DD）的合法时间戳（ms），供发布记录 ±3 小时时间窗匹配使用：
+ * - 拒绝纯日期字符串（缺少时分，无法判断 ±3 小时）
+ * - 无时区的 `YYYY-MM-DD HH:mm[:ss]` 按 UTC+8 解析（与 shared/publishDedupe.js 同口径）
+ */
+function parsePreciseTimestampMs(raw) {
+  if (raw == null || raw === "") return null;
+  if (typeof raw === "number") return parseValidTimestampMs(raw);
+  if (raw instanceof Date) return parseValidTimestampMs(raw);
+  if (typeof raw === "string") {
+    const s = raw.trim();
+    if (!s || DATE_RE.test(s)) return null;
+    if (/^\d+$/.test(s)) return parseValidTimestampMs(Number(s));
+    if (NAIVE_DATETIME_RE.test(s)) {
+      const iso = s.replace(" ", "T");
+      const withSec = iso.length === 16 ? `${iso}:00` : iso;
+      return parseValidTimestampMs(`${withSec}+08:00`);
+    }
+    return parseValidTimestampMs(s);
+  }
+  return null;
+}
+
+/**
+ * 清洗分组统计起点日期映射为 Map<groupName, "YYYY-MM-DD">（拒绝原型污染键与非法日期）。
+ */
+function normalizeGroupStartDates(raw) {
+  const map = new Map();
+  if (!isPlainObject(raw)) return map;
+  const source =
+    hasOwn(raw, "settings") && isPlainObject(raw.settings) ? raw.settings : raw;
+  for (const rawKey of Object.keys(source)) {
+    if (typeof rawKey !== "string") continue;
+    const group = rawKey.trim();
+    if (!group || FORBIDDEN_PROTO_KEYS.has(group)) continue;
+    const desc = Object.getOwnPropertyDescriptor(source, rawKey);
+    const val = desc ? desc.value : undefined;
+    let dateStr = "";
+    if (typeof val === "string") {
+      dateStr = val.trim();
+    } else if (isPlainObject(val) && typeof val.statsStartDate === "string") {
+      dateStr = val.statsStartDate.trim();
+    }
+    if (dateStr && isValidDateStr(dateStr)) {
+      map.set(group, dateStr);
+    }
+  }
+  return map;
+}
+
+/** 判断作品发布日期（UTC+8）是否早于该分组起点日期；缺失发布时间视为不排除（返回 false） */
+function isWorkBeforeGroupStartDate(work, groupStartDate) {
+  if (!groupStartDate || !isValidDateStr(groupStartDate)) return false;
+  if (!isPlainObject(work)) return false;
+  const pubMs = parseValidTimestampMs(work.publishTime);
+  if (pubMs === null) return false;
+  const pubDate = toUtc8DateStr(pubMs);
+  return Boolean(pubDate && pubDate < groupStartDate);
+}
+
+/**
+ * 推导作品所属的规范化账号 partition（与 shared/publishDedupe.js 同口径，用于 record_time 严格防串号）：
+ * 1. 若该分组平台的 meta.workCountsByAccount 记录了多于 1 个账号（含换号历史），整桶返回 ""（跳过 record_time）；
+ * 2. 收集桶级显式账号（partition/accountKey/phone、accountPartitions/accountKeys）与
+ *    meta.workCountsByAccount：任一侧多于 1 个账号，或两侧唯一账号互相冲突（换号后旧作品仍留存在桶内），
+ *    均返回 ""（跳过 record_time）；
+ * 3. 若无法通过 work / acc / meta 确定账号归属，绝不回落猜测 group 名称，直接返回 ""（跳过 record_time）。
+ */
+function resolveWorkCanonicalPartition(work, acc, canonicalPt) {
+  if (!canonicalPt) return "";
+
+  const metaParts = new Set();
+  const rawMetaKeys = new Set();
+  if (
+    isPlainObject(acc) &&
+    isPlainObject(acc.meta) &&
+    isPlainObject(acc.meta.workCountsByAccount)
+  ) {
+    for (const accId of Object.keys(acc.meta.workCountsByAccount)) {
+      const trimmed = typeof accId === "string" ? accId.trim() : "";
+      if (!trimmed || FORBIDDEN_PROTO_KEYS.has(trimmed)) continue;
+      rawMetaKeys.add(trimmed);
+      const norm = canonicalizePartition(trimmed, canonicalPt);
+      metaParts.add(norm || trimmed);
+    }
+    if (rawMetaKeys.size > 1 || metaParts.size > 1) return "";
+  }
+
+  const accParts = new Set();
+  if (isPlainObject(acc)) {
+    const fromAcc = deriveCanonicalPartition(acc, canonicalPt);
+    if (fromAcc) accParts.add(fromAcc);
+
+    const rawParts =
+      acc.accountPartitions instanceof Set
+        ? [...acc.accountPartitions]
+        : Array.isArray(acc.accountPartitions)
+        ? acc.accountPartitions
+        : [];
+    for (const p of rawParts) {
+      const norm = canonicalizePartition(p, canonicalPt);
+      if (norm) accParts.add(norm);
+    }
+
+    const rawKeys =
+      acc.accountKeys instanceof Set
+        ? [...acc.accountKeys]
+        : Array.isArray(acc.accountKeys)
+        ? acc.accountKeys
+        : [];
+    for (const k of rawKeys) {
+      const norm = canonicalizePartition(k, canonicalPt);
+      if (norm) accParts.add(norm);
+    }
+  }
+  if (accParts.size > 1) return "";
+
+  const onlyMetaPart = metaParts.size === 1 ? [...metaParts][0] : "";
+  const onlyAccPart = accParts.size === 1 ? [...accParts][0] : "";
+  if (onlyMetaPart && onlyAccPart && onlyMetaPart !== onlyAccPart) {
+    return "";
+  }
+
+  if (isPlainObject(work)) {
+    const fromWork = deriveCanonicalPartition(work, canonicalPt);
+    if (fromWork) return fromWork;
+  }
+
+  if (onlyAccPart) return onlyAccPart;
+  if (onlyMetaPart && onlyMetaPart.startsWith("persist:")) return onlyMetaPart;
+  return "";
 }
 
 /** 标题归一化（仅用于匹配）：去零宽字符、全角/中文标点归一、空白归一、去末尾独立话题标签 */
@@ -1265,7 +1405,14 @@ function collectWindowBuckets(bucketsByDay, queryDay, outBuckets) {
  * ③ 同 group+platform 内对未关联作品与未占用 target 做模糊匹配。
  * 先按 UTC+8 日历日时间窗（±2 天 + 缺时间桶）分桶，再在桶内用高频补集倒排一次打分并按 (core, day) 缓存。
  */
-function matchFuzzyGroupTargets(freeWorks, freeTargets, result, matchedWorks, occupiedTargets) {
+function matchFuzzyGroupTargets(
+  freeWorks,
+  freeTargets,
+  result,
+  matchedWorks,
+  occupiedTargets,
+  matchedPwKeys = null
+) {
   if (!freeWorks.length || !freeTargets.length) return;
 
   const targetItems = [];
@@ -1411,6 +1558,7 @@ function matchFuzzyGroupTargets(freeWorks, freeTargets, result, matchedWorks, oc
     const w = freeWorks[wi];
     const t = freeTargets[ti];
     matchedWorks.add(w.idx);
+    if (matchedPwKeys) matchedPwKeys.add(w.pwKey);
     occupiedTargets.add(t.idx);
     result.set(w.workKey, {
       contentKey: t.contentKey,
@@ -1427,7 +1575,12 @@ function matchFuzzyGroupTargets(freeWorks, freeTargets, result, matchedWorks, oc
  *   合簇前检查平台不冲突，且两簇所有跨簇成员对均满足时间窗与标题相似度 ≥ 阈值（禁止链式传递）
  * - 簇大小 ≥2 才成立，基于排序后的 `platform|workId`（不含 group）生成稳定 auto:<hash>
  */
-function clusterUnlinkedAcrossPlatforms(unlinkedWorks, result) {
+function clusterUnlinkedAcrossPlatforms(
+  unlinkedWorks,
+  result,
+  matchedWorks = null,
+  matchedPwKeys = null
+) {
   const autoKeys = new Set();
   if (!unlinkedWorks.length) return autoKeys;
 
@@ -1590,6 +1743,8 @@ function clusterUnlinkedAcrossPlatforms(unlinkedWorks, result) {
       autoKeys.add(contentKey);
       for (const idx of memberIndices) {
         const w = nodes[idx];
+        if (matchedWorks) matchedWorks.add(w.idx);
+        if (matchedPwKeys) matchedPwKeys.add(w.pwKey);
         result.set(w.workKey, {
           contentKey,
           matchedBy: "fuzzy",
@@ -1921,10 +2076,19 @@ function buildContentIndex(pushRecords) {
       }
     }
 
+    const publishTimeMs =
+      parsePreciseTimestampMs(rec.lastPublishAt) ?? parsePreciseTimestampMs(rec.createTime);
+
     parsedRecords.push({
       idx,
       platform,
       group,
+      partition: toSafeTrimmed(rec.partition),
+      accountKey: toSafeTrimmed(rec.accountKey),
+      phone: toSafeTrimmed(rec.phone),
+      lastPublishAt: rec.lastPublishAt !== undefined ? rec.lastPublishAt : null,
+      createTime: rec.createTime !== undefined ? rec.createTime : null,
+      publishTimeMs,
       recordDate,
       fullPath,
       selectedFile: toSafeTrimmed(rec.selectedFile),
@@ -1990,6 +2154,12 @@ function buildContentIndex(pushRecords) {
       contentKey,
       group: item.group,
       platform: item.platform,
+      partition: item.partition,
+      accountKey: item.accountKey,
+      phone: item.phone,
+      lastPublishAt: item.lastPublishAt,
+      createTime: item.createTime,
+      publishTimeMs: item.publishTimeMs,
       recordDate: item.recordDate,
       status: item.status,
       videoLink: item.directVideoLink,
@@ -2024,7 +2194,7 @@ function parseCutoffDate(date) {
   return isValidDateStr(trimmed) ? { ok: true, cutoffDate: trimmed } : { ok: false, cutoffDate: "" };
 }
 
-const AUTO_MATCH_RANK = { link: 3, title: 2, fuzzy: 1 };
+const AUTO_MATCH_RANK = { link: 4, title: 3, fuzzy: 2, record_time: 1 };
 
 function pickStrongestAutoEntry(autoEntries) {
   let best = autoEntries[0].entry;
@@ -2047,29 +2217,280 @@ function getLinkResultMeta(link) {
   return link instanceof Map ? LINK_RESULT_META.get(link) || null : null;
 }
 
+function buildPartitionToGroupsMap(accounts) {
+  const map = new Map();
+  for (const acc of Array.isArray(accounts) ? accounts : []) {
+    if (!isPlainObject(acc)) continue;
+    const groupKey = toSafeTrimmed(acc.group);
+    if (!groupKey) continue;
+    const canonicalPt = resolveCanonicalPlatform(toSafeString(acc.platform));
+    if (!canonicalPt) continue;
+    const part = resolveWorkCanonicalPartition(null, acc, canonicalPt);
+    if (part) {
+      let set = map.get(part);
+      if (!set) {
+        set = new Set();
+        map.set(part, set);
+      }
+      set.add(groupKey);
+    }
+  }
+  return map;
+}
+
+function resolveTargetStartDate(t, startDateByGroup, partitionToGroups) {
+  if (!startDateByGroup || startDateByGroup.size === 0) return "";
+  const tGroup = toSafeTrimmed(t.group);
+  if (tGroup && startDateByGroup.has(tGroup)) {
+    return startDateByGroup.get(tGroup);
+  }
+  const canonicalPt = resolveCanonicalPlatform(toSafeString(t.platform));
+  const part = deriveCanonicalPartition(t, canonicalPt);
+  if (part && partitionToGroups && partitionToGroups.has(part)) {
+    const groups = partitionToGroups.get(part);
+    if (groups && groups.size === 1) {
+      const onlyGroup = [...groups][0];
+      if (startDateByGroup.has(onlyGroup)) {
+        return startDateByGroup.get(onlyGroup);
+      }
+    }
+  }
+  return "";
+}
+
+/**
+ * ④b 按发布记录发布时间自动关联（不依赖标题，优先级在 ①直链 / ②唯一标题 / ③模糊匹配 / ④跨平台模糊聚类 / 手工规则之后）：
+ * - 仅针对 status === "success" 且尚未被 ①②③ 占用/阻断、具备有效规范账号与精确时间戳的 target
+ * - 候选集合 = 同平台、同账号（partition/accountKey/phone 归一）且作品发布时间在记录发布时间 ±3 小时
+ *   （RECORD_TIME_WINDOW_MS）内的全部作品（不先剔除已关联/已直链/手工关联/被排除的作品），按 pwKey 去重；
+ * - 只有该时间窗内恰好仅有 1 条作品、该作品尚未被任何方式关联/阻断/排除、无直链冲突、
+ *   且该作品也仅对应唯一有效竞争 contentKey 时，才自动关联到该内容并标记 matchedBy = "record_time"。
+ * - 已被有效手工关联到同一 contentKey 的同账号作品 1:1 占用对应 target，避免抢走其他作品。
+ */
+function matchRecordTimeTargets({
+  allEligibleTargets,
+  worksByGp,
+  overrideMap,
+  excludedAutoSet,
+  isValidAssignTarget,
+  matchedWorks,
+  matchedPwKeys,
+  occupiedTargets,
+  blockedWorks,
+  blockedTargets,
+  rawAutoResult,
+}) {
+  if (!allEligibleTargets.length) return;
+
+  const manualWorksByContentAcc = new Map();
+  const allWorksByAcc = new Map();
+  const unavailablePwKeys = new Set();
+
+  for (const gpWorks of worksByGp.values()) {
+    for (const w of gpWorks) {
+      const ov = overrideMap.get(w.pwKey);
+      const isValidManualAssign = Boolean(
+        ov && ov.action === "assign" && isValidAssignTarget(ov.contentKey)
+      );
+      const isManualDetach = Boolean(ov && ov.action === "detach");
+      if (isValidManualAssign) {
+        unavailablePwKeys.add(w.pwKey);
+        if (w.canonicalPt && w.canonicalPartition) {
+          const caKey = `${ov.contentKey}\0${w.canonicalPt}\0${w.canonicalPartition}`;
+          let byPw = manualWorksByContentAcc.get(caKey);
+          if (!byPw) {
+            byPw = new Map();
+            manualWorksByContentAcc.set(caKey, byPw);
+          }
+          if (!byPw.has(w.pwKey)) {
+            byPw.set(w.pwKey, w.precisePubMs);
+          }
+        }
+      }
+      if (
+        isManualDetach ||
+        excludedAutoSet.has(w.pwKey) ||
+        matchedWorks.has(w.idx) ||
+        blockedWorks.has(w.idx) ||
+        matchedPwKeys.has(w.pwKey) ||
+        rawAutoResult.has(w.workKey)
+      ) {
+        unavailablePwKeys.add(w.pwKey);
+      }
+
+      if (!w.canonicalPt || !w.canonicalPartition || w.precisePubMs === null) {
+        continue;
+      }
+      const accKey = `${w.canonicalPt}\0${w.canonicalPartition}`;
+      let byPw = allWorksByAcc.get(accKey);
+      if (!byPw) {
+        byPw = new Map();
+        allWorksByAcc.set(accKey, byPw);
+      }
+      pushToMap(byPw, w.pwKey, w);
+    }
+  }
+
+  const freeTargets = [];
+  for (const t of allEligibleTargets) {
+    if (t.status !== "success") continue;
+    if (occupiedTargets.has(t.idx) || blockedTargets.has(t.idx)) continue;
+    if (!t.canonicalPt || !t.canonicalPartition || t.publishTimeMs === null) continue;
+    freeTargets.push(t);
+  }
+  if (!freeTargets.length) return;
+
+  // 若已有作品被手工有效 assign 到同一内容且属同账号（±3h 内或作品缺精确发布时间），1:1 占用该 target
+  const recordTimeOccupiedTargets = new Set();
+  if (manualWorksByContentAcc.size > 0) {
+    const manualPairs = [];
+    for (const t of freeTargets) {
+      const caKey = `${t.contentKey}\0${t.canonicalPt}\0${t.canonicalPartition}`;
+      const byPw = manualWorksByContentAcc.get(caKey);
+      if (!byPw) continue;
+      for (const [pwKey, pubMs] of byPw.entries()) {
+        if (pubMs === null) {
+          manualPairs.push({ diff: RECORD_TIME_WINDOW_MS + 1, targetIdx: t.idx, pwKey });
+        } else {
+          const diff = Math.abs(pubMs - t.publishTimeMs);
+          if (diff <= RECORD_TIME_WINDOW_MS) {
+            manualPairs.push({ diff, targetIdx: t.idx, pwKey });
+          }
+        }
+      }
+    }
+    manualPairs.sort((a, b) =>
+      a.diff !== b.diff
+        ? a.diff - b.diff
+        : a.targetIdx !== b.targetIdx
+        ? a.targetIdx - b.targetIdx
+        : compareText(a.pwKey, b.pwKey)
+    );
+    const usedManualPw = new Set();
+    for (const pair of manualPairs) {
+      if (recordTimeOccupiedTargets.has(pair.targetIdx) || usedManualPw.has(pair.pwKey)) {
+        continue;
+      }
+      recordTimeOccupiedTargets.add(pair.targetIdx);
+      usedManualPw.add(pair.pwKey);
+    }
+  }
+
+  // 按账号建全量作品精确时间戳有序索引（含已关联作品，O((T+W) log W) 定位 ±3h 完整候选集合）
+  const sortedObsByAcc = new Map();
+  for (const [accKey, byPw] of allWorksByAcc.entries()) {
+    const flat = [];
+    for (const obsWorks of byPw.values()) {
+      for (let i = 0; i < obsWorks.length; i++) {
+        flat.push(obsWorks[i]);
+      }
+    }
+    flat.sort((a, b) => a.precisePubMs - b.precisePubMs);
+    sortedObsByAcc.set(accKey, flat);
+  }
+
+  // 计算所有剩余可用 target 与同账号全量作品在 ±3h 内的候选关系
+  const targetCandidates = [];
+  const competingContentsByPw = new Map();
+
+  for (const t of freeTargets) {
+    if (recordTimeOccupiedTargets.has(t.idx)) continue;
+    const accKey = `${t.canonicalPt}\0${t.canonicalPartition}`;
+    const sortedWorks = sortedObsByAcc.get(accKey);
+    if (!sortedWorks || sortedWorks.length === 0) continue;
+
+    const minMs = t.publishTimeMs - RECORD_TIME_WINDOW_MS;
+    const maxMs = t.publishTimeMs + RECORD_TIME_WINDOW_MS;
+    let lo = 0;
+    let hi = sortedWorks.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (sortedWorks[mid].precisePubMs < minMs) lo = mid + 1;
+      else hi = mid;
+    }
+
+    // 候选集合 = 时间窗内同账号的全部作品（绝不先剔除已关联/已直链/手工关联作品）
+    const windowPwSet = new Set();
+    const urlConflictPwSet = new Set();
+    for (let i = lo; i < sortedWorks.length; i++) {
+      const w = sortedWorks[i];
+      if (w.precisePubMs > maxMs) break;
+      windowPwSet.add(w.pwKey);
+      if (t.normUrl && t.normUrl !== w.normUrl) {
+        urlConflictPwSet.add(w.pwKey);
+      }
+    }
+
+    for (const pwKey of windowPwSet) {
+      if (unavailablePwKeys.has(pwKey) || urlConflictPwSet.has(pwKey)) continue;
+      let ckSet = competingContentsByPw.get(pwKey);
+      if (!ckSet) {
+        ckSet = new Set();
+        competingContentsByPw.set(pwKey, ckSet);
+      }
+      ckSet.add(t.contentKey);
+    }
+
+    // 只有时间窗内恰好 1 条作品、且它尚未被任何方式关联/阻断/排除、且无直链冲突时，才作为候选
+    if (windowPwSet.size === 1) {
+      const onlyPwKey = [...windowPwSet][0];
+      if (!unavailablePwKeys.has(onlyPwKey) && !urlConflictPwSet.has(onlyPwKey)) {
+        targetCandidates.push({ target: t, accKey, pwKey: onlyPwKey });
+      }
+    }
+  }
+
+  for (const cand of targetCandidates) {
+    const { target: t, accKey, pwKey } = cand;
+    if (occupiedTargets.has(t.idx) || matchedPwKeys.has(pwKey) || unavailablePwKeys.has(pwKey)) {
+      continue;
+    }
+    const competing = competingContentsByPw.get(pwKey);
+    if (!competing || competing.size !== 1) continue;
+
+    const byPw = allWorksByAcc.get(accKey);
+    const obsWorks = byPw ? byPw.get(pwKey) : null;
+    if (!obsWorks || !obsWorks.length) continue;
+    if (t.normUrl && obsWorks.some((w) => t.normUrl !== w.normUrl)) continue;
+
+    occupiedTargets.add(t.idx);
+    matchedPwKeys.add(pwKey);
+    unavailablePwKeys.add(pwKey);
+    for (const w of obsWorks) {
+      matchedWorks.add(w.idx);
+      rawAutoResult.set(w.workKey, {
+        contentKey: t.contentKey,
+        matchedBy: "record_time",
+      });
+    }
+  }
+}
+
 /**
  * 关联作品与内容，返回 Map<`group|platform|workId`, { contentKey, matchedBy, score? }>。
  * - 可选截止日 date：排除 recordDate > date 的 target 与有效 publishTime > date 的 work
+ * - 可选分组起点日期 groupSettings：排除作品发布日期（UTC+8）早于所属分组起点的作品与对应 target（缺发布时间不排除）
  * - 可选 worksDaily：将截至 date 仅存在于 worksDaily 的作品也纳入作品身份归属（仅接受手工覆盖）
- * - 可选手工矫正 overrides：按作品身份 `platform|workId` 存储；只有 detach 在 ③④ 之前按作品身份排除；
- *   ①–④ 照常运行（含被 assign 的作品参与占位），随后在全量分组上按作品身份 `platform|workId` 做一次统一归属裁决
- *   （同一作品挂在多分组时共用同一最终归属，日明细、跨平台汇总、GUI 完全一致），最后套用 overrides
- *   （assign 指向不存在/不稳定 contentKey 或未写入 contents 表的 auto:/manual: 时忽略）。
- * - auto 簇成员资格在自动阶段 ④ 确定：某成员被 assign 走后，不得改变其他作品的自动归属，
- *   剩余成员无论 ≥2 还是仅剩 1 条均保留原 `auto:` 键与 `fuzzy` 标记（仅剩 1 条时在汇总中显示为单平台）。
- * ① 有效直链 1:1 唯一匹配（多对一/一对多全部留空且禁止标题兜底）；
- * ② 标题命中且同 group+platform 内唯一 work、唯一未被①占用的 target，且 target 无冲突直链；
- * ③ 模糊匹配（同 group+platform，先汇总目标与作品全部标题别名的明确集数并在评分前硬拒绝冲突，排除占位/短标题，
- *    标题 core 子串≥6=0.95 / Float64 无损二元组 Dice，仅取 target 自身 recordDate/lastPublishAt，
- *    时间窗按 UTC+8 日历日相差 ≤2 天、缺时间门槛 +0.1，sim≥0.6、最佳比次佳高≥0.1、互为最佳）；
- * ④ 无发布记录作品跨平台聚类（同 group 不同 platform，同规则互为最佳成边 + Kruskal 全对相容合并每平台最多 1 条，
- *    簇大小≥2，按不含 group 的 platform|workId 生成稳定 auto:<hash>）。
+ * - 可选手工矫正 overrides：按作品身份 `platform|workId` 存储；
+ *   ① 有效直链 1:1 唯一匹配（多对一/一对多全部留空且禁止后续兜底）；
+ *   ② 标题命中且同 group+platform 内唯一 work、唯一未被①占用的 target，且 target 无冲突直链；
+ *   ③ 模糊匹配（同 group+platform，先汇总目标与作品全部标题别名的明确集数并在评分前硬拒绝冲突，排除占位/短标题，
+ *      标题 core 子串≥6=0.95 / Float64 无损二元组 Dice，仅取 target 自身 recordDate/lastPublishAt，
+ *      时间窗按 UTC+8 日历日相差 ≤2 天、缺时间门槛 +0.1，sim≥0.6、最佳比次佳高≥0.1、互为最佳）；
+ *   ④ 无发布记录作品跨平台聚类（同 group 不同 platform，同规则互为最佳成边 + Kruskal 全对相容合并每平台最多 1 条，
+ *      簇大小≥2，按不含 group 的 platform|workId 生成稳定 auto:<hash>）；
+ *   ④b 发布记录时间窗自动关联（status === "success"，同平台同账号 partition/accountKey 归一，
+ *      时间窗 ±3 小时内全量作品仅 1 条且尚未被上述任一规则或手工关联/排除，标记 record_time）；
+ *   ⑤ 在全量分组上按作品身份 `platform|workId` 做一次统一归属裁决，再套用按作品身份存储的手工覆盖。
  */
-function linkWorks({ contents, accounts, date, overrides, worksDaily } = {}) {
+function linkWorks({ contents, accounts, date, overrides, worksDaily, groupSettings } = {}) {
   const result = new Map();
   if (!Array.isArray(accounts)) return result;
   const { ok, cutoffDate } = parseCutoffDate(date);
   if (!ok) return result;
+
+  const startDateByGroup = normalizeGroupStartDates(groupSettings);
+  const partitionToGroups = startDateByGroup.size > 0 ? buildPartitionToGroupsMap(accounts) : null;
 
   const {
     overrides: overrideMap,
@@ -2079,6 +2500,7 @@ function linkWorks({ contents, accounts, date, overrides, worksDaily } = {}) {
   const dailyByGp = isPlainObject(worksDaily) ? worksDaily : null;
   const assignableContentKeys = new Set();
   const targetsByGp = new Map();
+  const allEligibleTargets = [];
   let targetSeq = 0;
 
   for (const c of Array.isArray(contents) ? contents : []) {
@@ -2099,6 +2521,10 @@ function linkWorks({ contents, accounts, date, overrides, worksDaily } = {}) {
         : toUtc8DateStr(t.lastPublishAt);
       const cutoffTargetDate = ownTargetDate || contentDate;
       if (cutoffDate && cutoffTargetDate && cutoffTargetDate > cutoffDate) continue;
+      if (startDateByGroup.size > 0 && cutoffTargetDate) {
+        const targetStartDate = resolveTargetStartDate(t, startDateByGroup, partitionToGroups);
+        if (targetStartDate && cutoffTargetDate < targetStartDate) continue;
+      }
       eligibleTargetCount++;
       const gpKey = `${toSafeTrimmed(t.group)}|${toSafeTrimmed(t.platform)}`;
       const rawTitles = Array.isArray(t.matchTitles)
@@ -2107,9 +2533,20 @@ function linkWorks({ contents, accounts, date, overrides, worksDaily } = {}) {
             (v) => v != null && v !== ""
           );
       const matchTitles = collectMatchTitles(rawTitles);
-      pushToMap(targetsByGp, gpKey, {
+      const canonicalPt = resolveCanonicalPlatform(toSafeString(t.platform));
+      const canonicalPartition = deriveCanonicalPartition(t, canonicalPt);
+      const targetPublishTimeMs =
+        parsePreciseTimestampMs(t.publishTimeMs) ??
+        parsePreciseTimestampMs(t.lastPublishAt) ??
+        parsePreciseTimestampMs(t.createTime);
+      const targetObj = {
         idx: targetSeq++,
+        gpKey,
         contentKey,
+        status: toSafeTrimmed(t.status).toLowerCase(),
+        canonicalPt,
+        canonicalPartition,
+        publishTimeMs: targetPublishTimeMs,
         normUrl: normalizeDirectUrl(t.videoLink),
         matchTitles,
         preparedCores: buildPreparedCores(rawTitles),
@@ -2117,7 +2554,9 @@ function linkWorks({ contents, accounts, date, overrides, worksDaily } = {}) {
         series: extractSeriesMarkersFromTitles(rawTitles),
         // ③ 模糊匹配时间窗只看该 target 自身日期，缺则走缺时间门槛 +0.1
         dayNum: dateStrToDayNum(ownTargetDate),
-      });
+      };
+      pushToMap(targetsByGp, gpKey, targetObj);
+      allEligibleTargets.push(targetObj);
     }
 
     const contentEligible = hasTargets
@@ -2150,6 +2589,7 @@ function linkWorks({ contents, accounts, date, overrides, worksDaily } = {}) {
   const worksByGp = new Map();
   const obsByPw = new Map();
   const gpInfoByKey = new Map();
+  const excludedBeforeStartWorkIdsByGp = new Map();
   let workSeq = 0;
 
   for (const acc of accounts) {
@@ -2160,6 +2600,8 @@ function linkWorks({ contents, accounts, date, overrides, worksDaily } = {}) {
     const platformKey = rawPlatform.trim();
     const gpKey = `${groupKey}|${platformKey}`;
     const rawGpKey = `${rawGroup}|${rawPlatform}`;
+    const groupStartDate = startDateByGroup.get(groupKey) || "";
+    const canonicalPt = resolveCanonicalPlatform(rawPlatform);
     if (!gpInfoByKey.has(rawGpKey)) gpInfoByKey.set(rawGpKey, { group: rawGroup, platform: rawPlatform });
     for (const w of Array.isArray(acc.works) ? acc.works : []) {
       if (!isPlainObject(w)) continue;
@@ -2167,10 +2609,19 @@ function linkWorks({ contents, accounts, date, overrides, worksDaily } = {}) {
       if (!workId) continue;
       const workKey = makeWorkKey(rawGroup, rawPlatform, workId);
       if (result.has(workKey)) continue;
-      result.set(workKey, { contentKey: null, matchedBy: null });
       const pwKey = makeWorkIdentityKey(rawPlatform, workId);
       const pubMs = parseValidTimestampMs(w.publishTime);
       const pubDate = pubMs !== null ? toUtc8DateStr(pubMs) : "";
+      if (groupStartDate && pubDate && pubDate < groupStartDate) {
+        let excludedIds = excludedBeforeStartWorkIdsByGp.get(rawGpKey);
+        if (!excludedIds) {
+          excludedIds = new Set();
+          excludedBeforeStartWorkIdsByGp.set(rawGpKey, excludedIds);
+        }
+        excludedIds.add(workId);
+        continue;
+      }
+      result.set(workKey, { contentKey: null, matchedBy: null });
       if (cutoffDate && ((pubDate && pubDate > cutoffDate) || excludedFuturePwKeys.has(pwKey))) {
         excludedFuturePwKeys.add(pwKey);
         continue;
@@ -2212,6 +2663,9 @@ function linkWorks({ contents, accounts, date, overrides, worksDaily } = {}) {
         memberKey: `${platformKey}|${workId}`,
         groupKey,
         platformKey,
+        canonicalPt,
+        canonicalPartition: resolveWorkCanonicalPartition(w, acc, canonicalPt),
+        precisePubMs: parsePreciseTimestampMs(w.publishTime),
         normTitle,
         preparedCore,
         series: workSeries,
@@ -2232,8 +2686,10 @@ function linkWorks({ contents, accounts, date, overrides, worksDaily } = {}) {
         gpInfo = { group: rawGpKey.slice(0, sep), platform: rawGpKey.slice(sep + 1) };
       }
       const { group, platform } = gpInfo;
+      const excludedIds = excludedBeforeStartWorkIdsByGp.get(rawGpKey) || null;
       for (const workId of Object.keys(accWorksDaily)) {
         if (!workId) continue;
+        if (excludedIds && excludedIds.has(workId)) continue;
         const workKey = makeWorkKey(group, platform, workId);
         if (result.has(workKey)) continue;
         const pwKey = makeWorkIdentityKey(platform, workId);
@@ -2255,70 +2711,93 @@ function linkWorks({ contents, accounts, date, overrides, worksDaily } = {}) {
     }
   }
 
-  const rawAutoResult = new Map();
-  const unlinkedForCluster = [];
+  const isValidAssignTarget = (contentKey) => {
+    if (isValidSyntheticContentKey(contentKey)) {
+      // auto:/manual: 合成内容必须在持久化 contents 表中存在才生效
+      return overrideContents.has(contentKey);
+    }
+    return assignableContentKeys.has(contentKey);
+  };
 
+  const rawAutoResult = new Map();
+  const matchedWorks = new Set();
+  const matchedPwKeys = new Set();
+  const occupiedTargets = new Set();
+  const blockedWorks = new Set();
+  const blockedTargets = new Set();
+
+  // Pass 1：按 group+platform 运行 ① 直链 与 ② 唯一标题匹配
   for (const [gpKey, gpWorks] of worksByGp.entries()) {
     const gpTargets = targetsByGp.get(gpKey);
-    const matchedWorks = new Set();
-    const occupiedTargets = new Set();
-    const blockedWorks = new Set();
-    const blockedTargets = new Set();
+    if (!gpTargets || !gpTargets.length) continue;
 
+    // ① 有效直链严格 1:1 匹配
+    const targetsByUrl = new Map();
+    const worksByUrl = new Map();
+    for (const t of gpTargets) if (t.normUrl) pushToMap(targetsByUrl, t.normUrl, t);
+    for (const w of gpWorks) if (w.normUrl) pushToMap(worksByUrl, w.normUrl, w);
+
+    for (const [url, urlWorks] of worksByUrl.entries()) {
+      const urlTargets = targetsByUrl.get(url);
+      if (!urlTargets) continue;
+      if (urlWorks.length === 1 && urlTargets.length === 1) {
+        matchedWorks.add(urlWorks[0].idx);
+        matchedPwKeys.add(urlWorks[0].pwKey);
+        occupiedTargets.add(urlTargets[0].idx);
+        rawAutoResult.set(urlWorks[0].workKey, {
+          contentKey: urlTargets[0].contentKey,
+          matchedBy: "link",
+        });
+      } else {
+        for (const w of urlWorks) blockedWorks.add(w.idx);
+        for (const t of urlTargets) blockedTargets.add(t.idx);
+      }
+    }
+
+    // ② 同 group+platform 唯一标题匹配
+    const worksByTitle = new Map();
+    const freeTargetsByTitle = new Map();
+    for (const w of gpWorks) if (w.normTitle) pushToMap(worksByTitle, w.normTitle, w);
+    for (const t of gpTargets) {
+      if (occupiedTargets.has(t.idx)) continue;
+      for (const mt of t.matchTitles) pushToMap(freeTargetsByTitle, mt, t);
+    }
+
+    const candidatesByTarget = new Map();
+    for (const w of gpWorks) {
+      if (matchedWorks.has(w.idx) || blockedWorks.has(w.idx) || !w.normTitle) continue;
+      if (worksByTitle.get(w.normTitle).length !== 1) continue;
+      const titleTargets = freeTargetsByTitle.get(w.normTitle);
+      if (!titleTargets || titleTargets.length !== 1) continue;
+      const t = titleTargets[0];
+      if (
+        blockedTargets.has(t.idx) ||
+        (t.normUrl && t.normUrl !== w.normUrl) ||
+        hasConflictingSeries(w.series, t.series)
+      ) {
+        continue;
+      }
+      pushToMap(candidatesByTarget, t.idx, { work: w, target: t });
+    }
+
+    for (const pairs of candidatesByTarget.values()) {
+      if (pairs.length === 1) {
+        matchedWorks.add(pairs[0].work.idx);
+        matchedPwKeys.add(pairs[0].work.pwKey);
+        occupiedTargets.add(pairs[0].target.idx);
+        rawAutoResult.set(pairs[0].work.workKey, {
+          contentKey: pairs[0].target.contentKey,
+          matchedBy: "title",
+        });
+      }
+    }
+  }
+
+  // Pass 2（③）：对剩余未匹配作品与 target 按 group+platform 运行模糊匹配，并收集待聚类作品
+  const unlinkedForCluster = [];
+  for (const [gpKey, gpWorks] of worksByGp.entries()) {
+    const gpTargets = targetsByGp.get(gpKey);
     if (gpTargets && gpTargets.length) {
-      // ① 有效直链严格 1:1 匹配
-      const targetsByUrl = new Map();
-      const worksByUrl = new Map();
-      for (const t of gpTargets) if (t.normUrl) pushToMap(targetsByUrl, t.normUrl, t);
-      for (const w of gpWorks) if (w.normUrl) pushToMap(worksByUrl, w.normUrl, w);
-
-      for (const [url, urlWorks] of worksByUrl.entries()) {
-        const urlTargets = targetsByUrl.get(url);
-        if (!urlTargets) continue;
-        if (urlWorks.length === 1 && urlTargets.length === 1) {
-          matchedWorks.add(urlWorks[0].idx);
-          occupiedTargets.add(urlTargets[0].idx);
-          rawAutoResult.set(urlWorks[0].workKey, { contentKey: urlTargets[0].contentKey, matchedBy: "link" });
-        } else {
-          for (const w of urlWorks) blockedWorks.add(w.idx);
-          for (const t of urlTargets) blockedTargets.add(t.idx);
-        }
-      }
-
-      // ② 同 group+platform 唯一标题匹配
-      const worksByTitle = new Map();
-      const freeTargetsByTitle = new Map();
-      for (const w of gpWorks) if (w.normTitle) pushToMap(worksByTitle, w.normTitle, w);
-      for (const t of gpTargets) {
-        if (occupiedTargets.has(t.idx)) continue;
-        for (const mt of t.matchTitles) pushToMap(freeTargetsByTitle, mt, t);
-      }
-
-      const candidatesByTarget = new Map();
-      for (const w of gpWorks) {
-        if (matchedWorks.has(w.idx) || blockedWorks.has(w.idx) || !w.normTitle) continue;
-        if (worksByTitle.get(w.normTitle).length !== 1) continue;
-        const titleTargets = freeTargetsByTitle.get(w.normTitle);
-        if (!titleTargets || titleTargets.length !== 1) continue;
-        const t = titleTargets[0];
-        if (
-          blockedTargets.has(t.idx) ||
-          (t.normUrl && t.normUrl !== w.normUrl) ||
-          hasConflictingSeries(w.series, t.series)
-        ) {
-          continue;
-        }
-        pushToMap(candidatesByTarget, t.idx, { work: w, target: t });
-      }
-
-      for (const pairs of candidatesByTarget.values()) {
-        if (pairs.length === 1) {
-          matchedWorks.add(pairs[0].work.idx);
-          occupiedTargets.add(pairs[0].target.idx);
-          rawAutoResult.set(pairs[0].work.workKey, { contentKey: pairs[0].target.contentKey, matchedBy: "title" });
-        }
-      }
-
       // ③ 作品↔发布记录 target 模糊匹配（只排除已匹配/已阻断/按作品身份排除自动；仅 assign 且未排除的作品照常参与占位）
       const freeWorks = [];
       for (const w of gpWorks) {
@@ -2337,7 +2816,14 @@ function linkWorks({ contents, accounts, date, overrides, worksDaily } = {}) {
         freeTargets.push(t);
       }
 
-      matchFuzzyGroupTargets(freeWorks, freeTargets, rawAutoResult, matchedWorks, occupiedTargets);
+      matchFuzzyGroupTargets(
+        freeWorks,
+        freeTargets,
+        rawAutoResult,
+        matchedWorks,
+        occupiedTargets,
+        matchedPwKeys
+      );
     }
 
     for (const w of gpWorks) {
@@ -2348,19 +2834,26 @@ function linkWorks({ contents, accounts, date, overrides, worksDaily } = {}) {
     }
   }
 
-  // ④ 无发布记录作品跨平台聚类（同 group，不同 platform；簇成员资格在此阶段确定）
-  clusterUnlinkedAcrossPlatforms(unlinkedForCluster, rawAutoResult);
+  // Pass 3（④）：无发布记录作品跨平台聚类（同 group，不同 platform；簇成员资格在此阶段确定）
+  clusterUnlinkedAcrossPlatforms(unlinkedForCluster, rawAutoResult, matchedWorks, matchedPwKeys);
+
+  // Pass 4（④b）：按发布记录成功目标同账号 ±3 小时唯一时间窗自动关联（放在既有直链/标题/模糊/聚类/手工规则之后，绝不抢占）
+  matchRecordTimeTargets({
+    allEligibleTargets,
+    worksByGp,
+    overrideMap,
+    excludedAutoSet,
+    isValidAssignTarget,
+    matchedWorks,
+    matchedPwKeys,
+    occupiedTargets,
+    blockedWorks,
+    blockedTargets,
+    rawAutoResult,
+  });
 
   // ⑤ 在全量分组上按作品身份 platform|workId 做一次统一归属裁决，再套用按作品身份存储的手工覆盖。
   //    注意：不清理因其他成员被 assign 走而仅剩 1 条的 auto:* 簇（assign 不得改变其他作品的自动归属）。
-  const isValidAssignTarget = (contentKey) => {
-    if (isValidSyntheticContentKey(contentKey)) {
-      // auto:/manual: 合成内容必须在持久化 contents 表中存在才生效
-      return overrideContents.has(contentKey);
-    }
-    return assignableContentKeys.has(contentKey);
-  };
-
   const byWorkIdentity = new Map();
   const syntheticObsByKey = new Map();
 
@@ -2435,6 +2928,8 @@ function linkWorks({ contents, accounts, date, overrides, worksDaily } = {}) {
     worksDaily: dailyByGp,
     cutoffDate,
     overrides,
+    groupSettings,
+    hasGroupSettings: startDateByGroup.size > 0,
     byWorkIdentity,
     rawAutoByWorkKey: rawAutoResult,
     syntheticTitlesByKey,
@@ -2511,6 +3006,7 @@ function summarizeBucketMatch(bucket) {
   }
   let hasManual = false;
   let hasFuzzy = false;
+  let hasRecordTime = false;
   let hasTitle = false;
   let hasLink = false;
   let minFuzzyScore = null;
@@ -2524,13 +3020,15 @@ function summarizeBucketMatch(bucket) {
           minFuzzyScore = w.score;
         }
       }
-    } else if (w.matchedBy === "title") hasTitle = true;
+    } else if (w.matchedBy === "record_time") hasRecordTime = true;
+    else if (w.matchedBy === "title") hasTitle = true;
     else if (w.matchedBy === "link") hasLink = true;
   }
 
   let matchMethod = null;
   if (hasManual) matchMethod = "manual";
   else if (hasFuzzy) matchMethod = "fuzzy";
+  else if (hasRecordTime) matchMethod = "record_time";
   else if (hasTitle) matchMethod = "title";
   else if (hasLink) matchMethod = "link";
 
@@ -2577,12 +3075,16 @@ function buildContentSummaryRows({
   date,
   overrides,
   groups,
+  groupSettings,
   includeDeleted = false,
 } = {}) {
   const { ok, cutoffDate } = parseCutoffDate(date);
   if (!ok) return [];
 
   const accountList = Array.isArray(accounts) ? accounts : [];
+  const startDateByGroup = normalizeGroupStartDates(groupSettings);
+  const partitionToGroups =
+    startDateByGroup.size > 0 ? buildPartitionToGroupsMap(accountList) : null;
   const dailyByGp = isPlainObject(worksDaily) ? worksDaily : null;
   const {
     overrides: overrideMap,
@@ -2616,7 +3118,9 @@ function buildContentSummaryRows({
       cachedMeta.accounts === accountList &&
       cachedMeta.worksDaily === dailyByGp &&
       cachedMeta.cutoffDate === cutoffDate &&
-      cachedMeta.overrides === overrides
+      cachedMeta.overrides === overrides &&
+      (cachedMeta.groupSettings === groupSettings ||
+        (!cachedMeta.hasGroupSettings && startDateByGroup.size === 0))
   );
   const resolvedLink = canReuseLink
     ? link
@@ -2626,6 +3130,7 @@ function buildContentSummaryRows({
         worksDaily: dailyByGp,
         date: cutoffDate,
         overrides,
+        groupSettings,
       });
   const linkMeta = LINK_RESULT_META.get(resolvedLink) || null;
   const byWorkIdentity = linkMeta && linkMeta.byWorkIdentity ? linkMeta.byWorkIdentity : null;
@@ -2680,6 +3185,10 @@ function buildContentSummaryRows({
         ? rawTDate
         : toUtc8DateStr(t.lastPublishAt) || contentDate;
       if (cutoffDate && tDate && tDate > cutoffDate) continue;
+      if (startDateByGroup.size > 0 && tDate) {
+        const targetStartDate = resolveTargetStartDate(t, startDateByGroup, partitionToGroups);
+        if (targetStartDate && tDate < targetStartDate) continue;
+      }
       eligibleCount++;
       if (tDate && (!minEligibleTargetDate || tDate < minEligibleTargetDate)) {
         minEligibleTargetDate = tDate;
@@ -2729,6 +3238,7 @@ function buildContentSummaryRows({
   // 1. 收集 accounts[*].works 中的作品观测（排除有效 publishTime > cutoffDate 的作品，按 groupSet 裁剪输出）
   const seenGpWorkKeys = new Set();
   const gpInfoByKey = new Map();
+  const excludedBeforeStartWorkIdsByGp = new Map();
   const excludedFuturePwKeys = new Set(
     linkMeta && linkMeta.excludedFuturePwKeys ? linkMeta.excludedFuturePwKeys : []
   );
@@ -2740,6 +3250,7 @@ function buildContentSummaryRows({
     const group = toSafeString(acc.group);
     const platform = toSafeString(acc.platform);
     const gpKey = `${group}|${platform}`;
+    const groupStartDate = startDateByGroup.get(group.trim()) || "";
     if (!gpInfoByKey.has(gpKey)) gpInfoByKey.set(gpKey, { group, platform });
     const inGroupScope = !groupSet || groupSet.has(group);
     const accWorksDaily = inGroupScope && dailyByGp && hasOwn(dailyByGp, gpKey) ? dailyByGp[gpKey] : null;
@@ -2755,6 +3266,15 @@ function buildContentSummaryRows({
       const pwKey = makeWorkIdentityKey(platform, workId);
       const pubMs = parseValidTimestampMs(w.publishTime);
       const pubDate = pubMs !== null ? toUtc8DateStr(pubMs) : "";
+      if (groupStartDate && pubDate && pubDate < groupStartDate) {
+        let excludedIds = excludedBeforeStartWorkIdsByGp.get(gpKey);
+        if (!excludedIds) {
+          excludedIds = new Set();
+          excludedBeforeStartWorkIdsByGp.set(gpKey, excludedIds);
+        }
+        excludedIds.add(workId);
+        continue;
+      }
       if (cutoffDate && pubDate && pubDate > cutoffDate) {
         excludedFuturePwKeys.add(pwKey);
         continue;
@@ -2805,8 +3325,10 @@ function buildContentSummaryRows({
       }
       const { group, platform } = gpInfo;
       if (groupSet && !groupSet.has(group)) continue;
+      const excludedIds = excludedBeforeStartWorkIdsByGp.get(gpKey) || null;
       for (const workId of Object.keys(accWorksDaily)) {
         if (!workId) continue;
+        if (excludedIds && excludedIds.has(workId)) continue;
         const workKey = makeWorkKey(group, platform, workId);
         if (seenGpWorkKeys.has(workKey)) continue;
         seenGpWorkKeys.add(workKey);
@@ -3058,6 +3580,7 @@ function buildContentSummaryRows({
 }
 
 module.exports = {
+  RECORD_TIME_WINDOW_MS,
   FUZZY_SIM_THRESHOLD,
   FUZZY_MISSING_TIME_PENALTY,
   FUZZY_MARGIN_MIN,
@@ -3067,6 +3590,8 @@ module.exports = {
   FUZZY_MIN_CORE_LEN,
   FUZZY_PLACEHOLDER_TITLES,
   FUZZY_THRESHOLDS,
+  normalizeGroupStartDates,
+  isWorkBeforeGroupStartDate,
   normalizeTitle,
   stripTopicsForFuzzy,
   extractCoreTitle,

@@ -3441,16 +3441,18 @@ function buildNewWorksFirst24hSection(
  * 纯函数构建数据分析结果（7 节 + 新作品前 24 小时），供 GUI「数据分析」tab 与 Excel「分析」sheet 共用。
  *
  * @param {object} params
- * @param {Array<object>} [params.dailyRows]    作品日明细行（建议含全量快照以支持截止日后恢复异常识别、环比与7天基线）
- * @param {Array<object>} [params.summaryRows]  跨平台内容汇总行（截至 to，可携带 S6 最早已知 firstPublishTime）
- * @param {Array<object>} [params.accountRows]  账号日快照行（截至 to）
- * @param {Array<object>} [params.intradayRows] 作品分时段快照行（近 7 天，用于「新作品前 24 小时」起量曲线）
- * @param {string} [params.to]                  截止日期 YYYY-MM-DD（上限为 UTC+8 今天，未来日期自动夹到今天）
- * @param {number} [params.period=30]           分析周期天数（7 / 30 或导出区间天数）
- * @param {number|Date} [params.now]            注入当前时间（UTC+8 今天上限与兜底截止日，保证确定性）
+ * @param {Array<object>} [params.dailyRows]             作品日明细行（建议含全量快照以支持截止日后恢复异常识别、环比与7天基线）
+ * @param {Array<object>|null} [params.accountWorkDailyRows] 可选，未受分组统计起点过滤的全量作品日明细行（仅用于账号级总播放骤降核验，不影响作品级口径）
+ * @param {Array<object>} [params.summaryRows]           跨平台内容汇总行（截至 to，可携带 S6 最早已知 firstPublishTime）
+ * @param {Array<object>} [params.accountRows]           账号日快照行（截至 to）
+ * @param {Array<object>} [params.intradayRows]          作品分时段快照行（近 7 天，用于「新作品前 24 小时」起量曲线）
+ * @param {string} [params.to]                           截止日期 YYYY-MM-DD（上限为 UTC+8 今天，未来日期自动夹到今天）
+ * @param {number} [params.period=30]                    分析周期天数（7 / 30 或导出区间天数）
+ * @param {number|Date} [params.now]                     注入当前时间（UTC+8 今天上限与兜底截止日，保证确定性）
  */
 function buildStatsAnalysis({
   dailyRows = [],
+  accountWorkDailyRows = null,
   summaryRows = [],
   accountRows = [],
   intradayRows = [],
@@ -3478,9 +3480,14 @@ function buildStatsAnalysis({
     contentMetaByKey.set(c.contentKey, c);
   }
 
+  // 账号级异常判定（如旧作品下架导致账号总播放真实下降）使用未受起点过滤的全量作品数据
+  const accountCheckSeriesByWork = Array.isArray(accountWorkDailyRows)
+    ? prepareWorkSeries(accountWorkDailyRows, resolvedTo).seriesByWork
+    : seriesByWork;
+
   const { cleanedAccountRows, accountPlaysAnomalies } = prepareAccountSeries(
     accountRows,
-    seriesByWork,
+    accountCheckSeriesByWork,
     resolvedTo
   );
 

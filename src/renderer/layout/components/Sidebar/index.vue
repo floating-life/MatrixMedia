@@ -87,6 +87,7 @@
 
 <script setup>
 import { computed, defineComponent, watch, ref } from "vue";
+import { ipcRenderer } from "electron";
 import draggable from "vuedraggable";
 import { Message } from "element-ui";
 import SidebarItem from "./SidebarItem";
@@ -122,6 +123,9 @@ const renameVisible = ref(false);
 const renameOld = ref("");
 const renameNew = ref("");
 const renaming = ref(false);
+// 若账号更新中途失败且回滚不彻底，记录未完成的 (oldName, newName)，
+// 允许用户以相同新名称直接重试继续完成，不被「分组已存在」拦死。
+const pendingRetryRename = ref(null);
 
 // 分组下拉选项：只取媒体平台管理模块的分组路由并去重。
 // permissionStore.routers 同时包含「媒体平台管理」(/accountManager/<组>)
@@ -143,13 +147,21 @@ const groupOptions = computed(() => {
 });
 
 function openRenameDialog() {
-  // 预选第一个可排序分组；用户可下拉切换
-  renameOld.value =
-    visibleRoutes.value
-      .filter((route) => !(route.meta && route.meta.affix))
-      .map((route) => extractGroupKey(route))
-      .filter(Boolean)[0] || "";
-  renameNew.value = "";
+  if (
+    pendingRetryRename.value &&
+    groupOptions.value.includes(pendingRetryRename.value.oldName)
+  ) {
+    renameOld.value = pendingRetryRename.value.oldName;
+    renameNew.value = pendingRetryRename.value.newName;
+  } else {
+    // 预选第一个可排序分组；用户可下拉切换
+    renameOld.value =
+      visibleRoutes.value
+        .filter((route) => !(route.meta && route.meta.affix))
+        .map((route) => extractGroupKey(route))
+        .filter(Boolean)[0] || "";
+    renameNew.value = "";
+  }
   renameVisible.value = true;
 }
 
@@ -164,7 +176,12 @@ async function confirmRenameGroup() {
     renameVisible.value = false;
     return;
   }
-  if (groupOptions.value.includes(newName)) {
+  const isRetryingSameRename = Boolean(
+    pendingRetryRename.value &&
+      pendingRetryRename.value.oldName === oldName &&
+      pendingRetryRename.value.newName === newName
+  );
+  if (groupOptions.value.includes(newName) && !isRetryingSameRename) {
     Message.warning(`分组「${newName}」已存在，请换一个名称`);
     return;
   }
@@ -177,44 +194,158 @@ async function confirmRenameGroup() {
     });
     const raw = (res && res.data) || {};
     const updates = [];
+    let hasExistingNewGroup = false;
     for (const dateKey of Object.keys(raw)) {
       for (const row of raw[dateKey] || []) {
         if (!row || !row.id) continue;
-        if (recordGroupOf(row) !== oldName) continue;
+        const rowGroup = recordGroupOf(row);
+        if (rowGroup === newName) {
+          hasExistingNewGroup = true;
+        }
+        if (rowGroup !== oldName) continue;
         const next = { ...row, group: newName };
         updates.push({
-          id: row.id,
-          date: row.date || dateKey,
-          group: newName,
-          // phone 是兼容字段（旧版本/CLI 按 phone 读写），同步重建
-          phone: buildCompatPhone(next),
+          nextItem: {
+            id: row.id,
+            date: row.date || dateKey,
+            group: newName,
+            // phone 是兼容字段（旧版本/CLI 按 phone 读写），同步重建
+            phone: buildCompatPhone(next),
+          },
+          prevItem: {
+            id: row.id,
+            date: row.date || dateKey,
+            group: row.group !== undefined ? row.group : oldName,
+            phone: row.phone,
+          },
         });
       }
+    }
+    if (hasExistingNewGroup && !isRetryingSameRename) {
+      Message.warning(`分组「${newName}」已存在，请换一个名称`);
+      return;
     }
     if (updates.length === 0) {
       Message.error(`未找到分组「${oldName}」下的账号记录`);
       return;
     }
-    for (const item of updates) {
-      const r = await dataRequest({
-        type: "update",
-        fileName: "account",
-        item,
+
+    // 第一步：先调主进程检查采集锁并执行统计目录迁移；采集忙或迁移失败时直接拒绝、账号不改
+    let migrateRes;
+    try {
+      migrateRes = await ipcRenderer.invoke("stats:rename-group", {
+        oldGroup: oldName,
+        newGroup: newName,
       });
-      if (r && r.success === false) {
-        throw new Error(r.message || "更新账号记录失败");
+    } catch (migrateErr) {
+      const msg = (migrateErr && migrateErr.message) || String(migrateErr);
+      Message.error(`统计目录迁移失败，账号未改动：${msg}`);
+      return;
+    }
+    if (!migrateRes || migrateRes.ok === false) {
+      const msg = (migrateRes && migrateRes.error) || "统计目录迁移失败";
+      if (migrateRes && migrateRes.busy) {
+        Message.warning(`${msg}（账号未改动，可稍后直接重试）`);
+      } else {
+        Message.error(`统计目录迁移失败，账号未改动：${msg}`);
+      }
+      return;
+    }
+
+    // 第二步：统计迁移成功后更新账号记录；若失败则回滚已更新账号与统计迁移，
+    // 回滚不彻底时保留同名重试路径，确保同名重试可继续完成、不被「分组已存在」拦死
+    const appliedOriginals = [];
+    let accountUpdateErr = null;
+    for (const entry of updates) {
+      try {
+        const r = await dataRequest({
+          type: "update",
+          fileName: "account",
+          item: entry.nextItem,
+        });
+        if (r && r.success === false) {
+          throw new Error(r.message || "更新账号记录失败");
+        }
+        appliedOriginals.push(entry.prevItem);
+      } catch (err) {
+        accountUpdateErr = err;
+        break;
       }
     }
+
+    if (accountUpdateErr) {
+      const errMsg =
+        (accountUpdateErr && accountUpdateErr.message) || String(accountUpdateErr);
+      let accountRollbackFailed = false;
+      for (let i = appliedOriginals.length - 1; i >= 0; i--) {
+        try {
+          const rb = await dataRequest({
+            type: "update",
+            fileName: "account",
+            item: appliedOriginals[i],
+          });
+          if (rb && rb.success === false) {
+            accountRollbackFailed = true;
+          }
+        } catch (_) {
+          accountRollbackFailed = true;
+        }
+      }
+
+      if (!accountRollbackFailed && migrateRes.rollbackId) {
+        let statsRollbackOk = false;
+        let statsRollbackErr = "";
+        try {
+          const rbRes = await ipcRenderer.invoke("stats:rollback-rename-group", {
+            rollbackId: migrateRes.rollbackId,
+          });
+          if (rbRes && rbRes.ok) {
+            statsRollbackOk = true;
+          } else {
+            statsRollbackErr = (rbRes && rbRes.error) || "统计目录回滚失败";
+          }
+        } catch (rbErr) {
+          statsRollbackErr = (rbErr && rbErr.message) || String(rbErr);
+        }
+        if (statsRollbackOk) {
+          pendingRetryRename.value = null;
+          Message.error(`更新账号记录失败，已自动回滚统计迁移：${errMsg}`);
+        } else {
+          pendingRetryRename.value = { oldName, newName };
+          Message.warning(
+            `更新账号记录失败（${errMsg}），统计目录回滚未完成（${statsRollbackErr}）；请以原新名称「${newName}」重试继续完成`
+          );
+        }
+      } else if (!accountRollbackFailed) {
+        pendingRetryRename.value = null;
+        Message.error(`更新账号记录失败，已回滚分组重命名：${errMsg}`);
+      } else {
+        pendingRetryRename.value = { oldName, newName };
+        await usePermissionStore().GenerateRoutes();
+        Message.warning(
+          `部分账号更新失败且未能完全回滚（${errMsg}），请以原新名称「${newName}」重试继续完成`
+        );
+      }
+      return;
+    }
+
+    pendingRetryRename.value = null;
     renameVisible.value = false;
     Message.success(`分组已重命名为「${newName}」`);
     await usePermissionStore().GenerateRoutes();
     // 当前若停留在旧分组页面，跳到新分组
     const currentPath = router.currentRoute.path || "";
-    const oldPrefix = `/accountManager/${oldName}`;
-    if (currentPath.startsWith(oldPrefix)) {
-      const tail = currentPath.slice(oldPrefix.length);
+    const oldAccountPrefix = `/accountManager/${oldName}`;
+    const oldStatsPrefix = `/data-stats/group/${oldName}`;
+    if (currentPath.startsWith(oldAccountPrefix)) {
+      const tail = currentPath.slice(oldAccountPrefix.length);
       router
         .push(`/accountManager/${newName}${tail}`.replace(/\/+$/, ""))
+        .catch(() => {});
+    } else if (currentPath.startsWith(oldStatsPrefix)) {
+      const tail = currentPath.slice(oldStatsPrefix.length);
+      router
+        .push(`/data-stats/group/${newName}${tail}`.replace(/\/+$/, ""))
         .catch(() => {});
     }
   } catch (e) {

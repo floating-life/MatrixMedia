@@ -2856,6 +2856,268 @@ function restoreContentsOverride(contentKeys, now = Date.now()) {
   return writeLinkOverrides(current, ts);
 }
 
+/* ---------------- group-settings（分组统计起点日期） ---------------- */
+
+const DEFAULT_GROUP_START_DATES = Object.freeze({
+  人间善恶录: "2026-11-15",
+  赛博老司机: "2026-11-24",
+});
+const GROUP_SETTINGS_MIN_YEAR = 1970;
+const GROUP_SETTINGS_MAX_YEAR = 2100;
+
+function groupSettingsFile() {
+  return path.join(baseDir(), "group-settings.json");
+}
+
+function isValidGroupStartDate(str) {
+  if (typeof str !== "string") return false;
+  const trimmed = str.trim();
+  if (!isValidAutoRunDate(trimmed)) return false;
+  const y = Number(trimmed.slice(0, 4));
+  return y >= GROUP_SETTINGS_MIN_YEAR && y <= GROUP_SETTINGS_MAX_YEAR;
+}
+
+/**
+ * 清洗分组统计起点日期映射为无原型字典 `{ [group]: "YYYY-MM-DD" }`：
+ * - 拒绝原型污染键名（__proto__ / constructor / prototype）
+ * - 兼容直接值 "YYYY-MM-DD" 与对象值 { statsStartDate: "YYYY-MM-DD" }
+ * - 坏数据（非法日期 / 非字符串 / 越界年份等）静默忽略（回落为未设置=不限制）
+ */
+function normalizeGroupSettings(raw) {
+  const out = Object.create(null);
+  if (!isPlainObject(raw)) return out;
+  for (const rawKey of Object.keys(raw)) {
+    if (typeof rawKey !== "string") continue;
+    const group = rawKey.trim();
+    if (!group || FORBIDDEN_PROTO_KEYS.has(group)) continue;
+    const desc = Object.getOwnPropertyDescriptor(raw, rawKey);
+    const val = desc ? desc.value : undefined;
+    let dateStr = "";
+    if (typeof val === "string") {
+      dateStr = val.trim();
+    } else if (isPlainObject(val) && typeof val.statsStartDate === "string") {
+      dateStr = val.statsStartDate.trim();
+    }
+    if (dateStr && isValidGroupStartDate(dateStr)) {
+      out[group] = dateStr;
+    }
+  }
+  return out;
+}
+
+/**
+ * 读取 <userData>/data-stats/group-settings.json，返回无原型字典 `{ [group]: "YYYY-MM-DD" }`。
+ * - 文件不存在（ENOENT）返回空字典
+ * - 非 strict 模式下 JSON 损坏 / 结构无效 / 读失败 warn 并回落为空字典（不限制）
+ * - strict 模式下（供改名迁移使用）读失败或结构损坏直接抛错，防止误写盘
+ */
+function readGroupSettings(options = {}) {
+  const strict = Boolean(options && (options.strict || options.throwOnError));
+  const file = groupSettingsFile();
+  let raw;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch (err) {
+    if (err && err.code === "ENOENT") return Object.create(null);
+    if (strict) throw err;
+    console.warn(`[dataStats] 读取 group-settings.json 失败 (${file}):`, (err && err.message) || err);
+    return Object.create(null);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    if (strict) {
+      const e = new Error(`group-settings.json JSON 损坏: ${(err && err.message) || err}`);
+      e.code = "GROUP_SETTINGS_PARSE_ERROR";
+      e.cause = err;
+      throw e;
+    }
+    console.warn(`[dataStats] group-settings.json JSON 损坏 (${file}):`, (err && err.message) || err);
+    return Object.create(null);
+  }
+  if (!isPlainObject(parsed)) {
+    if (strict) {
+      const e = new Error("group-settings.json 结构无效（需为对象）");
+      e.code = "GROUP_SETTINGS_INVALID_SCHEMA";
+      throw e;
+    }
+    console.warn(`[dataStats] group-settings.json 结构无效 (${file})`);
+    return Object.create(null);
+  }
+  return normalizeGroupSettings(parsed);
+}
+
+/** 原子持久化 group-settings.json（无原型清洗后落盘） */
+function writeGroupSettings(rawMap) {
+  const normalized = normalizeGroupSettings(rawMap);
+  writeWorksDailyAtomic(groupSettingsFile(), normalized);
+  return normalized;
+}
+
+/**
+ * 设置或清空单个分组的统计起点日期（YYYY-MM-DD，UTC+8）。
+ * dateStr 为空串 / null / undefined 时清空该分组限制。
+ * 写入前严格读取现有 group-settings.json：仅 ENOENT 视为空配置，
+ * 任何非 ENOENT 读失败（如 EBUSY/EPERM）或 JSON 损坏/结构异常直接拒绝写入并抛错，绝不以空配置覆盖。
+ */
+function setGroupStartDate(group, dateStr) {
+  const g = typeof group === "string" ? group.trim() : "";
+  if (!g || FORBIDDEN_PROTO_KEYS.has(g)) {
+    throw new Error("分组名称无效");
+  }
+  const isClear = dateStr === undefined || dateStr === null || (typeof dateStr === "string" && !dateStr.trim());
+  let validDate = "";
+  if (!isClear) {
+    if (typeof dateStr !== "string" || !isValidGroupStartDate(dateStr)) {
+      throw new Error(`起点日期无效（需 YYYY-MM-DD）：${dateStr}`);
+    }
+    validDate = dateStr.trim();
+  }
+  const current = readGroupSettings({ strict: true });
+  if (isClear) {
+    delete current[g];
+  } else {
+    current[g] = validDate;
+  }
+  return writeGroupSettings(current);
+}
+
+/** 扫描本地账号记录（account/*.json）中的全部分组名，供首次启动默认配置迁移识别已有分组 */
+function listExistingAccountGroupsFromDisk() {
+  const groups = new Set();
+  const candidateDirs = [];
+  try {
+    if (app && typeof app.getPath === "function") {
+      const docs = app.getPath("documents");
+      if (docs) candidateDirs.push(path.join(docs, "MatrixMedia", "data", "account"));
+      const ud = app.getPath("userData");
+      if (ud) candidateDirs.push(path.join(ud, "data", "account"));
+    }
+  } catch (_) {}
+  for (const dir of candidateDirs) {
+    let entries;
+    try {
+      if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) continue;
+      entries = fs.readdirSync(dir).filter((f) => /^\d{4}-\d{2}-\d{2}\.json$/.test(f));
+    } catch (_) {
+      continue;
+    }
+    for (const file of entries) {
+      const rows = readJson(path.join(dir, file), []);
+      if (!Array.isArray(rows)) continue;
+      for (const row of rows) {
+        if (!isPlainObject(row)) continue;
+        const g =
+          (typeof row.group === "string" && row.group.trim()) ||
+          (typeof row.phone === "string" ? row.phone.split("-")[0].trim() : "");
+        if (g) groups.add(g);
+      }
+    }
+  }
+  return groups;
+}
+
+/**
+ * 首次启动默认起点日期迁移：
+ * 仅当 group-settings.json 不存在时检查是否存在目标分组（data-stats 子目录或账号记录），
+ * 若命中则写入对应默认值（{ "人间善恶录": "2026-11-15", "赛博老司机": "2026-11-24" } 的存在子集）。
+ * 已存在 group-settings.json（包括用户手动清空后的 `{}`）绝不覆盖。
+ */
+function migrateDefaultGroupSettings(options = {}) {
+  const file = groupSettingsFile();
+  try {
+    fs.statSync(file);
+    return { migrated: false, reason: "exists", settings: readGroupSettings() };
+  } catch (statErr) {
+    if (!statErr || statErr.code !== "ENOENT") {
+      return { migrated: false, reason: "read-error", settings: Object.create(null) };
+    }
+  }
+  const existingGroups = new Set();
+  if (options && (Array.isArray(options.existingGroups) || options.existingGroups instanceof Set)) {
+    for (const g of options.existingGroups) {
+      if (typeof g === "string" && g.trim()) existingGroups.add(g.trim());
+    }
+  } else {
+    const root = baseDir();
+    try {
+      if (fs.existsSync(root)) {
+        for (const name of fs.readdirSync(root)) {
+          const full = path.join(root, name);
+          try {
+            if (fs.statSync(full).isDirectory()) existingGroups.add(name);
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+    for (const g of listExistingAccountGroupsFromDisk()) {
+      existingGroups.add(g);
+    }
+  }
+
+  const initial = Object.create(null);
+  for (const [groupName, defaultDate] of Object.entries(DEFAULT_GROUP_START_DATES)) {
+    if (existingGroups.has(groupName) || existingGroups.has(safeSeg(groupName))) {
+      initial[groupName] = defaultDate;
+    }
+  }
+  if (Object.keys(initial).length === 0) {
+    return { migrated: false, reason: "no-target-groups", settings: Object.create(null) };
+  }
+  const saved = writeGroupSettings(initial);
+  return { migrated: true, reason: "migrated", settings: saved };
+}
+
+/**
+ * 统计各分组中被 statsStartDate 排除的起点前作品条数（按 group 内去重 platform|workId 计数）。
+ * 发布时间缺失的作品视为不排除。
+ */
+function countExcludedWorksBeforeStartDate(groupSettingsInput) {
+  const settings = normalizeGroupSettings(
+    groupSettingsInput !== undefined ? groupSettingsInput : readGroupSettings()
+  );
+  const excludedByGroup = {};
+  let excludedTotal = 0;
+  if (Object.keys(settings).length === 0) {
+    return { excludedByGroup, excludedTotal };
+  }
+  const seenByGroup = new Map();
+  for (const acc of listAccounts()) {
+    const group = String(acc.group || "").trim();
+    if (!group) continue;
+    const startDate = settings[group];
+    if (!startDate) continue;
+    const works = readWorks(acc.group, acc.platform).works || [];
+    let seen = seenByGroup.get(group);
+    if (!seen) {
+      seen = new Set();
+      seenByGroup.set(group, seen);
+    }
+    for (const w of works) {
+      if (!isPlainObject(w) || w.workId == null || w.workId === "") continue;
+      const pubMs = parseValidPublishTime(w.publishTime);
+      if (pubMs === null) continue;
+      const pubDate = todayStr(pubMs);
+      if (pubDate && pubDate < startDate) {
+        seen.add(`${acc.platform}|${String(w.workId)}`);
+      }
+    }
+  }
+  for (const [group, set] of seenByGroup.entries()) {
+    if (set.size > 0) {
+      Object.defineProperty(excludedByGroup, group, {
+        value: set.size,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+      excludedTotal += set.size;
+    }
+  }
+  return { excludedByGroup, excludedTotal };
+}
+
 /* ---------------- 读取与聚合 ---------------- */
 
 /** 单账号完整数据（平台页用） */
@@ -2992,5 +3254,19 @@ module.exports = {
   mergeWorksOverride,
   deleteContentsOverride,
   restoreContentsOverride,
+  DEFAULT_GROUP_START_DATES,
+  baseDir,
+  safeSeg,
+  writeWorksDailyAtomic,
+  listGroupPlatformAccountsFromDisk,
+  listExistingAccountGroupsFromDisk,
+  groupSettingsFile,
+  isValidGroupStartDate,
+  normalizeGroupSettings,
+  readGroupSettings,
+  writeGroupSettings,
+  setGroupStartDate,
+  migrateDefaultGroupSettings,
+  countExcludedWorksBeforeStartDate,
   todayStr,
 };
