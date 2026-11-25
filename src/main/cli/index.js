@@ -59,6 +59,12 @@ import { resolveAccountPublishMode } from "../services/accountPublishSettingsRes
 import { resolveTaskPartition } from "../services/accountLookup.js";
 import { ensureAccountRecordsMigrated } from "../services/accountMigration.js";
 import { normalizeVideoMetadata } from "../../shared/videoMetadata.js";
+import {
+  applyPlatformPublishRules,
+  formatRuleAdjustmentsSummary,
+  mergeRuleAdjustments,
+  resolvePlatformOverrideValue,
+} from "../../shared/platformRules.js";
 import { resolveCollectionOption } from "../../shared/videoLink.js";
 import {
   normalizeBatchXlsxRows,
@@ -497,7 +503,24 @@ async function runBatchDirPublish(v, cfg) {
     }
 
     const stem = fileStem(resolvedFile);
-    const bt1 = row.title && row.title.trim() ? row.title.trim() : stem;
+    const rawBt1 =
+      resolvePlatformOverrideValue(row.titleByPlatform, v.platform, "title") ||
+      (row.title && row.title.trim()) ||
+      resolvePlatformOverrideValue(v.titleByPlatform, v.platform, "title") ||
+      stem;
+    const rawDesc =
+      resolvePlatformOverrideValue(
+        row.descByPlatform,
+        v.platform,
+        "description"
+      ) ||
+      row.description ||
+      resolvePlatformOverrideValue(
+        v.descByPlatform,
+        v.platform,
+        "description"
+      ) ||
+      "";
     const bookName = stem;
 
     // 封面：显式 --cover 全局覆盖 xlsx 封面列；行内相对路径相对视频目录解析。
@@ -517,7 +540,7 @@ async function runBatchDirPublish(v, cfg) {
           index: i + 1,
           total: rows.length,
           fileName: row.fileName,
-          title: row.title,
+          title: rawBt1,
           platform: v.platform,
           phone: v.phone || "",
           status: "skipped",
@@ -532,7 +555,7 @@ async function runBatchDirPublish(v, cfg) {
           index: i + 1,
           total: rows.length,
           fileName: row.fileName,
-          title: row.title,
+          title: rawBt1,
           platform: v.platform,
           phone: v.phone || "",
           status: "skipped",
@@ -545,17 +568,72 @@ async function runBatchDirPublish(v, cfg) {
       coverPath = absCover;
     }
 
+    // 横版封面（4:3）：显式 --cover-h 全局覆盖 xlsx 横版封面列
+    const rawCoverH = String(v.coverPathH || row.coverPathH || "").trim();
+    let coverPathH = "";
+    if (rawCoverH) {
+      const absCoverH = path.isAbsolute(rawCoverH)
+        ? rawCoverH
+        : path.join(resolvedDir, rawCoverH);
+      const coverHOk =
+        fs.existsSync(absCoverH) && fs.statSync(absCoverH).isFile();
+      const extHOk =
+        v.platform !== "视频号" || /\.(jpe?g|png)$/i.test(absCoverH);
+      if (!coverHOk) {
+        const r = {
+          index: i + 1,
+          total: rows.length,
+          fileName: row.fileName,
+          title: rawBt1,
+          platform: v.platform,
+          phone: v.phone || "",
+          status: "skipped",
+          message: "横版封面文件不存在: " + absCoverH,
+        };
+        results.push(r);
+        console.log(JSON.stringify({ progress: true, ...r }));
+        continue;
+      }
+      if (!extHOk) {
+        const r = {
+          index: i + 1,
+          total: rows.length,
+          fileName: row.fileName,
+          title: rawBt1,
+          platform: v.platform,
+          phone: v.phone || "",
+          status: "skipped",
+          message: "视频号横版封面仅支持 jpg/png 格式: " + absCoverH,
+        };
+        results.push(r);
+        console.log(JSON.stringify({ progress: true, ...r }));
+        continue;
+      }
+      coverPathH = absCoverH;
+    }
+
     // 标签统一走共享 splitAndSanitizeTags（与 GUI / HTTP 保持完全一致）
     const tagList = splitAndSanitizeTags(row.tags);
-    let bq = "";
-    if (tagList.length) {
-      const hashtagPlatforms = new Set(["视频号", "抖音", "快手"]);
-      if (hashtagPlatforms.has(v.platform)) {
-        bq = tagList.map((t) => (t.startsWith("#") ? t : "#" + t)).join(" ");
-      } else {
-        bq = tagList.join(",");
-      }
-    }
+    const ruled = applyPlatformPublishRules(
+      v.platform,
+      {
+        title: rawBt1,
+        description: rawDesc,
+        shortTitle: row.shortTitle,
+        tags: tagList,
+      },
+      { log: true }
+    );
+    const bt1 = ruled.title;
+    const rowRuleAdjustments = ruled.adjustments || [];
+    const rowRuleSummary = ruled.summary || "";
+    const rowRulePatch =
+      rowRuleAdjustments.length > 0
+        ? {
+            ruleAdjustments: rowRuleAdjustments,
+            ruleAdjustmentsSummary: rowRuleSummary,
+          }
+        : {};
 
     const rawCs =
       (row.creativeStatement && String(row.creativeStatement).trim()) ||
@@ -564,6 +642,9 @@ async function runBatchDirPublish(v, cfg) {
     const cs = resolveCreativeStatementForPlatform(rawCs, v.platform);
     // 合集：优先使用 xlsx 每行「合集」列，留空时回退 CLI --collection；非支持平台自动忽略
     const rowPublishOptions = { ...(v.publishOptions || {}) };
+    if (coverPathH) {
+      rowPublishOptions.coverPathH = coverPathH;
+    }
     const rowCollectionInput =
       (row.collection && String(row.collection).trim()) ||
       (v.collection && String(v.collection).trim()) ||
@@ -586,10 +667,10 @@ async function runBatchDirPublish(v, cfg) {
     }
     const metadata = normalizeVideoMetadata(
       {
-        title: bt1,
-        description: row.description,
-        shortTitle: row.shortTitle,
-        tags: tagList,
+        title: ruled.title,
+        description: ruled.bodyDescription,
+        shortTitle: ruled.shortTitle,
+        tags: ruled.tags,
       },
       v.platform
     );
@@ -695,6 +776,8 @@ async function runBatchDirPublish(v, cfg) {
       creativeStatement: cs,
       ...(rowReservationId ? { throttleReservationId: rowReservationId } : {}),
       coverPath,
+      ...(coverPathH ? { coverPathH } : {}),
+      ...rowRulePatch,
       filePath: resolvedFile,
       useragent: cfg.useragent,
       phone: derivePhoneForRecord(v),
@@ -951,7 +1034,10 @@ async function runBatchDirPublish(v, cfg) {
         ...metadata.legacy,
         creativeStatement: cs,
         coverPath,
+        coverPathH,
+        ...rowRulePatch,
       },
+      ...rowRulePatch,
       url: cfg.upload,
       show: false,
       mmCliSuppressWindow: false,
@@ -1139,11 +1225,21 @@ async function runBatchDirPublish(v, cfg) {
                 (payload && payload.publishMode === "draft") ||
                 effectivePublishMode.publishToDraft,
             });
-            updateRecord(completion.recordStatus, completion.message);
+            const mergedAdj = mergeRuleAdjustments(
+              rowRuleAdjustments,
+              payload && payload.ruleAdjustments
+            );
+            const mergedSummary = formatRuleAdjustmentsSummary(mergedAdj);
+            const msgWithAdj =
+              mergedSummary &&
+              !String(completion.message || "").includes(mergedSummary)
+                ? `${completion.message}（规则调整：${mergedSummary}）`
+                : completion.message;
+            updateRecord(completion.recordStatus, msgWithAdj);
             settleRowLedger(completion.recordStatus, {
               savedAsDraft: completion.savedAsDraft,
             }).finally(() =>
-              finish(completion.exitCode === 0, completion.message)
+              finish(completion.exitCode === 0, msgWithAdj)
             );
           } else if (channel === "puppeteer-noLogin") {
             if (payload && payload.taskId != null && payload.taskId !== taskId)
@@ -1170,6 +1266,7 @@ async function runBatchDirPublish(v, cfg) {
       platform: v.platform,
       phone: v.phone || "",
       creativeStatement: cs,
+      ...rowRulePatch,
       status: taskResult.ok ? "success" : "failed",
       message: taskResult.message,
     };
@@ -1346,7 +1443,13 @@ export async function runCliMain(argv = process.argv) {
       requestDraftMode: Boolean(v.draft),
     });
     const isDraftSingle = effectivePublishMode.publishToDraft === true;
-    const candTitle = sanitizeTitle(v.title) || fileStem(v.file);
+    const rawCandTitle = sanitizeTitle(v.title) || fileStem(v.file);
+    const candTitle =
+      applyPlatformPublishRules(v.platform, {
+        title: rawCandTitle,
+        description: v.description || "",
+        tags: v.tags || v.bq || "",
+      }).title || rawCandTitle;
     const pushRecords = readPushDataRecordsForCli();
 
     // 显式 --publish-at 先按 UTC+8 做格式与未来时间校验
@@ -1464,6 +1567,15 @@ export async function runCliMain(argv = process.argv) {
       throw err;
     }
     const finalCs = result.creativeStatement || v.creativeStatement || "none";
+    const cliRulePatch =
+      Array.isArray(result.ruleAdjustments) && result.ruleAdjustments.length > 0
+        ? {
+            ruleAdjustments: result.ruleAdjustments,
+            ruleAdjustmentsSummary:
+              result.ruleAdjustmentsSummary ||
+              formatRuleAdjustmentsSummary(result.ruleAdjustments),
+          }
+        : {};
     if (result.exitCode === 4 || result.status === "needs_attention") {
       if (result.duplicate) {
         console.log(
@@ -1476,6 +1588,7 @@ export async function runCliMain(argv = process.argv) {
             publishAt: result.publishAt ?? null,
             plannedAtMs: result.plannedAtMs ?? null,
             creativeStatement: finalCs,
+            ...cliRulePatch,
             ...(result.requestedCreativeStatement !== undefined
               ? { requestedCreativeStatement: result.requestedCreativeStatement }
               : {}),
@@ -1502,6 +1615,7 @@ export async function runCliMain(argv = process.argv) {
             resultStatus: result.status,
             publishMode: result.publishMode,
             creativeStatement: finalCs,
+            ...cliRulePatch,
             outcome: result.outcome,
             needsAttention: true,
             // 草稿未确认场景透传诊断字段，便于 e2e/脚本消费（#42）
@@ -1533,6 +1647,7 @@ export async function runCliMain(argv = process.argv) {
             ? { plannedAtMs: result.plannedAtMs }
             : {}),
           creativeStatement: finalCs,
+          ...cliRulePatch,
           throttled: Boolean(result.throttled || v.throttled),
           ...(throttleReason ? { throttleReason, reason: throttleReason } : {}),
           ...(throttleReasons.length > 0 ? { reasons: throttleReasons } : {}),
@@ -1547,6 +1662,7 @@ export async function runCliMain(argv = process.argv) {
           resultStatus: result.status,
           publishMode: result.publishMode,
           creativeStatement: finalCs,
+          ...cliRulePatch,
           // 草稿模式的保存结果校验字段（#42），老版本 App 无这两个字段
           ...(result.draftVerified !== undefined
             ? { draftVerified: result.draftVerified }

@@ -5,6 +5,11 @@ import {
   replyPublishOutcome,
 } from "./publishOutcome.js";
 import { resolveBjhCreativeStatementLabel } from "../../../shared/creativeStatement.js";
+import { buildPlatformVideoTextDetailed } from "../../../shared/videoMetadata.js";
+import {
+  formatRuleAdjustmentsSummary,
+  mergeRuleAdjustments,
+} from "../../../shared/platformRules.js";
 import {
   WAIT_SELECTOR_APPEAR_MS,
   WAIT_UPLOAD_PROCESSING_MS,
@@ -430,7 +435,13 @@ async function ensureBjhTitle(page, title, fileStem) {
 export default async function (page, data, window, event) {
   // 发布模式下一旦派发过点击，后续任何异常都无法排除已发出 → 外层不得整体重试（宁漏勿重）
   let bjhClickDispatched = false;
-  const wantTitle = (data.data && (data.data.title || data.data.bt1)) || "";
+  const text = buildPlatformVideoTextDetailed("百家号", data.data || {});
+  const wantTitle = text.title || "";
+  const bjhRuleAdjustments = mergeRuleAdjustments(
+    data.ruleAdjustments || (data.data && data.data.ruleAdjustments),
+    text.adjustments
+  );
+  const bjhAdjSummary = formatRuleAdjustmentsSummary(bjhRuleAdjustments);
   const fileStem = path.basename(
     String(data.filePath || ""),
     path.extname(String(data.filePath || ""))
@@ -684,6 +695,7 @@ export default async function (page, data, window, event) {
     console.log(
       isDraftMode ? "✅ 百家号视频已保存草稿" : "✅ 百家号视频上传成功"
     );
+    const bjhBaseSuccessMsg = isDraftMode ? "保存草稿成功" : "上传成功";
     await replyPublishOutcome({
       page,
       data,
@@ -691,7 +703,16 @@ export default async function (page, data, window, event) {
       event,
       urlBefore,
       isDraftMode,
-      successMessage: isDraftMode ? "保存草稿成功" : "上传成功",
+      successMessage: bjhAdjSummary
+        ? `${bjhBaseSuccessMsg}（规则调整：${bjhAdjSummary}）`
+        : bjhBaseSuccessMsg,
+      extraPayload:
+        bjhRuleAdjustments.length > 0
+          ? {
+              ruleAdjustments: bjhRuleAdjustments,
+              ruleAdjustmentsSummary: bjhAdjSummary,
+            }
+          : {},
     });
   } catch (err) {
     const failMessage = err?.message || "上传失败";

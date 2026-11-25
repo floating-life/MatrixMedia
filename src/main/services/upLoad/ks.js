@@ -10,7 +10,7 @@ import {
   isCreativeStatementNone,
   resolveKsCreativeStatementLabel,
 } from "../../../shared/creativeStatement.js";
-import { buildPlatformVideoText } from "../../../shared/videoMetadata.js";
+import * as videoMetadata from "../../../shared/videoMetadata.js";
 import { resolveVideoLinkOption } from "../../../shared/videoLink.js";
 import { attachKsProductLink } from "./ksProductLink.js";
 import {
@@ -600,6 +600,7 @@ export default async function (page, data, window, event) {
 
   console.log(data);
   let descFillText = "";
+  let ksRuleAdjustments = [];
   try {
     let sel = '#joyride-wrapper input[type="file"]';
     await page.waitForSelector(sel, { timeout: WAIT_SELECTOR_APPEAR_MS });
@@ -623,8 +624,18 @@ export default async function (page, data, window, event) {
   // 描述（含标题拼接）填写：回读校验 + execCommand 兜底，失败抛错中止发布（#34）。
   // 抛错交给上层失败上报/自动重试，避免静默发出空标题/空简介的作品。
   try {
-    const text = buildPlatformVideoText("快手", data.data);
-    descFillText = composeKsFillText(text);
+    const text =
+      typeof videoMetadata.buildPlatformVideoTextDetailed === "function"
+        ? videoMetadata.buildPlatformVideoTextDetailed("快手", data.data)
+        : videoMetadata.buildPlatformVideoText("快手", data.data);
+    ksRuleAdjustments =
+      typeof videoMetadata.mergeRuleAdjustments === "function"
+        ? videoMetadata.mergeRuleAdjustments(
+            data.ruleAdjustments || (data.data && data.data.ruleAdjustments),
+            text.adjustments
+          )
+        : [];
+    descFillText = text.ksFillText || composeKsFillText(text);
     await fillKsDescription(page, descFillText);
   } catch (e) {
     console.error("❌ 快手描述填写失败:", e?.message || e);
@@ -775,6 +786,13 @@ export default async function (page, data, window, event) {
         ? `✅ 快手已点击存草稿入口（网页端无草稿箱，未能核验），click via=${clicked.via}`
         : `✅ 快手视频已触发发布，click via=${clicked.via}`
     );
+    const ksAdjSummary =
+      typeof videoMetadata.formatRuleAdjustmentsSummary === "function"
+        ? videoMetadata.formatRuleAdjustmentsSummary(ksRuleAdjustments)
+        : "";
+    const ksBaseSuccessMsg = isDraftMode
+      ? "已点击取消发布/存草稿入口（快手网页端无草稿箱，无法核验）"
+      : "上传成功";
     await replyPublishOutcome({
       page,
       data,
@@ -784,10 +802,18 @@ export default async function (page, data, window, event) {
       isDraftMode,
       // 快手编辑页视频上传完常驻「上传成功」，发布模式不能把它当发布成功信号
       excludeSuccessToasts: ["上传成功", "草稿已保存"],
-      successMessage: isDraftMode
-        ? "已点击取消发布/存草稿入口（快手网页端无草稿箱，无法核验）"
-        : "上传成功",
-      extraPayload: isDraftMode ? { draftUnverified: true } : {},
+      successMessage: ksAdjSummary
+        ? `${ksBaseSuccessMsg}（规则调整：${ksAdjSummary}）`
+        : ksBaseSuccessMsg,
+      extraPayload: {
+        ...(isDraftMode ? { draftUnverified: true } : {}),
+        ...(ksRuleAdjustments.length > 0
+          ? {
+              ruleAdjustments: ksRuleAdjustments,
+              ruleAdjustmentsSummary: ksAdjSummary,
+            }
+          : {}),
+      },
     });
   } catch (e) {
     // 失败瞬间截图留证（登录过期 / 风控弹窗 / 元素改版都能一眼看出）

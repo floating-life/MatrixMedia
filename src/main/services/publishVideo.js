@@ -32,6 +32,11 @@ import { resolveAccountPublishMode } from "./accountPublishSettingsResolver.js";
 import { resolveTaskPartition } from "./accountLookup.js";
 import { resolvePublishCompletion } from "../../shared/publishResult.js";
 import { normalizeVideoMetadata } from "../../shared/videoMetadata.js";
+import {
+  applyPlatformPublishRules,
+  formatRuleAdjustmentsSummary,
+  mergeRuleAdjustments,
+} from "../../shared/platformRules.js";
 import { resolveCollectionOption } from "../../shared/videoLink.js";
 import {
   DY_SYNC_TOUTIAO_CONFLICT_MESSAGE,
@@ -111,6 +116,25 @@ function resolveCoverPath(v) {
 }
 
 /**
+ * 提前校验横版封面文件（4:3，抖音/视频号生效）：存在性 + 视频号 jpg/png 格式校验。
+ */
+function resolveCoverPathH(v) {
+  const raw = v && (v.coverPathH || v.coverH);
+  if (!raw) return { ok: true, coverPathH: "" };
+  const coverPathH = path.resolve(raw);
+  if (!fs.existsSync(coverPathH) || !fs.statSync(coverPathH).isFile()) {
+    return { ok: false, message: `横版封面文件不存在: ${coverPathH}` };
+  }
+  if (v.platform === "视频号" && !/\.(jpe?g|png)$/i.test(coverPathH)) {
+    return {
+      ok: false,
+      message: `视频号横版封面仅支持 jpg/png 格式: ${coverPathH}`,
+    };
+  }
+  return { ok: true, coverPathH };
+}
+
+/**
  * 单文件发布（与 cli publish 单文件模式一致）
  * @param {object} v parsePublishArgs 解析后的参数
  * @param {{ sourceFile: string, resolvedFile: string } | null} fileContext 多平台复用已下载文件时传入
@@ -153,7 +177,34 @@ export async function runSingleFilePublish(
 
   const sourceFile = String(v.file || "").trim();
   const stem = fileStemFromSource(sourceFile);
-  const metadata = normalizeVideoMetadata(v, v.platform);
+  const rawMetadata = normalizeVideoMetadata(v, v.platform);
+  const ruled = applyPlatformPublishRules(
+    v.platform,
+    {
+      title: rawMetadata.title,
+      description: rawMetadata.description,
+      shortTitle: rawMetadata.shortTitle,
+      tags: rawMetadata.tags,
+      titleByPlatform: v.titleByPlatform,
+      descByPlatform: v.descByPlatform,
+    },
+    { log: true }
+  );
+  const metadata = {
+    title: ruled.title,
+    description: ruled.bodyDescription,
+    shortTitle: ruled.shortTitle,
+    tags: ruled.tags,
+    legacy: {
+      bt1: ruled.title,
+      bt2: ruled.bodyDescription,
+      bt2Filled: ruled.shortTitle,
+      bdText: ruled.bodyDescription,
+      bq: ruled.tagsText,
+    },
+  };
+  const ruleAdjustments = ruled.adjustments || [];
+  const ruleAdjustmentsSummary = ruled.summary || "";
   const bookName = (v.bookName && String(v.bookName).trim()) || stem;
 
   // 封面文件在组装参数时就校验（存在性 / 视频号 jpg|png），失败早于视频下载与上传
@@ -163,6 +214,12 @@ export async function runSingleFilePublish(
     return { exitCode: 2, status: "failed", message: cover.message };
   }
   const coverPath = cover.coverPath;
+  const coverH = resolveCoverPathH(v);
+  if (!coverH.ok) {
+    await releaseOwnReservation();
+    return { exitCode: 2, status: "failed", message: coverH.message };
+  }
+  const coverPathH = coverH.coverPathH;
 
   let cleanupDownload = null;
   let resolvedFile = sourceFile;
@@ -197,6 +254,9 @@ export async function runSingleFilePublish(
         metadata,
         bookName,
         coverPath,
+        coverPathH,
+        ruleAdjustments,
+        ruleAdjustmentsSummary,
       },
       options
     );
@@ -208,7 +268,17 @@ export async function runSingleFilePublish(
 async function runSingleFilePublishInner(
   v,
   cfg,
-  { sourceFile, resolvedFile, stem, metadata, bookName, coverPath = "" },
+  {
+    sourceFile,
+    resolvedFile,
+    stem,
+    metadata,
+    bookName,
+    coverPath = "",
+    coverPathH = "",
+    ruleAdjustments = [],
+    ruleAdjustmentsSummary = "",
+  },
   options = {}
 ) {
   // 新分组模型：CLI/HTTP 传入的 partition 可能仍按历史「phone 前缀」规则拼出，
@@ -280,6 +350,19 @@ async function runSingleFilePublishInner(
   } else {
     delete effectivePublishOptions.dySyncToutiao;
   }
+  if (coverPathH) {
+    effectivePublishOptions.coverPathH = coverPathH;
+  }
+
+  const ruleAdjustmentsPatch =
+    Array.isArray(ruleAdjustments) && ruleAdjustments.length > 0
+      ? {
+          ruleAdjustments,
+          ruleAdjustmentsSummary:
+            ruleAdjustmentsSummary ||
+            formatRuleAdjustmentsSummary(ruleAdjustments),
+        }
+      : {};
 
   const taskPayload = {
     taskId: Date.now() + Math.random(),
@@ -295,8 +378,11 @@ async function runSingleFilePublishInner(
       ...metadata.legacy,
       creativeStatement: normalizeCreativeStatement(finalCreativeStatement),
       coverPath,
+      coverPathH,
       noDownload: v.noDownload === true,
+      ...ruleAdjustmentsPatch,
     },
+    ...ruleAdjustmentsPatch,
     url: cfg.upload,
     show: v.show,
     mmCliSuppressWindow: false,
@@ -333,6 +419,8 @@ async function runSingleFilePublishInner(
     ...(throttleReason ? { throttleReason } : {}),
     ...(activeReservationId ? { throttleReservationId: activeReservationId } : {}),
     coverPath,
+    ...(coverPathH ? { coverPathH } : {}),
+    ...ruleAdjustmentsPatch,
     noDownload: v.noDownload === true,
     filePath:
       v.publishAt && isRemotePublishFile(sourceFile)
@@ -558,6 +646,7 @@ async function runSingleFilePublishInner(
         publishAt: scheduledRecord.scheduledPublishAtText,
         plannedAtMs: scheduledRecord.scheduledPublishAt,
         creativeStatement: finalCreativeStatement,
+        ...ruleAdjustmentsPatch,
         throttled: isThrottled,
         throttleReason,
         reason: throttleReason,
@@ -778,16 +867,31 @@ async function runSingleFilePublishInner(
               (payload && payload.publishMode === "draft") ||
               effectivePublishMode.publishToDraft,
           });
-          updateRecord(completion.recordStatus, completion.message);
+          const mergedAdj = mergeRuleAdjustments(
+            ruleAdjustments,
+            payload && payload.ruleAdjustments
+          );
+          const mergedSummary = formatRuleAdjustmentsSummary(mergedAdj);
+          const finalMessage =
+            mergedSummary && !String(completion.message || "").includes(mergedSummary)
+              ? `${completion.message}（规则调整：${mergedSummary}）`
+              : completion.message;
+          updateRecord(completion.recordStatus, finalMessage);
           settleImmediateLedger(completion.recordStatus, {
             savedAsDraft: completion.savedAsDraft,
           }).finally(() => {
             finish({
               exitCode: completion.exitCode,
               status: completion.status,
-              message: completion.message,
+              message: finalMessage,
               id: recordId,
               creativeStatement: finalCreativeStatement,
+              ...(mergedAdj.length > 0
+                ? {
+                    ruleAdjustments: mergedAdj,
+                    ruleAdjustmentsSummary: mergedSummary,
+                  }
+                : {}),
               publishMode: completion.savedAsDraft ? "draft" : "publish",
               outcome: payload && payload.outcome,
               needsAttention: completion.fallbackDraft,
@@ -824,9 +928,12 @@ async function runSingleFilePublishInner(
       resolve({
         exitCode: 0,
         status: "submitted",
-        message: "已提交发布任务",
+        message: ruleAdjustmentsSummary
+          ? `已提交发布任务（规则调整：${ruleAdjustmentsSummary}）`
+          : "已提交发布任务",
         id: recordId,
         creativeStatement: finalCreativeStatement,
+        ...ruleAdjustmentsPatch,
       });
     }
   });
@@ -924,6 +1031,12 @@ export async function runMultiPlatformPublish(parsedList) {
       reason: throttleReason,
       reasons: throttleReasons,
       creativeStatement: finalCs,
+      ...(Array.isArray(result.ruleAdjustments) && result.ruleAdjustments.length > 0
+        ? {
+            ruleAdjustments: result.ruleAdjustments,
+            ruleAdjustmentsSummary: result.ruleAdjustmentsSummary || "",
+          }
+        : {}),
       ...(result.needsAttention ? { needsAttention: true } : {}),
       ...(result.duplicate ? { duplicate: true } : {}),
       ...(result.requestedCreativeStatement !== undefined
@@ -961,6 +1074,13 @@ export async function runMultiPlatformPublish(parsedList) {
           throttleReason,
           reason: throttleReason,
           reasons: throttleReasons,
+          ...(Array.isArray(result.ruleAdjustments) &&
+          result.ruleAdjustments.length > 0
+            ? {
+                ruleAdjustments: result.ruleAdjustments,
+                ruleAdjustmentsSummary: result.ruleAdjustmentsSummary || "",
+              }
+            : {}),
           ...(result.needsAttention ? { needsAttention: true } : {}),
           ...(result.duplicate ? { duplicate: true } : {}),
           ...(result.requestedCreativeStatement !== undefined
@@ -1086,6 +1206,13 @@ export async function runMultiPlatformPublish(parsedList) {
         throttleReason,
         reason: throttleReason,
         reasons: throttleReasons,
+        ...(Array.isArray(result.ruleAdjustments) &&
+        result.ruleAdjustments.length > 0
+          ? {
+              ruleAdjustments: result.ruleAdjustments,
+              ruleAdjustmentsSummary: result.ruleAdjustmentsSummary || "",
+            }
+          : {}),
         ...(result.needsAttention ? { needsAttention: true } : {}),
         ...(result.duplicate ? { duplicate: true } : {}),
         ...(result.requestedCreativeStatement !== undefined

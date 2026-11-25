@@ -143,6 +143,29 @@
             字，且不能包含特殊标点符号。
           </p>
         </el-form-item>
+        <el-form-item label="分平台标题">
+          <div class="platform-title-grid">
+            <div
+              v-for="item in platformTitleOverrideList"
+              :key="item.pt"
+              class="platform-title-item"
+            >
+              <span class="platform-title-label"
+                >{{ item.pt }}<small v-if="item.hint">（{{ item.hint }}）</small></span
+              >
+              <el-input
+                :value="getPlatformTitleOverride(item.pt)"
+                size="small"
+                clearable
+                :placeholder="`留空使用通用标题`"
+                @input="setPlatformTitleOverride(item.pt, $event)"
+              />
+            </div>
+          </div>
+          <p class="bt2-tip">
+            选填。填写后优先覆盖该平台的通用标题；超出平台字数上限时仍会自动按标点兜底截断。
+          </p>
+        </el-form-item>
         <el-form-item label="封面图片">
           <div class="cover-field-row">
             <el-button size="small" @click="chooseCoverImage">{{
@@ -161,10 +184,52 @@
             }}</span>
           </div>
           <p class="bt2-tip">
-            选填。设置后抖音 / 快手 / 视频号会使用自定义封面（竖图 3:4
-            最佳；视频号仅支持 jpg/png），不选则由平台自动截取视频帧。
+            选填（竖版 3:4 最佳）。设置后抖音 / 快手 / 视频号会使用自定义封面（视频号仅支持
+            jpg/png），不选则由平台自动截取视频帧。
           </p>
         </el-form-item>
+        <el-form-item label="横版封面(4:3)">
+          <div class="cover-field-row">
+            <el-button size="small" @click="chooseCoverHImage">{{
+              form.coverPathH ? "重新选择横版封面" : "选择横版封面(4:3)"
+            }}</el-button>
+            <el-button
+              v-if="form.coverPathH"
+              type="text"
+              size="small"
+              class="cover-clear"
+              @click="form.coverPathH = ''"
+              >清除</el-button
+            >
+            <span
+              v-if="form.coverPathH"
+              class="cover-name"
+              :title="form.coverPathH"
+              >{{ coverHFileName }}</span
+            >
+          </div>
+          <p class="bt2-tip">
+            选填（仅抖音 / 视频号生效）。指定后将居中裁切为 1440×1080（4:3）；留空但已选竖版封面时，自动由竖封面居中并两侧模糊补边生成 4:3 横版封面（视频号仅支持 jpg/png）。
+          </p>
+        </el-form-item>
+        <el-alert
+          v-if="metaRuleWarnings.length"
+          type="warning"
+          :closable="false"
+          show-icon
+          class="rule-precheck-alert"
+          title="发布前预检：部分平台文案超限，发布时将自动截断 / 裁剪标签（不阻断发布）"
+        >
+          <div class="rule-precheck-list">
+            <div
+              v-for="w in metaRuleWarnings"
+              :key="w.platform"
+              class="rule-precheck-item"
+            >
+              {{ w.summary }}
+            </div>
+          </div>
+        </el-alert>
         <el-form-item label="定时发布">
           <el-switch
             v-model="scheduledPublish"
@@ -363,6 +428,31 @@
         description="请先在右上角添加媒体平台账号"
       />
 
+      <el-alert
+        v-if="checkedPlatformRuleWarnings.length"
+        type="warning"
+        :closable="false"
+        show-icon
+        class="rule-precheck-alert"
+        title="发布前预检：已勾选平台将自动截断 / 裁剪标签（不阻断发布）"
+      >
+        <div class="rule-precheck-list">
+          <div
+            v-for="(w, idx) in checkedPlatformRuleWarnings.slice(0, 6)"
+            :key="w.key || w.platform || idx"
+            class="rule-precheck-item"
+          >
+            {{ w.summary }}
+          </div>
+          <div
+            v-if="checkedPlatformRuleWarnings.length > 6"
+            class="rule-precheck-item"
+          >
+            …等共 {{ checkedPlatformRuleWarnings.length }} 条平台规则调整
+          </div>
+        </div>
+      </el-alert>
+
       <div slot="footer" class="dialog-footer">
         <el-button :disabled="publishing" @click="goBackToMeta"
           >上一步</el-button
@@ -388,6 +478,31 @@
       width="920px"
       @close="handleAttrsClose"
     >
+      <el-alert
+        v-if="checkedPlatformRuleWarnings.length"
+        type="warning"
+        :closable="false"
+        show-icon
+        class="rule-precheck-alert"
+        title="发布前预检：已勾选平台存在超限项，发布时将自动截断 / 裁剪标签（不阻断发布）"
+      >
+        <div class="rule-precheck-list">
+          <div
+            v-for="(w, idx) in checkedPlatformRuleWarnings.slice(0, 8)"
+            :key="w.key || w.platform || idx"
+            class="rule-precheck-item"
+          >
+            {{ w.summary }}
+          </div>
+          <div
+            v-if="checkedPlatformRuleWarnings.length > 8"
+            class="rule-precheck-item"
+          >
+            …等共 {{ checkedPlatformRuleWarnings.length }} 条平台规则调整
+          </div>
+        </div>
+      </el-alert>
+
       <p v-if="!attrsHasSph" class="bt2-tip">
         当前未勾选视频号，无需配置第三方属性，确认后可直接发布。
       </p>
@@ -399,6 +514,33 @@
       >
         <el-table-column prop="pt" label="平台" width="100" />
         <el-table-column prop="phone" label="账号" min-width="140" />
+        <el-table-column
+          v-if="!isDirBatchMode"
+          label="覆盖标题（可选）"
+          min-width="200"
+        >
+          <template slot-scope="{ row }">
+            <div class="attrs-title-cell">
+              <el-input
+                v-if="platformSupportsTitleOverride(row.pt)"
+                :value="getPlatformTitleOverride(row.pt)"
+                size="mini"
+                clearable
+                :placeholder="getPlatformTitleOverridePlaceholder(row.pt)"
+                @input="setPlatformTitleOverride(row.pt, $event)"
+              />
+              <span v-else class="attrs-unsupported">使用短标题/简介</span>
+              <el-tag
+                v-if="getCheckedPlatformRowWarning(row.pt)"
+                size="mini"
+                type="warning"
+                class="attrs-truncate-tag"
+                :title="getCheckedPlatformRowWarning(row.pt)"
+                >将截断</el-tag
+              >
+            </div>
+          </template>
+        </el-table-column>
         <el-table-column label="第三方属性" min-width="420">
           <template slot-scope="{ row }">
             <div
@@ -619,8 +761,7 @@
         >
       </div>
       <p class="bt2-tip" style="margin-bottom: 12px">
-        声明文件支持列：文件名 / 标题 / 简介 / 标签 / 视频号短标题 / 封面（选填，填图片路径，绝对路径或相对视频目录均可；视频号仅支持
-        jpg/png，路径无效会阻断发布）/ 合集（选填，抖音/快手/视频号生效，留空不选）。
+        声明文件支持列：文件名 / 标题 / 简介 / 标签 / 视频号短标题 / 封面 / 横版封面（选填，抖音与视频号 4:3 封面；路径无效会阻断发布）/ 合集 / 分平台覆盖列（如「抖音标题」「百家号标题」「快手简介」，优先于通用标题/简介）。
       </p>
 
       <el-table
@@ -666,6 +807,21 @@
           min-width="120"
           show-overflow-tooltip
         />
+        <el-table-column
+          prop="coverPathH"
+          label="横版封面"
+          min-width="120"
+          show-overflow-tooltip
+        />
+        <el-table-column
+          label="分平台覆盖"
+          min-width="140"
+          show-overflow-tooltip
+        >
+          <template slot-scope="{ row }">
+            <span>{{ formatRowPlatformOverrides(row) || "—" }}</span>
+          </template>
+        </el-table-column>
         <el-table-column
           prop="collection"
           label="合集"
@@ -853,12 +1009,91 @@ import {
 } from "@/utils/localVideoPublishBt2";
 import { normalizeVideoMetadata } from "../../shared/videoMetadata.js";
 import {
+  PLATFORM_RULES,
+  applyPlatformPublishRules,
+  getPlatformRule,
+  normalizePlatformTextMap,
+  previewPlatformPublishAdjustments,
+  resolvePlatformRuleKey,
+} from "../../shared/platformRules.js";
+import {
   sanitizeTitle,
   sanitizeDescription,
   splitAndSanitizeTags,
 } from "../../shared/textSanitize.js";
 import { parsePublishAtUtc8 } from "../../shared/publishThrottle.js";
 import AiGenerateButton from "@/components/ai/AiGenerateButton.vue";
+
+const TITLE_OVERRIDE_PLATFORMS = [
+  { pt: "抖音", hint: "≤30字" },
+  { pt: "百家号", hint: "≤20字" },
+  { pt: "小红书", hint: "≤20字" },
+  { pt: "头条", hint: "≤30字" },
+  { pt: "哔哩哔哩", hint: "≤80字" },
+  { pt: "快手", hint: "并入正文" },
+];
+
+const PRECHECK_ALL_PLATFORMS = [
+  "抖音",
+  "视频号",
+  "快手",
+  "百家号",
+  "头条",
+  "小红书",
+  "哔哩哔哩",
+];
+
+function safeResolvePlatformRuleKey(pt) {
+  if (typeof resolvePlatformRuleKey === "function") {
+    const r = resolvePlatformRuleKey(pt);
+    if (r) return r;
+  }
+  return String(pt || "").trim();
+}
+
+function safeGetPlatformRule(pt) {
+  if (typeof getPlatformRule === "function") {
+    const r = getPlatformRule(pt);
+    if (r && typeof r === "object") return r;
+  }
+  if (PLATFORM_RULES && typeof PLATFORM_RULES === "object") {
+    const k = safeResolvePlatformRuleKey(pt);
+    if (k && PLATFORM_RULES[k]) return PLATFORM_RULES[k];
+  }
+  return null;
+}
+
+function safeNormalizePlatformTextMap(raw, kind = "title") {
+  if (typeof normalizePlatformTextMap === "function") {
+    const res = normalizePlatformTextMap(raw, kind);
+    if (res && typeof res === "object") return res;
+  }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out = {};
+  for (const [k, v] of Object.entries(raw)) {
+    const s = String(v == null ? "" : v).trim();
+    if (s) out[k] = s;
+  }
+  return out;
+}
+
+function safeApplyPlatformRules(pt, input, options) {
+  if (typeof applyPlatformPublishRules === "function") {
+    const res = applyPlatformPublishRules(pt, input, options);
+    if (res && typeof res === "object" && typeof res.title === "string") {
+      return res;
+    }
+  }
+  return null;
+}
+
+function safePreviewPlatformRules(platforms, input) {
+  if (typeof previewPlatformPublishAdjustments === "function") {
+    const res = previewPlatformPublishAdjustments(platforms, input);
+    if (Array.isArray(res)) return res;
+  }
+  return [];
+}
 
 function fileBaseName(p) {
   if (!p) return "";
@@ -1029,8 +1264,12 @@ export default {
         bt1: "",
         description: "",
         shortTitle: "",
-        // 自定义封面图片绝对路径（发布第一步选图；重发时从历史记录带入）
+        // 分平台覆盖标题（key 为规范平台中文名，如 抖音 / 百家号 / 小红书 / 头条 / 哔哩哔哩 / 快手）
+        titleByPlatform: {},
+        // 自定义封面图片绝对路径（竖版 3:4；发布第一步选图；重发时从历史记录带入）
         coverPath: "",
+        // 横版封面绝对路径（4:3，仅抖音 / 视频号生效；留空时有竖封面则自动生成）
+        coverPathH: "",
         noDownload: false,
         dySyncToutiao: readDySyncToutiaoPreference(),
       },
@@ -1070,6 +1309,87 @@ export default {
     },
     coverFileName() {
       return this.form.coverPath ? fileBaseName(this.form.coverPath) : "";
+    },
+    coverHFileName() {
+      return this.form.coverPathH ? fileBaseName(this.form.coverPathH) : "";
+    },
+    isDirBatchMode() {
+      return Array.isArray(this.dirBatchFiles) && this.dirBatchFiles.length > 0;
+    },
+    platformTitleOverrideList() {
+      return TITLE_OVERRIDE_PLATFORMS.map((item) => {
+        const rule = safeGetPlatformRule(item.pt);
+        const hint =
+          rule && rule.titleMax != null
+            ? `≤${rule.titleMax}字`
+            : item.hint;
+        return { pt: item.pt, hint };
+      });
+    },
+    metaRuleWarnings() {
+      const title = String((this.form && this.form.bt1) || "").trim();
+      const description = String(
+        (this.form && this.form.description) || ""
+      ).trim();
+      const tags = Array.isArray(this.bqTags) ? this.bqTags : [];
+      const titleByPlatform =
+        (this.form && this.form.titleByPlatform) || {};
+      if (
+        !title &&
+        !description &&
+        tags.length === 0 &&
+        Object.keys(titleByPlatform).length === 0
+      ) {
+        return [];
+      }
+      return safePreviewPlatformRules(PRECHECK_ALL_PLATFORMS, {
+        title,
+        description,
+        shortTitle: (this.form && this.form.shortTitle) || "",
+        tags,
+        titleByPlatform,
+      });
+    },
+    checkedPlatformRuleWarnings() {
+      const nodes = this.checkedPlatformNodes || [];
+      if (!nodes.length) return [];
+      const platforms = nodes.map((n) => n.pt);
+      if (this.isDirBatchMode) {
+        const warnings = [];
+        for (const row of this.dirBatchFiles || []) {
+          const stem = String((row && row.fileName) || "").replace(
+            /\.[^/.]+$/,
+            ""
+          );
+          const rowWarnings = safePreviewPlatformRules(platforms, {
+            title: (row && row.title) || stem,
+            description: (row && row.description) || "",
+            shortTitle: (row && row.shortTitle) || "",
+            tags: (row && row.tags) || "",
+            titleByPlatform: (row && row.titleByPlatform) || {},
+            descByPlatform: (row && row.descByPlatform) || {},
+          });
+          for (const w of rowWarnings) {
+            warnings.push({
+              key: `${row.fileName}:${w.platform}`,
+              platform: w.platform,
+              adjustments: w.adjustments,
+              summary: `${row.fileName} ${w.summary}`,
+            });
+          }
+        }
+        return warnings;
+      }
+      return safePreviewPlatformRules(platforms, {
+        title: (this.form && this.form.bt1) || "",
+        description: (this.form && this.form.description) || "",
+        shortTitle: (this.form && this.form.shortTitle) || "",
+        tags: Array.isArray(this.bqTags) ? this.bqTags : [],
+        titleByPlatform: (this.form && this.form.titleByPlatform) || {},
+      }).map((w) => ({
+        ...w,
+        key: w.platform,
+      }));
     },
     batchStatementOptions() {
       return CREATIVE_STATEMENT_OPTIONS;
@@ -1240,27 +1560,90 @@ export default {
       const picked = await ipcRenderer.invoke("dialog:openImageFile");
       if (picked) this.form.coverPath = picked;
     },
+    async chooseCoverHImage() {
+      const picked = await ipcRenderer.invoke("dialog:openImageFile");
+      if (picked) this.form.coverPathH = picked;
+    },
+    platformSupportsTitleOverride(pt) {
+      const canonical = safeResolvePlatformRuleKey(pt);
+      return TITLE_OVERRIDE_PLATFORMS.some((it) => it.pt === canonical);
+    },
+    getPlatformTitleOverride(pt) {
+      const canonical = safeResolvePlatformRuleKey(pt);
+      const map = (this.form && this.form.titleByPlatform) || {};
+      return String(map[canonical] || "");
+    },
+    setPlatformTitleOverride(pt, value) {
+      const canonical = safeResolvePlatformRuleKey(pt);
+      if (!canonical) return;
+      if (!this.form.titleByPlatform || typeof this.form.titleByPlatform !== "object") {
+        this.$set(this.form, "titleByPlatform", {});
+      }
+      const nextVal = String(value == null ? "" : value);
+      if (!nextVal) {
+        if (this.$delete) {
+          this.$delete(this.form.titleByPlatform, canonical);
+        } else {
+          delete this.form.titleByPlatform[canonical];
+        }
+      } else {
+        this.$set(this.form.titleByPlatform, canonical, nextVal);
+      }
+    },
+    getPlatformTitleOverridePlaceholder(pt) {
+      const rule = safeGetPlatformRule(pt);
+      if (rule && rule.titleMax != null) {
+        return `留空用通用标题（≤${rule.titleMax}字）`;
+      }
+      return "留空用通用标题";
+    },
+    getCheckedPlatformRowWarning(pt) {
+      const canonical = safeResolvePlatformRuleKey(pt);
+      const hit = (this.checkedPlatformRuleWarnings || []).find(
+        (w) => w.platform === canonical
+      );
+      return hit ? hit.summary : "";
+    },
+    formatRowPlatformOverrides(row) {
+      if (!row || typeof row !== "object") return "";
+      const parts = [];
+      const titles =
+        row.titleByPlatform && typeof row.titleByPlatform === "object"
+          ? row.titleByPlatform
+          : {};
+      const descs =
+        row.descByPlatform && typeof row.descByPlatform === "object"
+          ? row.descByPlatform
+          : {};
+      for (const k of Object.keys(titles)) {
+        if (titles[k]) parts.push(`${k}标题`);
+      }
+      for (const k of Object.keys(descs)) {
+        if (descs[k]) parts.push(`${k}简介`);
+      }
+      return parts.join(" / ");
+    },
     /**
      * 封面文件发布前校验（GUI 直发不经 runSingleFilePublish 的 resolveCoverPath，
      * 不在这里拦就会到上传阶段才失败，视频白传一次）：
      * 文件必须存在；勾选视频号时仅收 jpg/png（上传控件 accept 限制）。
      * @returns {string} 错误消息，空串表示通过
      */
-    validateCoverPath(coverPath, platformNames = []) {
+    validateCoverPath(coverPath, platformNames = [], label = "封面") {
       const p = String(coverPath || "").trim();
       if (!p) return "";
       let stat = null;
       try {
         stat = require("fs").statSync(p);
       } catch (_) {
-        return `封面文件不存在: ${p}`;
+        return `${label}文件不存在: ${p}`;
       }
-      if (!stat.isFile()) return `封面路径不是文件: ${p}`;
+      if (!stat.isFile()) return `${label}路径不是文件: ${p}`;
       const needSph = (platformNames || []).some((pt) =>
         String(pt || "").includes("视频号")
       );
       if (needSph && !/\.(jpe?g|png)$/i.test(p)) {
-        return `视频号封面仅支持 jpg/png 格式: ${p}`;
+        return `视频号${label}仅支持 jpg/png 格式: ${p}`;
       }
       return "";
     },
@@ -1279,7 +1662,9 @@ export default {
         bt1: "",
         description: "",
         shortTitle: "",
+        titleByPlatform: {},
         coverPath: "",
+        coverPathH: "",
         noDownload: false,
         dySyncToutiao: readDySyncToutiaoPreference(),
       };
@@ -1330,7 +1715,9 @@ export default {
         bt1: (form.bt1 || "").trim(),
         description: (form.description || form.bdText || "").trim(),
         shortTitle: (form.shortTitle || form.bt2Filled || "").trim(),
+        titleByPlatform: safeNormalizePlatformTextMap(form.titleByPlatform, "title"),
         coverPath: (form.coverPath || "").trim(),
+        coverPathH: (form.coverPathH || "").trim(),
         noDownload: form.noDownload === true,
         dySyncToutiao,
       };
@@ -1431,6 +1818,11 @@ export default {
       const bookName =
         sanitizeTitle(this.form.title) || this.defaultBookName();
       const bt1 = sanitizeTitle(this.form.bt1);
+      const titleByPlatform = safeNormalizePlatformTextMap(
+        this.form.titleByPlatform,
+        "title"
+      );
+      const coverPathH = (this.form.coverPathH || "").trim();
       const metadata = normalizeVideoMetadata({
         title: bt1,
         description: sanitizeDescription(this.form.description),
@@ -1450,6 +1842,8 @@ export default {
           ...metadata.legacy,
           bq: formatBqFromTags(metadata.tags),
           coverPath: (this.form.coverPath || "").trim(),
+          ...(coverPathH ? { coverPathH } : {}),
+          ...(Object.keys(titleByPlatform).length > 0 ? { titleByPlatform } : {}),
           noDownload: this.form.noDownload === true,
         },
       };
@@ -1867,6 +2261,55 @@ export default {
         /* ignore */
       }
     },
+    resolvePlatformRulePayload(pt, baseData = {}, options = {}) {
+      const titleByPlatform =
+        (baseData && baseData.titleByPlatform) ||
+        (this.form && this.form.titleByPlatform) ||
+        {};
+      const descByPlatform = (baseData && baseData.descByPlatform) || {};
+      const hasTitle = Boolean(
+        (baseData.title != null && String(baseData.title).trim()) ||
+          (baseData.bt1 != null && String(baseData.bt1).trim())
+      );
+      const hasDesc = Boolean(
+        (baseData.description != null && String(baseData.description).trim()) ||
+          (baseData.bdText != null && String(baseData.bdText).trim())
+      );
+      const hasShort = Boolean(
+        (baseData.shortTitle != null && String(baseData.shortTitle).trim()) ||
+          (baseData.bt2Filled != null && String(baseData.bt2Filled).trim())
+      );
+      const hasTags = Array.isArray(baseData.tags)
+        ? baseData.tags.length > 0
+        : Boolean(
+            (baseData.tags != null && String(baseData.tags).trim()) ||
+              (baseData.bq != null && String(baseData.bq).trim())
+          );
+      const hasMap =
+        Object.keys(titleByPlatform || {}).length > 0 ||
+        Object.keys(descByPlatform || {}).length > 0;
+      if (!hasTitle && !hasDesc && !hasShort && !hasTags && !hasMap) {
+        return null;
+      }
+      return safeApplyPlatformRules(
+        pt,
+        {
+          title: baseData.title != null ? baseData.title : baseData.bt1 || "",
+          description:
+            baseData.description != null
+              ? baseData.description
+              : baseData.bdText || "",
+          shortTitle:
+            baseData.shortTitle != null
+              ? baseData.shortTitle
+              : baseData.bt2Filled || "",
+          tags: baseData.tags !== undefined ? baseData.tags : baseData.bq,
+          titleByPlatform,
+          descByPlatform,
+        },
+        options
+      );
+    },
     buildPlatformVideoPayload(platformNode, baseVideo) {
       const link = buildVideoLinkOption(
         platformNode.pt,
@@ -1882,17 +2325,59 @@ export default {
       const dySyncToutiao =
         String((platformNode && platformNode.pt) || "").includes("抖音") &&
         Boolean(this.form && this.form.dySyncToutiao === true);
+      const baseData = (baseVideo && baseVideo.data) || {};
+      const coverPathH = String(
+        baseData.coverPathH || (this.form && this.form.coverPathH) || ""
+      ).trim();
+      const ruled = this.resolvePlatformRulePayload(platformNode.pt, baseData, {
+        log: true,
+      });
+      let nextData = {
+        ...baseData,
+        creativeStatement: this.getPlatformStatement(platformNode.id),
+      };
+      if (ruled && typeof normalizeVideoMetadata === "function") {
+        const meta = normalizeVideoMetadata(
+          {
+            title: ruled.title,
+            description: ruled.bodyDescription,
+            shortTitle: ruled.shortTitle,
+            tags: ruled.tags,
+          },
+          platformNode.pt
+        );
+        const hashtagPlatforms = new Set(["视频号", "抖音", "快手"]);
+        const nextBq = hashtagPlatforms.has(platformNode.pt)
+          ? formatBqFromTags(ruled.tags)
+          : ruled.tags.map((t) => String(t).replace(/^#/, "")).join(",");
+        nextData = {
+          ...nextData,
+          title: meta.title,
+          description: meta.description,
+          shortTitle: meta.shortTitle,
+          tags: meta.tags,
+          ...meta.legacy,
+          bq: nextBq,
+          ...(ruled.adjusted
+            ? {
+                ruleAdjustments: ruled.adjustments,
+                ruleAdjustmentsSummary: ruled.summary,
+              }
+            : {}),
+        };
+      }
+      if (coverPathH) {
+        nextData.coverPathH = coverPathH;
+      }
       return {
         ...baseVideo,
         publishOptions: {
           link: link.value,
           ...(collection ? { collection } : {}),
           ...(dySyncToutiao ? { dySyncToutiao: true } : {}),
+          ...(coverPathH ? { coverPathH } : {}),
         },
-        data: {
-          ...baseVideo.data,
-          creativeStatement: this.getPlatformStatement(platformNode.id),
-        },
+        data: nextData,
       };
     },
     saveDySyncToutiaoPreference(val) {
@@ -2602,7 +3087,9 @@ export default {
         bt1: "",
         description: "",
         shortTitle: "",
+        titleByPlatform: {},
         coverPath: "",
+        coverPathH: "",
         noDownload: false,
         dySyncToutiao: readDySyncToutiaoPreference(),
       };
@@ -2814,6 +3301,15 @@ export default {
         this.$message.error(coverError);
         return;
       }
+      const coverHError = this.validateCoverPath(
+        this.form.coverPathH,
+        platforms.map((p) => p.pt),
+        "横版封面"
+      );
+      if (coverHError) {
+        this.$message.error(coverHError);
+        return;
+      }
       const baseVideo = this.buildVideoPayload();
       const selectedFile = fileBaseName(this.localFilePath);
       const currentDate = moment().format("YYYY-MM-DD");
@@ -2836,12 +3332,19 @@ export default {
         return 0;
       });
 
+      const resolvePreviewTitleForPlatform = (pt) => {
+        const ruled = this.resolvePlatformRulePayload(pt, baseVideo.data, {
+          log: false,
+        });
+        return (ruled && ruled.title) || baseVideo.data.title || baseVideo.bookName;
+      };
+
       const dupCheckTargets = platforms.map((p) => ({
         pt: p.pt,
         phone: p.phone,
         accountKey: p.accountKey,
         partition: buildAccountPartitionOf(p, p.pt),
-        title: baseVideo.data.title || baseVideo.bookName,
+        title: resolvePreviewTitleForPlatform(p.pt),
       }));
       const dupDecision = await this.confirmDuplicatePublishTargets(dupCheckTargets);
       if (!dupDecision.proceed) {
@@ -2865,7 +3368,7 @@ export default {
             partition: buildAccountPartitionOf(p, p.pt),
             filePath: this.localFilePath,
             textType: "local",
-            title: baseVideo.data.title || baseVideo.bookName,
+            title: resolvePreviewTitleForPlatform(p.pt),
             isDraft: effectiveMode.publishToDraft,
           };
         });
@@ -2929,6 +3432,16 @@ export default {
                 noDownload: video.data.noDownload === true,
                 publishOptions: video.publishOptions,
                 coverPath: video.data.coverPath || "",
+                ...(video.data.coverPathH
+                  ? { coverPathH: video.data.coverPathH }
+                  : {}),
+                ...(Array.isArray(video.data.ruleAdjustments) &&
+                video.data.ruleAdjustments.length > 0
+                  ? {
+                      ruleAdjustments: video.data.ruleAdjustments,
+                      ruleAdjustmentsSummary: video.data.ruleAdjustmentsSummary,
+                    }
+                  : {}),
                 filePath: this.localFilePath,
                 useragent: this.ptConfig[p.pt].useragent,
                 phone: p.phone,
@@ -2997,6 +3510,16 @@ export default {
                 noDownload: video.data.noDownload === true,
                 publishOptions: video.publishOptions,
                 coverPath: video.data.coverPath || "",
+                ...(video.data.coverPathH
+                  ? { coverPathH: video.data.coverPathH }
+                  : {}),
+                ...(Array.isArray(video.data.ruleAdjustments) &&
+                video.data.ruleAdjustments.length > 0
+                  ? {
+                      ruleAdjustments: video.data.ruleAdjustments,
+                      ruleAdjustmentsSummary: video.data.ruleAdjustmentsSummary,
+                    }
+                  : {}),
                 filePath: this.localFilePath,
                 publishAttemptCount: oldAttempt + 1,
                 republishCount: oldRepublish + 1,
@@ -3035,6 +3558,16 @@ export default {
                 noDownload: video.data.noDownload === true,
                 publishOptions: video.publishOptions,
                 coverPath: video.data.coverPath || "",
+                ...(video.data.coverPathH
+                  ? { coverPathH: video.data.coverPathH }
+                  : {}),
+                ...(Array.isArray(video.data.ruleAdjustments) &&
+                video.data.ruleAdjustments.length > 0
+                  ? {
+                      ruleAdjustments: video.data.ruleAdjustments,
+                      ruleAdjustmentsSummary: video.data.ruleAdjustmentsSummary,
+                    }
+                  : {}),
                 filePath: this.localFilePath,
                 useragent: this.ptConfig[p.pt].useragent,
                 phone: p.phone,
@@ -3297,29 +3830,59 @@ export default {
       const fs = require("fs");
       const nodePath = require("path");
       const coverErrors = [];
+      const coverHErrors = [];
       const coverResolvedByRow = new Map();
+      const coverHResolvedByRow = new Map();
       filteredRows.forEach((row) => {
         const raw = String(row.coverPath || "").trim();
-        if (!raw) return;
-        const abs = nodePath.isAbsolute(raw)
-          ? raw
-          : nodePath.join(this.dirPath, raw);
-        let ok = false;
-        try {
-          ok = fs.statSync(abs).isFile();
-        } catch (_) {
-          ok = false;
+        if (raw) {
+          const abs = nodePath.isAbsolute(raw)
+            ? raw
+            : nodePath.join(this.dirPath, raw);
+          let ok = false;
+          try {
+            ok = fs.statSync(abs).isFile();
+          } catch (_) {
+            ok = false;
+          }
+          if (!ok) {
+            coverErrors.push(`${row.fileName}: ${abs}`);
+          } else {
+            coverResolvedByRow.set(row.fileName, abs);
+          }
         }
-        if (!ok) {
-          coverErrors.push(`${row.fileName}: ${abs}`);
-          return;
+        const rawH = String(row.coverPathH || "").trim();
+        if (rawH) {
+          const absH = nodePath.isAbsolute(rawH)
+            ? rawH
+            : nodePath.join(this.dirPath, rawH);
+          let okH = false;
+          try {
+            okH = fs.statSync(absH).isFile();
+          } catch (_) {
+            okH = false;
+          }
+          if (!okH) {
+            coverHErrors.push(`${row.fileName}: ${absH}`);
+          } else {
+            coverHResolvedByRow.set(row.fileName, absH);
+          }
         }
-        coverResolvedByRow.set(row.fileName, abs);
       });
       if (coverErrors.length) {
         this.$message.error(
           `封面文件不存在（前 5 个）: ${coverErrors.slice(0, 5).join("；")}${
             coverErrors.length > 5 ? ` 等共 ${coverErrors.length} 个` : ""
+          }`
+        );
+        return;
+      }
+      if (coverHErrors.length) {
+        this.$message.error(
+          `横版封面文件不存在（前 5 个）: ${coverHErrors
+            .slice(0, 5)
+            .join("；")}${
+            coverHErrors.length > 5 ? ` 等共 ${coverHErrors.length} 个` : ""
           }`
         );
         return;
@@ -3334,6 +3897,7 @@ export default {
             : row.fileName,
           resolvedPath: resolved ? resolved.resolvedPath : "",
           coverResolved: coverResolvedByRow.get(row.fileName) || "",
+          coverHResolved: coverHResolvedByRow.get(row.fileName) || "",
         };
       });
 
@@ -3394,6 +3958,15 @@ export default {
           );
           return;
         }
+        const badCoverHRow = this.dirBatchFiles.find(
+          (r) => r.coverHResolved && !/\.(jpe?g|png)$/i.test(r.coverHResolved)
+        );
+        if (badCoverHRow) {
+          this.$message.error(
+            `视频号横版封面仅支持 jpg/png 格式（文件 ${badCoverHRow.fileName}）: ${badCoverHRow.coverHResolved}`
+          );
+          return;
+        }
       }
 
       const currentDate = moment().format("YYYY-MM-DD");
@@ -3419,17 +3992,32 @@ export default {
         return 0;
       });
 
+      const resolveDirRowTitleForPlatform = (fileRow, pt) => {
+        const stem = fileRow.fileName.replace(/\.[^/.]+$/, "");
+        const baseTitle = sanitizeTitle(fileRow.title) || stem;
+        const ruled = safeApplyPlatformRules(
+          pt,
+          {
+            title: baseTitle,
+            description: sanitizeDescription(fileRow.description),
+            tags: splitAndSanitizeTags(fileRow.tags),
+            titleByPlatform: fileRow.titleByPlatform || {},
+            descByPlatform: fileRow.descByPlatform || {},
+          },
+          { log: false }
+        );
+        return (ruled && ruled.title) || baseTitle;
+      };
+
       const dirDupTargets = [];
       for (const fileRow of this.dirBatchFiles) {
-        const stem = fileRow.fileName.replace(/\.[^/.]+$/, "");
-        const rowTitle = sanitizeTitle(fileRow.title) || stem;
         for (const p of platforms) {
           dirDupTargets.push({
             pt: p.pt,
             phone: p.phone,
             accountKey: p.accountKey,
             partition: buildAccountPartitionOf(p, p.pt),
-            title: rowTitle,
+            title: resolveDirRowTitleForPlatform(fileRow, p.pt),
           });
         }
       }
@@ -3448,8 +4036,6 @@ export default {
         const dirPlanEntries = [];
         for (let rIdx = 0; rIdx < this.dirBatchFiles.length; rIdx++) {
           const fileRow = this.dirBatchFiles[rIdx];
-          const stem = fileRow.fileName.replace(/\.[^/.]+$/, "");
-          const rowTitle = sanitizeTitle(fileRow.title) || stem;
           const rowFilePath =
             fileRow.resolvedPath || path.join(this.dirPath, fileRow.fileName);
           for (let pIdx = 0; pIdx < platforms.length; pIdx++) {
@@ -3463,7 +4049,7 @@ export default {
               partition: buildAccountPartitionOf(p, p.pt),
               filePath: rowFilePath,
               textType: "local",
-              title: rowTitle,
+              title: resolveDirRowTitleForPlatform(fileRow, p.pt),
               isDraft: effectiveMode.publishToDraft,
             });
           }
@@ -3533,28 +4119,52 @@ export default {
           const dirDySyncToutiao =
             String(p.pt || "").includes("抖音") &&
             Boolean(this.form && this.form.dySyncToutiao === true);
+          const dirCoverPathH = String(fileRow.coverHResolved || "").trim();
           const dirPublishOptions = {
             ...(dirCollection ? { collection: dirCollection } : {}),
             ...(dirDySyncToutiao ? { dySyncToutiao: true } : {}),
+            ...(dirCoverPathH ? { coverPathH: dirCoverPathH } : {}),
           };
           const effectiveMode = resolveEffectivePublishMode(isDraftMode, p);
 
-          // Format bq for this platform
-          const hashtagPlatforms = new Set(["视频号", "抖音", "快手"]);
-          let bq;
-          if (hashtagPlatforms.has(p.pt)) {
-            bq = tagList
-              .map((t) => (t.startsWith("#") ? t : "#" + t))
-              .join(" ");
-          } else {
-            bq = tagList.map((t) => t.replace(/^#/, "")).join(",");
-          }
-          const metadata = normalizeVideoMetadata(
+          const dirRuled = safeApplyPlatformRules(
+            p.pt,
             {
               title: bt1,
               description,
               shortTitle: bt2FilledForVideohao,
               tags: tagList,
+              titleByPlatform: fileRow.titleByPlatform || {},
+              descByPlatform: fileRow.descByPlatform || {},
+            },
+            { log: true }
+          );
+          const finalTitle = dirRuled ? dirRuled.title : bt1;
+          const finalDescription = dirRuled
+            ? dirRuled.bodyDescription
+            : description;
+          const finalTags = dirRuled ? dirRuled.tags : tagList;
+          const dirRuleAdjustments =
+            dirRuled && dirRuled.adjusted ? dirRuled.adjustments : [];
+          const dirRuleSummary =
+            dirRuled && dirRuled.adjusted ? dirRuled.summary : "";
+
+          // Format bq for this platform
+          const hashtagPlatforms = new Set(["视频号", "抖音", "快手"]);
+          let bq;
+          if (hashtagPlatforms.has(p.pt)) {
+            bq = finalTags
+              .map((t) => (t.startsWith("#") ? t : "#" + t))
+              .join(" ");
+          } else {
+            bq = finalTags.map((t) => t.replace(/^#/, "")).join(",");
+          }
+          const metadata = normalizeVideoMetadata(
+            {
+              title: finalTitle,
+              description: finalDescription,
+              shortTitle: bt2FilledForVideohao,
+              tags: finalTags,
             },
             p.pt
           );
@@ -3605,6 +4215,13 @@ export default {
                   bq,
                   creativeStatement,
                   coverPath: fileRow.coverResolved || "",
+                  ...(dirCoverPathH ? { coverPathH: dirCoverPathH } : {}),
+                  ...(dirRuleAdjustments.length > 0
+                    ? {
+                        ruleAdjustments: dirRuleAdjustments,
+                        ruleAdjustmentsSummary: dirRuleSummary,
+                      }
+                    : {}),
                   noDownload: this.form.noDownload === true,
                   ...(Object.keys(dirPublishOptions).length > 0
                     ? { publishOptions: dirPublishOptions }
@@ -3666,6 +4283,13 @@ export default {
                 bq,
                 creativeStatement,
                 coverPath: fileRow.coverResolved || "",
+                ...(dirCoverPathH ? { coverPathH: dirCoverPathH } : {}),
+                ...(dirRuleAdjustments.length > 0
+                  ? {
+                      ruleAdjustments: dirRuleAdjustments,
+                      ruleAdjustmentsSummary: dirRuleSummary,
+                    }
+                  : {}),
                 noDownload: this.form.noDownload === true,
                 ...(Object.keys(dirPublishOptions).length > 0
                   ? { publishOptions: dirPublishOptions }
@@ -3762,6 +4386,13 @@ export default {
               bq,
               creativeStatement,
               coverPath: fileRow.coverResolved || "",
+              ...(dirCoverPathH ? { coverPathH: dirCoverPathH } : {}),
+              ...(dirRuleAdjustments.length > 0
+                ? {
+                    ruleAdjustments: dirRuleAdjustments,
+                    ruleAdjustmentsSummary: dirRuleSummary,
+                  }
+                : {}),
               noDownload: this.form.noDownload === true,
             },
             textOtherName,
@@ -4021,6 +4652,44 @@ export default {
 .attrs-unsupported {
   color: #909399;
   font-size: 12px;
+}
+.platform-title-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 12px;
+}
+.platform-title-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.platform-title-label {
+  font-size: 12px;
+  color: #606266;
+  line-height: 1.4;
+}
+.platform-title-label small {
+  color: #909399;
+  font-size: 11px;
+}
+.rule-precheck-alert {
+  margin-bottom: 12px;
+}
+.rule-precheck-list {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.rule-precheck-item {
+  word-break: break-all;
+}
+.attrs-title-cell {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.attrs-truncate-tag {
+  flex: 0 0 auto;
 }
 :deep(.platform-statement-select .el-input) {
   width: 100%;

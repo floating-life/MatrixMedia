@@ -24,6 +24,10 @@ import {
   splitAndSanitizeTags,
   splitHashtagTags,
 } from "../../shared/textSanitize.js";
+import {
+  normalizePlatformTextMap,
+  resolvePlatformOverrideValue,
+} from "../../shared/platformRules.js";
 
 export { PLATFORM_ALIASES, VIDEO_PUBLISH_CANONICAL, resolvePublishPlatform };
 
@@ -100,8 +104,11 @@ export const KNOWN_PUBLISH_SWITCHES = new Set(
 export const KNOWN_PUBLISH_VALUE_FLAGS = new Set([
   "--platform", "-p", "--file", "-f", "--phone", "--partition",
   "--title", "-t", "--description", "--desc", "--short-title",
+  "--title-by-platform", "--titleByPlatform",
+  "--desc-by-platform", "--descByPlatform",
   "--name", "--book-name", "--bt2", "--tags", "--bq", "--publish-at",
-  "--dir", "--config", "--xlsx", "--cover", "--creative-statement", "--cs",
+  "--dir", "--config", "--xlsx", "--cover", "--cover-h", "--coverH", "--cover-path-h",
+  "--creative-statement", "--cs",
   "--collection", "--sph-link-type", "--sph-link-value",
   "--sph-product-id", "--sph-drama-id", "--sph-series-id",
 ]);
@@ -134,6 +141,8 @@ export function parsePublishArgs(subArgv) {
     title: null,
     description: "",
     shortTitle: "",
+    titleByPlatform: {},
+    descByPlatform: {},
     bookName: null,
     bt2: null,
     bq: "",
@@ -143,6 +152,7 @@ export function parsePublishArgs(subArgv) {
     dir: null,
     config: null,
     cover: null,
+    coverPathH: null,
     creativeStatement: null,
     draft: false,
     allowDuplicate: false,
@@ -273,6 +283,57 @@ export function parsePublishArgs(subArgv) {
       if (!v.ok) return v;
       out.cover = v.value;
       i += 1;
+    } else if (a === "--cover-h" || a === "--coverH" || a === "--cover-path-h") {
+      const v = consumeStrictOptionValue(a, i);
+      if (!v.ok) return v;
+      out.coverPathH = v.value;
+      i += 1;
+    } else if (a === "--title-by-platform" || a === "--titleByPlatform") {
+      const v = consumeTextValue(a, i);
+      if (!v.ok) return v;
+      let parsedMap;
+      try {
+        parsedMap = JSON.parse(v.value);
+      } catch (_) {
+        return {
+          ok: false,
+          error: `参数 ${a} 必须是合法的 JSON 对象，例如 '{"dy":"抖音标题","bjh":"百家号标题"}'`,
+        };
+      }
+      if (!parsedMap || typeof parsedMap !== "object" || Array.isArray(parsedMap)) {
+        return {
+          ok: false,
+          error: `参数 ${a} 必须是 JSON 对象（平台 key → 标题）`,
+        };
+      }
+      out.titleByPlatform = {
+        ...out.titleByPlatform,
+        ...normalizePlatformTextMap(parsedMap, "title"),
+      };
+      i += 1;
+    } else if (a === "--desc-by-platform" || a === "--descByPlatform") {
+      const v = consumeTextValue(a, i);
+      if (!v.ok) return v;
+      let parsedMap;
+      try {
+        parsedMap = JSON.parse(v.value);
+      } catch (_) {
+        return {
+          ok: false,
+          error: `参数 ${a} 必须是合法的 JSON 对象，例如 '{"ks":"快手简介"}'`,
+        };
+      }
+      if (!parsedMap || typeof parsedMap !== "object" || Array.isArray(parsedMap)) {
+        return {
+          ok: false,
+          error: `参数 ${a} 必须是 JSON 对象（平台 key → 简介）`,
+        };
+      }
+      out.descByPlatform = {
+        ...out.descByPlatform,
+        ...normalizePlatformTextMap(parsedMap, "description"),
+      };
+      i += 1;
     } else if (a === "--creative-statement" || a === "--cs") {
       const v = consumeStrictOptionValue(a, i);
       if (!v.ok) return v;
@@ -337,6 +398,23 @@ export function parsePublishArgs(subArgv) {
   if (out.title != null) out.title = sanitizeTitle(out.title);
   out.description = sanitizeDescription(out.description);
   out.shortTitle = sanitizeTitle(out.shortTitle);
+  // 分平台覆盖优先级：titleByPlatform[平台] > title；descByPlatform[平台] > description
+  const platformTitleOverride = resolvePlatformOverrideValue(
+    out.titleByPlatform,
+    out.platform,
+    "title"
+  );
+  if (platformTitleOverride) {
+    out.title = platformTitleOverride;
+  }
+  const platformDescOverride = resolvePlatformOverrideValue(
+    out.descByPlatform,
+    out.platform,
+    "description"
+  );
+  if (platformDescOverride) {
+    out.description = platformDescOverride;
+  }
   if (out.bt2 != null) {
     out.bt2 =
       out.platform === "视频号"
@@ -594,6 +672,33 @@ export function publishBodyToArgv(body) {
     "--creative-statement"
   );
   pushPair(["cover", "coverPath", "cover-path"], "--cover");
+  pushPair(["coverPathH", "coverH", "cover-h", "cover-path-h"], "--cover-h");
+  const rawTitleByPlatform =
+    body.titleByPlatform !== undefined
+      ? body.titleByPlatform
+      : body["title-by-platform"];
+  if (
+    rawTitleByPlatform &&
+    typeof rawTitleByPlatform === "object" &&
+    !Array.isArray(rawTitleByPlatform) &&
+    Object.keys(rawTitleByPlatform).length > 0
+  ) {
+    argv.push("--title-by-platform", JSON.stringify(rawTitleByPlatform));
+  }
+  const rawDescByPlatform =
+    body.descByPlatform !== undefined
+      ? body.descByPlatform
+      : body["desc-by-platform"] !== undefined
+      ? body["desc-by-platform"]
+      : body.descriptionByPlatform;
+  if (
+    rawDescByPlatform &&
+    typeof rawDescByPlatform === "object" &&
+    !Array.isArray(rawDescByPlatform) &&
+    Object.keys(rawDescByPlatform).length > 0
+  ) {
+    argv.push("--desc-by-platform", JSON.stringify(rawDescByPlatform));
+  }
   if (typeof body.collection === "string" && body.collection.trim() !== "") {
     argv.push("--collection", body.collection);
   }
@@ -664,11 +769,35 @@ export function publishBodyToArgv(body) {
   return argv;
 }
 
+function validateHttpPlatformTextMaps(obj) {
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return "";
+  for (const [keys, label] of [
+    [["titleByPlatform", "title-by-platform"], "titleByPlatform"],
+    [["descByPlatform", "desc-by-platform", "descriptionByPlatform"], "descByPlatform"],
+  ]) {
+    for (const k of keys) {
+      if (hasOwnKey(obj, k) && obj[k] != null) {
+        if (typeof obj[k] !== "object" || Array.isArray(obj[k])) {
+          return `${label} 必须是按平台映射的对象`;
+        }
+        for (const [pk, pv] of Object.entries(obj[k])) {
+          if (pv != null && typeof pv !== "string") {
+            return `${label}.${pk} 必须是字符串`;
+          }
+        }
+      }
+    }
+  }
+  return "";
+}
+
 /**
  * 解析 HTTP / CLI 共用的发布参数
  * @param {object} body
  */
 export function parsePublishRequest(body) {
+  const mapErr = validateHttpPlatformTextMaps(body);
+  if (mapErr) return { ok: false, error: mapErr };
   const err = validateHttpCollectionInput(body);
   if (err) return { ok: false, error: err };
   const parsed = parsePublishArgs(publishBodyToArgv(body));
@@ -688,6 +817,11 @@ const SHARED_PUBLISH_BODY_KEYS = [
   "desc",
   "shortTitle",
   "short-title",
+  "titleByPlatform",
+  "title-by-platform",
+  "descByPlatform",
+  "desc-by-platform",
+  "descriptionByPlatform",
   "phone",
   "partition",
   "bookName",
@@ -704,6 +838,10 @@ const SHARED_PUBLISH_BODY_KEYS = [
   "cover",
   "coverPath",
   "cover-path",
+  "coverPathH",
+  "coverH",
+  "cover-h",
+  "cover-path-h",
   "collection",
   "collections",
   "show",
@@ -756,11 +894,36 @@ function mergePublishBody(shared, target) {
       ...(options || {}),
     };
   }
-  return {
+  const merged = {
     ...shared,
     ...target,
     ...(Object.keys(platformOptions).length > 0 ? { platformOptions } : {}),
   };
+  // 多平台目标子对象显式传了 title/description 且自身未传分平台映射时，
+  // 不让顶层 shared.titleByPlatform / descByPlatform 反向覆盖 target 的显式值
+  const targetHasDirectTitle =
+    (target.title != null && String(target.title).trim() !== "") ||
+    (target.t != null && String(target.t).trim() !== "");
+  const targetHasTitleMap =
+    target.titleByPlatform !== undefined ||
+    target["title-by-platform"] !== undefined;
+  if (targetHasDirectTitle && !targetHasTitleMap) {
+    delete merged.titleByPlatform;
+    delete merged["title-by-platform"];
+  }
+  const targetHasDirectDesc =
+    (target.description != null && String(target.description).trim() !== "") ||
+    (target.desc != null && String(target.desc).trim() !== "");
+  const targetHasDescMap =
+    target.descByPlatform !== undefined ||
+    target["desc-by-platform"] !== undefined ||
+    target.descriptionByPlatform !== undefined;
+  if (targetHasDirectDesc && !targetHasDescMap) {
+    delete merged.descByPlatform;
+    delete merged["desc-by-platform"];
+    delete merged.descriptionByPlatform;
+  }
+  return merged;
 }
 
 function normalizePublishTargets(body) {
@@ -985,6 +1148,10 @@ export function parseMultiPublishRequest(body, options = {}) {
     return { ok: false, error: "请求体必须是 JSON 对象" };
   }
 
+  const rootMapErr = validateHttpPlatformTextMaps(body);
+  if (rootMapErr) {
+    return { ok: false, error: rootMapErr };
+  }
   const rootCollectionErr = validateHttpCollectionInput(body);
   if (rootCollectionErr) {
     return { ok: false, error: rootCollectionErr };
@@ -1013,6 +1180,12 @@ export function parseMultiPublishRequest(body, options = {}) {
   const skipped = [];
 
   for (let i = 0; i < targets.length; i++) {
+    const targetMapErr = validateHttpPlatformTextMaps(targets[i]);
+    if (targetMapErr) {
+      const label =
+        targets[i].platform != null ? String(targets[i].platform) : `#${i + 1}`;
+      return { ok: false, error: `平台 ${label}: ${targetMapErr}` };
+    }
     const targetCollectionErr = validateHttpCollectionInput(targets[i]);
     if (targetCollectionErr) {
       const label =
@@ -1086,14 +1259,18 @@ export function publishHelpText() {
   -p, --platform <id>   平台：dy|抖音、tt|头条、ks|快手、blbl|哔哩哔哩、bjh|百家号、sph|视频号、xhs|小红书、fqsp|番茄视频
   -f, --file <path>     本地视频文件路径，或 http(s) 远程视频 URL（远程会先下载到临时目录，发布结束后自动删除）
       --dir <path>          [batch] video directory path; must be paired with --config
-      --config <path>       [batch] xlsx 声明文件（列：文件名/标题/简介/标签/视频号短标题/封面/创作声明/合集）
+      --config <path>       [batch] xlsx 声明文件（列：文件名/标题/简介/标签/视频号短标题/封面/横版封面/创作声明/合集，另支持可选分平台列「<平台中文名>标题」「<平台中文名>简介」如 抖音标题、百家号标题、快手简介）
       --cs, --creative-statement <val>  creative statement value for single-file mode.
                             Valid values: none | ai_generated | fiction | marketing | personal_opinion | repost | self_made_no_repost
                             (self_made_no_repost is blbl-only). Default: configured setting (default ai_generated; unsupported platforms fall back to none).
-      --cover <path>    自定义封面图片路径（抖音/快手/视频号生效；竖封面 3:4 比例最佳，
-                            抖音横封面基于竖封面自动生成；视频号仅收 jpg/png）。
+      --cover <path>    自定义竖版封面图片路径（3:4，抖音/快手/视频号生效；自动归一为 1080×1440 JPEG；
+                            视频号仅收 jpg/png）。未传 --cover-h 时，抖音/视频号将基于竖封面自动生成 1440×1080（4:3 居中+模糊背景）横版封面。
                             单文件模式传绝对路径；--dir 批量模式下全局覆盖 xlsx「封面」列，
                             未传时用 xlsx 每行的封面列（相对路径相对视频目录解析）
+      --cover-h <path>  自定义横版封面图片路径（4:3，仅抖音/视频号生效；自动归一为 1440×1080 JPEG，
+                            居中裁切不拉伸；视频号仅收 jpg/png）。--dir 批量模式下全局覆盖 xlsx「横版封面」列
+      --title-by-platform <json> 分平台标题覆盖（JSON 对象，平台 key 如 '{"dy":"抖音标题","bjh":"百家号标题"}'；优先级高于 --title）
+      --desc-by-platform <json>  分平台简介覆盖（JSON 对象，平台 key 如 '{"ks":"快手简介"}'；优先级高于 --description）
       --collection <name> 发布时选择的合集名称（抖音/快手/视频号生效，按去空白后完全匹配；留空不选，
                             其他平台忽略）。--dir 批量模式下每行优先用 xlsx「合集」列，留空时回退本参数；
                             找不到入口、找不到同名合集或回读不符时中止发布、截图留证且不重试

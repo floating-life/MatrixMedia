@@ -99,17 +99,20 @@ MCP Server 按以下顺序寻找 MatrixMedia：环境变量 `MATRIXMEDIA_BIN`（
 | -------------- | ---- | ------------------------------------------------------------- |
 | `platform`     | 是   | `dy` / `ks` / `blbl` / `bjh` / `tt` / `sph` / `xhs` / `fqsp`  |
 | `file`         | 是   | 视频文件绝对路径                                              |
-| `title`        | 是   | 视频标题                                                      |
-| `description`  | 否   | 视频简介或正文                                                |
+| `title`        | 是   | 视频标题（发布前按平台上限自动兜底截断）                      |
+| `description`  | 否   | 视频简介或正文（超限时优先保留 `#话题` 仅截正文）             |
+| `titleByPlatform` | 否 | 按平台覆盖标题的对象（key 为平台 code 或中文名，如 `{ "dy": "抖音标题", "bjh": "百家号标题" }`）；优先于 `title` |
+| `descByPlatform`  | 否 | 按平台覆盖简介的对象（key 为平台 code 或中文名）；优先于 `description` |
 | `shortTitle`   | 否   | 视频号短标题，建议 6～16 字；其他平台忽略                     |
 | `phone`        | 是   | 账号手机号，CLI 据此推导 session partition                    |
 | `bt2`          | 否   | 旧兼容字段：视频号作为短标题，其他平台作为简介                |
-| `tags`         | 否   | 标签字符串                                                    |
+| `tags`         | 否   | 标签字符串（快手 / 抖音超 4 个时只保留前 4 个）               |
 | `address`      | 否   | 地址（百家号等）                                              |
 | `publishAt`    | 否   | 定时发布，`YYYY-MM-DD HH:mm:ss`                               |
 | `show`         | 否   | 是否显示底层浏览器窗口                                        |
 | `draft`             | 否   | `true` 时保存到草稿箱，不直接发布                             |
-| `cover`             | 否   | 自定义封面图片路径（抖音 / 快手 / 视频号；竖封面 3:4 比例最佳，抖音横封面基于竖封面自动生成；视频号仅收 jpg/png） |
+| `cover`             | 否   | 自定义竖版封面图片路径（3:4 最佳；抖音 / 快手 / 视频号；视频号仅收 jpg/png） |
+| `coverPathH`        | 否   | 自定义横版封面(4:3)路径（仅抖音 / 视频号生效；居中裁切为 1440×1080 JPEG；未传但有 `cover` 时自动由竖封面居中+模糊补边生成 4:3） |
 | `creativeStatement` | 否   | 创作声明 / 视频号视频标注                                     |
 | `sphProductId`      | 否   | 视频号商品上架编号（推荐） |
 | `sphDramaId`        | 否   | 视频号小程序短剧挂载（**短剧名称**，如 `泳陷错恋`）                          |
@@ -158,7 +161,7 @@ MCP Server 按以下顺序寻找 MatrixMedia：环境变量 `MATRIXMEDIA_BIN`（
 }
 ```
 
-当 `platform` 不是 `sph` 时，`sphProductId` / `sphDramaId` / `sphSeriesId` / `sphLink` 会被忽略。若商品、短剧或剧集添加失败但视频已成功转存草稿，Tool 返回 `status: needs_attention`，不会误报为发布成功。
+当 `platform` 不是 `sph` 时，`sphProductId` / `sphDramaId` / `sphSeriesId` / `sphLink` 会被忽略。若商品、短剧或剧集添加失败但视频已成功转存草稿，Tool 返回 `status: needs_attention`，不会误报为发布成功。若本次发布触发了平台标题/简介截断或标签裁剪，完成回执中会附带 `ruleAdjustments` 与 `ruleAdjustmentsSummary` 字段。
 
 ### publish_article
 

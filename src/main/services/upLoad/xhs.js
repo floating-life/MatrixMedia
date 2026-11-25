@@ -18,9 +18,13 @@ import {
   getXhsSecondClickDelayMs,
 } from "../../../shared/xhsPublishPolicy.js";
 import {
-  buildPlatformVideoText,
+  buildPlatformVideoTextDetailed,
   normalizeVideoTags,
 } from "../../../shared/videoMetadata.js";
+import {
+  formatRuleAdjustmentsSummary,
+  mergeRuleAdjustments,
+} from "../../../shared/platformRules.js";
 
 /**
  * 生成 [min, max] 范围内的随机整数，用于像素偏移、步数等非时间场景。
@@ -269,6 +273,12 @@ async function waitXhs(page, min = 1500, max = 4000) {
 export default async function (page, data, window, event) {
   const isDraftMode =
     data.publishMode === "draft" || data.publishToDraft === true;
+  const text = buildPlatformVideoTextDetailed("小红书", data.data || {});
+  const xhsRuleAdjustments = mergeRuleAdjustments(
+    data.ruleAdjustments || (data.data && data.data.ruleAdjustments),
+    text.adjustments
+  );
+  const xhsAdjSummary = formatRuleAdjustmentsSummary(xhsRuleAdjustments);
   console.log("小红书上传开始:", data);
 
   try {
@@ -286,7 +296,6 @@ export default async function (page, data, window, event) {
   }
 
   try {
-    const text = buildPlatformVideoText("小红书", data.data);
     const titleSelector =
       ".publish-page-content-base .edit-container .d-input input.d-text";
     await page.waitForSelector(titleSelector, {
@@ -294,13 +303,8 @@ export default async function (page, data, window, event) {
     });
     const titleInput = await page.$(titleSelector);
     if (!titleInput) throw new Error("未找到标题输入框");
-    const rawTitle = text.title;
-    const titleText = rawTitle.slice(0, 20);
-    if (rawTitle.length > 20) {
-      console.warn(
-        `[xhs] ⚠️ 标题共${rawTitle.length}字，超过20字限制，已截断为: "${titleText}"`
-      );
-    }
+    // 标题上限（20字）及截断已由 src/shared/platformRules.js 统一处理
+    const titleText = text.title;
     await titleInput.click({ clickCount: 3 });
     await page.keyboard.press("Backspace");
     if (titleText) {
@@ -323,8 +327,10 @@ export default async function (page, data, window, event) {
     const editor = await page.$(editorSelector);
     if (!editor) throw new Error("未找到正文编辑器");
 
-    const descText = String(data.data?.description || "").trim();
-    const tags = normalizeVideoTags(data.data?.tags);
+    const descText = String(text.bodyDescription || "").trim();
+    const tags = Array.isArray(text.tags)
+      ? text.tags
+      : normalizeVideoTags(data.data?.tags);
 
     // 聚焦编辑器（先 puppeteer click 定位 caret，再字符串 evaluate 调 .focus() 双保险）
     await editor.click({ clickCount: 2 });
@@ -539,6 +545,7 @@ export default async function (page, data, window, event) {
     console.log(
       isDraftMode ? "✅ 小红书视频已保存草稿" : "✅ 小红书视频上传成功"
     );
+    const xhsBaseSuccessMsg = isDraftMode ? "保存草稿成功" : "上传成功";
     await replyPublishOutcome({
       page,
       data,
@@ -546,7 +553,16 @@ export default async function (page, data, window, event) {
       event,
       urlBefore,
       isDraftMode,
-      successMessage: isDraftMode ? "保存草稿成功" : "上传成功",
+      successMessage: xhsAdjSummary
+        ? `${xhsBaseSuccessMsg}（规则调整：${xhsAdjSummary}）`
+        : xhsBaseSuccessMsg,
+      extraPayload:
+        xhsRuleAdjustments.length > 0
+          ? {
+              ruleAdjustments: xhsRuleAdjustments,
+              ruleAdjustmentsSummary: xhsAdjSummary,
+            }
+          : {},
       // 草稿保存成功后用户需回到矩媒手动发布，web 窗口已无用，强制关闭；
       // 直接发布仍保留保守模式（closeWindowAfterPublish=false）让用户核对。
       closeWindowData: isDraftMode

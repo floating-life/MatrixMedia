@@ -152,23 +152,164 @@ function cleanExcelMetaCell(raw) {
 }
 
 /**
+ * Excel 分平台标题/简介表头别名映射（与 src/shared/platformRules.js 对齐，
+ * 本模块保持纯 CommonJS 以便 Node 单测直接 require）。
+ */
+const XLSX_PLATFORM_HEADER_ALIASES = {
+  抖音: "抖音",
+  dy: "抖音",
+  douyin: "抖音",
+  视频号: "视频号",
+  微信视频号: "视频号",
+  sph: "视频号",
+  shipinhao: "视频号",
+  wxvideo: "视频号",
+  channels: "视频号",
+  快手: "快手",
+  ks: "快手",
+  kuaishou: "快手",
+  百家号: "百家号",
+  百度百家号: "百家号",
+  bjh: "百家号",
+  baijiahao: "百家号",
+  头条: "头条",
+  今日头条: "头条",
+  头条号: "头条",
+  tt: "头条",
+  toutiao: "头条",
+  小红书: "小红书",
+  xhs: "小红书",
+  xiaohongshu: "小红书",
+  red: "小红书",
+  哔哩哔哩: "哔哩哔哩",
+  b站: "哔哩哔哩",
+  bilibili: "哔哩哔哩",
+  blbl: "哔哩哔哩",
+  bili: "哔哩哔哩",
+  番茄视频: "番茄视频",
+  番茄: "番茄视频",
+  fqsp: "番茄视频",
+  fanqie: "番茄视频",
+  fq: "番茄视频",
+};
+
+/**
+ * 解析批量 xlsx 的分平台表头：
+ * 如「抖音标题」「百家号标题」「快手简介」「B站标题」「今日头条标题」「dy_title」「ks简介」。
+ * 明确排除「视频号短标题」「短标题」「标题」「简介」等既有列。
+ * @param {string} cleanedLowerKey cleanExcelMetaCell(k).toLowerCase()
+ * @returns {{ platform: string, field: "title"|"description", exactCanonical: boolean } | null}
+ */
+function parsePlatformOverrideHeader(cleanedLowerKey) {
+  if (!cleanedLowerKey) return null;
+  if (
+    cleanedLowerKey === "标题" ||
+    cleanedLowerKey === "title" ||
+    cleanedLowerKey === "简介" ||
+    cleanedLowerKey === "description" ||
+    cleanedLowerKey === "desc" ||
+    cleanedLowerKey === "视频号短标题" ||
+    cleanedLowerKey === "短标题" ||
+    cleanedLowerKey === "shorttitle" ||
+    cleanedLowerKey.endsWith("短标题")
+  ) {
+    return null;
+  }
+  const m = cleanedLowerKey.match(
+    /^(.+?)[-_\s]*(标题|简介|title|description|desc)$/
+  );
+  if (!m) return null;
+  const prefix = m[1].replace(/[-_\s]+$/g, "").trim();
+  const suffix = m[2];
+  if (!prefix) return null;
+  const canonical = XLSX_PLATFORM_HEADER_ALIASES[prefix];
+  if (!canonical) return null;
+  const field =
+    suffix === "标题" || suffix === "title" ? "title" : "description";
+  return {
+    platform: canonical,
+    field,
+    exactCanonical: prefix === canonical.toLowerCase(),
+  };
+}
+
+/**
  * GUI（dialog:openBatchXlsx）与 CLI（parseXlsxRows）共用的批量 Excel 行归一化函数。
- * 保证两条 Excel 导入链路对 title / description / shortTitle / tags 的清洗结果完全一致。
+ * 保证两条 Excel 导入链路对 title / description / shortTitle / tags / coverPathH /
+ * 分平台覆盖（titleByPlatform / descByPlatform）的清洗结果完全一致。
  *
  * @param {Array<Record<string, unknown>>} rows xlsx.utils.sheet_to_json 产出的原始行
- * @returns {Array<{fileName: string, title: string, description: string, shortTitle: string, tags: string, coverPath: string, creativeStatement: string}>}
+ * @returns {Array<{fileName: string, title: string, description: string, shortTitle: string, tags: string, coverPath: string, coverPathH: string, creativeStatement: string, collection: string, titleByPlatform: Record<string, string>, descByPlatform: Record<string, string>}>}
  */
 function normalizeBatchXlsxRows(rows) {
   if (!Array.isArray(rows)) return [];
   return rows
     .map((row) => {
       const map = {};
+      const titleCanonical = {};
+      const titleAlias = {};
+      const descCanonical = {};
+      const descAlias = {};
       if (row && typeof row === "object") {
         Object.keys(row).forEach((k) => {
           const key = cleanExcelMetaCell(k).toLowerCase();
           map[key] = row[k];
+          const parsedHeader = parsePlatformOverrideHeader(key);
+          if (parsedHeader) {
+            if (parsedHeader.field === "title") {
+              const val = sanitizeTitle(row[k]);
+              if (val) {
+                if (parsedHeader.exactCanonical) {
+                  titleCanonical[parsedHeader.platform] = val;
+                } else if (!titleAlias[parsedHeader.platform]) {
+                  titleAlias[parsedHeader.platform] = val;
+                }
+              }
+            } else {
+              const val = sanitizeDescription(row[k]);
+              if (val) {
+                if (parsedHeader.exactCanonical) {
+                  descCanonical[parsedHeader.platform] = val;
+                } else if (!descAlias[parsedHeader.platform]) {
+                  descAlias[parsedHeader.platform] = val;
+                }
+              }
+            }
+          }
         });
       }
+      const coverPathRaw =
+        map["封面"] != null && String(map["封面"]).trim() !== ""
+          ? map["封面"]
+          : map["竖版封面"] != null && String(map["竖版封面"]).trim() !== ""
+          ? map["竖版封面"]
+          : map["竖封面"] != null && String(map["竖封面"]).trim() !== ""
+          ? map["竖封面"]
+          : map["竖版封面(3:4)"] != null && String(map["竖版封面(3:4)"]).trim() !== ""
+          ? map["竖版封面(3:4)"]
+          : map["竖版封面（3:4）"] != null && String(map["竖版封面（3:4）"]).trim() !== ""
+          ? map["竖版封面（3:4）"]
+          : map["cover"] != null
+          ? map["cover"]
+          : map["coverpath"] || "";
+      const coverPathHRaw =
+        map["横版封面"] != null && String(map["横版封面"]).trim() !== ""
+          ? map["横版封面"]
+          : map["横版封面(4:3)"] != null && String(map["横版封面(4:3)"]).trim() !== ""
+          ? map["横版封面(4:3)"]
+          : map["横版封面（4:3）"] != null && String(map["横版封面（4:3）"]).trim() !== ""
+          ? map["横版封面（4:3）"]
+          : map["横封面"] != null && String(map["横封面"]).trim() !== ""
+          ? map["横封面"]
+          : map["4:3封面"] != null && String(map["4:3封面"]).trim() !== ""
+          ? map["4:3封面"]
+          : map["coverpathh"] != null && String(map["coverpathh"]).trim() !== ""
+          ? map["coverpathh"]
+          : map["coverh"] != null && String(map["coverh"]).trim() !== ""
+          ? map["coverh"]
+          : map["cover_h"] != null && String(map["cover_h"]).trim() !== ""
+          ? map["cover_h"]
+          : map["cover-h"] || "";
       return {
         fileName: cleanExcelMetaCell(
           map["文件名"] != null
@@ -197,13 +338,8 @@ function normalizeBatchXlsxRows(rows) {
         tags: sanitizeTags(
           map["标签"] != null ? map["标签"] : map["tags"] || ""
         ),
-        coverPath: cleanExcelMetaCell(
-          map["封面"] != null
-            ? map["封面"]
-            : map["cover"] != null
-            ? map["cover"]
-            : map["coverpath"] || ""
-        ),
+        coverPath: cleanExcelMetaCell(coverPathRaw),
+        coverPathH: cleanExcelMetaCell(coverPathHRaw),
         creativeStatement: cleanExcelMetaCell(
           map["创作声明"] != null
             ? map["创作声明"]
@@ -220,6 +356,8 @@ function normalizeBatchXlsxRows(rows) {
             ? map["collection"]
             : ""
         ),
+        titleByPlatform: { ...titleAlias, ...titleCanonical },
+        descByPlatform: { ...descAlias, ...descCanonical },
       };
     })
     .filter((r) => r.fileName);
@@ -266,6 +404,17 @@ function sanitizePlatformOptionsCollections(rawPlatformOptions) {
   return next;
 }
 
+function sanitizePlatformTextMapValues(rawMap, sanitizer) {
+  if (!rawMap || typeof rawMap !== "object" || Array.isArray(rawMap)) return rawMap;
+  const next = { ...rawMap };
+  for (const k of Object.keys(next)) {
+    if (typeof next[k] === "string") {
+      next[k] = sanitizer(next[k]);
+    }
+  }
+  return next;
+}
+
 /**
  * 清洗单条 HTTP /publish 请求体（或 platforms[] 子对象）的文案字段。
  * 返回浅拷贝，不修改入参原对象。
@@ -281,6 +430,26 @@ function sanitizePublishPayloadObject(raw, parentPlatform = "") {
   for (const k of TITLE_BODY_KEYS) {
     if (Object.prototype.hasOwnProperty.call(out, k) && out[k] != null) {
       out[k] = sanitizeTitle(out[k]);
+    }
+  }
+  for (const k of ["titleByPlatform", "title-by-platform"]) {
+    if (
+      Object.prototype.hasOwnProperty.call(out, k) &&
+      out[k] &&
+      typeof out[k] === "object" &&
+      !Array.isArray(out[k])
+    ) {
+      out[k] = sanitizePlatformTextMapValues(out[k], sanitizeTitle);
+    }
+  }
+  for (const k of ["descByPlatform", "desc-by-platform", "descriptionByPlatform"]) {
+    if (
+      Object.prototype.hasOwnProperty.call(out, k) &&
+      out[k] &&
+      typeof out[k] === "object" &&
+      !Array.isArray(out[k])
+    ) {
+      out[k] = sanitizePlatformTextMapValues(out[k], sanitizeDescription);
     }
   }
   if (
@@ -361,6 +530,13 @@ const CLI_VALUE_FLAGS = new Set([
   "--config",
   "--xlsx",
   "--cover",
+  "--cover-h",
+  "--coverH",
+  "--cover-path-h",
+  "--title-by-platform",
+  "--titleByPlatform",
+  "--desc-by-platform",
+  "--descByPlatform",
   "--creative-statement",
   "--cs",
   "--collection",

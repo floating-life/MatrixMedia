@@ -92,12 +92,14 @@ matrixmedia.exe cli publish -p dy --phone 13800138000 -f C:\video.mp4 -t "标题
 | `-p` / `--platform`        | 发布平台                                                                   |
 | `-f` / `--file`            | 本地视频路径，或 `http(s)://` 远程视频 URL → `filePath`、`data.textOtherName`（文件名无扩展名）；远程 URL 先下载到临时目录，默认上限 4 GiB，返回非视频类型（HTML/JSON 等）直接报错；服务端只回通用类型时会按视频容器魔数复核内容 |
 | `--phone` / `--partition`  | 会话分区，与账号树一致（`--phone` 支持完整 phone，如 `分组-账号名`）       |
-| `-t` / `--title`           | **视频标题**（必填）→ `data.title`                                         |
-| `--description` / `--desc` | **视频简介** → `data.description`                                          |
+| `-t` / `--title`           | **视频标题**（必填）→ `data.title`（发布前按平台上限自动兜底截断）         |
+| `--description` / `--desc` | **视频简介** → `data.description`（超限时优先保留 `#话题`、仅截正文）      |
+| `--title-by-platform`      | **分平台覆盖标题** JSON 对象（如 `'{"dy":"抖音标题","bjh":"百家号标题"}'`）；优先级：分平台覆盖 > `--title`，覆盖值超限同样自动截断 |
+| `--desc-by-platform`       | **分平台覆盖简介** JSON 对象（如 `'{"ks":"快手简介"}'`）；优先级：分平台覆盖 > `--description` |
 | `--short-title`            | **视频号短标题** → `data.shortTitle`，仅视频号消费                         |
 | `--name` / `--book-name`   | **名称**（任务记录名）→ `bookName`；省略时默认与视频文件名（无扩展名）一致 |
 | `--bt2`                    | 旧兼容字段：视频号作为短标题，其他平台作为简介                             |
-| `--tags` / `--bq`          | **视频标签** → `data.tags`                                                 |
+| `--tags` / `--bq`          | **视频标签** → `data.tags`（快手 / 抖音最多取前 4 个，超限自动裁剪并写入日志与回执） |
 
 平台写入规则：
 
@@ -113,7 +115,8 @@ matrixmedia.exe cli publish -p dy --phone 13800138000 -f C:\video.mp4 -t "标题
 | `--show`                   | 当前 CLI 会忽略，仍后台运行                                                |
 | `--no-close-window`        | CLI 下无效，仅与 GUI 显示窗口场景有关                                      |
 | `--draft`                  | 保存到平台草稿箱，不直接发布                                               |
-| `--cover`                  | 自定义封面图片路径（抖音 / 快手 / 视频号生效；竖封面 3:4 比例最佳，抖音横封面基于竖封面自动生成；视频号仅收 jpg/png）。单文件模式传绝对路径；`--dir` 批量模式下全局覆盖 xlsx「封面」列，未传时用 xlsx 每行的「封面」列（相对路径相对视频目录解析，路径无效跳过该行） |
+| `--cover`                  | 自定义竖版封面图片路径（3:4 最佳，抖音 / 快手 / 视频号生效；视频号仅收 jpg/png）。单文件模式传绝对路径；`--dir` 批量模式下全局覆盖 xlsx「封面」列，未传时用 xlsx 每行的「封面」列（相对路径相对视频目录解析，路径无效跳过该行） |
+| `--cover-h`                | 自定义横版封面(4:3)路径（仅抖音 / 视频号生效；自动居中裁切为 1440×1080 JPEG；视频号仅收 jpg/png）。未传但有 `--cover` 时自动由竖封面居中+两侧模糊补边生成 4:3 横封面（生成失败仅告警、保留竖封面）；横封面上传失败则中止本条发布。`--dir` 批量模式下全局覆盖 xlsx「横版封面」列。xlsx 亦支持 `<平台中文名>标题` / `<平台中文名>简介` 可选覆盖列（如 `抖音标题`、`百家号标题`、`快手简介`） |
 | `--sph-product-id`         | 视频号商品上架快捷参数（商品编号）；其他平台忽略 |
 | `--sph-drama-id` | 视频号小程序短剧挂载快捷参数（**短剧名称**，如 `泳陷错恋`）；其他平台忽略                           |
 | `--sph-series-id` | 视频号剧集挂载快捷参数（**剧集名称**，视频号原生剧集）；其他平台忽略                           |
@@ -181,7 +184,8 @@ electron . cli publish -p sph --phone 13800138000 -f /path/to/video.mp4 \
 
 ### 注意事项
 
-1. **登录态**：CLI 与 GUI 共用同一 `partition` 会话（`userData` 固定为 `matrix-video`）。抖音和视频号可使用 **`cli login`** 在终端完成扫码登录；其它平台可先在 GUI 登录，或保证该 `partition` 已有有效 Cookie。
+1. **平台文案规则与自动截断**：统一定义于 `src/shared/platformRules.js`（抖音标题 ≤30 / 话题 ≤4、百家号标题 ≤20、小红书标题 ≤20、快手话题 ≤4 等；字数按 `Array.from` 计）。超限时优先按最后标点截断（截后少于上限一半或无标点则硬截，不加省略号）；简介超限优先保留 `#话题` 仅截正文。发生截断或裁标签时，日志与 stdout JSON 回执中会附带 `ruleAdjustments` 与 `ruleAdjustmentsSummary` 字段，不改变退出码契约。
+2. **登录态**：CLI 与 GUI 共用同一 `partition` 会话（`userData` 固定为 `matrix-video`）。抖音和视频号可使用 **`cli login`** 在终端完成扫码登录；其它平台可先在 GUI 登录，或保证该 `partition` 已有有效 Cookie。
 2. **与 GUI 同时运行**：CLI 模式不会申请单实例锁；若与 GUI 同时使用同一账号 partition，可能导致会话冲突，建议错峰使用。
 3. **进程生命周期**：CLI 仍会启动一个 Electron 主进程，只是不显示 GUI。命令完成、参数失败或业务失败后会主动退出；执行发布期间进程存在属于正常现象。
 4. **启动诊断**：终端会依次输出 Puppeteer 初始化、Electron ready、CLI 参数识别和最终退出码。初始化超过 15 秒会以退出码 `1` 结束并打印明确错误，不会无限静默等待。

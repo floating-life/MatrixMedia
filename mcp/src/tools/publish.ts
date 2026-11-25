@@ -26,10 +26,22 @@ export const publishVideoTool: Tool = {
         type: "string",
         description: "Video title.",
       },
+      titleByPlatform: {
+        type: "object",
+        additionalProperties: { type: "string" },
+        description:
+          'Optional per-platform title overrides keyed by platform code or Chinese name (e.g. {"dy":"抖音标题","bjh":"百家号标题"}). Takes priority over title; still truncated to platform limit if overlength.',
+      },
       description: {
         type: "string",
         description:
           "Optional video description or body. Douyin/Kuaishou/Shipinhao append tags after this text; Xiaohongshu uses it as body; Bilibili uses it as the introduction field.",
+      },
+      descByPlatform: {
+        type: "object",
+        additionalProperties: { type: "string" },
+        description:
+          'Optional per-platform description overrides keyed by platform code or Chinese name (e.g. {"ks":"快手简介"}). Takes priority over description; tags are preserved first when truncating.',
       },
       shortTitle: {
         type: "string",
@@ -96,7 +108,12 @@ export const publishVideoTool: Tool = {
       cover: {
         type: "string",
         description:
-          "Optional absolute path to a custom cover image. Effective for Douyin (dy), Kuaishou (ks) and Shipinhao (sph) single-file publish; 3:4 portrait ratio recommended (1080x1440 fits all three; Douyin auto-generates the horizontal cover from the portrait one; Shipinhao accepts jpg/png only).",
+          "Optional absolute path to a custom vertical (3:4) cover image. Effective for Douyin (dy), Kuaishou (ks) and Shipinhao (sph) single-file publish; normalized to 1080x1440 JPEG. When coverPathH is omitted, Douyin and Shipinhao auto-generate a 1440x1080 (4:3) horizontal cover from this portrait cover. Shipinhao accepts jpg/png only.",
+      },
+      coverPathH: {
+        type: "string",
+        description:
+          "Optional absolute path to a custom horizontal (4:3) cover image. Effective for Douyin (dy) and Shipinhao (sph); normalized to 1440x1080 JPEG (center crop without stretching). Shipinhao accepts jpg/png only.",
       },
       collection: {
         type: "string",
@@ -165,6 +182,21 @@ export async function handlePublishVideo(
   const creativeStatement =
     args.creativeStatement == null ? "" : String(args.creativeStatement).trim();
   const cover = args.cover == null ? "" : String(args.cover).trim();
+  const rawCoverH =
+    args.coverPathH !== undefined ? args.coverPathH : args.coverH;
+  const coverPathH = rawCoverH == null ? "" : String(rawCoverH).trim();
+  const titleByPlatform =
+    args.titleByPlatform &&
+    typeof args.titleByPlatform === "object" &&
+    !Array.isArray(args.titleByPlatform)
+      ? (args.titleByPlatform as Record<string, unknown>)
+      : null;
+  const descByPlatform =
+    args.descByPlatform &&
+    typeof args.descByPlatform === "object" &&
+    !Array.isArray(args.descByPlatform)
+      ? (args.descByPlatform as Record<string, unknown>)
+      : null;
   const collection =
     args.collection == null ? "" : String(args.collection).trim();
   const sphProductId =
@@ -254,6 +286,13 @@ export async function handlePublishVideo(
     ...(dySyncToutiao ? ["--dy-sync-toutiao"] : []),
     ...(creativeStatement ? ["--creative-statement", creativeStatement] : []),
     ...(cover ? ["--cover", cover] : []),
+    ...(coverPathH ? ["--cover-h", coverPathH] : []),
+    ...(titleByPlatform && Object.keys(titleByPlatform).length > 0
+      ? ["--title-by-platform", JSON.stringify(titleByPlatform)]
+      : []),
+    ...(descByPlatform && Object.keys(descByPlatform).length > 0
+      ? ["--desc-by-platform", JSON.stringify(descByPlatform)]
+      : []),
     ...(collection ? ["--collection", collection] : []),
     ...sphLinkArgs,
   ];
@@ -288,6 +327,12 @@ export async function handlePublishVideo(
         ...(lastJson.creativeStatement !== undefined
           ? { creativeStatement: lastJson.creativeStatement }
           : {}),
+        ...(lastJson.ruleAdjustments !== undefined
+          ? { ruleAdjustments: lastJson.ruleAdjustments }
+          : {}),
+        ...(lastJson.ruleAdjustmentsSummary !== undefined
+          ? { ruleAdjustmentsSummary: lastJson.ruleAdjustmentsSummary }
+          : {}),
         ...(lastJson.throttled !== undefined
           ? { throttled: Boolean(lastJson.throttled) }
           : {}),
@@ -306,6 +351,12 @@ export async function handlePublishVideo(
       publishMode: lastJson?.publishMode,
       ...(lastJson?.creativeStatement !== undefined
         ? { creativeStatement: lastJson.creativeStatement }
+        : {}),
+      ...(lastJson?.ruleAdjustments !== undefined
+        ? { ruleAdjustments: lastJson.ruleAdjustments }
+        : {}),
+      ...(lastJson?.ruleAdjustmentsSummary !== undefined
+        ? { ruleAdjustmentsSummary: lastJson.ruleAdjustmentsSummary }
         : {}),
       ...(lastJson?.draftVerified !== undefined
         ? { draftVerified: lastJson.draftVerified }

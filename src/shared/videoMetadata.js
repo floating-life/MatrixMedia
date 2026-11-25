@@ -4,6 +4,15 @@ import {
   splitAndSanitizeTags,
   splitHashtagTags,
 } from "./textSanitize.js";
+import {
+  PLATFORM_RULES,
+  applyPlatformPublishRules,
+  formatRuleAdjustmentsSummary,
+  getPlatformRule,
+  mergeRuleAdjustments,
+} from "./platformRules.js";
+
+export { formatRuleAdjustmentsSummary, mergeRuleAdjustments };
 
 function firstText(...values) {
   return values.map((value) => sanitizeTitle(value)).find(Boolean) || "";
@@ -39,26 +48,24 @@ export function joinDescriptionAndTags(description, tags) {
 }
 
 /**
- * 各平台话题/标签的硬上限：超出时平台不是「权重降低」，而是直接拒绝本次提交。
+ * 各平台话题/标签的硬上限（与 platformRules.js 同源）：超出时平台不是「权重降低」，而是直接拒绝本次提交。
  *
  * 快手：编辑器里每个 #话题 都是一个话题 chip，第 5 个会弹出「最多只能添加4个话题」，
  * 并且「发布」按钮的点击被这个校验吞掉——页面停在发布页、不改地址、不给成功提示，
  * 最终被 waitForPublishSignal 判成 signal=none 的「发布异常」。
- * 真实复现：5 个话题连续两次发布均 publish_abnormal，裁到 4 个后同一账号立即发布成功。
- * 所以在拼接描述文本时就裁到上限，并明确 warn 丢掉哪几个（不静默）。
+ * 抖音：实测第 5 个起同样弹出「最多添加4个话题」阻断发布。
  */
 export const PLATFORM_TAG_LIMITS = {
-  快手: 4,
-  // 抖音：编辑器内每个 #话题 均为独立 chip，实测第 5 个起平台弹出「最多添加4个话题」
-  // 并阻断发布（发布按钮点击被吞，页面停在发布页）。同一账号裁到 4 个后立即发布成功。
-  // 此为平台硬限制，实测确认。
-  抖音: 4,
+  快手: PLATFORM_RULES.快手.tagMax,
+  抖音: PLATFORM_RULES.抖音.tagMax,
 };
 
 export function formatTagsForPlatform(platform, tags) {
   const prefix = platform === "哔哩哔哩" ? "" : "#";
   let normalized = prefix ? splitHashtagTags(tags) : normalizeVideoTags(tags);
-  const limit = PLATFORM_TAG_LIMITS[platform] || 0;
+  const rule = getPlatformRule(platform);
+  const limit =
+    (rule && rule.tagMax) || PLATFORM_TAG_LIMITS[platform] || 0;
   if (limit > 0 && normalized.length > limit) {
     const dropped = normalized.slice(limit);
     console.warn(
@@ -70,29 +77,43 @@ export function formatTagsForPlatform(platform, tags) {
   return normalized.map((tag) => `${prefix}${tag}`).join(" ");
 }
 
-export function buildPlatformVideoText(platform, metadata = {}) {
-  const title = firstText(metadata.title, metadata.bt1);
-  const description = firstDescriptionText(metadata.description, metadata.bdText);
-  const tagsText = formatTagsForPlatform(
+export function buildPlatformVideoTextDetailed(platform, metadata = {}) {
+  const applied = applyPlatformPublishRules(
     platform,
-    metadata.tags ?? metadata.bq
+    {
+      title: firstText(metadata.title, metadata.bt1),
+      description: firstDescriptionText(metadata.description, metadata.bdText),
+      shortTitle:
+        platform === "视频号"
+          ? firstText(metadata.shortTitle, metadata.bt2Filled)
+          : "",
+      tags: metadata.tags ?? metadata.bq,
+      titleByPlatform: metadata.titleByPlatform,
+      descByPlatform: metadata.descByPlatform,
+    },
+    { log: true }
   );
-  const usesCombinedDescription = [
-    "抖音",
-    "视频号",
-    "快手",
-    "小红书",
-  ].includes(platform);
 
   return {
-    title,
-    description: usesCombinedDescription
-      ? joinDescriptionAndTags(description, tagsText)
-      : description,
-    shortTitle:
-      platform === "视频号"
-        ? firstText(metadata.shortTitle, metadata.bt2Filled)
-        : "",
+    title: applied.title,
+    description: applied.combinedDescription,
+    bodyDescription: applied.bodyDescription,
+    ksFillText: applied.ksFillText,
+    shortTitle: applied.shortTitle,
+    tags: applied.tags,
+    tagsText: applied.tagsText,
+    adjusted: applied.adjusted,
+    adjustments: applied.adjustments,
+    summary: applied.summary,
+  };
+}
+
+export function buildPlatformVideoText(platform, metadata = {}) {
+  const detailed = buildPlatformVideoTextDetailed(platform, metadata);
+  return {
+    title: detailed.title,
+    description: detailed.description,
+    shortTitle: detailed.shortTitle,
   };
 }
 

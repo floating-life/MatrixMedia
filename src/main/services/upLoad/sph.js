@@ -1,6 +1,7 @@
 import path from "path";
 import fs from "fs";
-import { normalizeCoverForUpload } from "../coverCompat.js";
+import * as coverCompat from "../coverCompat.js";
+import { capturePublishFailureScreenshot } from "./failureScreenshot.js";
 import maybeClosePublishWindow from "./closeWindow.js";
 import { head, matchesHead, replaceAllText } from "./textReadback.js";
 import { resolveVideoLinkOption } from "../../../shared/videoLink.js";
@@ -21,7 +22,11 @@ import {
   WAIT_UPLOAD_PROCESSING_MS,
   pollPageUntil,
 } from "./uploadTimeouts.js";
-import { buildPlatformVideoText } from "../../../shared/videoMetadata.js";
+import { buildPlatformVideoTextDetailed } from "../../../shared/videoMetadata.js";
+import {
+  formatRuleAdjustmentsSummary,
+  mergeRuleAdjustments,
+} from "../../../shared/platformRules.js";
 import {
   readPageUrl,
   readPageText,
@@ -174,7 +179,10 @@ async function uploadSphCustomCover(page, coverPath) {
   }
   // 封面归一：视频号 file input 只收 jpeg/jpg/png，非 3:4 源图居中裁切成
   // 1080×1440 jpg（失败回退原图，不阻断发布）
-  coverPath = await normalizeCoverForUpload(coverPath);
+  coverPath =
+    typeof coverCompat.normalizeCoverForUpload === "function"
+      ? await coverCompat.normalizeCoverForUpload(coverPath)
+      : coverPath;
 
   const srcBefore = await page.evaluate(() => {
     const app = document.querySelector("wujie-app.wujie_iframe");
@@ -317,6 +325,469 @@ async function uploadSphCustomCover(page, coverPath) {
     console.warn("[sph] ⚠️ 封面弹窗未关闭，尝试 Esc 收敛");
     await page.keyboard.press("Escape").catch(() => {});
     await page.waitForTimeout(1000);
+  }
+}
+
+/**
+ * 视频号横版封面（4:3）DOM 选择器集中配置【未经真机校准，待真机存草稿核对】。
+ * 所有查询均在 wujie-app.wujie_iframe 的 shadowRoot 内执行；
+ * 修改选择器只需改本对象，任何一步失败都会采集封面区 outerHTML 片段与诊断截图。
+ */
+export const SPH_HORIZONTAL_COVER_SELECTORS = Object.freeze({
+  wujieHost: "wujie-app.wujie_iframe",
+  // 竖封面槽位（排除用，避免误点竖封面）
+  verticalSlotSelector: ".vertical-cover-wrap",
+  // 横版封面槽位优先选择器
+  slotSelectors: [
+    ".horizon-cover-wrap",
+    ".horizontal-cover-wrap",
+    '[class*="horizon" i][class*="cover" i]',
+    '[class*="horizontal" i][class*="cover" i]',
+    '[class*="cover" i][class*="4-3" i]',
+    '[class*="cover" i][class*="4_3" i]',
+  ],
+  // 横版封面槽位 img 优先选择器
+  slotImgSelectors: [
+    ".cover-img-horizon",
+    ".cover-img-horizontal",
+    ".horizon-cover-wrap img",
+    ".horizontal-cover-wrap img",
+    '[class*="horizon" i][class*="cover" i] img',
+    '[class*="horizontal" i][class*="cover" i] img',
+  ],
+  // 文案兜底关键字（在非竖封面的 cover 容器里匹配）
+  slotTextKeywords: ["4:3", "4：3", "横封面", "横版封面", "横屏封面", "朋友圈"],
+  // 封面编辑弹窗
+  dialogSelector: ".weui-desktop-dialog",
+  dialogKeywords: ["编辑封面", "更换封面", "上传封面"],
+  // 弹窗内上传封面入口文案
+  uploadTabTexts: ["上传封面", "本地上传"],
+  // 文件输入框
+  fileInputSelectors: [
+    '.single-cover-uploader-wrap input[type="file"]',
+    '.weui-desktop-dialog input[type="file"]',
+  ],
+  // 确认按钮文案
+  confirmButtonTexts: ["确定", "确认"],
+  // 诊断采集容器选择器
+  diagContainerSelector: '.cover-preview-wrap, .vertical-cover-wrap, [class*="cover"]',
+});
+
+async function dumpSphHorizontalCoverDiagnostics(page, stage, { data, window } = {}) {
+  try {
+    const diag = await page.evaluate((cfg) => {
+      const norm = (t) => String(t || "").replace(/\s+/g, " ").trim();
+      const app = document.querySelector(cfg.wujieHost);
+      const root = app && app.shadowRoot;
+      if (!root) return { hasShadow: false, snippets: [], imgs: [], dialogs: [] };
+      const nodes = Array.from(root.querySelectorAll(cfg.diagContainerSelector));
+      const snippets = [];
+      const imgs = [];
+      for (const el of nodes) {
+        const r = el.getBoundingClientRect();
+        if (r.width < 20 || r.height < 20) continue;
+        if (snippets.length < 6) {
+          snippets.push({
+            cls: String(el.className || "").slice(0, 80),
+            rect: {
+              x: Math.round(r.x),
+              y: Math.round(r.y),
+              w: Math.round(r.width),
+              h: Math.round(r.height),
+            },
+            text: norm(el.textContent).slice(0, 80),
+            outerHTML: String(el.outerHTML || "").slice(0, 600),
+          });
+        }
+        const img = el.querySelector("img");
+        if (img && img.src && imgs.length < 12) {
+          imgs.push({
+            parentCls: String(el.className || "").slice(0, 60),
+            imgCls: String(img.className || "").slice(0, 60),
+            src: String(img.src || "").slice(0, 120),
+          });
+        }
+      }
+      const dialogs = Array.from(root.querySelectorAll(cfg.dialogSelector))
+        .filter((d) => d.getBoundingClientRect().width > 0)
+        .slice(0, 3)
+        .map((d) => ({
+          cls: String(d.className || "").slice(0, 80),
+          text: norm(d.textContent).slice(0, 160),
+          outerHTML: String(d.outerHTML || "").slice(0, 600),
+        }));
+      return { hasShadow: true, snippets, imgs, dialogs };
+    }, SPH_HORIZONTAL_COVER_SELECTORS);
+    console.warn(
+      `[sph][cover-h][diag] stage=${stage} hasShadow=${diag.hasShadow} imgs=${JSON.stringify(
+        diag.imgs
+      )} dialogs=${JSON.stringify(diag.dialogs)}`
+    );
+    console.warn(
+      `[sph][cover-h][diag] stage=${stage} coverAreaHTML=${JSON.stringify(
+        diag.snippets
+      ).slice(0, 3600)}`
+    );
+  } catch (e) {
+    console.warn(
+      `[sph][cover-h][diag] 采集 DOM 诊断失败(stage=${stage}): ${(e && e.message) || e}`
+    );
+  }
+  try {
+    const shot = await capturePublishFailureScreenshot(
+      page,
+      { ...(data || {}), pt: "视频号", _diagStage: `cover-h-${stage}` },
+      { window }
+    );
+    if (shot) {
+      console.warn(`[sph][cover-h][diag] stage=${stage} 诊断截图已保存: ${shot}`);
+    }
+  } catch (_) {
+    /* 诊断截图失败不覆盖主错 */
+  }
+}
+
+/**
+ * 视频号上传自定义横版封面（4:3，1440×1080 JPEG）。
+ * 校验与竖封面同等严格：弹窗必须关闭 且 横封面槽位 img src 相对设置前发生变化；
+ * 任何一步失败均采集诊断日志（outerHTML 片段 + 截图）并抛错中止本条视频号发布。
+ */
+export async function uploadSphHorizontalCover(
+  page,
+  coverPathH,
+  {
+    data,
+    window,
+    alreadyNormalized = false,
+    waitAfterUploadMs = 5000,
+    pollTimeoutMs = 20000,
+  } = {}
+) {
+  if (!coverPathH || !fs.existsSync(coverPathH)) {
+    throw new Error(`横版封面文件不存在: ${coverPathH}`);
+  }
+  const effectivePath = alreadyNormalized
+    ? coverPathH
+    : typeof coverCompat.normalizeHorizontalCoverForUpload === "function"
+    ? await coverCompat.normalizeHorizontalCoverForUpload(coverPathH)
+    : coverPathH;
+  const slotAttr = "data-mm-sph-cover-h-slot";
+  const slotToken = `sph-ch-${Date.now()}`;
+  let stage = "定位横封面槽位";
+
+  try {
+    // 1. 在 wujie 影子树中定位横封面槽位并记录原 src，然后点击打开弹窗
+    const locateRes = await page.evaluate(
+      (cfg, attr, token) => {
+        const norm = (t) => String(t || "").replace(/\s+/g, "").trim();
+        const app = document.querySelector(cfg.wujieHost);
+        const root = app && app.shadowRoot;
+        if (!root) return { ok: false, reason: "no-shadow" };
+
+        const verticalEl = root.querySelector(cfg.verticalSlotSelector);
+        const isVerticalRelated = (el) => {
+          if (!el || !verticalEl) return false;
+          return (
+            el === verticalEl ||
+            verticalEl.contains(el) ||
+            el.contains(verticalEl)
+          );
+        };
+        const isVisible = (el) => {
+          if (!el) return false;
+          const r = el.getBoundingClientRect();
+          return r.width > 20 && r.height > 20;
+        };
+
+        let slot = null;
+        let strategy = "";
+
+        // 策略 1：优先匹配显式横封面选择器
+        for (const sel of cfg.slotSelectors) {
+          const cand = Array.from(root.querySelectorAll(sel)).find(
+            (el) => isVisible(el) && !isVerticalRelated(el)
+          );
+          if (cand) {
+            slot = cand;
+            strategy = `selector:${sel}`;
+            break;
+          }
+        }
+
+        // 策略 2：按文案关键字（4:3 / 横封面 等）定位非竖封面槽位
+        if (!slot) {
+          const cands = Array.from(
+            root.querySelectorAll('[class*="cover"], .cover-preview-wrap')
+          ).filter((el) => {
+            if (!isVisible(el) || isVerticalRelated(el)) return false;
+            const t = norm(el.textContent);
+            return (
+              t.length <= 40 &&
+              cfg.slotTextKeywords.some((kw) => t.includes(norm(kw)))
+            );
+          });
+          if (cands.length > 0) {
+            cands.sort((a, b) => {
+              const aHasImg = a.querySelector("img") ? 0 : 1;
+              const bHasImg = b.querySelector("img") ? 0 : 1;
+              if (aHasImg !== bHasImg) return aHasImg - bHasImg;
+              return norm(a.textContent).length - norm(b.textContent).length;
+            });
+            slot = cands[0];
+            strategy = "keyword";
+          }
+        }
+
+        // 策略 3：若存在多个 .cover-preview-wrap 且其一为竖封面，取非竖封面的槽位
+        if (!slot) {
+          const previews = Array.from(
+            root.querySelectorAll(".cover-preview-wrap")
+          ).filter((el) => isVisible(el) && !isVerticalRelated(el));
+          if (previews.length > 0) {
+            slot = previews[0];
+            strategy = "other-cover-preview-wrap";
+          }
+        }
+
+        if (!slot) return { ok: false, reason: "slot-not-found" };
+
+        slot.setAttribute(attr, token);
+        let img = slot.querySelector("img");
+        if (!img) {
+          for (const sel of cfg.slotImgSelectors) {
+            const candidateImg = root.querySelector(sel);
+            if (candidateImg) {
+              img = candidateImg;
+              break;
+            }
+          }
+        }
+        const srcBefore = img && img.src ? img.src : "";
+        slot.click();
+        return { ok: true, strategy, srcBefore };
+      },
+      SPH_HORIZONTAL_COVER_SELECTORS,
+      slotAttr,
+      slotToken
+    );
+
+    if (!locateRes || !locateRes.ok) {
+      throw new Error(
+        `未找到视频号横版封面(4:3)编辑入口（reason=${
+          (locateRes && locateRes.reason) || "unknown"
+        }）`
+      );
+    }
+    console.log(
+      `[sph][cover-h] 已点击横封面入口（策略=${locateRes.strategy}，原src=${String(
+        locateRes.srcBefore || ""
+      ).slice(0, 80)}）`
+    );
+
+    // 2. 等待编辑封面弹窗可见
+    stage = "等待横封面弹窗";
+    await page.waitForFunction(
+      (cfg) => {
+        const app = document.querySelector(cfg.wujieHost);
+        const root = app && app.shadowRoot;
+        if (!root) return false;
+        for (const d of root.querySelectorAll(cfg.dialogSelector)) {
+          const t = (d.textContent || "").replace(/\s+/g, "");
+          const r = d.getBoundingClientRect();
+          if (r.width > 0 && cfg.dialogKeywords.some((kw) => t.includes(kw))) {
+            return true;
+          }
+        }
+        return false;
+      },
+      { timeout: 15000 },
+      SPH_HORIZONTAL_COVER_SELECTORS
+    );
+    await page.waitForTimeout(1000);
+
+    // 3. 切到「上传封面」tab（若弹窗内未直接露出 file input）
+    stage = "点击上传封面入口";
+    const tabRes = await page.evaluate((cfg) => {
+      const norm = (t) => String(t || "").replace(/\s+/g, "").trim();
+      const app = document.querySelector(cfg.wujieHost);
+      const root = app && app.shadowRoot;
+      if (!root) return { ok: false, reason: "no-shadow" };
+      const dlg = Array.from(root.querySelectorAll(cfg.dialogSelector)).find(
+        (d) => {
+          const t = norm(d.textContent);
+          return (
+            d.getBoundingClientRect().width > 0 &&
+            cfg.dialogKeywords.some((kw) => t.includes(kw))
+          );
+        }
+      );
+      if (!dlg) return { ok: false, reason: "no-dialog" };
+      for (const el of dlg.querySelectorAll("*")) {
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 || el.children.length > 2) continue;
+        if (cfg.uploadTabTexts.includes(norm(el.textContent))) {
+          el.click();
+          return { ok: true, clickedTab: true };
+        }
+      }
+      // 兜底：若弹窗直接内嵌了图片 file input，视为已在上传视图
+      const directInput = dlg.querySelector('input[type="file"]');
+      if (directInput) return { ok: true, clickedTab: false };
+      return { ok: false, reason: "no-upload-tab" };
+    }, SPH_HORIZONTAL_COVER_SELECTORS);
+    if (!tabRes || !tabRes.ok) {
+      throw new Error(
+        `视频号横封面弹窗内未找到「上传封面」入口（${
+          (tabRes && tabRes.reason) || "unknown"
+        }）`
+      );
+    }
+    if (tabRes.clickedTab) {
+      await page.waitForTimeout(1000);
+    }
+
+    // 4. 注入 1440×1080 横版封面文件
+    stage = "注入横封面文件";
+    const inputHandle = await page.evaluateHandle((cfg) => {
+      const app = document.querySelector(cfg.wujieHost);
+      const root = app && app.shadowRoot;
+      if (!root) return null;
+      for (const sel of cfg.fileInputSelectors) {
+        const found = root.querySelector(sel);
+        if (found) return found;
+      }
+      return (
+        Array.from(root.querySelectorAll('input[type="file"]')).find((i) =>
+          /image/i.test(i.accept || "")
+        ) || null
+      );
+    }, SPH_HORIZONTAL_COVER_SELECTORS);
+    const inputEl = inputHandle && inputHandle.asElement ? inputHandle.asElement() : null;
+    if (!inputEl) {
+      throw new Error("未找到视频号横封面上传 file input");
+    }
+    await inputEl.uploadFile(path.resolve(effectivePath));
+    console.log("[sph][cover-h] 横版封面文件已注入上传区:", effectivePath);
+
+    if (waitAfterUploadMs > 0) {
+      await page.waitForTimeout(waitAfterUploadMs);
+    }
+
+    // 5. 点「确定 / 确认」
+    stage = "确认横封面弹窗";
+    const confirmed = await page.evaluate((cfg) => {
+      const norm = (t) => String(t || "").replace(/\s+/g, "").trim();
+      const app = document.querySelector(cfg.wujieHost);
+      const root = app && app.shadowRoot;
+      if (!root) return { ok: false, reason: "no-shadow" };
+      const dlg = Array.from(root.querySelectorAll(cfg.dialogSelector)).find(
+        (d) => {
+          const t = norm(d.textContent);
+          return (
+            d.getBoundingClientRect().width > 0 &&
+            cfg.dialogKeywords.some((kw) => t.includes(kw))
+          );
+        }
+      );
+      if (!dlg) return { ok: false, reason: "no-dialog" };
+      for (const label of cfg.confirmButtonTexts) {
+        for (const b of dlg.querySelectorAll(
+          "button,.weui-desktop-btn,[role='button']"
+        )) {
+          const r = b.getBoundingClientRect();
+          if (r.width > 0 && !b.disabled && norm(b.textContent) === label) {
+            b.click();
+            return { ok: true, label };
+          }
+        }
+      }
+      return { ok: false, reason: "no-confirm-btn" };
+    }, SPH_HORIZONTAL_COVER_SELECTORS);
+    if (!confirmed || !confirmed.ok) {
+      throw new Error(
+        `视频号横封面弹窗确认失败（${
+          (confirmed && confirmed.reason) || "unknown"
+        }）`
+      );
+    }
+    console.log(`[sph][cover-h] 横封面弹窗已点「${confirmed.label}」`);
+
+    // 6. 严格校验：弹窗必须已关闭 且 横封面槽位 img src 相对设置前变化
+    stage = "校验横封面生效";
+    const deadline = Date.now() + Math.max(0, pollTimeoutMs);
+    let after = { src: "", dialogOpen: true };
+    do {
+      after = await page.evaluate(
+        (cfg, attr, token) => {
+          const norm = (t) => String(t || "").replace(/\s+/g, "").trim();
+          const app = document.querySelector(cfg.wujieHost);
+          const root = app && app.shadowRoot;
+          if (!root) return { src: "", dialogOpen: false };
+          const marked = root.querySelector(`[${attr}="${token}"]`);
+          let img = marked ? marked.querySelector("img") : null;
+          if (!img) {
+            for (const sel of cfg.slotImgSelectors) {
+              const cand = root.querySelector(sel);
+              if (cand && cand.src) {
+                img = cand;
+                break;
+              }
+            }
+          }
+          const dlg = Array.from(root.querySelectorAll(cfg.dialogSelector)).find(
+            (d) => {
+              const t = norm(d.textContent);
+              return (
+                d.getBoundingClientRect().width > 0 &&
+                cfg.dialogKeywords.some((kw) => t.includes(kw))
+              );
+            }
+          );
+          return { src: img && img.src ? img.src : "", dialogOpen: !!dlg };
+        },
+        SPH_HORIZONTAL_COVER_SELECTORS,
+        slotAttr,
+        slotToken
+      );
+      const changed = Boolean(after.src && after.src !== locateRes.srcBefore);
+      if (!after.dialogOpen && changed) {
+        break;
+      }
+      if (Date.now() < deadline) {
+        await page.waitForTimeout(500);
+      }
+    } while (Date.now() < deadline);
+
+    const changed = Boolean(after.src && after.src !== locateRes.srcBefore);
+    if (after.dialogOpen || !changed) {
+      throw new Error(
+        `视频号横版封面(4:3)设置未确认生效（弹窗仍开=${after.dialogOpen}，槽位图片变化=${changed}，src=${String(
+          after.src || ""
+        ).slice(0, 120)}）`
+      );
+    }
+    console.log(
+      `[sph][cover-h] 横版封面(4:3)已设置并校验通过（src变化=true, 弹窗已关=true）: ${String(
+        after.src
+      ).slice(0, 120)}`
+    );
+  } catch (err) {
+    await dumpSphHorizontalCoverDiagnostics(page, stage, { data, window });
+    const msg = (err && err.message) || String(err);
+    throw new Error(
+      msg.includes("已中止")
+        ? msg
+        : `视频号横版封面(4:3)设置失败（${stage}）：${msg}，已中止本条视频号发布，未发布`
+    );
+  } finally {
+    await page
+      .evaluate((cfg, attr, token) => {
+        const app = document.querySelector(cfg.wujieHost);
+        const root = app && app.shadowRoot;
+        const el = root && root.querySelector(`[${attr}="${token}"]`);
+        if (el) el.removeAttribute(attr);
+      }, SPH_HORIZONTAL_COVER_SELECTORS, slotAttr, slotToken)
+      .catch(() => {});
   }
 }
 
@@ -519,8 +990,15 @@ export default async function (page, data, window, event, onFinish) {
     return;
   }
 
+  let sphRuleAdjustments = [];
+  let sphAdjSummary = "";
   try {
-    const text = buildPlatformVideoText("视频号", data.data);
+    const text = buildPlatformVideoTextDetailed("视频号", data.data);
+    sphRuleAdjustments = mergeRuleAdjustments(
+      data.ruleAdjustments || (data.data && data.data.ruleAdjustments),
+      text.adjustments
+    );
+    sphAdjSummary = formatRuleAdjustmentsSummary(sphRuleAdjustments);
     const isMac = process.platform === "darwin";
 
     /** 实时查询影子树里的输入字段内容（editor 读 textContent，input 读 value） */
@@ -644,11 +1122,47 @@ export default async function (page, data, window, event, onFinish) {
     await tryDeclareOriginal(page);
     await waitSphUploadProcessing(page);
 
-    // 自定义封面：仅当传入 coverPath；失败抛错中止本次发布
-    // （封面是缩略图点击的命脉，不允许静默跳过——与抖音流程同策略）
-    const coverPath = data.data && data.data.coverPath;
-    if (coverPath) {
-      await uploadSphCustomCover(page, coverPath);
+    // 自定义封面（双比例：竖 3:4 + 横 4:3）：
+    // - 给了 coverPath：先设竖封面（1080×1440）
+    // - 给了 coverPathH：归一 1440×1080 后设横封面槽位
+    // - 没给 coverPathH 但给了 coverPath：自动生成 1440×1080 后设横封面槽位；
+    //   自动生成失败则只设竖封面、日志告警、不中止；横封面上传设置失败则中止本条发布。
+    const rawCoverPath = (data.data && data.data.coverPath) || "";
+    const rawCoverPathH =
+      (data.data && data.data.coverPathH) ||
+      (data.publishOptions && data.publishOptions.coverPathH) ||
+      "";
+    if (rawCoverPath || rawCoverPathH) {
+      const dualCovers =
+        typeof coverCompat.resolveDualCoversForUpload === "function"
+          ? await coverCompat.resolveDualCoversForUpload({
+              coverPath: rawCoverPath,
+              coverPathH: rawCoverPathH,
+            })
+          : {
+              verticalPath: rawCoverPath
+                ? typeof coverCompat.normalizeCoverForUpload === "function"
+                  ? await coverCompat.normalizeCoverForUpload(rawCoverPath)
+                  : rawCoverPath
+                : "",
+              horizontalPath: rawCoverPathH || "",
+              horizontalAutoGenerated: false,
+              horizontalGenWarning: "",
+            };
+      if (rawCoverPath) {
+        await uploadSphCustomCover(page, dualCovers.verticalPath || rawCoverPath);
+      }
+      if (dualCovers.horizontalPath) {
+        await uploadSphHorizontalCover(page, dualCovers.horizontalPath, {
+          data,
+          window,
+          alreadyNormalized: true,
+        });
+      } else if (dualCovers.horizontalGenWarning) {
+        console.warn(
+          `[sph] 横版封面自动生成失败（仅保留竖封面，不中止发布）：${dualCovers.horizontalGenWarning}`
+        );
+      }
     }
 
     // 选择合集（留空跳过；找不到入口/同名合集/回读不符时抛确定性错误中止发布且不重试）
@@ -718,6 +1232,11 @@ export default async function (page, data, window, event, onFinish) {
             };
       }
     }
+    if (sphRuleAdjustments.length > 0) {
+      extraPayload.ruleAdjustments = sphRuleAdjustments;
+      extraPayload.ruleAdjustmentsSummary = sphAdjSummary;
+    }
+    const sphBaseSuccessMsg = isDraftMode ? "保存草稿成功" : "上传成功";
     await replyPublishOutcome({
       page,
       data,
@@ -725,7 +1244,9 @@ export default async function (page, data, window, event, onFinish) {
       event,
       urlBefore,
       isDraftMode,
-      successMessage: isDraftMode ? "保存草稿成功" : "上传成功",
+      successMessage: sphAdjSummary
+        ? `${sphBaseSuccessMsg}（规则调整：${sphAdjSummary}）`
+        : sphBaseSuccessMsg,
       extraPayload,
       draftVerdictOverride,
     });

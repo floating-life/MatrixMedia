@@ -8,6 +8,11 @@ import {
   isCreativeStatementNone,
   resolveTtCreativeStatementLabel,
 } from "../../../shared/creativeStatement.js";
+import { buildPlatformVideoTextDetailed } from "../../../shared/videoMetadata.js";
+import {
+  formatRuleAdjustmentsSummary,
+  mergeRuleAdjustments,
+} from "../../../shared/platformRules.js";
 import {
   WAIT_SELECTOR_APPEAR_MS,
   WAIT_UPLOAD_PROCESSING_MS,
@@ -659,6 +664,12 @@ async function openToutiaoCoverDialog(page) {
 export default async function (page, data, window, event) {
   const isDraftMode =
     data.publishMode === "draft" || data.publishToDraft === true;
+  const text = buildPlatformVideoTextDetailed("头条", data.data || {});
+  const ttRuleAdjustments = mergeRuleAdjustments(
+    data.ruleAdjustments || (data.data && data.data.ruleAdjustments),
+    text.adjustments
+  );
+  const ttAdjSummary = formatRuleAdjustmentsSummary(ttRuleAdjustments);
   let hasTagSelector = false;
   let publishStage = "初始化";
 
@@ -699,7 +710,7 @@ export default async function (page, data, window, event) {
     if (!input) throw new Error("未找到头条标题输入框");
     await input.click({ clickCount: 3 });
     await page.keyboard.press("Backspace");
-    await page.keyboard.type(data.data.title || data.data.bt1 || "", {
+    await page.keyboard.type(text.title || "", {
       delay: 50,
     });
     console.log("[tt] 标题已输入");
@@ -771,6 +782,7 @@ export default async function (page, data, window, event) {
     console.log(
       shouldSaveDraft ? "✅ 头条号视频已保存草稿" : "✅ 头条号视频上传成功"
     );
+    const ttBaseSuccessMsg = shouldSaveDraft ? "保存草稿成功" : "上传成功";
     await replyPublishOutcome({
       page,
       data,
@@ -778,10 +790,18 @@ export default async function (page, data, window, event) {
       event,
       urlBefore,
       isDraftMode: shouldSaveDraft,
-      successMessage: shouldSaveDraft ? "保存草稿成功" : "上传成功",
+      successMessage: ttAdjSummary
+        ? `${ttBaseSuccessMsg}（规则调整：${ttAdjSummary}）`
+        : ttBaseSuccessMsg,
       extraPayload: {
         publishMode: shouldSaveDraft ? "draft" : "publish",
         publishToDraft: shouldSaveDraft,
+        ...(ttRuleAdjustments.length > 0
+          ? {
+              ruleAdjustments: ttRuleAdjustments,
+              ruleAdjustmentsSummary: ttAdjSummary,
+            }
+          : {}),
       },
     });
   } catch (e) {

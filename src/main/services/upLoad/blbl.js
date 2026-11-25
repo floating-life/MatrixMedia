@@ -14,9 +14,13 @@ import {
   WAIT_UPLOAD_PROCESSING_MS,
 } from "./uploadTimeouts.js";
 import {
-  buildPlatformVideoText,
+  buildPlatformVideoTextDetailed,
   normalizeVideoTags,
 } from "../../../shared/videoMetadata.js";
+import {
+  formatRuleAdjustmentsSummary,
+  mergeRuleAdjustments,
+} from "../../../shared/platformRules.js";
 
 async function waitForBlblAutoCover(page) {
   await pollPageUntil(
@@ -174,7 +178,12 @@ async function selectBlblCreativeStatement(page, data) {
 export default async function (page, data, window, event) {
   const isDraftMode =
     data.publishMode === "draft" || data.publishToDraft === true;
-  const text = buildPlatformVideoText("哔哩哔哩", data.data);
+  const text = buildPlatformVideoTextDetailed("哔哩哔哩", data.data);
+  const blblRuleAdjustments = mergeRuleAdjustments(
+    data.ruleAdjustments || (data.data && data.data.ruleAdjustments),
+    text.adjustments
+  );
+  const blblAdjSummary = formatRuleAdjustmentsSummary(blblRuleAdjustments);
 
   console.log(data);
   try {
@@ -240,7 +249,9 @@ export default async function (page, data, window, event) {
     console.error("❌ 输入简介失败", e);
   }
   try {
-    const tag = normalizeVideoTags(data.data.tags ?? data.data.bq);
+    const tag = Array.isArray(text.tags)
+      ? text.tags
+      : normalizeVideoTags(data.data.tags ?? data.data.bq);
     const selector = ".tag-container .input-instance input";
     await page.waitForSelector(selector, { timeout: WAIT_SELECTOR_APPEAR_MS });
     const input = await page.$(selector);
@@ -295,6 +306,7 @@ export default async function (page, data, window, event) {
     console.log(
       isDraftMode ? "✅ 哔哩哔哩视频已保存草稿" : "✅ 哔哩哔哩视频上传成功"
     );
+    const blblBaseSuccessMsg = isDraftMode ? "保存草稿成功" : "上传成功";
     await replyPublishOutcome({
       page,
       data,
@@ -302,7 +314,16 @@ export default async function (page, data, window, event) {
       event,
       urlBefore,
       isDraftMode,
-      successMessage: isDraftMode ? "保存草稿成功" : "上传成功",
+      successMessage: blblAdjSummary
+        ? `${blblBaseSuccessMsg}（规则调整：${blblAdjSummary}）`
+        : blblBaseSuccessMsg,
+      extraPayload:
+        blblRuleAdjustments.length > 0
+          ? {
+              ruleAdjustments: blblRuleAdjustments,
+              ruleAdjustmentsSummary: blblAdjSummary,
+            }
+          : {},
     });
   } catch (e) {
     // 失败瞬间截图留证（登录过期 / 风控弹窗 / 元素改版都能一眼看出）

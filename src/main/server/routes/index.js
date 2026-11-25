@@ -135,6 +135,9 @@ router.post("/publish", async function (req, res) {
     const { resolveAccountPublishMode } = await import(
       "../../services/accountPublishSettingsResolver.js"
     );
+    const { applyPlatformPublishRules } = await import(
+      "../../../shared/platformRules.js"
+    );
 
     const throttleSettings = readPublishThrottleSettings();
     const sanitizedBody = sanitizePublishPayloadObject(req.body || {});
@@ -221,7 +224,13 @@ router.post("/publish", async function (req, res) {
         requestDraftMode: Boolean(target.draft),
       });
       const isDraft = Boolean(effectiveMode.publishToDraft);
-      const candTitle = target.title || fileStemForDedupe(target.file);
+      const rawCandTitle = target.title || fileStemForDedupe(target.file);
+      const candTitle =
+        applyPlatformPublishRules(target.platform, {
+          title: rawCandTitle,
+          description: target.description || "",
+          tags: target.tags || target.bq || "",
+        }).title || rawCandTitle;
       const targetAllowDup = Boolean(rootAllowDuplicate || target.allowDuplicate === true);
       if (targetAllowDup) {
         target.allowDuplicate = true;
@@ -365,7 +374,13 @@ router.post("/publish", async function (req, res) {
           requestDraftMode: Boolean(t.draft),
         });
         const isDraft = Boolean(effectiveMode.publishToDraft);
-        const candTitle = t.title || fileStemForDedupe(t.file);
+        const rawCandTitle = t.title || fileStemForDedupe(t.file);
+        const candTitle =
+          applyPlatformPublishRules(t.platform, {
+            title: rawCandTitle,
+            description: t.description || "",
+            tags: t.tags || t.bq || "",
+          }).title || rawCandTitle;
         const allowDup = Boolean(t.allowDuplicate);
         if (allowDup) {
           t.allowDuplicate = true;

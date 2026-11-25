@@ -124,16 +124,19 @@
 | `platform`           | 单平台 | 上表任一平台 code 或中文名，如 `xhs` / `小红书`（与 `platforms` 二选一）                                                                 |
 | `platforms`          | 多平台 | 平台数组，可一次包含全部 8 个平台；如 `["dy","xhs","ks"]` 或对象数组 `[{ "platform": "dy", "phone": "138..." }, ...]`                    |
 | `file`               | 是     | 本地视频绝对路径，或 `http://` / `https://` 远程视频 URL（会先下载到临时目录，全部平台发布结束后自动删除；定时发布则在到点执行时再下载）。远程下载默认上限 4 GiB，`Content-Type` 不是视频（HTML / JSON 等错误页）或超过上限时直接返回失败，不落盘；当服务端只回通用类型（`application/octet-stream` / 未声明）时，再按视频容器魔数复核一次响应内容 |
-| `title`              | 是     | 视频标题                                                                                                                                 |
-| `description`        | 否     | 视频简介；抖音、快手、视频号会与标签拼接，小红书写入正文，哔哩哔哩写入简介控件                                                           |
+| `title`              | 是     | 视频标题（发布前按平台上限自动兜底截断）                                                                                                 |
+| `description`        | 否     | 视频简介；抖音、快手、视频号会与标签拼接，小红书写入正文，哔哩哔哩写入简介控件（超限时优先保留 `#话题` 仅截正文）                        |
+| `titleByPlatform`    | 否     | 按平台覆盖标题的对象，key 用 code、中文名或常见别名，如 `{ "dy": "抖音标题", "bjh": "百家号标题" }`；覆盖值超限同样兜底截断              |
+| `descByPlatform`     | 否     | 按平台覆盖简介的对象，key 用 code、中文名或常见别名，如 `{ "ks": "快手简介" }`                                                           |
 | `shortTitle`         | 否     | 视频号短标题，建议 6 ～ 16 字；其他平台忽略                                                                                              |
 | `phone`              | 二选一 | 账号手机号（与 GUI 账号树一致）；多平台时可作为默认值，单个平台对象内可覆盖                                                              |
 | `partition`          | 二选一 | 完整 session，如 `persist:13800138000抖音`                                                                                               |
 | `bt2`                | 否     | 旧兼容字段：视频号作为短标题，其他平台作为简介                                                                                           |
-| `tags`               | 否     | 标签，支持空格 / 逗号分隔；HTTP 会按 GUI 批量发布习惯拆分后再按平台补 `#` 或去 `#`                                                       |
+| `tags`               | 否     | 标签，支持空格 / 逗号分隔；HTTP 会按 GUI 批量发布习惯拆分后再按平台补 `#` 或去 `#`（快手 / 抖音最多保留前 4 个，超限自动裁剪并记入回执） |
 | `publishAt`          | 否     | 一次性定时发布，格式 `YYYY-MM-DD HH:mm:ss`（多平台时需全部一致）                                                                         |
 | `draft`              | 否     | `true` 时保存到平台草稿箱，不直接发布                                                                                                    |
-| `cover`              | 否     | 自定义封面图片路径（别名 `coverPath` / `cover-path`；抖音 / 快手 / 视频号生效；竖封面 3:4 比例最佳，抖音横封面基于竖封面自动生成；视频号仅收 jpg/png）           |
+| `cover`              | 否     | 自定义竖版封面图片路径（3:4 最佳；别名 `coverPath` / `cover-path`；抖音 / 快手 / 视频号生效；视频号仅收 jpg/png）                        |
+| `coverPathH`         | 否     | 自定义横版封面(4:3)路径（别名 `coverH` / `cover-h` / `cover_h`；仅抖音 / 视频号生效；居中裁切为 1440×1080 JPEG；留空且有竖封面时自动居中+两侧模糊补边生成 4:3 横封面，生成失败告警不中止，横封面上传失败则中止本条发布） |
 | `collection`         | 否     | 发布时选择的合集名称字符串（如 `"民间故事"`；仅抖音 / 快手 / 视频号生效，按去空白后完全匹配；留空不选，其他平台忽略）。找不到入口、找不到同名合集或回读不符时中止本平台发布、截图留证且不重试 |
 | `collections`        | 否     | 按平台覆盖合集名称，key 用 code 或中文名，如 `{ "dy": "抖音合集", "ks": "" }`（显式传 `""` 可取消该平台的全局合集） |
 | `sphProductId`       | 否     | 视频号商品上架快捷字段（商品编号）；仅视频号生效，等价于 `platformOptions.sph.link.type=product` |
@@ -145,6 +148,8 @@
 | `creativeStatements` | 否     | 按平台覆盖声明，key 用 code 或中文名，如 `{ "dy": "ai_generated", "blbl": "fiction" }`；某平台不支持所选值时回退 `none`                  |
 | `allowDuplicate`     | 否     | 默认 `false`；7 天内同平台+同账号+清洗后同标题已有成功/进行中记录时默认拦截，传 `true` 才放行（亦可在多平台 `platforms[]` 子对象内按平台单独指定） |
 | `noThrottle`         | 否     | 默认 `false`；开启发布节流时同账号间隔不足、超出允许发布时段（默认 06:00–23:30 UTC+8）、达当日上限或配置了平台错峰延迟会自动顺延为定时任务（显式 `publishAt` 同样只顺延不提前），传 `true` 可绕过（支持顶层或 `platforms[]` 单平台覆盖） |
+
+**分平台文案覆盖优先级**：`platforms[].titleByPlatform[平台]` > `platforms[].title` > `titleByPlatform[平台]` > `title`（`description` 与 `descByPlatform` 同理）。覆盖结果若超出平台字数/标签上限（如抖音标题 ≤30、百家号/小红书标题 ≤20、快手标签 ≤4），仍会按标点兜底截断（简介优先保留 `#话题`），并在响应体与 `results[]` 中返回 `ruleAdjustments` / `ruleAdjustmentsSummary`。
 
 **创作声明优先级**（与 GUI 一致）：`platforms[].creativeStatement` > `creativeStatements[平台]` > `creativeStatement` > 主进程发布设置 `defaultCreativeStatement`（出厂默认 `ai_generated`）。
 
@@ -164,6 +169,7 @@
 | `duplicate`                      | 触发 7 天内重复发布拦截时为 `true`                   |
 | `lastPublishAt` / `lastPublishAtText` | 触发重复发布拦截时返回上次匹配记录的时间戳（ms）与 UTC+8 时间文本 |
 | `creativeStatement`              | 单平台响应写出最终生效的创作声明（多平台写在每个 `results[]` 条目中） |
+| `ruleAdjustments` / `ruleAdjustmentsSummary` | 触发平台字数截断或标签裁剪时返回结构化明细数组（平台、字段、原长→新长、前后预览或移除标签）与可读摘要（未触发时不返回） |
 | `throttled` / `throttleReason` / `reason` / `reasons` | 触发节流顺延为定时任务时返回 `throttled: true`、顺延原因文案及结构化原因数组 `reasons` |
 | `message`                        | 结果说明（重复拦截时含上次发布时间；节流排期时含计划时间与原因） |
 | `total` / `succeeded` / `failed` | 多平台提交汇总；最终成功失败以 `pushData` 记录为准   |
