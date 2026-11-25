@@ -41,6 +41,7 @@ const {
 const {
   DEFAULT_ANALYSIS_PERIOD,
   NEW_WORKS_FIRST_24H_DAYS,
+  filterSummaryRowsForGroup,
   buildStatsAnalysis,
 } = require("./statsAnalysis");
 
@@ -53,7 +54,10 @@ const DEFAULT_INTRADAY_DAYS = 3;
 const MAX_INTRADAY_DAYS = 60;
 const MAX_SHEET_ROWS = 200000;
 const ROW_LIMIT_EXCEEDED_CODE = "ROW_LIMIT_EXCEEDED";
+const UNKNOWN_GROUP_CODE = "UNKNOWN_GROUP";
 const FUTURE_DATE_RANGE_ERROR = "所选日期都在未来";
+const EXCEL_SHEET_NAME_MAX_LEN = 31;
+const EXCEL_SHEET_ILLEGAL_RE = /[:\\/?*\[\]\x00-\x1f]/g;
 
 const SHEET_NAMES = [
   "作品日明细",
@@ -152,6 +156,7 @@ const WORK_INTRADAY_HEADERS = [
 const SUMMARY_BASE_HEADERS = [
   "内容ID",
   "标题",
+  "分组",
   "素材文件",
   "首发日期",
   "覆盖平台数",
@@ -167,6 +172,7 @@ const SUMMARY_BASE_HEADERS = [
 const PLATFORM_DAILY_HEADERS = [
   "日期",
   "平台",
+  "分组",
   "有数据作品数",
   "播放日增合计",
   "点赞日增合计",
@@ -315,6 +321,104 @@ function sanitizeNumberCell(value) {
 
 function compareText(a, b) {
   return a < b ? -1 : a > b ? 1 : 0;
+}
+
+function normalizeGroupOrderValue(val) {
+  if (val === undefined || val === null || val === "") return null;
+  const n = Number(val);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+function compareGroupNamesWithOrder(aKey, bKey, orderMap) {
+  const aStr = String(aKey == null ? "" : aKey);
+  const bStr = String(bKey == null ? "" : bKey);
+  const hasMap = orderMap && typeof orderMap === "object";
+  const ao = hasMap && hasOwn(orderMap, aStr) ? normalizeGroupOrderValue(safeOwnGet(orderMap, aStr)) : null;
+  const bo = hasMap && hasOwn(orderMap, bStr) ? normalizeGroupOrderValue(safeOwnGet(orderMap, bStr)) : null;
+  if (ao !== null && bo !== null && ao !== bo) return ao - bo;
+  if (ao !== null && bo === null) return -1;
+  if (ao === null && bo !== null) return 1;
+  return compareText(aStr, bStr);
+}
+
+function trimUtf16Safe(str, maxLen) {
+  if (!str || maxLen <= 0) return "";
+  if (str.length <= maxLen) return str;
+  let end = maxLen;
+  const lastCode = str.charCodeAt(end - 1);
+  if (lastCode >= 0xd800 && lastCode <= 0xdbff) {
+    end -= 1;
+  }
+  return str.slice(0, Math.max(0, end));
+}
+
+/** 清洗 Excel sheet 名片段：替换非法字符 : \ / ? * [ ] 与控制字符，合并连续下划线并去除首尾空白/下划线/单引号 */
+function sanitizeExcelSheetSegment(raw, fallback = "分组") {
+  const cleaned = String(raw == null ? "" : raw)
+    .replace(EXCEL_SHEET_ILLEGAL_RE, "_")
+    .replace(/_+/g, "_")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^['_\s]+|['_\s]+$/g, "")
+    .trim();
+  return cleaned || fallback;
+}
+
+/**
+ * 构造分组分析 sheet 名（格式「分析-<分组名>」）：
+ * - 清洗 Excel 非法字符（:\ / ? * [ ] 及控制字符）与首尾单引号
+ * - 长度严格 ≤ 31 字符（不截断 UTF-16 代理对）
+ * - 相对 usedLowerNames（大小写不敏感）保证工作簿内唯一
+ */
+function buildGroupAnalysisSheetName(groupName, usedLowerNames) {
+  const prefix = "分析-";
+  const safeGroup = sanitizeExcelSheetSegment(groupName, "分组");
+  const trimSheet = (raw, maxLen) => {
+    let out = trimUtf16Safe(raw, maxLen).replace(/['\s]+$/g, "");
+    if (!out || out === "分析" || out === prefix) {
+      out = trimUtf16Safe(`${prefix}分组`, maxLen);
+    }
+    return out;
+  };
+  const used = usedLowerNames instanceof Set ? usedLowerNames : new Set();
+  let candidate = trimSheet(`${prefix}${safeGroup}`, EXCEL_SHEET_NAME_MAX_LEN);
+  if (used.has(candidate.toLowerCase())) {
+    let seq = 2;
+    while (true) {
+      const suffix = `-${seq}`;
+      const maxStem = EXCEL_SHEET_NAME_MAX_LEN - suffix.length;
+      const stem = trimSheet(`${prefix}${safeGroup}`, maxStem);
+      candidate = `${stem}${suffix}`;
+      if (!used.has(candidate.toLowerCase())) break;
+      seq += 1;
+    }
+  }
+  used.add(candidate.toLowerCase());
+  return candidate;
+}
+
+function isAnalysisSheetName(name) {
+  return name === "分析" || (typeof name === "string" && name.startsWith("分析-"));
+}
+
+function validateOptionalGroupParam(rawGroup) {
+  if (rawGroup === undefined || rawGroup === null || rawGroup === "") return "";
+  if (typeof rawGroup !== "string") {
+    throw new Error("group 需为字符串");
+  }
+  return rawGroup.trim();
+}
+
+function createUnknownGroupError(group, availableGroups) {
+  const list = Array.isArray(availableGroups)
+    ? [...new Set(availableGroups.map((g) => String(g || "").trim()).filter(Boolean))].sort(compareText)
+    : [];
+  const suffix = list.length ? `（可用分组：${list.join("、")}）` : "（当前无可用分组）";
+  const err = new Error(`未知分组：${group}${suffix}`);
+  err.code = UNKNOWN_GROUP_CODE;
+  err.group = group;
+  err.availableGroups = list;
+  return err;
 }
 
 function comparePlatform(a, b) {
@@ -498,6 +602,35 @@ function resolveIoDeps(options = {}, depsArg) {
               ? s.listGroupPlatformAccountsFromDisk(g, p)
               : [];
           },
+    listKnownGroups:
+      typeof injected.listKnownGroups === "function"
+        ? () => injected.listKnownGroups()
+        : storeApi && typeof storeApi.listExistingAccountGroupsFromDisk === "function"
+        ? () => [...storeApi.listExistingAccountGroupsFromDisk()]
+        : hasInjectedDataSource
+        ? null
+        : () => {
+            const s = getStore();
+            return typeof s.listExistingAccountGroupsFromDisk === "function"
+              ? [...s.listExistingAccountGroupsFromDisk()]
+              : [];
+          },
+    readGroupOrderMap: isPlainObject(options.groupOrder)
+      ? () => options.groupOrder
+      : isPlainObject(injected.groupOrder)
+      ? () => injected.groupOrder
+      : typeof injected.readGroupOrderMap === "function"
+      ? () => injected.readGroupOrderMap()
+      : storeApi && typeof storeApi.readGroupOrderMapFromDisk === "function"
+      ? () => storeApi.readGroupOrderMapFromDisk()
+      : hasInjectedDataSource
+      ? () => Object.create(null)
+      : () => {
+          const s = getStore();
+          return typeof s.readGroupOrderMapFromDisk === "function"
+            ? s.readGroupOrderMapFromDisk()
+            : Object.create(null);
+        },
     now: injected.now !== undefined ? injected.now : options.now,
     appVersion:
       injected.appVersion !== undefined ? injected.appVersion : options.appVersion,
@@ -821,17 +954,79 @@ function filterSummaryRowsByGroupScope(
   });
 }
 
+function resolveDatasetGroupContext(options, io, rawAccounts) {
+  const explicitGroup = validateOptionalGroupParam(options && options.group);
+  const knownGroupsSet = new Set();
+  const groupOrderMap = Object.create(null);
+
+  try {
+    const rawOrder = io && typeof io.readGroupOrderMap === "function" ? io.readGroupOrderMap() : null;
+    if (isPlainObject(rawOrder)) {
+      for (const key of Object.keys(rawOrder)) {
+        const g = typeof key === "string" ? key.trim() : "";
+        if (!g || g === "__proto__" || g === "constructor" || g === "prototype") continue;
+        const ord = normalizeGroupOrderValue(safeOwnGet(rawOrder, key));
+        if (ord !== null) groupOrderMap[g] = ord;
+      }
+    }
+  } catch (_) {}
+
+  for (const acc of Array.isArray(rawAccounts) ? rawAccounts : []) {
+    if (!isPlainObject(acc)) continue;
+    const g = acc.group == null ? "" : String(acc.group).trim();
+    if (g) {
+      knownGroupsSet.add(g);
+      if (groupOrderMap[g] === undefined) {
+        const accOrd = normalizeGroupOrderValue(
+          acc.groupOrder !== undefined ? acc.groupOrder : acc.meta && acc.meta.groupOrder
+        );
+        if (accOrd !== null) groupOrderMap[g] = accOrd;
+      }
+    }
+  }
+
+  if (io && typeof io.listKnownGroups === "function") {
+    try {
+      const extra = io.listKnownGroups();
+      if (Array.isArray(extra) || extra instanceof Set) {
+        for (const item of extra) {
+          const g = typeof item === "string" ? item.trim() : "";
+          if (g) knownGroupsSet.add(g);
+        }
+      }
+    } catch (_) {}
+  }
+
+  let groupSet = null;
+  if (explicitGroup) {
+    if (!knownGroupsSet.has(explicitGroup)) {
+      throw createUnknownGroupError(explicitGroup, [...knownGroupsSet]);
+    }
+    groupSet = new Set([explicitGroup]);
+  } else if (Array.isArray(options && options.groups) && options.groups.length > 0) {
+    groupSet = new Set(options.groups.map((g) => String(g)));
+  }
+
+  return {
+    explicitGroup,
+    groupSet,
+    groupOrderMap,
+    knownGroups: [...knownGroupsSet].sort((a, b) => compareGroupNamesWithOrder(a, b, groupOrderMap)),
+  };
+}
+
 function loadRawDataset(options = {}, depsArg) {
   const io = resolveIoDeps(options, depsArg);
-  const groupSet =
-    Array.isArray(options.groups) && options.groups.length > 0
-      ? new Set(options.groups.map((g) => String(g)))
-      : null;
+  const rawAccounts = io.listAccounts() || [];
+  const { explicitGroup, groupSet, groupOrderMap, knownGroups } = resolveDatasetGroupContext(
+    options,
+    io,
+    rawAccounts
+  );
 
   const rawGroupSettings = io.readGroupSettings() || Object.create(null);
   const startDateByGroup = normalizeGroupStartDates(rawGroupSettings);
 
-  const rawAccounts = io.listAccounts() || [];
   const allAccountsData = [];
   const unfilteredAllAccountsData = [];
   const allWorksDailyByGp = Object.create(null);
@@ -912,12 +1107,15 @@ function loadRawDataset(options = {}, depsArg) {
 
   // 保留全量分组账号与发布记录用于全量作品身份归属裁决，输出阶段再按 groupSet 裁剪
   const allPushRecords = io.readPushRecords() || [];
-  const latestDataDate = resolveDefaultCutoffDate(allAccountsData, (g, p) => io.readDaily(g, p));
+  const latestDataDate = resolveDefaultCutoffDate(outputAccountsData, (g, p) => io.readDaily(g, p));
   const linkOverrides = readStrictLinkOverrides(io);
 
   return {
     io,
+    explicitGroup,
     groupSet,
+    groupOrderMap,
+    knownGroups,
     groupSettings: rawGroupSettings,
     startDateByGroup,
     hasStartDateExclusions,
@@ -945,15 +1143,16 @@ function loadRawDataset(options = {}, depsArg) {
  */
 function loadSummaryDataset(options = {}, depsArg, explicitCutoffDate = "") {
   const io = resolveIoDeps(options, depsArg);
-  const groupSet =
-    Array.isArray(options.groups) && options.groups.length > 0
-      ? new Set(options.groups.map((g) => String(g)))
-      : null;
+  const rawAccounts = io.listAccounts() || [];
+  const { explicitGroup, groupSet, groupOrderMap, knownGroups } = resolveDatasetGroupContext(
+    options,
+    io,
+    rawAccounts
+  );
 
   const rawGroupSettings = io.readGroupSettings() || Object.create(null);
   const startDateByGroup = normalizeGroupStartDates(rawGroupSettings);
 
-  const rawAccounts = io.listAccounts() || [];
   const allAccountsData = [];
   const allWorksDailyByGp = Object.create(null);
   const excludedWorkIdsByGp = new Map();
@@ -1015,12 +1214,15 @@ function loadSummaryDataset(options = {}, depsArg, explicitCutoffDate = "") {
   const allPushRecords = io.readPushRecords() || [];
   const latestDataDate = explicitCutoffDate
     ? ""
-    : resolveDefaultCutoffDate(allAccountsData, (g, p) => io.readDaily(g, p));
+    : resolveDefaultCutoffDate(outputAccountsData, (g, p) => io.readDaily(g, p));
   const linkOverrides = readStrictLinkOverrides(io);
 
   return {
     io,
+    explicitGroup,
     groupSet,
+    groupOrderMap,
+    knownGroups,
     groupSettings: rawGroupSettings,
     startDateByGroup,
     excludedWorkIdsByGp,
@@ -1513,20 +1715,30 @@ function assertExportRangeNotAllFuture(from, to, nowVal = Date.now()) {
   };
 }
 
-function buildDefaultExportFileName(from, to) {
+function buildDefaultExportFileName(from, to, group) {
   const f = typeof from === "string" ? from.trim() : "";
   const t = typeof to === "string" ? to.trim() : "";
+  const rawGroup = typeof group === "string" ? group.trim() : "";
+  const safeGroup = rawGroup
+    ? rawGroup
+        .replace(/[\\/:*?"<>|\x00-\x1f]/g, "-")
+        .replace(/\s+/g, " ")
+        .replace(/-+/g, "-")
+        .replace(/^[.\-\s]+|[.\-\s]+$/g, "")
+        .slice(0, 40)
+    : "";
+  const prefix = safeGroup ? `MatrixMedia-作品数据-${safeGroup}` : "MatrixMedia-作品数据";
   if (f && t) {
-    return `MatrixMedia-作品数据-${f}_${t}.xlsx`;
+    return `${prefix}-${f}_${t}.xlsx`;
   }
   if (!f && t) {
     const resolvedFrom = shiftDateStr(t, -DEFAULT_RANGE_DAYS);
-    return `MatrixMedia-作品数据-${resolvedFrom}_${t}.xlsx`;
+    return `${prefix}-${resolvedFrom}_${t}.xlsx`;
   }
   if (f && !t) {
-    return `MatrixMedia-作品数据-${f}_起.xlsx`;
+    return `${prefix}-${f}_起.xlsx`;
   }
-  return "MatrixMedia-作品数据.xlsx";
+  return `${prefix}.xlsx`;
 }
 
 /**
@@ -1648,6 +1860,7 @@ function buildContentSummaryData(options = {}, depsArg) {
     rows,
     deletedRows,
     date: cutoffDate,
+    ...(dataset.explicitGroup ? { group: dataset.explicitGroup } : {}),
     excludedBeforeStartCount: dataset.excludedBeforeStartCount,
     excludedBeforeStartByGroup: dataset.excludedBeforeStartByGroup,
     counts: {
@@ -2471,6 +2684,110 @@ function compareFallbackRecordTime(a, b) {
  * - 未匹配到已采集作品的发布记录视为独立作品（例如旧平台首发未采集、新平台后补发），继续参与内容级最早已知首发判定（补发不算新作品）
  * - 若已采集作品缺失平台 publishTime，返回 workFallbackByPwKey 供分析用 analysisRows 补齐
  */
+function resolveContentEarliestPublishTime(works, recs) {
+  const matchedWorkPwKeys = new Set();
+  const linkMatchedPwKeys = new Set();
+  const unmatchedRecs = [];
+  const remainingRecs = [];
+  const fallbackByPwKey = new Map();
+
+  // Pass 1：直链精确 1:1 匹配同一作品
+  for (const rec of recs) {
+    if (rec.normUrl) {
+      const urlMatch = works.find(
+        (w) => w.normUrl && w.normUrl === rec.normUrl && (!rec.platform || w.platform === rec.platform)
+      );
+      if (urlMatch) {
+        matchedWorkPwKeys.add(urlMatch.pwKey);
+        linkMatchedPwKeys.add(urlMatch.pwKey);
+        if (
+          urlMatch.pubMs === null &&
+          (!fallbackByPwKey.has(urlMatch.pwKey) ||
+            compareFallbackRecordTime(rec, fallbackByPwKey.get(urlMatch.pwKey)) < 0)
+        ) {
+          fallbackByPwKey.set(urlMatch.pwKey, rec);
+        }
+        continue;
+      }
+    }
+    remainingRecs.push(rec);
+  }
+
+  // Pass 2：同平台同分组（无冲突直链、日期窗 ≤2 天或任一端缺日期）匹配同一作品
+  for (const rec of remainingRecs) {
+    let bestWork = null;
+    let bestUnmatched = false;
+    let bestDayDiff = Infinity;
+    for (const w of works) {
+      if (linkMatchedPwKeys.has(w.pwKey)) continue;
+      if (rec.platform && w.platform !== rec.platform) continue;
+      if (rec.group && w.groups.size > 0 && !w.groups.has(rec.group)) continue;
+      if (rec.normUrl && w.normUrl && rec.normUrl !== w.normUrl) continue;
+      let dayDiff = 3;
+      if (w.dayNum !== null && rec.dayNum !== null) {
+        dayDiff = Math.abs(w.dayNum - rec.dayNum);
+        if (dayDiff > 2) continue;
+      }
+      const isUnmatched = !matchedWorkPwKeys.has(w.pwKey);
+      if (
+        !bestWork ||
+        (isUnmatched && !bestUnmatched) ||
+        (isUnmatched === bestUnmatched && dayDiff < bestDayDiff)
+      ) {
+        bestWork = w;
+        bestUnmatched = isUnmatched;
+        bestDayDiff = dayDiff;
+      }
+    }
+    if (bestWork) {
+      matchedWorkPwKeys.add(bestWork.pwKey);
+      if (
+        bestWork.pubMs === null &&
+        (!fallbackByPwKey.has(bestWork.pwKey) ||
+          compareFallbackRecordTime(rec, fallbackByPwKey.get(bestWork.pwKey)) < 0)
+      ) {
+        fallbackByPwKey.set(bestWork.pwKey, rec);
+      }
+    } else {
+      unmatchedRecs.push(rec);
+    }
+  }
+
+  const resolvedWorkTimes = [];
+  const workFallbacks = [];
+  for (const w of works) {
+    if (w.pubMs !== null) {
+      resolvedWorkTimes.push({ ms: w.pubMs, date: w.pubDate });
+    } else if (fallbackByPwKey.has(w.pwKey)) {
+      const fbRec = fallbackByPwKey.get(w.pwKey);
+      const fb = { ms: fbRec.ms, date: fbRec.date };
+      resolvedWorkTimes.push(fb);
+      workFallbacks.push([w.pwKey, fb]);
+    }
+  }
+  for (const rec of unmatchedRecs) {
+    resolvedWorkTimes.push({ ms: rec.ms, date: rec.date });
+  }
+
+  let earliestDate = "";
+  for (const wt of resolvedWorkTimes) {
+    if (wt.date && (!earliestDate || wt.date < earliestDate)) {
+      earliestDate = wt.date;
+    }
+  }
+  let earliestMs = null;
+  if (earliestDate) {
+    for (const wt of resolvedWorkTimes) {
+      if (wt.date === earliestDate && wt.ms !== null) {
+        if (earliestMs === null || wt.ms < earliestMs) {
+          earliestMs = wt.ms;
+        }
+      }
+    }
+  }
+  return { pubDate: earliestDate, pubMs: earliestMs, workFallbacks };
+}
+
 function resolveAnalysisPublishTimes(
   summaryRows,
   allContents,
@@ -2479,11 +2796,13 @@ function resolveAnalysisPublishTimes(
   cutoffTo,
   allPushRecords,
   deletedFilter = null,
-  startDateByGroup = null
+  startDateByGroup = null,
+  groupSet = null
 ) {
   if (!Array.isArray(summaryRows) || summaryRows.length === 0) {
     return { summaryRows: [], workFallbackByPwKey: new Map() };
   }
+  const hasGroupScope = groupSet instanceof Set && groupSet.size > 0;
   const hasDeletedFilter = hasActiveDeletedFilter(deletedFilter);
   const linkMeta = link instanceof Map ? getLinkResultMeta(link) : null;
   const byWorkIdentity = linkMeta && linkMeta.byWorkIdentity ? linkMeta.byWorkIdentity : null;
@@ -2495,13 +2814,14 @@ function resolveAnalysisPublishTimes(
     if (isPlainObject(c) && c.contentKey) contentKeySet.add(String(c.contentKey));
   }
 
-  // 1. 收集全量已采集作品（按 platform|workId 去重，归到 S6 关联后的 contentKey）
+  // 1. 收集已采集作品（按 platform|workId 去重，归到 S6 关联后的 contentKey；传入 groupSet 时仅限目标分组）
   const worksByContent = new Map();
   const workByPwKey = new Map();
   for (const acc of Array.isArray(allAccountsData) ? allAccountsData : []) {
     if (!isPlainObject(acc)) continue;
-    const group = acc.group == null ? "" : String(acc.group).trim();
     const rawGroup = acc.group == null ? "" : String(acc.group);
+    const group = rawGroup.trim();
+    if (hasGroupScope && !groupSet.has(rawGroup) && !groupSet.has(group)) continue;
     const platform = acc.platform == null ? "" : String(acc.platform).trim();
     const rawPlatform = acc.platform == null ? "" : String(acc.platform);
     for (const w of Array.isArray(acc.works) ? acc.works : []) {
@@ -2539,7 +2859,6 @@ function resolveAnalysisPublishTimes(
           pubMs,
           pubDate,
           dayNum: pubDate ? dateStrToDayNum(pubDate) : null,
-          fallbackRec: null,
         };
         workByPwKey.set(pwKey, workInfo);
         let arr = worksByContent.get(ck);
@@ -2560,7 +2879,7 @@ function resolveAnalysisPublishTimes(
     }
   }
 
-  // 2. 收集全部有效发布记录（与 buildContentIndex 相同口径），按 contentKey 分组
+  // 2. 收集全部有效发布记录（与 buildContentIndex 相同口径），按 contentKey 分组；传入 groupSet 时仅限目标分组
   const recsByContent = new Map();
   if (Array.isArray(allPushRecords) && allPushRecords.length > 0 && contentKeySet.size > 0) {
     for (let idx = 0; idx < allPushRecords.length; idx++) {
@@ -2609,6 +2928,7 @@ function resolveAnalysisPublishTimes(
 
       const platform = typeof rec.pt === "string" ? rec.pt.trim() : "";
       const group = resolveRecordGroup(rec);
+      if (hasGroupScope && !groupSet.has(group)) continue;
       if (startDateByGroup instanceof Map && startDateByGroup.size > 0 && group && recTime.date) {
         const gStart = startDateByGroup.get(group);
         if (gStart && recTime.date < gStart) continue;
@@ -2631,129 +2951,73 @@ function resolveAnalysisPublishTimes(
   }
 
   // 3. 逐内容将发布记录匹配到对应作品，按「作品」决定优先级后再取内容最早已知首发时间
+  //    全局模式下同时计算每个分组各自的首发时间（_publishByGroup），供多分组分析 sheet 拆分复用
   const infoByContentKey = new Map();
+  const infoByContentGroup = !hasGroupScope ? new Map() : null;
   const workFallbackByPwKey = new Map();
   const allContentKeys = new Set([...worksByContent.keys(), ...recsByContent.keys()]);
 
   for (const ck of allContentKeys) {
     const works = worksByContent.get(ck) || [];
     const recs = recsByContent.get(ck) || [];
-    const matchedWorkPwKeys = new Set();
-    // 已被发布记录直链精确匹配的作品：日期兜底不再把其他（如同账号更早首发）记录吸到它身上
-    const linkMatchedPwKeys = new Set();
-    const unmatchedRecs = [];
-    const remainingRecs = [];
-
-    // Pass 1：直链精确 1:1 匹配同一作品
-    for (const rec of recs) {
-      if (rec.normUrl) {
-        const urlMatch = works.find(
-          (w) => w.normUrl && w.normUrl === rec.normUrl && (!rec.platform || w.platform === rec.platform)
-        );
-        if (urlMatch) {
-          matchedWorkPwKeys.add(urlMatch.pwKey);
-          linkMatchedPwKeys.add(urlMatch.pwKey);
-          if (
-            urlMatch.pubMs === null &&
-            (!urlMatch.fallbackRec || compareFallbackRecordTime(rec, urlMatch.fallbackRec) < 0)
-          ) {
-            urlMatch.fallbackRec = rec;
-          }
-          continue;
-        }
-      }
-      remainingRecs.push(rec);
+    const resolved = resolveContentEarliestPublishTime(works, recs);
+    for (const [pwKey, fb] of resolved.workFallbacks) {
+      workFallbackByPwKey.set(pwKey, fb);
+    }
+    if (resolved.pubDate || resolved.pubMs !== null) {
+      infoByContentKey.set(ck, { pubDate: resolved.pubDate, pubMs: resolved.pubMs });
     }
 
-    // Pass 2：同平台同分组（无冲突直链、日期窗 ≤2 天或任一端缺日期）匹配同一作品
-    for (const rec of remainingRecs) {
-      let bestWork = null;
-      let bestUnmatched = false;
-      let bestDayDiff = Infinity;
+    if (infoByContentGroup) {
+      const contentGroups = new Set();
       for (const w of works) {
-        if (linkMatchedPwKeys.has(w.pwKey)) continue;
-        if (rec.platform && w.platform !== rec.platform) continue;
-        if (rec.group && w.groups.size > 0 && !w.groups.has(rec.group)) continue;
-        if (rec.normUrl && w.normUrl && rec.normUrl !== w.normUrl) continue;
-        let dayDiff = 3;
-        if (w.dayNum !== null && rec.dayNum !== null) {
-          dayDiff = Math.abs(w.dayNum - rec.dayNum);
-          if (dayDiff > 2) continue;
-        }
-        const isUnmatched = !matchedWorkPwKeys.has(w.pwKey);
-        if (
-          !bestWork ||
-          (isUnmatched && !bestUnmatched) ||
-          (isUnmatched === bestUnmatched && dayDiff < bestDayDiff)
-        ) {
-          bestWork = w;
-          bestUnmatched = isUnmatched;
-          bestDayDiff = dayDiff;
-        }
+        for (const wg of w.groups) if (wg) contentGroups.add(wg);
       }
-      if (bestWork) {
-        matchedWorkPwKeys.add(bestWork.pwKey);
-        if (
-          bestWork.pubMs === null &&
-          (!bestWork.fallbackRec || compareFallbackRecordTime(rec, bestWork.fallbackRec) < 0)
-        ) {
-          bestWork.fallbackRec = rec;
-        }
-      } else {
-        unmatchedRecs.push(rec);
+      for (const rec of recs) {
+        if (rec.group) contentGroups.add(rec.group);
       }
-    }
-
-    // 汇总本内容全部作品（已采集作品 + 未采集到的发布记录作品）的发布时间
-    const resolvedWorkTimes = [];
-    for (const w of works) {
-      if (w.pubMs !== null) {
-        // tier 1：平台实采 publishTime 优先级最高
-        resolvedWorkTimes.push({ ms: w.pubMs, date: w.pubDate });
-      } else if (w.fallbackRec) {
-        const fb = { ms: w.fallbackRec.ms, date: w.fallbackRec.date };
-        resolvedWorkTimes.push(fb);
-        workFallbackByPwKey.set(w.pwKey, fb);
-      }
-    }
-    for (const rec of unmatchedRecs) {
-      resolvedWorkTimes.push({ ms: rec.ms, date: rec.date });
-    }
-
-    let earliestDate = "";
-    for (const wt of resolvedWorkTimes) {
-      if (wt.date && (!earliestDate || wt.date < earliestDate)) {
-        earliestDate = wt.date;
-      }
-    }
-    let earliestMs = null;
-    if (earliestDate) {
-      for (const wt of resolvedWorkTimes) {
-        if (wt.date === earliestDate && wt.ms !== null) {
-          if (earliestMs === null || wt.ms < earliestMs) {
-            earliestMs = wt.ms;
+      if (contentGroups.size > 1) {
+        const perGroup = Object.create(null);
+        for (const cg of contentGroups) {
+          const gWorks = works.filter((w) => w.groups.has(cg));
+          const gRecs = recs.filter((rec) => rec.group === cg);
+          const gRes = resolveContentEarliestPublishTime(gWorks, gRecs);
+          if (gRes.pubDate || gRes.pubMs !== null) {
+            perGroup[cg] = { pubDate: gRes.pubDate, pubMs: gRes.pubMs };
           }
         }
+        if (Object.keys(perGroup).length > 0) {
+          infoByContentGroup.set(ck, perGroup);
+        }
       }
-    }
-    if (earliestDate || earliestMs !== null) {
-      infoByContentKey.set(ck, { pubDate: earliestDate, pubMs: earliestMs });
     }
   }
 
   const enrichedSummaryRows = summaryRows.map((row) => {
     if (!isPlainObject(row) || !row.contentKey) return row;
-    const info = infoByContentKey.get(String(row.contentKey));
-    if (!info) return row;
+    const ck = String(row.contentKey);
+    const info = infoByContentKey.get(ck);
+    const perGroup = infoByContentGroup ? infoByContentGroup.get(ck) : null;
+    if (!info && !perGroup) return row;
     const curDate =
       typeof row.firstPublishDate === "string" && isValidDateStr(row.firstPublishDate.trim())
         ? row.firstPublishDate.trim()
         : "";
-    return {
-      ...row,
-      firstPublishDate: info.pubDate || curDate,
-      firstPublishTime: info.pubMs,
-    };
+    const outRow = info
+      ? {
+          ...row,
+          firstPublishDate: info.pubDate || curDate,
+          firstPublishTime: info.pubMs,
+        }
+      : { ...row };
+    if (perGroup) {
+      Object.defineProperty(outRow, "_publishByGroup", {
+        value: perGroup,
+        enumerable: false,
+        configurable: true,
+      });
+    }
+    return outRow;
   });
 
   return { summaryRows: enrichedSummaryRows, workFallbackByPwKey };
@@ -2778,8 +3042,33 @@ function applyWorkFallbackPublishTimes(analysisRows, workFallbackByPwKey) {
   }
 }
 
+function extractSummaryRowGroupText(row, groupOrderMap) {
+  if (!isPlainObject(row)) return null;
+  const set = new Set();
+  if (Array.isArray(row.groups) && row.groups.length > 0) {
+    for (const g of row.groups) {
+      const s = typeof g === "string" ? g.trim() : "";
+      if (s) set.add(s);
+    }
+  } else if (isPlainObject(row.perPlatform)) {
+    for (const pgKey of Object.keys(row.perPlatform)) {
+      const { group } = parsePgKey(pgKey);
+      const s = group.trim();
+      if (s) set.add(s);
+    }
+  }
+  if (set.size > 0) {
+    const sorted = [...set].sort((a, b) => compareGroupNamesWithOrder(a, b, groupOrderMap));
+    return sorted.join("、");
+  }
+  if (typeof row.group === "string" && row.group.trim()) {
+    return row.group.trim();
+  }
+  return null;
+}
+
 /** Sheet 2: 作品跨平台汇总 */
-function buildContentSummarySheet(summaryRows) {
+function buildContentSummarySheet(summaryRows, groupOrderMap) {
   const pgKeySet = new Set();
   for (const row of summaryRows) {
     if (!isPlainObject(row.perPlatform)) continue;
@@ -2833,6 +3122,7 @@ function buildContentSummarySheet(summaryRows) {
     const cells = [
       sanitizeTextCell(row.contentKey),
       sanitizeTextCell(row.title),
+      sanitizeTextCell(extractSummaryRowGroupText(row, groupOrderMap)),
       sanitizeTextCell(row.file),
       sanitizeTextCell(row.firstPublishDate),
       sanitizeNumberCell(row.platformCount),
@@ -2883,7 +3173,7 @@ function buildContentSummarySheet(summaryRows) {
  * Sheet 3: 平台日汇总（由作品日明细按「日期+平台+作品ID」去重后按 日期+平台 求和；
  * 同一作品多分组只取按分组名排序第一组的一份观测，null 不计，全 null 为空）
  */
-function buildPlatformDailySheet(workDailyRows) {
+function buildPlatformDailySheet(workDailyRows, groupOrderMap) {
   const buckets = new Map();
 
   for (const r of workDailyRows) {
@@ -2910,12 +3200,15 @@ function buildPlatformDailySheet(workDailyRows) {
     const agg = {
       date: bucket.date,
       platform: bucket.platform,
+      groups: new Set(),
       workCount: 0,
       sums: Object.create(null),
     };
     for (const dk of WORK_DELTA_KEYS) agg.sums[dk] = null;
 
     for (const obs of bucket.byWorkId.values()) {
+      const grp = obs && typeof obs.group === "string" ? obs.group.trim() : "";
+      if (grp) agg.groups.add(grp);
       const hasCumulativeData = WORK_STAT_KEYS.some((k) => obs[k] !== null);
       if (hasCumulativeData) agg.workCount += 1;
 
@@ -2927,6 +3220,10 @@ function buildPlatformDailySheet(workDailyRows) {
         }
       }
     }
+    const sortedGroups = [...agg.groups].sort((a, b) =>
+      compareGroupNamesWithOrder(a, b, groupOrderMap)
+    );
+    agg.group = sortedGroups.join("、");
     rows.push(agg);
   }
 
@@ -2940,6 +3237,7 @@ function buildPlatformDailySheet(workDailyRows) {
     aoa.push([
       sanitizeTextCell(r.date),
       sanitizeTextCell(r.platform),
+      sanitizeTextCell(r.group || null),
       sanitizeNumberCell(r.workCount),
       sanitizeNumberCell(r.sums.playDelta),
       sanitizeNumberCell(r.sums.likeDelta),
@@ -3094,6 +3392,10 @@ function buildAnalysisSheet(analysis) {
 
   // 首块：文字小结（每行一句）
   aoa.push([sanitizeTextCell("文字小结")]);
+  const analysisGroup = typeof a.group === "string" ? a.group.trim() : "";
+  if (analysisGroup) {
+    aoa.push([sanitizeTextCell(`分组：${analysisGroup}`)]);
+  }
   const summaryLines =
     isPlainObject(a.summary) && Array.isArray(a.summary.lines) ? a.summary.lines : [];
   for (const line of summaryLines) {
@@ -3699,6 +4001,12 @@ function buildSchemaSheet(dynamicSchemaEntries) {
     ],
     [
       "作品跨平台汇总",
+      "分组",
+      "group",
+      "该内容已采集作品所属分组（无作品时取发布记录所属分组；跨多分组以顿号分隔，单分组分析/导出时按作品各自分组拆开计）。",
+    ],
+    [
+      "作品跨平台汇总",
       "素材文件",
       "file",
       "关联本地视频素材完整路径，无则为空单元格。",
@@ -3782,6 +4090,12 @@ function buildSchemaSheet(dynamicSchemaEntries) {
       "本地快照采集日期（YYYY-MM-DD，UTC+8），非平台自然日。平台数据本身存在 T+1 延迟（如抖音当天不可查）。",
     ],
     ["平台日汇总", "平台", "platform", "平台中文名。"],
+    [
+      "平台日汇总",
+      "分组",
+      "group",
+      "当日该平台纳入汇总的作品所属分组（多分组以顿号分隔；按「日期+平台+作品ID」去重时取纳入观测所属分组）。",
+    ],
     [
       "平台日汇总",
       "有数据作品数",
@@ -3937,6 +4251,12 @@ function buildSchemaSheet(dynamicSchemaEntries) {
       "anomalies",
       "异常规则：①疑似采集异常：某作品某指标某日为 0 或缺失，而前后有记录日都 >0（掉 0 又涨回），使用全历史快照（含截止日之后恢复快照）识别；以及账号级总播放相对上次有效正值骤降（归 0 或降幅 ≥50%）且作品级无对应下降时标为异常并剔除；剔除说明：此类异常点在第 1–5 节全部计算中剔除，并按截止日内有效快照重算日增、走势与排行。②疑似上推荐：仅对单日实测日增（断档后首日不触发）判定，单日播放日增 ≥ 前 7 个日历日窗口日均 × 5 且 ≥ 1000（窗内跨断档增量按天数均摊）。",
     ],
+    [
+      "分析",
+      "分分组分析（分析-<分组名>）",
+      "groupAnalyses",
+      "全局导出在保留全局「分析」sheet 的同时，为每个分组追加「分析-<分组名>」sheet（超 31 字符或含非法字符自动清洗去重），结构与 1–7 节口径与全局「分析」一致，仅纳入该分组数据；跨组内容按作品各自分组拆开计且不重复计入同一分组。指定 --group 导出时仅导出该分组且全部 sheet 按该分组过滤。",
+    ],
 
     // 6. 字段说明
     ["字段说明", "sheet", "sheet", "字段所属工作表名称。"],
@@ -3967,7 +4287,7 @@ function buildSchemaSheet(dynamicSchemaEntries) {
 }
 
 /** Sheet 7: 导出信息 */
-function buildMetaSheet({ exportedAt, from, to, appVersion, counts, analysisPeriod }) {
+function buildMetaSheet({ exportedAt, from, to, appVersion, counts, analysisPeriod, group }) {
   const aoa = [META_HEADERS.map(sanitizeTextCell)];
   aoa.push(
     [sanitizeTextCell("导出时间"), sanitizeTextCell(exportedAt)],
@@ -3979,6 +4299,10 @@ function buildMetaSheet({ exportedAt, from, to, appVersion, counts, analysisPeri
     [sanitizeTextCell("未关联作品数"), sanitizeNumberCell(counts.unlinkedWorks)],
     [sanitizeTextCell("analysisPeriod"), sanitizeNumberCell(analysisPeriod)]
   );
+  const groupName = typeof group === "string" ? group.trim() : "";
+  if (groupName) {
+    aoa.push([sanitizeTextCell("导出分组"), sanitizeTextCell(groupName)]);
+  }
   return aoa;
 }
 
@@ -4072,15 +4396,19 @@ function buildStatsAnalysisData(options = {}, depsArg) {
   const accountDaily = collectAccountDailyRows(dataset.outputAccountsData, "", resolvedTo, {
     sortRows: false,
   });
+  const effectiveSingleGroup =
+    dataset.explicitGroup ||
+    (dataset.groupSet && dataset.groupSet.size === 1 ? [...dataset.groupSet][0] : "");
   const { summaryRows: analysisSummaryRows, workFallbackByPwKey } = resolveAnalysisPublishTimes(
     summaryRows,
     allContents,
-    dataset.allAccountsData,
+    dataset.groupSet ? dataset.outputAccountsData : dataset.allAccountsData,
     link,
     resolvedTo,
     dataset.allPushRecords,
     deletedFilter,
-    dataset.startDateByGroup
+    dataset.startDateByGroup,
+    dataset.groupSet
   );
   applyWorkFallbackPublishTimes(analysisRows, workFallbackByPwKey);
 
@@ -4122,6 +4450,7 @@ function buildStatsAnalysisData(options = {}, depsArg) {
     summaryRows: analysisSummaryRows,
     accountRows: accountDaily.allRows,
     intradayRows: intradayAnalysisRows,
+    group: effectiveSingleGroup || undefined,
     to: resolvedTo,
     period,
     now: nowVal,
@@ -4318,24 +4647,28 @@ function buildStatsWorkbookData(options = {}, deps) {
       deletedFilter,
     });
   const workIntradayAoa = formatWorkIntradayAoa(workIntradayRows);
-  const contentSummary = buildContentSummarySheet(summaryRows);
-  const platformDaily = buildPlatformDailySheet(workDailyRows);
+  const contentSummary = buildContentSummarySheet(summaryRows, dataset.groupOrderMap);
+  const platformDaily = buildPlatformDailySheet(workDailyRows, dataset.groupOrderMap);
   const accountDaily = collectAccountDailyRows(
     dataset.outputAccountsData,
     resolvedFrom,
     resolvedTo,
     { sortRows: true }
   );
+  const effectiveSingleGroup =
+    dataset.explicitGroup ||
+    (dataset.groupSet && dataset.groupSet.size === 1 ? [...dataset.groupSet][0] : "");
   const analysisPeriod = resolveAnalysisPeriodFromRange(resolvedFrom, resolvedTo);
   const { summaryRows: analysisSummaryRows, workFallbackByPwKey } = resolveAnalysisPublishTimes(
     summaryRows,
     allContents,
-    dataset.allAccountsData,
+    dataset.groupSet ? dataset.outputAccountsData : dataset.allAccountsData,
     link,
     resolvedTo,
     dataset.allPushRecords,
     deletedFilter,
-    dataset.startDateByGroup
+    dataset.startDateByGroup,
+    dataset.groupSet
   );
   applyWorkFallbackPublishTimes(analysisRows, workFallbackByPwKey);
   applyWorkFallbackPublishTimes(intradayAnalysisRows, workFallbackByPwKey);
@@ -4352,6 +4685,7 @@ function buildStatsWorkbookData(options = {}, deps) {
     summaryRows: analysisSummaryRows,
     accountRows: accountDaily.allRows,
     intradayRows: intradayAnalysisRows,
+    group: effectiveSingleGroup || undefined,
     to: resolvedTo,
     period: analysisPeriod,
     now: nowVal,
@@ -4363,6 +4697,103 @@ function buildStatsWorkbookData(options = {}, deps) {
   const accountDailyAoa = formatAccountDailyAoa(reconciledAccountDailyRows);
   const analysisAoa = buildAnalysisSheet(analysis);
   const schemaAoa = buildSchemaSheet(contentSummary.dynamicSchemaEntries);
+
+  // 全局（非单分组过滤）导出时，为每个分组追加「分析-<分组名>」sheet（按 accountGroupOrder 排序）
+  const groupAnalyses = Object.create(null);
+  const groupSheetNames = [];
+  const groupSheets = Object.create(null);
+  if (!effectiveSingleGroup) {
+    const groupSetPresent = new Set();
+    const firstGroupByPwKey = new Map();
+    let hasSharedPwKeyAcrossGroups = false;
+    for (const acc of dataset.outputAccountsData) {
+      if (!isPlainObject(acc)) continue;
+      const g = acc.group == null ? "" : String(acc.group).trim();
+      if (g) groupSetPresent.add(g);
+      if (!hasSharedPwKeyAcrossGroups) {
+        const pt = acc.platform == null ? "" : String(acc.platform);
+        const checkPw = (wid) => {
+          if (wid == null || wid === "") return;
+          const pk = `${pt}|${wid}`;
+          const prevG = firstGroupByPwKey.get(pk);
+          if (prevG === undefined) {
+            firstGroupByPwKey.set(pk, g);
+          } else if (prevG !== g) {
+            hasSharedPwKeyAcrossGroups = true;
+          }
+        };
+        if (isPlainObject(acc.worksDaily)) {
+          for (const wid of Object.keys(acc.worksDaily)) {
+            checkPw(wid);
+            if (hasSharedPwKeyAcrossGroups) break;
+          }
+        }
+        if (!hasSharedPwKeyAcrossGroups && Array.isArray(acc.works)) {
+          for (let wi = 0; wi < acc.works.length; wi++) {
+            const w = acc.works[wi];
+            if (isPlainObject(w)) checkPw(w.workId);
+            if (hasSharedPwKeyAcrossGroups) break;
+          }
+        }
+      }
+    }
+    const exportGroups = [...groupSetPresent].sort((a, b) =>
+      compareGroupNamesWithOrder(a, b, dataset.groupOrderMap)
+    );
+    const usedSheetNamesLower = new Set(SHEET_NAMES.map((n) => n.toLowerCase()));
+    for (const g of exportGroups) {
+      let gSummaryForAnalysis = analysisSummaryRows;
+      if (hasSharedPwKeyAcrossGroups) {
+        const gSet = new Set([g]);
+        const gAccounts = dataset.outputAccountsData.filter((a) => a && String(a.group).trim() === g);
+        let gSum = buildContentSummaryRows({
+          contents: allContents,
+          accounts: dataset.allAccountsData,
+          link,
+          worksDaily: latestWorksDailyByGp,
+          date: resolvedTo,
+          overrides: dataset.linkOverrides,
+          groups: gSet,
+          groupSettings: dataset.groupSettings,
+        });
+        gSum = filterSummaryRowsByGroupScope(
+          gSum,
+          allContents,
+          link,
+          gAccounts,
+          gSet,
+          resolvedTo,
+          dataset.startDateByGroup
+        );
+        gSummaryForAnalysis = resolveAnalysisPublishTimes(
+          gSum,
+          allContents,
+          gAccounts,
+          link,
+          resolvedTo,
+          dataset.allPushRecords,
+          deletedFilter,
+          dataset.startDateByGroup,
+          gSet
+        ).summaryRows;
+      }
+      const gAnalysis = buildStatsAnalysis({
+        dailyRows: analysisRows,
+        accountWorkDailyRows,
+        summaryRows: gSummaryForAnalysis,
+        accountRows: accountDaily.allRows,
+        intradayRows: intradayAnalysisRows,
+        group: g,
+        to: resolvedTo,
+        period: analysisPeriod,
+        now: nowVal,
+      });
+      const sheetName = buildGroupAnalysisSheetName(g, usedSheetNamesLower);
+      groupAnalyses[g] = gAnalysis;
+      groupSheetNames.push(sheetName);
+      groupSheets[sheetName] = buildAnalysisSheet(gAnalysis);
+    }
+  }
 
   const workCounts = computeWorkCountsFromSummaryRows(summaryRows);
   const counts = {
@@ -4385,6 +4816,7 @@ function buildStatsWorkbookData(options = {}, deps) {
     appVersion,
     counts,
     analysisPeriod,
+    group: effectiveSingleGroup || "",
   });
 
   const sheets = {
@@ -4394,11 +4826,24 @@ function buildStatsWorkbookData(options = {}, deps) {
     平台日汇总: platformDaily.aoa,
     账号日快照: accountDailyAoa,
     分析: analysisAoa,
+    ...groupSheets,
     字段说明: schemaAoa,
     导出信息: metaAoa,
   };
 
-  for (const name of SHEET_NAMES) {
+  const sheetOrder = [
+    "作品日明细",
+    "作品时段明细",
+    "作品跨平台汇总",
+    "平台日汇总",
+    "账号日快照",
+    "分析",
+    ...groupSheetNames,
+    "字段说明",
+    "导出信息",
+  ];
+
+  for (const name of sheetOrder) {
     const aoa = sheets[name];
     const dataRows = Array.isArray(aoa) && aoa.length > 0 ? aoa.length - 1 : 0;
     if (dataRows > maxRows) {
@@ -4409,13 +4854,16 @@ function buildStatsWorkbookData(options = {}, deps) {
   return {
     from: resolvedFrom,
     to: resolvedTo,
+    group: effectiveSingleGroup || null,
     analysisPeriod,
     exportedAt,
     appVersion,
-    sheetOrder: [...SHEET_NAMES],
+    sheetOrder,
     sheets,
     counts,
     analysis,
+    groupAnalyses,
+    groupSheetNames,
   };
 }
 
@@ -4489,7 +4937,7 @@ function writeStatsXlsx(data, filePath, options = {}) {
   for (const name of order) {
     const aoa = Array.isArray(data.sheets[name]) ? data.sheets[name] : [];
     const ws = xlsx.utils.aoa_to_sheet(aoa);
-    const maxW = name === "字段说明" || name === "分析" ? 64 : 44;
+    const maxW = name === "字段说明" || isAnalysisSheetName(name) ? 64 : 44;
     ws["!cols"] = computeColWidths(aoa, maxW);
     xlsx.utils.book_append_sheet(wb, ws, name);
   }
@@ -5160,6 +5608,8 @@ module.exports = {
   SHEET_NAMES,
   MAX_SHEET_ROWS,
   ROW_LIMIT_EXCEEDED_CODE,
+  UNKNOWN_GROUP_CODE,
+  EXCEL_SHEET_NAME_MAX_LEN,
   FUTURE_DATE_RANGE_ERROR,
   WORK_DAILY_HEADERS,
   WORK_INTRADAY_HEADERS,
@@ -5171,6 +5621,10 @@ module.exports = {
   isValidDateStr,
   sanitizeTextCell,
   sanitizeNumberCell,
+  sanitizeExcelSheetSegment,
+  buildGroupAnalysisSheetName,
+  isAnalysisSheetName,
+  compareGroupNamesWithOrder,
   validateExportDateRange,
   assertExportRangeNotAllFuture,
   buildDefaultExportFileName,

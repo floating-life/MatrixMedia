@@ -2975,6 +2975,8 @@ function addWorkToBucket(bucket, workItem, metrics) {
   const workUrl = toSafeTrimmed(url);
   const pgKey = `${platform}|${group}`;
   if (platform) bucket.platforms.add(platform);
+  const trimmedGroup = toSafeTrimmed(group);
+  if (trimmedGroup) bucket.groups.add(trimmedGroup);
   bucket.workItems.push(workItem);
 
   if (!hasOwn(bucket.perPlatform, pgKey)) {
@@ -3151,7 +3153,8 @@ function buildContentSummaryRows({
     recordFirstDate,
     minWorkPublishMs,
     isUnlinked,
-    canAssignTarget = true
+    canAssignTarget = true,
+    targetGroups = null
   ) => ({
     contentKey,
     title: title || "(无标题)",
@@ -3161,6 +3164,8 @@ function buildContentSummaryRows({
     isUnlinked,
     canAssignTarget: Boolean(!isUnlinked && canAssignTarget && !isUnstableRecordKey(contentKey)),
     platforms: new Set(),
+    groups: new Set(),
+    targetGroups: targetGroups instanceof Set ? new Set(targetGroups) : new Set(),
     perPlatform: {},
     workItems: [],
     hiddenWorkCount: 0,
@@ -3176,8 +3181,10 @@ function buildContentSummaryRows({
     const rawTargets = Array.isArray(c.targets) ? c.targets.filter(isPlainObject) : [];
     const hasTargets = rawTargets.length > 0;
     const eligibleTargetsByGp = new Map();
+    const targetGroups = new Set();
     let eligibleCount = 0;
     let minEligibleTargetDate = "";
+    let minGroupTargetDate = "";
 
     for (const t of rawTargets) {
       const rawTDate = toSafeTrimmed(t.recordDate);
@@ -3193,7 +3200,18 @@ function buildContentSummaryRows({
       if (tDate && (!minEligibleTargetDate || tDate < minEligibleTargetDate)) {
         minEligibleTargetDate = tDate;
       }
-      const gpKey = `${toSafeTrimmed(t.group)}|${toSafeTrimmed(t.platform)}`;
+      const tGroup = toSafeTrimmed(t.group);
+      if (groupSet) {
+        if (tGroup && groupSet.has(tGroup)) {
+          targetGroups.add(tGroup);
+          if (tDate && (!minGroupTargetDate || tDate < minGroupTargetDate)) {
+            minGroupTargetDate = tDate;
+          }
+        }
+      } else if (tGroup) {
+        targetGroups.add(tGroup);
+      }
+      const gpKey = `${tGroup}|${toSafeTrimmed(t.platform)}`;
       pushToMap(eligibleTargetsByGp, gpKey, {
         normUrl: normalizeDirectUrl(t.videoLink),
         matchTitles: collectMatchTitles(Array.isArray(t.matchTitles) ? t.matchTitles : [t.title]),
@@ -3204,7 +3222,9 @@ function buildContentSummaryRows({
       ? eligibleCount > 0
       : !cutoffDate || !contentDate || contentDate <= cutoffDate;
     const effectiveRecordDate = hasTargets
-      ? minEligibleTargetDate || (!cutoffDate || !contentDate || contentDate <= cutoffDate ? contentDate : "")
+      ? (groupSet && minGroupTargetDate) ||
+        minEligibleTargetDate ||
+        (!cutoffDate || !contentDate || contentDate <= cutoffDate ? contentDate : "")
       : contentDate;
     const canAssignTarget = c.assignable !== false && !isUnstableRecordKey(contentKey);
 
@@ -3215,6 +3235,7 @@ function buildContentSummaryRows({
       eligible,
       canAssignTarget,
       eligibleTargetsByGp,
+      targetGroups,
     });
 
     if (!eligible) continue;
@@ -3229,7 +3250,8 @@ function buildContentSummaryRows({
           effectiveRecordDate,
           null,
           false,
-          canAssignTarget
+          canAssignTarget,
+          targetGroups
         )
       );
     }
@@ -3453,7 +3475,8 @@ function buildContentSummaryRows({
               meta.recordDate,
               null,
               false,
-              meta.canAssignTarget
+              meta.canAssignTarget,
+              meta.targetGroups
             )
           : makeBucket(resolvedLinkedKey, fallbackTitle, "", "", null, false, true);
         buckets.set(bucketId, bucket);
@@ -3474,6 +3497,7 @@ function buildContentSummaryRows({
             platform,
             title: bestTitle,
             url: bestUrl,
+            ...(bestPubMs !== null ? { publishTime: bestPubMs } : {}),
             publishDate: bestPubMs !== null ? toUtc8DateStr(bestPubMs) : "",
             matchedBy: resolvedMatchedBy,
             score: resolvedScore,
@@ -3511,6 +3535,7 @@ function buildContentSummaryRows({
           platform,
           title: bestTitle || "(无标题)",
           url: bestUrl,
+          ...(bestPubMs !== null ? { publishTime: bestPubMs } : {}),
           publishDate: bestPubMs !== null ? toUtc8DateStr(bestPubMs) : "",
           matchedBy: resolvedMatchedBy === "manual-detach" ? "manual-detach" : null,
           score: null,
@@ -3539,9 +3564,15 @@ function buildContentSummaryRows({
     }
     const hasWorkPub = b.minWorkPublishMs !== null;
     const matchInfo = summarizeBucketMatch(b);
+    const rowGroups =
+      b.groups.size > 0
+        ? [...b.groups].sort(compareText)
+        : [...b.targetGroups].sort(compareText);
     const row = {
       contentKey: b.contentKey,
       title: b.title,
+      group: rowGroups.join("、"),
+      groups: rowGroups,
       file: b.file,
       firstPublishDate: hasWorkPub ? toUtc8DateStr(b.minWorkPublishMs) : b.recordFirstDate,
       firstPublishDateSource: hasWorkPub || b.isUnlinked ? "work" : "record",

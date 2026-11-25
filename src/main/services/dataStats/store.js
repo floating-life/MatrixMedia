@@ -3019,6 +3019,54 @@ function listExistingAccountGroupsFromDisk() {
 }
 
 /**
+ * 扫描本地账号记录（account/*.json）提取各分组的 groupOrder（对齐 accountGroupOrder.js 口径）。
+ * 返回无原型字典 `{ [group]: number }`；无记录或读取失败返回空字典。
+ */
+function readGroupOrderMapFromDisk() {
+  const map = Object.create(null);
+  const candidateDirs = [];
+  try {
+    if (app && typeof app.getPath === "function") {
+      const docs = app.getPath("documents");
+      if (docs) candidateDirs.push(path.join(docs, "MatrixMedia", "data", "account"));
+      const ud = app.getPath("userData");
+      if (ud) candidateDirs.push(path.join(ud, "data", "account"));
+    }
+  } catch (_) {}
+  for (const dir of candidateDirs) {
+    let entries;
+    try {
+      if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) continue;
+      entries = fs
+        .readdirSync(dir)
+        .filter((f) => /^\d{4}-\d{2}-\d{2}\.json$/.test(f))
+        .sort()
+        .reverse();
+    } catch (_) {
+      continue;
+    }
+    for (const file of entries) {
+      const rows = readJson(path.join(dir, file), []);
+      if (!Array.isArray(rows)) continue;
+      for (const row of rows) {
+        if (!isPlainObject(row)) continue;
+        const g =
+          (typeof row.group === "string" && row.group.trim()) ||
+          (typeof row.phone === "string" ? row.phone.split("-")[0].trim() : "");
+        if (!g || FORBIDDEN_PROTO_KEYS.has(g) || map[g] !== undefined) continue;
+        if (row.groupOrder !== undefined && row.groupOrder !== null && row.groupOrder !== "") {
+          const n = Number(row.groupOrder);
+          if (Number.isFinite(n) && n >= 0) {
+            map[g] = n;
+          }
+        }
+      }
+    }
+  }
+  return map;
+}
+
+/**
  * 首次启动默认起点日期迁移：
  * 仅当 group-settings.json 不存在时检查是否存在目标分组（data-stats 子目录或账号记录），
  * 若命中则写入对应默认值（{ "人间善恶录": "2026-11-15", "赛博老司机": "2026-11-24" } 的存在子集）。
@@ -3260,6 +3308,7 @@ module.exports = {
   writeWorksDailyAtomic,
   listGroupPlatformAccountsFromDisk,
   listExistingAccountGroupsFromDisk,
+  readGroupOrderMapFromDisk,
   groupSettingsFile,
   isValidGroupStartDate,
   normalizeGroupSettings,

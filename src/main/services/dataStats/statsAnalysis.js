@@ -3437,6 +3437,358 @@ function buildNewWorksFirst24hSection(
   };
 }
 
+const STAT_TO_TOTAL_KEY = Object.freeze({
+  play: "totalPlay",
+  like: "totalLike",
+  comment: "totalComment",
+  share: "totalShare",
+  favorite: "totalFavorite",
+  fansDelta: "totalFansDelta",
+});
+
+function rowMatchesGroupMeta(row, targetGroup) {
+  if (!isPlainObject(row) || !targetGroup) return false;
+  if (Array.isArray(row.groups)) {
+    return row.groups.some((g) => String(g == null ? "" : g).trim() === targetGroup);
+  }
+  if (typeof row.group === "string" && row.group.trim() === targetGroup) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * 按单个分组过滤并拆分跨平台内容汇总行：
+ * - 一条内容只归属其作品所在分组；同一内容跨多个分组时，仅保留目标分组下的作品并重算合计、覆盖平台数与首发时间
+ * - 同一分组内按 platform|workId 与 contentKey 去重，确保不重复计入同一分组
+ */
+function filterSummaryRowsForGroup(summaryRows, targetGroup) {
+  const g = typeof targetGroup === "string" ? targetGroup.trim() : "";
+  if (!g) return Array.isArray(summaryRows) ? summaryRows : [];
+  if (!Array.isArray(summaryRows) || summaryRows.length === 0) return [];
+
+  const outByKey = new Map();
+  const seenPwByKey = new Map();
+
+  for (let i = 0; i < summaryRows.length; i++) {
+    const row = summaryRows[i];
+    if (!isPlainObject(row) || !row.contentKey) continue;
+    const ck = String(row.contentKey);
+    const hasPerPlatformObj = isPlainObject(row.perPlatform);
+    const pgEntries = hasPerPlatformObj ? Object.entries(row.perPlatform) : [];
+
+    let seenPw = seenPwByKey.get(ck);
+    if (!seenPw) {
+      seenPw = new Set();
+      seenPwByKey.set(ck, seenPw);
+    }
+
+    if (pgEntries.length > 0) {
+      let totalValidCells = 0;
+      let keptCellCount = 0;
+      const keptPerPlatform = {};
+
+      for (let pi = 0; pi < pgEntries.length; pi++) {
+        const [pgKey, cell] = pgEntries[pi];
+        if (!isPlainObject(cell)) continue;
+        totalValidCells += 1;
+        const { platform, group: pgGroupRaw } = parsePgKey(pgKey);
+        if (!platform) continue;
+        const pgGroup = pgGroupRaw.trim();
+
+        let matchedCell = null;
+        if (pgGroup) {
+          if (pgGroup !== g) continue;
+          if (Array.isArray(cell.works) && cell.works.length > 0) {
+            const uniqueWorks = [];
+            for (const w of cell.works) {
+              if (!isPlainObject(w)) continue;
+              const wp =
+                typeof w.platform === "string" && w.platform.trim() ? w.platform.trim() : platform;
+              const wid = w.workId == null ? "" : String(w.workId).trim();
+              const pwKey = wid ? `${wp}|${wid}` : "";
+              if (pwKey) {
+                if (seenPw.has(pwKey)) continue;
+                seenPw.add(pwKey);
+              }
+              uniqueWorks.push(w);
+            }
+            if (!uniqueWorks.length) continue;
+            if (uniqueWorks.length === cell.works.length) {
+              matchedCell = cell;
+            } else {
+              const recomputed = {
+                urls: [],
+                workIds: [],
+                works: uniqueWorks,
+              };
+              for (const k of WORK_STAT_KEYS) recomputed[k] = null;
+              for (const w of uniqueWorks) {
+                for (const k of WORK_STAT_KEYS) {
+                  const v = hasOwn(w, k) ? fastNormalizeMetric(w[k]) : null;
+                  recomputed[k] = addNullable(recomputed[k], v);
+                }
+                if (w.workId != null && w.workId !== "") recomputed.workIds.push(String(w.workId));
+                if (typeof w.url === "string" && w.url.trim() && !recomputed.urls.includes(w.url.trim())) {
+                  recomputed.urls.push(w.url.trim());
+                }
+              }
+              matchedCell = recomputed;
+            }
+          } else {
+            const pwKeys = collectCellWorkPwKeys(platform, cell);
+            if (pwKeys.length > 0) {
+              let anyNew = false;
+              for (const pwKey of pwKeys) {
+                if (!seenPw.has(pwKey)) {
+                  seenPw.add(pwKey);
+                  anyNew = true;
+                }
+              }
+              if (!anyNew) continue;
+            }
+            matchedCell = cell;
+          }
+        } else {
+          // 兼容 pgKey 未携带 "|group" 的调用：按 works[].group 或行级 group 归属
+          if (
+            Array.isArray(cell.works) &&
+            cell.works.some((w) => isPlainObject(w) && typeof w.group === "string" && w.group.trim())
+          ) {
+            const groupWorks = [];
+            for (const w of cell.works) {
+              if (!isPlainObject(w)) continue;
+              if (String(w.group || "").trim() !== g) continue;
+              const wp =
+                typeof w.platform === "string" && w.platform.trim() ? w.platform.trim() : platform;
+              const wid = w.workId == null ? "" : String(w.workId).trim();
+              const pwKey = wid ? `${wp}|${wid}` : "";
+              if (pwKey) {
+                if (seenPw.has(pwKey)) continue;
+                seenPw.add(pwKey);
+              }
+              groupWorks.push(w);
+            }
+            if (!groupWorks.length) continue;
+            const recomputed = { urls: [], workIds: [], works: groupWorks };
+            for (const k of WORK_STAT_KEYS) recomputed[k] = null;
+            for (const w of groupWorks) {
+              for (const k of WORK_STAT_KEYS) {
+                const v = hasOwn(w, k) ? fastNormalizeMetric(w[k]) : null;
+                recomputed[k] = addNullable(recomputed[k], v);
+              }
+              if (w.workId != null && w.workId !== "") recomputed.workIds.push(String(w.workId));
+              if (typeof w.url === "string" && w.url.trim() && !recomputed.urls.includes(w.url.trim())) {
+                recomputed.urls.push(w.url.trim());
+              }
+            }
+            matchedCell = recomputed;
+          } else if (rowMatchesGroupMeta(row, g)) {
+            const pwKeys = collectCellWorkPwKeys(platform, cell);
+            if (pwKeys.length > 0) {
+              let anyNew = false;
+              for (const pwKey of pwKeys) {
+                if (!seenPw.has(pwKey)) {
+                  seenPw.add(pwKey);
+                  anyNew = true;
+                }
+              }
+              if (!anyNew) continue;
+            }
+            matchedCell = cell;
+          } else {
+            continue;
+          }
+        }
+
+        const outPgKey = pgGroup ? pgKey : `${platform}|${g}`;
+        if (!hasOwn(keptPerPlatform, outPgKey)) {
+          keptPerPlatform[outPgKey] = matchedCell;
+        } else {
+          const prevCell = keptPerPlatform[outPgKey];
+          const merged = {
+            ...prevCell,
+            urls: Array.isArray(prevCell.urls) ? [...prevCell.urls] : [],
+            workIds: Array.isArray(prevCell.workIds) ? [...prevCell.workIds] : [],
+            works: Array.isArray(prevCell.works) ? [...prevCell.works] : [],
+          };
+          for (const k of WORK_STAT_KEYS) {
+            const pv = hasOwn(prevCell, k) ? fastNormalizeMetric(prevCell[k]) : null;
+            const nv = hasOwn(matchedCell, k) ? fastNormalizeMetric(matchedCell[k]) : null;
+            merged[k] = addNullable(pv, nv);
+          }
+          if (Array.isArray(matchedCell.urls)) {
+            for (const u of matchedCell.urls) {
+              if (!merged.urls.includes(u)) merged.urls.push(u);
+            }
+          }
+          if (Array.isArray(matchedCell.workIds)) {
+            for (const wid of matchedCell.workIds) {
+              if (!merged.workIds.includes(wid)) merged.workIds.push(wid);
+            }
+          }
+          if (Array.isArray(matchedCell.works)) {
+            for (const w of matchedCell.works) merged.works.push(w);
+          }
+          keptPerPlatform[outPgKey] = merged;
+        }
+        keptCellCount += 1;
+      }
+
+      if (keptCellCount === 0) continue;
+
+      const isSplit = keptCellCount < totalValidCells;
+      const pubByGroup =
+        isPlainObject(row._publishByGroup) && hasOwn(row._publishByGroup, g)
+          ? row._publishByGroup[g]
+          : null;
+
+      let nextFirstPublishDate =
+        typeof row.firstPublishDate === "string" ? row.firstPublishDate : "";
+      let nextFirstPublishTime =
+        row.firstPublishTime !== undefined
+          ? row.firstPublishTime
+          : row.firstPublishTimeMs !== undefined
+          ? row.firstPublishTimeMs
+          : null;
+
+      if (pubByGroup) {
+        nextFirstPublishDate = pubByGroup.pubDate || "";
+        nextFirstPublishTime = pubByGroup.pubMs != null ? pubByGroup.pubMs : null;
+      } else if (isSplit) {
+        let minMs = null;
+        let minDate = "";
+        for (const cell of Object.values(keptPerPlatform)) {
+          if (!Array.isArray(cell.works)) continue;
+          for (const w of cell.works) {
+            if (!isPlainObject(w)) continue;
+            const wMs = parseTimestampMs(
+              w.publishTime !== undefined ? w.publishTime : w.publishTimeMs
+            );
+            if (wMs !== null && (minMs === null || wMs < minMs)) minMs = wMs;
+            const wDate =
+              typeof w.publishDate === "string" && isValidDateStr(w.publishDate.trim())
+                ? w.publishDate.trim()
+                : wMs !== null
+                ? toUtc8DateStr(wMs)
+                : "";
+            if (wDate && (!minDate || wDate < minDate)) minDate = wDate;
+          }
+        }
+        if (minMs !== null) {
+          const msDate = toUtc8DateStr(minMs);
+          if (msDate && (!minDate || msDate < minDate)) minDate = msDate;
+        }
+        if (minDate || minMs !== null) {
+          nextFirstPublishDate = minDate;
+          nextFirstPublishTime = minMs;
+        }
+      }
+
+      const existingOut = outByKey.get(ck);
+      if (!existingOut) {
+        const nextRow = {
+          ...row,
+          group: g,
+          groups: [g],
+          firstPublishDate: nextFirstPublishDate,
+          firstPublishTime: nextFirstPublishTime,
+          perPlatform: keptPerPlatform,
+        };
+        recomputeSummaryRowTotals(nextRow);
+        outByKey.set(ck, nextRow);
+      } else {
+        for (const [kPg, kCell] of Object.entries(keptPerPlatform)) {
+          if (!hasOwn(existingOut.perPlatform, kPg)) {
+            existingOut.perPlatform[kPg] = kCell;
+          } else {
+            const prevCell = existingOut.perPlatform[kPg];
+            const merged = {
+              ...prevCell,
+              urls: Array.isArray(prevCell.urls) ? [...prevCell.urls] : [],
+              workIds: Array.isArray(prevCell.workIds) ? [...prevCell.workIds] : [],
+              works: Array.isArray(prevCell.works) ? [...prevCell.works] : [],
+            };
+            for (const k of WORK_STAT_KEYS) {
+              const pv = hasOwn(prevCell, k) ? fastNormalizeMetric(prevCell[k]) : null;
+              const nv = hasOwn(kCell, k) ? fastNormalizeMetric(kCell[k]) : null;
+              merged[k] = addNullable(pv, nv);
+            }
+            if (Array.isArray(kCell.urls)) {
+              for (const u of kCell.urls) {
+                if (!merged.urls.includes(u)) merged.urls.push(u);
+              }
+            }
+            if (Array.isArray(kCell.workIds)) {
+              for (const wid of kCell.workIds) {
+                if (!merged.workIds.includes(wid)) merged.workIds.push(wid);
+              }
+            }
+            if (Array.isArray(kCell.works)) {
+              for (const w of kCell.works) merged.works.push(w);
+            }
+            existingOut.perPlatform[kPg] = merged;
+          }
+        }
+        if (
+          nextFirstPublishDate &&
+          (!existingOut.firstPublishDate || nextFirstPublishDate < existingOut.firstPublishDate)
+        ) {
+          existingOut.firstPublishDate = nextFirstPublishDate;
+        }
+        const curMs = parseTimestampMs(existingOut.firstPublishTime);
+        const nxtMs = parseTimestampMs(nextFirstPublishTime);
+        if (nxtMs !== null && (curMs === null || nxtMs < curMs)) {
+          existingOut.firstPublishTime = nxtMs;
+        }
+        recomputeSummaryRowTotals(existingOut);
+      }
+    } else if (rowMatchesGroupMeta(row, g)) {
+      if (!outByKey.has(ck)) {
+        const pubByGroup =
+          isPlainObject(row._publishByGroup) && hasOwn(row._publishByGroup, g)
+            ? row._publishByGroup[g]
+            : null;
+        outByKey.set(ck, {
+          ...row,
+          group: g,
+          groups: [g],
+          ...(pubByGroup
+            ? {
+                firstPublishDate: pubByGroup.pubDate || row.firstPublishDate || "",
+                firstPublishTime:
+                  pubByGroup.pubMs != null ? pubByGroup.pubMs : row.firstPublishTime ?? null,
+              }
+            : {}),
+        });
+      }
+    }
+  }
+
+  return [...outByKey.values()];
+}
+
+function recomputeSummaryRowTotals(row) {
+  const distinctPlatforms = new Set();
+  const totals = {};
+  for (const k of WORK_STAT_KEYS) totals[k] = null;
+  if (isPlainObject(row.perPlatform)) {
+    for (const [pgKey, cell] of Object.entries(row.perPlatform)) {
+      if (!isPlainObject(cell)) continue;
+      const { platform } = parsePgKey(pgKey);
+      if (platform) distinctPlatforms.add(platform);
+      for (const k of WORK_STAT_KEYS) {
+        const v = hasOwn(cell, k) ? fastNormalizeMetric(cell[k]) : null;
+        totals[k] = addNullable(totals[k], v);
+      }
+    }
+  }
+  row.platformCount = distinctPlatforms.size;
+  for (const k of WORK_STAT_KEYS) {
+    row[STAT_TO_TOTAL_KEY[k]] = totals[k];
+  }
+}
+
 /**
  * 纯函数构建数据分析结果（7 节 + 新作品前 24 小时），供 GUI「数据分析」tab 与 Excel「分析」sheet 共用。
  *
@@ -3446,6 +3798,7 @@ function buildNewWorksFirst24hSection(
  * @param {Array<object>} [params.summaryRows]           跨平台内容汇总行（截至 to，可携带 S6 最早已知 firstPublishTime）
  * @param {Array<object>} [params.accountRows]           账号日快照行（截至 to）
  * @param {Array<object>} [params.intradayRows]          作品分时段快照行（近 7 天，用于「新作品前 24 小时」起量曲线）
+ * @param {string} [params.group]                        可选，单个分组名；传入时全量 7 节与图表数据均仅按该分组统计（跨组内容按作品拆开计）
  * @param {string} [params.to]                           截止日期 YYYY-MM-DD（上限为 UTC+8 今天，未来日期自动夹到今天）
  * @param {number} [params.period=30]                    分析周期天数（7 / 30 或导出区间天数）
  * @param {number|Date} [params.now]                     注入当前时间（UTC+8 今天上限与兜底截止日，保证确定性）
@@ -3456,37 +3809,71 @@ function buildStatsAnalysis({
   summaryRows = [],
   accountRows = [],
   intradayRows = [],
+  group,
   to,
   period = DEFAULT_ANALYSIS_PERIOD,
   now = Date.now(),
 } = {}) {
+  const resolvedGroup = typeof group === "string" && group.trim() ? group.trim() : "";
+  const effectiveDailyRows = resolvedGroup
+    ? (Array.isArray(dailyRows) ? dailyRows : []).filter(
+        (r) => isPlainObject(r) && String(r.group == null ? "" : r.group).trim() === resolvedGroup
+      )
+    : dailyRows;
+  const effectiveAccountWorkDailyRows = Array.isArray(accountWorkDailyRows)
+    ? resolvedGroup
+      ? accountWorkDailyRows.filter(
+          (r) => isPlainObject(r) && String(r.group == null ? "" : r.group).trim() === resolvedGroup
+        )
+      : accountWorkDailyRows
+    : null;
+  const effectiveAccountRows = resolvedGroup
+    ? (Array.isArray(accountRows) ? accountRows : []).filter(
+        (r) => isPlainObject(r) && String(r.group == null ? "" : r.group).trim() === resolvedGroup
+      )
+    : accountRows;
+  const effectiveIntradayRows = resolvedGroup
+    ? (Array.isArray(intradayRows) ? intradayRows : []).filter(
+        (r) => isPlainObject(r) && String(r.group == null ? "" : r.group).trim() === resolvedGroup
+      )
+    : intradayRows;
+  const effectiveSummaryRows = resolvedGroup
+    ? filterSummaryRowsForGroup(summaryRows, resolvedGroup)
+    : summaryRows;
+
   const resolvedPeriod = resolvePeriod(period);
-  const resolvedTo = resolveToDate(to, dailyRows, accountRows, now, intradayRows);
+  const resolvedTo = resolveToDate(
+    to,
+    effectiveDailyRows,
+    effectiveAccountRows,
+    now,
+    effectiveIntradayRows
+  );
   const currentStart = shiftDateStr(resolvedTo, -(resolvedPeriod - 1));
   const prevEnd = shiftDateStr(currentStart, -1);
   const prevStart = shiftDateStr(currentStart, -resolvedPeriod);
 
   // 先用全量快照做去重、采集异常识别与截止日内清洗重算（第 1–5 节共用清洗后序列）
-  const summaryWorkToContent = buildSummaryWorkToContentMap(summaryRows);
+  const summaryWorkToContent = buildSummaryWorkToContentMap(effectiveSummaryRows);
   const { seriesByWork, allCollectionAnomalies, snapshotDays } = prepareWorkSeries(
-    dailyRows,
+    effectiveDailyRows,
     resolvedTo,
     summaryWorkToContent
   );
 
-  const contentRows = normalizeContentRows(summaryRows, resolvedTo, seriesByWork);
+  const contentRows = normalizeContentRows(effectiveSummaryRows, resolvedTo, seriesByWork);
   const contentMetaByKey = new Map();
   for (const c of contentRows) {
     contentMetaByKey.set(c.contentKey, c);
   }
 
   // 账号级异常判定（如旧作品下架导致账号总播放真实下降）使用未受起点过滤的全量作品数据
-  const accountCheckSeriesByWork = Array.isArray(accountWorkDailyRows)
-    ? prepareWorkSeries(accountWorkDailyRows, resolvedTo).seriesByWork
+  const accountCheckSeriesByWork = Array.isArray(effectiveAccountWorkDailyRows)
+    ? prepareWorkSeries(effectiveAccountWorkDailyRows, resolvedTo).seriesByWork
     : seriesByWork;
 
   const { cleanedAccountRows, accountPlaysAnomalies } = prepareAccountSeries(
-    accountRows,
+    effectiveAccountRows,
     accountCheckSeriesByWork,
     resolvedTo
   );
@@ -3508,7 +3895,7 @@ function buildStatsAnalysis({
     to: resolvedTo,
   });
   const newWorksFirst24h = buildNewWorksFirst24hSection(
-    intradayRows,
+    effectiveIntradayRows,
     contentMetaByKey,
     seriesByWork,
     resolvedTo,
@@ -3542,6 +3929,7 @@ function buildStatsAnalysis({
   });
 
   const result = {
+    group: resolvedGroup || null,
     to: resolvedTo,
     period: resolvedPeriod,
     currentRange: { from: currentStart, to: resolvedTo },
@@ -3593,5 +3981,6 @@ module.exports = {
   ACCOUNT_PLAYS_SHARP_DROP_RATIO,
   ANALYSIS_THRESHOLDS,
   classifyTrajectory,
+  filterSummaryRowsForGroup,
   buildStatsAnalysis,
 };
