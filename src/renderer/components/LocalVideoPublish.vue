@@ -761,7 +761,7 @@
         >
       </div>
       <p class="bt2-tip" style="margin-bottom: 12px">
-        声明文件支持列：文件名 / 标题 / 简介 / 标签 / 视频号短标题 / 封面 / 横版封面（选填，抖音与视频号 4:3 封面；路径无效会阻断发布）/ 合集 / 分平台覆盖列（如「抖音标题」「百家号标题」「快手简介」，优先于通用标题/简介）。
+        声明文件支持列：文件名 / 标题 / 简介 / 标签 / 视频号短标题 / 封面 / 横版封面（选填，抖音与视频号 4:3 封面；路径无效会阻断发布）/ 合集 / 分平台覆盖列（如「抖音标题」「百家号标题」「百家号简介」「快手简介」，优先于通用标题/简介；百家号无独立标题，总作品描述≤50字）。
       </p>
 
       <el-table
@@ -1027,7 +1027,7 @@ import AiGenerateButton from "@/components/ai/AiGenerateButton.vue";
 
 const TITLE_OVERRIDE_PLATFORMS = [
   { pt: "抖音", hint: "≤30字" },
-  { pt: "百家号", hint: "≤20字" },
+  { pt: "百家号", hint: "作品描述首句，共≤50字" },
   { pt: "小红书", hint: "≤20字" },
   { pt: "头条", hint: "≤30字" },
   { pt: "哔哩哔哩", hint: "≤80字" },
@@ -1603,6 +1603,9 @@ export default {
       const rule = safeGetPlatformRule(pt);
       if (rule && rule.titleMax != null) {
         return `留空用通用标题（≤${rule.titleMax}字）`;
+      }
+      if (safeResolvePlatformRuleKey(pt) === "百家号") {
+        return "留空用通用标题（作品描述首句，共≤50字）";
       }
       return "留空用通用标题";
     },

@@ -65,13 +65,14 @@ export const PLATFORM_RULES = Object.freeze({
   }),
   百家号: Object.freeze({
     code: "bjh",
-    titleMax: 20, // 已确认（百家号视频标题上限 20 字；若英文/数字按 0.5 计则本值更保守，待真机核对）
-    descMax: null, // 当前 bjh.js 不填写简介（待真机核对新版是否有简介栏及上限）
-    tagMax: null, // 当前 bjh.js 不填写标签（待真机核对）
+    titleMax: null, // 真机 2026-11-25 确认：百家号新版视频页无独立标题框，只有 50 字「作品描述」；「百家号标题」覆盖列作为作品描述第一句
+    descMax: 50, // 真机 2026-11-25 确认：作品描述计数器上限 50 字（含拼接进去的标题与 #话题）
+    tagMax: null, // 不按固定个数硬裁，受 50 字 descMax 约束（放不下则丢话题）
     coverRatios: Object.freeze([]),
-    usesCombinedDescription: false,
-    hasSeparateTitle: true,
-    tagsInDescriptionBudget: false,
+    usesCombinedDescription: true,
+    hasSeparateTitle: false,
+    combinesTitleIntoDescription: true,
+    tagsInDescriptionBudget: true,
   }),
   头条: Object.freeze({
     code: "tt",
@@ -530,6 +531,80 @@ function collapseText(t) {
   return String(t || "").replace(/\s+/g, "");
 }
 
+function dedupeTagList(lists) {
+  const out = [];
+  const seen = new Set();
+  for (const list of lists) {
+    if (!Array.isArray(list)) continue;
+    for (const t of list) {
+      if (!t || seen.has(t)) continue;
+      seen.add(t);
+      out.push(t);
+    }
+  }
+  return out;
+}
+
+/** 百家号作品描述首句（标题）与正文拼接：标题末尾或正文开头已有标点时不重复加「，」 */
+function joinBjhTitleAndBody(titleText, bodyText) {
+  const t = String(titleText || "").trim();
+  const b = String(bodyText || "").trim();
+  if (!t) return b;
+  if (!b) return t;
+  if (collapseText(b).startsWith(collapseText(t))) return b;
+  const sep =
+    /[，。！？、；：,.!?;:]$/.test(t) || /^[，。！？、；：,.!?;:]/.test(b)
+      ? ""
+      : "，";
+  return `${t}${sep}${b}`;
+}
+
+/** 百家号作品描述按上限截断，并保证 ≤ 上限的标题部分始终完整保留 */
+function truncateBjhTextPreservingTitle(fullText, titleText, descLimit) {
+  const origLen = countChars(fullText);
+  if (descLimit == null || origLen <= descLimit) {
+    return {
+      text: fullText,
+      truncated: false,
+      originalLength: origLen,
+      finalLength: origLen,
+    };
+  }
+  const t = String(titleText || "");
+  const tLen = countChars(t);
+  if (!t || !fullText.startsWith(t)) {
+    return truncateTextByPunctuation(fullText, descLimit);
+  }
+  if (tLen >= descLimit) {
+    return {
+      text: t,
+      truncated: true,
+      originalLength: origLen,
+      finalLength: tLen,
+    };
+  }
+  const res = truncateTextByPunctuation(fullText, descLimit);
+  if (res.text.startsWith(t)) {
+    return res;
+  }
+  // 标点截断落在了标题内部或裁掉了标题末尾标点 → 完整保留标题
+  if (tLen >= descLimit / 2) {
+    return {
+      text: t,
+      truncated: true,
+      originalLength: origLen,
+      finalLength: tLen,
+    };
+  }
+  const hard = Array.from(fullText).slice(0, descLimit).join("");
+  return {
+    text: hard,
+    truncated: true,
+    originalLength: origLen,
+    finalLength: countChars(hard),
+  };
+}
+
 function makeAdjustment({
   platform,
   field,
@@ -698,7 +773,294 @@ export function applyPlatformPublishRules(platform, input = {}, options = {}) {
   let combinedDescription = description;
   let ksFillText = description;
 
-  if (rule.tagsInDescriptionBudget) {
+  if (canonical === "百家号") {
+    // 百家号新版视频发布页无独立标题框，只有 50 字「作品描述」：
+    // 1) 若填了「百家号简介」覆盖（descByPlatform）→ 直接用它（不拼标题）；
+    // 2) 否则 = 百家号标题（覆盖或通用标题）+ 「，」+ 通用简介正文，整体按 50 字用标点截断规则截
+    //    （标题必须完整保留；标题自身超 50 则只截标题）；
+    // 3) 话题按 S17 规则识别，仅在 50 字内放得下时保留，放不下就丢话题。
+    const descLimit = rule.descMax;
+    const formatTagsStr = (list) => list.map((t) => `#${t}`).join(" ");
+
+    if (overrideDesc) {
+      const extracted = extractInlineHashtags(overrideDesc);
+      const inlineSet = new Set(extracted.inlineTags);
+      const allTagNames = dedupeTagList([extracted.inlineTags, keptTags]);
+      const extraTagsNatural = allTagNames.filter((t) => !inlineSet.has(t));
+      const extraTagsNaturalStr = formatTagsStr(extraTagsNatural);
+      const naturalCombined = [overrideDesc, extraTagsNaturalStr]
+        .filter(Boolean)
+        .join(" ");
+
+      if (descLimit == null || countChars(naturalCombined) <= descLimit) {
+        bodyDescription = overrideDesc;
+        keptTags = allTagNames;
+        combinedDescription = naturalCombined;
+      } else if (countChars(overrideDesc) <= descLimit) {
+        // 覆盖简介本身 ≤ 50：完整保留覆盖简介，仅追加 50 字内放得下的外部话题
+        const remaining = overrideDesc
+          ? Math.max(0, descLimit - countChars(overrideDesc) - 1)
+          : descLimit;
+        const { kept: keptExtra, droppedByLength } = selectTagsWithinBudget(
+          extraTagsNatural,
+          { tagMax: rule.tagMax, maxTagsBudget: remaining }
+        );
+        bodyDescription = overrideDesc;
+        keptTags = dedupeTagList([extracted.inlineTags, keptExtra]);
+        combinedDescription = [overrideDesc, formatTagsStr(keptExtra)]
+          .filter(Boolean)
+          .join(" ");
+        if (droppedByLength.length > 0) {
+          adjustments.push(
+            makeAdjustment({
+              platform: canonical,
+              field: "tags",
+              action: "trim_tags",
+              limit: descLimit,
+              originalLength: allTagNames.length,
+              finalLength: keptTags.length,
+              droppedTags: droppedByLength,
+              reason: `标签总长超出简介上限 ${descLimit} 字`,
+            })
+          );
+        }
+      } else {
+        // 覆盖简介本身 > 50：剥离内联话题后按标点截断正文至 ≤ 50，剩余空间放得下的话题才保留
+        const bodySource = extracted.body;
+        const bodyRes = truncateTextByPunctuation(bodySource, descLimit);
+        const remaining = bodyRes.text
+          ? Math.max(0, descLimit - countChars(bodyRes.text) - 1)
+          : descLimit;
+        const { kept: workingTags, droppedByLength } = selectTagsWithinBudget(
+          allTagNames,
+          { tagMax: rule.tagMax, maxTagsBudget: remaining }
+        );
+        bodyDescription = bodyRes.text;
+        keptTags = workingTags;
+        combinedDescription = [bodyDescription, formatTagsStr(workingTags)]
+          .filter(Boolean)
+          .join(" ");
+        if (droppedByLength.length > 0) {
+          adjustments.push(
+            makeAdjustment({
+              platform: canonical,
+              field: "tags",
+              action: "trim_tags",
+              limit: descLimit,
+              originalLength: allTagNames.length,
+              finalLength: keptTags.length,
+              droppedTags: droppedByLength,
+              reason: `标签总长超出简介上限 ${descLimit} 字`,
+            })
+          );
+        }
+        if (bodyRes.truncated) {
+          adjustments.push(
+            makeAdjustment({
+              platform: canonical,
+              field: "description",
+              action: "truncate",
+              limit: descLimit,
+              originalLength: countChars(overrideDesc),
+              finalLength: countChars(combinedDescription),
+              originalPreview: previewText(overrideDesc, 18),
+              finalPreview: previewText(combinedDescription, 18),
+            })
+          );
+        }
+      }
+      // 同步 title 为覆盖正文，保证发布记录真实反映覆盖描述，且二次调用严格幂等
+      title = bodyDescription ? sanitizeTitle(bodyDescription) : "";
+      ksFillText = combinedDescription;
+    } else if (descLimit != null && title && countChars(title) > descLimit) {
+      // 标题自身超 50：只截标题（不拼通用简介正文），剩余空间放得下的话题才保留
+      const descExtracted = extractInlineHashtags(baseDesc);
+      const origTitle = title;
+      const origNatural = joinBjhTitleAndBody(origTitle, baseDesc);
+      const titleRes = truncateTextByPunctuation(origTitle, descLimit);
+      title = titleRes.text;
+
+      const titleInlineTags = extractInlineHashtags(title).inlineTags;
+      const titleInlineSet = new Set(titleInlineTags);
+      const allTagNames = dedupeTagList([
+        titleInlineTags,
+        descExtracted.inlineTags,
+        keptTags,
+      ]);
+      const extraCandidates = allTagNames.filter(
+        (t) => !titleInlineSet.has(t)
+      );
+      const remaining = title
+        ? Math.max(0, descLimit - countChars(title) - 1)
+        : descLimit;
+      const { kept: keptExtra, droppedByLength } = selectTagsWithinBudget(
+        extraCandidates,
+        { tagMax: rule.tagMax, maxTagsBudget: remaining }
+      );
+      bodyDescription = title;
+      keptTags = dedupeTagList([titleInlineTags, keptExtra]);
+      combinedDescription = [bodyDescription, formatTagsStr(keptExtra)]
+        .filter(Boolean)
+        .join(" ");
+      ksFillText = combinedDescription;
+
+      adjustments.push(
+        makeAdjustment({
+          platform: canonical,
+          field: "description",
+          action: "truncate",
+          limit: descLimit,
+          originalLength: countChars(origNatural),
+          finalLength: countChars(combinedDescription),
+          originalPreview: previewText(origNatural, 18),
+          finalPreview: previewText(combinedDescription, 18),
+        })
+      );
+      if (droppedByLength.length > 0) {
+        adjustments.push(
+          makeAdjustment({
+            platform: canonical,
+            field: "tags",
+            action: "trim_tags",
+            limit: descLimit,
+            originalLength: allTagNames.length,
+            finalLength: keptTags.length,
+            droppedTags: droppedByLength,
+            reason: `标签总长超出简介上限 ${descLimit} 字`,
+          })
+        );
+      }
+    } else {
+      // 标题 ≤ 50（或无标题）：标题 + 「，」 + 通用简介正文，整体按 50 字截断且完整保留标题
+      const naturalBody = joinBjhTitleAndBody(title, baseDesc);
+      const naturalInlineTags = extractInlineHashtags(naturalBody).inlineTags;
+      const naturalInlineSet = new Set(naturalInlineTags);
+      const allTagNamesNatural = dedupeTagList([naturalInlineTags, keptTags]);
+      const extraTagsNatural = allTagNamesNatural.filter(
+        (t) => !naturalInlineSet.has(t)
+      );
+      const naturalCombined = [naturalBody, formatTagsStr(extraTagsNatural)]
+        .filter(Boolean)
+        .join(" ");
+
+      if (descLimit == null || countChars(naturalCombined) <= descLimit) {
+        bodyDescription = naturalBody;
+        keptTags = allTagNamesNatural;
+        combinedDescription = naturalCombined;
+      } else if (countChars(naturalBody) <= descLimit) {
+        // 组装文本本身 ≤ 50：保持正文与内联话题完整，仅追加 50 字内放得下的外部话题
+        const remaining = naturalBody
+          ? Math.max(0, descLimit - countChars(naturalBody) - 1)
+          : descLimit;
+        const { kept: keptExtra, droppedByLength } = selectTagsWithinBudget(
+          extraTagsNatural,
+          { tagMax: rule.tagMax, maxTagsBudget: remaining }
+        );
+        bodyDescription = naturalBody;
+        keptTags = dedupeTagList([naturalInlineTags, keptExtra]);
+        combinedDescription = [naturalBody, formatTagsStr(keptExtra)]
+          .filter(Boolean)
+          .join(" ");
+        if (droppedByLength.length > 0) {
+          adjustments.push(
+            makeAdjustment({
+              platform: canonical,
+              field: "tags",
+              action: "trim_tags",
+              limit: descLimit,
+              originalLength: allTagNamesNatural.length,
+              finalLength: keptTags.length,
+              droppedTags: droppedByLength,
+              reason: `标签总长超出简介上限 ${descLimit} 字`,
+            })
+          );
+        }
+      } else {
+        // 组装文本本身 > 50：只剥离简介部分的内联话题（不改动标题），按 50 字截断并完整保留标题，剩余空间放话题
+        const titleInlineTags = extractInlineHashtags(title).inlineTags;
+        const titleInlineSet = new Set(titleInlineTags);
+        let descBodyClean = "";
+        let descInlineTags = [];
+        if (title && baseDesc && baseDesc.startsWith(title)) {
+          const tailExt = extractInlineHashtags(baseDesc.slice(title.length));
+          const cleanTail = tailExt.body.replace(
+            /^[，。！？、；：,.!?;:\s]+$/,
+            ""
+          );
+          descBodyClean = joinBjhTitleAndBody(title, cleanTail);
+          descInlineTags = tailExt.inlineTags;
+        } else {
+          const descExt = extractInlineHashtags(baseDesc);
+          descBodyClean = joinBjhTitleAndBody(title, descExt.body);
+          descInlineTags = descExt.inlineTags;
+        }
+        const allTagNames = dedupeTagList([
+          titleInlineTags,
+          descInlineTags,
+          keptTags,
+        ]);
+        const extraCandidates = allTagNames.filter(
+          (t) => !titleInlineSet.has(t)
+        );
+        const truncRes = truncateBjhTextPreservingTitle(
+          descBodyClean,
+          title,
+          descLimit
+        );
+        const bodyFinal = truncRes.text;
+        const remaining = bodyFinal
+          ? Math.max(0, descLimit - countChars(bodyFinal) - 1)
+          : descLimit;
+        const { kept: keptExtra, droppedByLength } = selectTagsWithinBudget(
+          extraCandidates,
+          { tagMax: rule.tagMax, maxTagsBudget: remaining }
+        );
+        bodyDescription = bodyFinal;
+        keptTags = dedupeTagList([titleInlineTags, keptExtra]);
+        combinedDescription = [bodyDescription, formatTagsStr(keptExtra)]
+          .filter(Boolean)
+          .join(" ");
+
+        if (
+          title &&
+          bodyDescription &&
+          !collapseText(bodyDescription).startsWith(collapseText(title))
+        ) {
+          title = sanitizeTitle(bodyDescription);
+        }
+
+        if (droppedByLength.length > 0) {
+          adjustments.push(
+            makeAdjustment({
+              platform: canonical,
+              field: "tags",
+              action: "trim_tags",
+              limit: descLimit,
+              originalLength: allTagNames.length,
+              finalLength: keptTags.length,
+              droppedTags: droppedByLength,
+              reason: `标签总长超出简介上限 ${descLimit} 字`,
+            })
+          );
+        }
+        if (truncRes.truncated) {
+          adjustments.push(
+            makeAdjustment({
+              platform: canonical,
+              field: "description",
+              action: "truncate",
+              limit: descLimit,
+              originalLength: countChars(naturalBody),
+              finalLength: countChars(combinedDescription),
+              originalPreview: previewText(naturalBody, 18),
+              finalPreview: previewText(combinedDescription, 18),
+            })
+          );
+        }
+      }
+      ksFillText = combinedDescription;
+    }
+  } else if (rule.tagsInDescriptionBudget) {
     // 抖音 / 视频号 / 快手 / 小红书：#话题 与正文共享简介/描述上限
     // 检查简介内嵌 #话题（如用户在正文里手写了 #xxx）
     const extracted = extractInlineHashtags(description);

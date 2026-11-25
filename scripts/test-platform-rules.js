@@ -79,7 +79,11 @@ function testRuleTable() {
   }
 
   assert.strictEqual(PLATFORM_RULES["抖音"].titleMax, 30);
-  assert.strictEqual(PLATFORM_RULES["百家号"].titleMax, 20);
+  assert.strictEqual(PLATFORM_RULES["百家号"].titleMax, null);
+  assert.strictEqual(PLATFORM_RULES["百家号"].descMax, 50);
+  assert.strictEqual(PLATFORM_RULES["百家号"].hasSeparateTitle, false);
+  assert.strictEqual(PLATFORM_RULES["百家号"].combinesTitleIntoDescription, true);
+  assert.strictEqual(PLATFORM_RULES["百家号"].tagsInDescriptionBudget, true);
   assert.strictEqual(PLATFORM_RULES["小红书"].titleMax, 20);
   assert.strictEqual(PLATFORM_RULES["头条"].titleMax, 30);
   assert.strictEqual(PLATFORM_RULES["快手"].tagMax, 4);
@@ -189,30 +193,55 @@ function testApplyPlatformRulesFull() {
   const { applyPlatformPublishRules, countChars } = platformRules;
 
   // 3a-1. 覆盖标题优先于通用标题，且覆盖值本身超长（标点前 ≥ 一半 → 按标点截）
-  const bjhPunct = applyPlatformPublishRules("百家号", {
+  const xhsPunct = applyPlatformPublishRules("小红书", {
     title: "通用短标题",
     titleByPlatform: {
-      bjh: "百家号专属深度解读攻略，超过二十个字也要按标点截断",
+      xhs: "小红书专属深度解读攻略，超过二十个字也要按标点截断",
+    },
+  });
+  assert.strictEqual(xhsPunct.adjusted, true);
+  assert.strictEqual(xhsPunct.title, "小红书专属深度解读攻略");
+  assert.strictEqual(countChars(xhsPunct.title), 11);
+  assert.strictEqual(xhsPunct.adjustments[0].platform, "小红书");
+  assert.strictEqual(xhsPunct.adjustments[0].field, "title");
+  assert.strictEqual(xhsPunct.adjustments[0].originalLength, 25);
+  assert.strictEqual(xhsPunct.adjustments[0].finalLength, 11);
+  assert.ok(xhsPunct.adjustments[0].message.includes("25→11"));
+
+  // 3a-2. 覆盖值超长且标点前 < 一半 → 硬截到 20
+  const xhsHard = applyPlatformPublishRules("小红书", {
+    title: "通用短标题",
+    titleByPlatform: {
+      小红书: "小红书标题，后面连续二十五个汉字没有任何标点符号所以硬截",
+    },
+  });
+  assert.strictEqual(xhsHard.adjusted, true);
+  assert.strictEqual(countChars(xhsHard.title), 20);
+
+  // 3a-3. 百家号新版 50 字作品描述（无独立 titleMax）：标题超 50 只截标题，标点截断/硬截
+  const bjhPunct = applyPlatformPublishRules("百家号", {
+    title: "通用短标题",
+    description: "通用简介正文",
+    titleByPlatform: {
+      bjh: "百家号专属深度解读攻略第一段超过三十个字用来测试标点截断，超过五十个字也要按标点截断不保留后面多出来的字",
     },
   });
   assert.strictEqual(bjhPunct.adjusted, true);
-  assert.strictEqual(bjhPunct.title, "百家号专属深度解读攻略");
-  assert.strictEqual(countChars(bjhPunct.title), 11);
+  assert.strictEqual(bjhPunct.combinedDescription, "百家号专属深度解读攻略第一段超过三十个字用来测试标点截断");
+  assert.strictEqual(countChars(bjhPunct.combinedDescription), 28);
+  assert.ok(!bjhPunct.combinedDescription.includes("通用简介正文"));
   assert.strictEqual(bjhPunct.adjustments[0].platform, "百家号");
-  assert.strictEqual(bjhPunct.adjustments[0].field, "title");
-  assert.strictEqual(bjhPunct.adjustments[0].originalLength, 25);
-  assert.strictEqual(bjhPunct.adjustments[0].finalLength, 11);
-  assert.ok(bjhPunct.adjustments[0].message.includes("25→11"));
+  assert.strictEqual(bjhPunct.adjustments[0].field, "description");
 
-  // 3a-2. 覆盖值超长且标点前 < 一半 → 硬截到 20
   const bjhHard = applyPlatformPublishRules("百家号", {
     title: "通用短标题",
     titleByPlatform: {
-      百家号: "百家号标题，后面连续二十五个汉字没有任何标点符号所以硬截",
+      百家号:
+        "百家号标题，后面连续五十五个汉字没有任何标点符号所以必须硬截到五十个字以内测试看看有没有超出限制呢绝对超过五十个字",
     },
   });
   assert.strictEqual(bjhHard.adjusted, true);
-  assert.strictEqual(countChars(bjhHard.title), 20);
+  assert.strictEqual(countChars(bjhHard.combinedDescription), 50);
 
   // 3b. 抖音标题 ≤30、小红书标题 ≤20
   const dyLong = applyPlatformPublishRules("抖音", {
@@ -838,11 +867,11 @@ function testS17ReworkCases() {
     // 修改字段后快照自动失效并重新应用规则
     const baseR1 = applyPlatformPublishRules("百家号", { title: "短标题" });
     const mutated = videoMetadata.buildPlatformVideoTextDetailed("百家号", {
-      title: "事后被改成了超过二十个字的百家号长标题需要重新截断",
+      title: "事后被改成了超过五十个字的百家号长作品描述首句需要重新按五十上限截断并且绝不能超过平台计数器上限限制绝对超长",
       platformRulesApplied: createAppliedRuleSnapshot(baseR1),
     });
     assert.strictEqual(mutated.adjusted, true);
-    assert.ok(countChars(mutated.title) <= 20);
+    assert.ok(countChars(mutated.description) <= 50);
   }
 
   console.log("✓ 3.5 S17 返修用例（话题识别/不丢正文/全平台幂等/B站保话题/Grok三组用例）通过");
@@ -1092,32 +1121,45 @@ function testGuiLocalVideoPublish() {
   assert.ok(sfc.template.content.includes("将截断"));
   assert.ok(sfc.template.content.includes("分平台标题"));
 
-  // 预检提示（非阻断）：标题 35 字 + 5 个标签 → 抖音/百家号/小红书/快手均有预检项
+  // 百家号提示文案反映新版无独立标题、作品描述首句共 ≤50 字
+  const overrideList = comp.computed.platformTitleOverrideList.call(state);
+  const bjhOverrideItem = overrideList.find((x) => x.pt === "百家号");
+  assert.ok(bjhOverrideItem && bjhOverrideItem.hint.includes("50"));
+  assert.ok(
+    state.getPlatformTitleOverridePlaceholder("百家号").includes("50")
+  );
+
+  // 预检提示（非阻断）：标题 35 字 + 简介 20 字 + 5 个标签 → 抖音/百家号/小红书/快手均有预检项
   state.form.bt1 = "一二三四五六七八九十，一二三四五六七八九十，一二三四五六七八九十多余字";
+  state.form.description = "补充一段二十字以上的通用简介内容用来触发百家号预检";
   state.bqTags = ["甲", "乙", "丙", "丁", "戊"];
   const metaWarnings = comp.computed.metaRuleWarnings.call(state);
   assert.ok(metaWarnings.some((w) => w.platform === "抖音"));
   assert.ok(metaWarnings.some((w) => w.platform === "百家号"));
   assert.ok(metaWarnings.some((w) => w.platform === "快手"));
 
-  // 为百家号设置合规覆盖标题（≤20 字）后，百家号不再触发预检告警
-  state.setPlatformTitleOverride("百家号", "百家号合规短标题");
+  // 为百家号设置较短覆盖标题（加上简介+标签总长 ≤50 字）后，百家号不再触发预检告警
+  state.form.description = "简短补充";
+  state.setPlatformTitleOverride("百家号", "百家号合规首句");
   const afterOverrideWarnings = comp.computed.metaRuleWarnings.call(state);
   assert.ok(!afterOverrideWarnings.some((w) => w.platform === "百家号"));
 
-  // buildPlatformVideoPayload：百家号取覆盖标题；抖音截断并携带 ruleAdjustments；空 coverPathH 不污染 publishOptions
+  // buildPlatformVideoPayload：百家号取覆盖标题作首句拼作品描述；抖音截断并携带 ruleAdjustments；空 coverPathH 不污染 publishOptions
   const baseVideo = state.buildVideoPayload();
   const bjhNode = { id: "n-bjh", pt: "百家号", phone: "13800138000", url: "https://bjh" };
   const dyNode = { id: "n-dy", pt: "抖音", phone: "13800138000", url: "https://dy" };
   const ksNode = { id: "n-ks", pt: "快手", phone: "13800138000", url: "https://ks" };
 
   const bjhPayload = state.buildPlatformVideoPayload(bjhNode, baseVideo);
-  assert.strictEqual(bjhPayload.data.title, "百家号合规短标题");
+  assert.strictEqual(bjhPayload.data.title, "百家号合规首句");
+  assert.strictEqual(bjhPayload.data.description, "百家号合规首句，简短补充");
   assert.strictEqual(bjhPayload.data.ruleAdjustments, undefined);
   assert.strictEqual(bjhPayload.data.titleByPlatform, undefined);
   assert.ok(
     bjhPayload.data.platformRulesApplied &&
-      bjhPayload.data.platformRulesApplied.platform === "百家号"
+      bjhPayload.data.platformRulesApplied.platform === "百家号" &&
+      bjhPayload.data.platformRulesApplied.combinedDescription ===
+        "百家号合规首句，简短补充 #甲 #乙 #丙 #丁 #戊"
   );
   assert.strictEqual(
     Object.prototype.hasOwnProperty.call(bjhPayload.publishOptions, "coverPathH"),
@@ -1626,6 +1668,34 @@ async function testPublishVideoAndMcpIntegration() {
     assert.strictEqual(
       Object.prototype.hasOwnProperty.call(lastTaskPayload.publishOptions || {}, "coverPathH"),
       false
+    );
+    // 8b-2. 百家号新版 50 字作品描述走 publishVideo.js 端到端透传 snapshot 与 ruleAdjustments
+    const resBjh = await publishVideoMod.runSingleFilePublish({
+      platform: "百家号",
+      phone: "13800138000",
+      partition: "persist:13800138000百家号",
+      file: videoFile,
+      title: "济公断豆腐坊泼脏水",
+      description:
+        "黑心掌柜半夜往豆腐缸里泼脏水，结果被济公一眼识破当众拆穿真相，街坊邻居全都拍手叫好，掌柜灰溜溜逃跑",
+      tags: ["济公", "民间故事"],
+      noThrottle: true,
+      allowDuplicate: true,
+    });
+    assert.strictEqual(resBjh.status, "success");
+    assert.strictEqual(resBjh.exitCode, 0);
+    assert.ok(Array.isArray(resBjh.ruleAdjustments) && resBjh.ruleAdjustments.length > 0);
+    assert.ok(
+      lastTaskPayload.data.platformRulesApplied &&
+        lastTaskPayload.data.platformRulesApplied.platform === "百家号" &&
+        platformRules.countChars(
+          lastTaskPayload.data.platformRulesApplied.combinedDescription
+        ) <= 50
+    );
+    assert.ok(
+      lastTaskPayload.data.platformRulesApplied.combinedDescription.startsWith(
+        "济公断豆腐坊泼脏水"
+      )
     );
   } finally {
     Module._load = origLoad;

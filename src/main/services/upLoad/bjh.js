@@ -341,111 +341,552 @@ async function clickBjhActionButton(page, buttonText) {
   );
 }
 
-// 新版百家号标题是 contenteditable div（class 形如 FeEditorApp-xxx-contentEditable），
-// hash 中段每次构建可能变，用前缀+后缀模糊匹配。
-const BJH_TITLE_SELECTOR =
+// 新版百家号视频发布页没有独立标题框，唯一 contenteditable div（class 形如 FeEditorApp-xxx-contentEditable）
+// 是「作品描述」（上限 50 字）；hash 中段每次构建可能变，用前缀+后缀模糊匹配。
+export const BJH_DESC_SELECTOR =
   'div[contenteditable="true"][class*="contentEditable"], div[contenteditable="true"][class*="FeEditorApp"]';
 
-function normBjhTitle(s) {
-  return String(s || "").replace(/\s+/g, " ").trim();
+export function normBjhDesc(s) {
+  return String(s == null ? "" : s)
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
-// 一致，或页面按字数上限截断（当前是目标标题的前缀）都算正常；
-// 但若当前内容就是/含文件名（目标标题本身不含），一律不算正常。
-function bjhTitleOk(cur, want, fileStem) {
-  if (cur === want) return true;
-  const stem = normBjhTitle(fileStem);
-  if (stem && cur.includes(stem) && !want.includes(stem)) return false;
-  if (stem && want.length > stem.length && want.startsWith(stem) && cur === stem)
-    return false;
-  return cur.length >= 5 && want.startsWith(cur);
+/**
+ * 百家号作品描述严格相等校验：
+ * 回读 textContent 归一后必须完全等于期望文本（不是「包含」/前缀放行，也不再做 fileStem 猜测）；
+ * 任何文件名残留、重复叠加、截断或多余内容一律判失败。
+ */
+export function bjhDescOk(cur, want) {
+  const expected = normBjhDesc(want);
+  if (!expected) return true;
+  return normBjhDesc(cur) === expected;
 }
 
-// 清空标题框并输入目标标题。
-// 注意：不要用 page.evaluate + selection API，打包压缩后局部变量会被改名
-// 导致 "ReferenceError: r is not defined"。这里全部走 puppeteer 原生 API。
-async function fillBjhTitle(page, titleHandle, title) {
-  await titleHandle.focus();
-  // 三连击 = 选中当前段落（contenteditable 里等价于全选这一段）
-  await titleHandle.click({ clickCount: 3 });
-  await page.waitForTimeout(100);
-  // 兜底再来一次 Ctrl/Cmd+A 全选
-  const isMac = process.platform === "darwin";
-  await page.keyboard.down(isMac ? "Meta" : "Control");
-  await page.keyboard.press("KeyA");
-  await page.keyboard.up(isMac ? "Meta" : "Control");
-  await page.waitForTimeout(80);
-  await page.keyboard.press("Backspace");
-  await page.waitForTimeout(150);
-  // 再兜底：如果还有残留文字（个别情况下选区清不掉），直接通过 element.evaluate
-  // 把 textContent 置空（绑定到 handle，无需 selector，避免压缩问题）。
+/** 构造百家号确定性失败错误（标记 noRetry + bjhDeterministic，避免外层 5 次重复上传） */
+export function createBjhDeterministicError(
+  message,
+  code = "BJH_DESC_DETERMINISTIC"
+) {
+  const err = new Error(message);
+  err.bjhDeterministic = true;
+  err.noRetry = true;
+  err.code = code;
+  return err;
+}
+
+export function isBjhNoRetryError(err) {
+  return Boolean(
+    err && (err.noRetry === true || err.bjhDeterministic === true)
+  );
+}
+
+/** 关闭浮在作品描述框上的「新增智能文案…」蓝色引导气泡（有则点 ×，没有跳过） */
+export async function dismissBjhSmartCopyBubble(page) {
   try {
-    const remain = await titleHandle.evaluate(function (el) {
-      return (el.textContent || "").trim();
+    const result = await page.evaluate(function () {
+      var isVisible = function (el) {
+        if (!el || el.isConnected === false) return false;
+        var rect = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+        if (rect && (rect.width <= 0 || rect.height <= 0)) return false;
+        if (typeof window !== "undefined" && typeof window.getComputedStyle === "function") {
+          var st = window.getComputedStyle(el);
+          if (
+            st &&
+            (st.display === "none" ||
+              st.visibility === "hidden" ||
+              String(st.opacity) === "0")
+          ) {
+            return false;
+          }
+        }
+        return true;
+      };
+      var norm = function (t) {
+        return String(t || "").replace(/\s+/g, "");
+      };
+      var keywords = ["新增智能文案", "AI为您生成优质文案", "快来试试吧"];
+      var candidates = document.querySelectorAll(
+        '[class*="popover"], [class*="tooltip"], [class*="guide"], [class*="tip"], [class*="bubble"], [role="tooltip"], div'
+      );
+      var targetBubble = null;
+      var bestLen = Infinity;
+      for (var i = 0; i < candidates.length; i++) {
+        var el = candidates[i];
+        if (!isVisible(el)) continue;
+        var txt = norm(el.textContent);
+        if (!txt || txt.length > 120) continue;
+        var hit = false;
+        for (var k = 0; k < keywords.length; k++) {
+          if (txt.indexOf(keywords[k]) !== -1) {
+            hit = true;
+            break;
+          }
+        }
+        if (!hit) continue;
+        if (txt.length < bestLen) {
+          bestLen = txt.length;
+          targetBubble = el;
+        }
+      }
+      if (!targetBubble) return { found: false, closed: false };
+
+      var scopes = [targetBubble];
+      if (
+        targetBubble.parentElement &&
+        norm(targetBubble.parentElement.textContent).length <= 160
+      ) {
+        scopes.push(targetBubble.parentElement);
+      }
+      var closeSelectors = [
+        '[aria-label="close"]',
+        '[aria-label*="关闭"]',
+        'button[class*="close"]',
+        'span[class*="close"]',
+        'i[class*="close"]',
+        '[class*="close"]',
+        "button",
+        "svg",
+      ];
+      for (var s = 0; s < scopes.length; s++) {
+        var scope = scopes[s];
+        for (var c = 0; c < closeSelectors.length; c++) {
+          var nodes = scope.querySelectorAll(closeSelectors[c]);
+          for (var j = 0; j < nodes.length; j++) {
+            var n = nodes[j];
+            if (!isVisible(n)) continue;
+            var nt = norm(n.textContent);
+            if (
+              (closeSelectors[c] === "button" || closeSelectors[c] === "svg") &&
+              nt &&
+              nt !== "×" &&
+              nt !== "✕" &&
+              nt !== "x" &&
+              nt !== "X"
+            ) {
+              continue;
+            }
+            var clickTarget =
+              n.tagName &&
+              n.tagName.toLowerCase() === "svg" &&
+              n.parentElement
+                ? n.parentElement
+                : n;
+            try {
+              clickTarget.click();
+              return {
+                found: true,
+                closed: true,
+                selector: closeSelectors[c],
+                bubbleText: norm(targetBubble.textContent).slice(0, 60),
+              };
+            } catch (_) {}
+          }
+        }
+        var allKids = scope.querySelectorAll("span, i, div, a");
+        for (var m = 0; m < allKids.length; m++) {
+          var kid = allKids[m];
+          if (!isVisible(kid)) continue;
+          var kt = norm(kid.textContent);
+          if (kt === "×" || kt === "✕" || kt === "x" || kt === "X") {
+            try {
+              kid.click();
+              return {
+                found: true,
+                closed: true,
+                selector: "text-x",
+                bubbleText: norm(targetBubble.textContent).slice(0, 60),
+              };
+            } catch (_) {}
+          }
+        }
+      }
+      return {
+        found: true,
+        closed: false,
+        bubbleText: norm(targetBubble.textContent).slice(0, 60),
+      };
     });
-    if (remain) {
-      await titleHandle.evaluate(function (el) {
-        el.textContent = "";
-        el.dispatchEvent(new Event("input", { bubbles: true }));
-      });
-      await titleHandle.focus();
+    if (result && result.found) {
+      console.log("[bjh][desc] 智能文案引导气泡处理:", JSON.stringify(result));
+      if (result.closed) {
+        await page.waitForTimeout(200);
+      }
     }
-  } catch (_) {
-    /* 忽略兜底失败 */
+    return result || { found: false, closed: false };
+  } catch (e) {
+    console.warn("[bjh][desc] 检测/关闭智能文案气泡异常（跳过）:", e?.message || e);
+    return { found: false, closed: false };
   }
-  await page.keyboard.type(title, { delay: 50 });
 }
 
-// 发布前终检：百家号在视频解析完成后会异步把文件名回填/追加进标题，
-// 早先填好的标题可能被拼成「标题+文件名」。这里在点发布前重读标题，不符就重填。
-async function ensureBjhTitle(page, title, fileStem) {
-  const want = normBjhTitle(title);
-  if (!want) return;
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    const handle = await page.$(BJH_TITLE_SELECTOR);
-    if (!handle) {
-      throw new Error("百家号标题终检找不到标题框，已停止发布（页面可能改版）");
+/** 读取作品描述编辑器当前 textContent 与计数器文本（如 38/50），用于校验与诊断日志 */
+export async function readBjhDescSnapshot(page) {
+  const snap = await page.evaluate(function (sel) {
+    var el = document.querySelector(sel);
+    if (!el) {
+      return {
+        found: false,
+        rawText: "",
+        counterText: "",
+        activeInside: false,
+      };
     }
-    const cur = normBjhTitle(
-      await handle.evaluate(function (el) {
-        return el.textContent || "";
-      })
+    var rawText = String(el.textContent || "");
+    var active = document.activeElement;
+    var activeInside = Boolean(
+      active && (active === el || (el.contains && el.contains(active)))
     );
-    if (bjhTitleOk(cur, want, fileStem)) {
-      if (attempt > 1) console.log("[bjh] 标题终检：重填后已一致");
-      return;
+    var counterText = "";
+    var container = el.parentElement;
+    for (var depth = 0; container && depth < 6 && !counterText; depth++) {
+      var nodes = container.querySelectorAll
+        ? container.querySelectorAll("span, div, p")
+        : [];
+      for (var i = 0; i < nodes.length; i++) {
+        var n = nodes[i];
+        if (n === el || (el.contains && el.contains(n))) continue;
+        var t = String(n.textContent || "").trim();
+        if (/^\d+\s*\/\s*\d+$/.test(t)) {
+          counterText = t;
+          break;
+        }
+      }
+      if (!counterText) {
+        var ct = String(container.textContent || "");
+        var m = ct.match(/\b\d+\s*\/\s*50\b/);
+        if (m) counterText = m[0];
+      }
+      container = container.parentElement;
     }
+    return {
+      found: true,
+      rawText: rawText,
+      counterText: counterText,
+      activeInside: activeInside,
+    };
+  }, BJH_DESC_SELECTOR);
+  const s = snap || {
+    found: false,
+    rawText: "",
+    counterText: "",
+    activeInside: false,
+  };
+  return {
+    ...s,
+    normText: normBjhDesc(s.rawText),
+  };
+}
+
+/**
+ * 可靠清空并写入百家号「作品描述」：
+ * 1. 先关掉可能遮挡点击的「智能文案」引导气泡；
+ * 2. 在编辑器内用 DOM Range (selectNodeContents) 选中全部内容后 execCommand('delete') 清空；
+ * 3. 若仍有残留，仅在确认焦点位于该编辑器内时才补发 Ctrl/Cmd+A + Backspace；
+ * 4. 选中整个编辑器内容并用 execCommand('insertText') 覆盖写入（绝不在残留文本前追加）；
+ * 5. 回读 textContent 归一后必须与期望文本完全相等，不等则清空重写，最多 3 次，仍不等抛确定性失败（noRetry=true）。
+ */
+export async function fillBjhDescription(
+  page,
+  desc,
+  { maxAttempts = 3 } = {}
+) {
+  const fillText = String(desc == null ? "" : desc)
+    .replace(/\r?\n+/g, " ")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+  const wantNorm = normBjhDesc(fillText);
+  if (!wantNorm) return { ok: true, text: "", counterText: "" };
+
+  let lastAfter = {
+    found: false,
+    rawText: "",
+    normText: "",
+    counterText: "",
+  };
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    await dismissBjhSmartCopyBubble(page);
+
+    const before = await readBjhDescSnapshot(page);
+    console.log(
+      `[bjh][desc] 第 ${attempt}/${maxAttempts} 次写入前: found=${
+        before.found
+      } textContent=${JSON.stringify(before.rawText)} counter=${JSON.stringify(
+        before.counterText || "未读到"
+      )}`
+    );
+    if (!before.found) {
+      throw createBjhDeterministicError(
+        "未找到百家号作品描述编辑器（确定性失败：页面可能改版，不再重试）",
+        "BJH_DESC_EDITOR_MISSING"
+      );
+    }
+
+    // 1. DOM Range 全选编辑器内容 + execCommand('delete')
+    const clearRes = await page.evaluate(function (sel) {
+      var el = document.querySelector(sel);
+      if (!el) return { ok: false, focused: false, rangeSelected: false, deleted: false, remain: "" };
+      try {
+        if (el.scrollIntoView) el.scrollIntoView({ block: "center" });
+      } catch (_) {}
+      try {
+        el.focus();
+      } catch (_) {}
+      var active = document.activeElement;
+      var focused = Boolean(
+        active && (active === el || (el.contains && el.contains(active)))
+      );
+      var rangeSelected = false;
+      if (
+        document.createRange &&
+        typeof window !== "undefined" &&
+        window.getSelection
+      ) {
+        try {
+          var range = document.createRange();
+          range.selectNodeContents(el);
+          var selection = window.getSelection();
+          if (selection) {
+            selection.removeAllRanges();
+            selection.addRange(range);
+            rangeSelected = true;
+          }
+        } catch (_) {}
+      }
+      var deleted = false;
+      if (document.execCommand) {
+        try {
+          deleted = Boolean(document.execCommand("delete", false, null));
+        } catch (_) {}
+      }
+      return {
+        ok: true,
+        focused: focused,
+        rangeSelected: rangeSelected,
+        deleted: deleted,
+        remain: String(el.textContent || ""),
+      };
+    }, BJH_DESC_SELECTOR);
+
+    await page.waitForTimeout(100);
+
+    // 2. delete 后若仍有残留，仅在焦点确认处于该编辑器内时才补发 Ctrl/Cmd+A + Backspace
+    let afterClear = await readBjhDescSnapshot(page);
+    if (afterClear.normText) {
+      const focusOk = await page
+        .evaluate(function (sel) {
+          var el = document.querySelector(sel);
+          if (!el) return false;
+          try {
+            el.focus();
+          } catch (_) {}
+          var active = document.activeElement;
+          return Boolean(
+            active && (active === el || (el.contains && el.contains(active)))
+          );
+        }, BJH_DESC_SELECTOR)
+        .catch(() => false);
+
+      console.log(
+        `[bjh][desc] 第 ${attempt}/${maxAttempts} 次 delete 后残留: remain=${JSON.stringify(
+          afterClear.rawText
+        )} focusInside=${focusOk} clearRes=${JSON.stringify(clearRes)}`
+      );
+
+      if (focusOk && page.keyboard) {
+        const modKey = process.platform === "darwin" ? "Meta" : "Control";
+        await page.keyboard.down(modKey);
+        await page.keyboard.press("KeyA");
+        await page.keyboard.up(modKey);
+        await page.waitForTimeout(80);
+        await page.keyboard.press("Backspace");
+        await page.waitForTimeout(150);
+        afterClear = await readBjhDescSnapshot(page);
+      }
+    }
+
+    // 3. 再次用 selectNodeContents 覆盖选区后 execCommand('insertText') 写入（防止在残留文本前追加）
+    const insertRes = await page.evaluate(
+      function (payload) {
+        var el = document.querySelector(payload.sel);
+        if (!el) return { ok: false, inserted: false, afterInsert: "" };
+        try {
+          el.focus();
+        } catch (_) {}
+        if (
+          document.createRange &&
+          typeof window !== "undefined" &&
+          window.getSelection
+        ) {
+          try {
+            var range = document.createRange();
+            range.selectNodeContents(el);
+            var selection = window.getSelection();
+            if (selection) {
+              selection.removeAllRanges();
+              selection.addRange(range);
+            }
+          } catch (_) {}
+        }
+        var inserted = false;
+        if (document.execCommand) {
+          try {
+            inserted = Boolean(
+              document.execCommand("insertText", false, payload.text)
+            );
+          } catch (_) {}
+        }
+        return {
+          ok: true,
+          inserted: inserted,
+          afterInsert: String(el.textContent || ""),
+        };
+      },
+      { sel: BJH_DESC_SELECTOR, text: fillText }
+    );
+
+    await page.waitForTimeout(250);
+    let after = await readBjhDescSnapshot(page);
+
+    // 4. 仅当编辑器已彻底清空（normText === ""）但 insertText 未生效且焦点在编辑器内时，才走 keyboard.type 兜底；
+    //    若编辑器非空则绝不 keyboard.type，避免在旧文本前重复叠加。
+    if (!bjhDescOk(after.rawText, wantNorm) && after.normText === "") {
+      const focusOk = await page
+        .evaluate(function (sel) {
+          var el = document.querySelector(sel);
+          if (!el) return false;
+          try {
+            el.focus();
+          } catch (_) {}
+          var active = document.activeElement;
+          return Boolean(
+            active && (active === el || (el.contains && el.contains(active)))
+          );
+        }, BJH_DESC_SELECTOR)
+        .catch(() => false);
+      if (focusOk && page.keyboard && typeof page.keyboard.type === "function") {
+        console.log(
+          `[bjh][desc] 第 ${attempt}/${maxAttempts} 次 insertText 未落地且编辑器为空，改用 keyboard.type 兜底`
+        );
+        await page.keyboard.type(fillText, { delay: 30 });
+        await page.waitForTimeout(250);
+        after = await readBjhDescSnapshot(page);
+      }
+    }
+
+    lastAfter = after;
+    console.log(
+      `[bjh][desc] 第 ${attempt}/${maxAttempts} 次写入后: textContent=${JSON.stringify(
+        after.rawText
+      )} norm=${JSON.stringify(after.normText)} expect=${JSON.stringify(
+        wantNorm
+      )} counter=${JSON.stringify(
+        after.counterText || "未读到"
+      )} insertOk=${Boolean(insertRes && insertRes.inserted)}`
+    );
+
+    if (bjhDescOk(after.rawText, wantNorm)) {
+      if (attempt > 1) {
+        console.log(`[bjh][desc] 作品描述已在第 ${attempt} 次重写后完全一致`);
+      }
+      return {
+        ok: true,
+        text: after.normText,
+        counterText: after.counterText,
+      };
+    }
+
     console.warn(
-      `[bjh] 标题终检不一致（第 ${attempt} 次），当前="${cur}"，重填为="${want}"`
+      `[bjh][desc] 第 ${attempt}/${maxAttempts} 次写入校验不相等: 当前=${JSON.stringify(
+        after.normText
+      )} 期望=${JSON.stringify(wantNorm)} 计数器=${JSON.stringify(
+        after.counterText || "未读到"
+      )}`
     );
-    await fillBjhTitle(page, handle, title);
-    await page.waitForTimeout(1500);
+    if (attempt < maxAttempts) {
+      await page.waitForTimeout(300);
+    }
   }
-  const last = await page.$(BJH_TITLE_SELECTOR);
-  const cur = last
-    ? normBjhTitle(await last.evaluate((el) => el.textContent || ""))
-    : "";
-  if (!bjhTitleOk(cur, want, fileStem)) {
-    throw new Error(
-      `百家号标题被页面改写且无法纠正（当前="${cur}"），已停止发布，请检查后重发`
+
+  throw createBjhDeterministicError(
+    `百家号作品描述写入校验失败（尝试 ${maxAttempts} 次后仍与期望不一致，确定性失败，不再重试）：当前="${
+      lastAfter.normText
+    }"，期望="${wantNorm}"，计数器="${lastAfter.counterText || "未读到"}"`,
+    "BJH_DESC_WRITE_MISMATCH"
+  );
+}
+
+// 发布前终检：百家号在视频解析完成后可能异步把文件名回填进作品描述。
+// 这里只做完全相等校验，不等则走 fillBjhDescription 清空重写（绝不追加），仍不等抛确定性失败中止发布。
+export async function ensureBjhDescription(
+  page,
+  desc,
+  { maxAttempts = 3 } = {}
+) {
+  const wantNorm = normBjhDesc(desc);
+  if (!wantNorm) return { ok: true, text: "", counterText: "" };
+
+  const before = await readBjhDescSnapshot(page);
+  console.log(
+    `[bjh][desc] 发布前终检读取: found=${before.found} textContent=${JSON.stringify(
+      before.rawText
+    )} counter=${JSON.stringify(before.counterText || "未读到")} expect=${JSON.stringify(
+      wantNorm
+    )}`
+  );
+  if (!before.found) {
+    throw createBjhDeterministicError(
+      "百家号作品描述终检找不到编辑器（确定性失败：页面可能改版，不再重试）",
+      "BJH_DESC_EDITOR_MISSING"
     );
   }
+  if (bjhDescOk(before.rawText, wantNorm)) {
+    return {
+      ok: true,
+      text: before.normText,
+      counterText: before.counterText,
+    };
+  }
+  console.warn(
+    `[bjh][desc] 发布前终检不一致，当前=${JSON.stringify(
+      before.normText
+    )}，期望=${JSON.stringify(wantNorm)}，开始清空重写`
+  );
+  const rewritten = await fillBjhDescription(page, desc, { maxAttempts });
+  await page.waitForTimeout(800);
+  const verified = await readBjhDescSnapshot(page);
+  console.log(
+    `[bjh][desc] 发布前终检复核: textContent=${JSON.stringify(
+      verified.rawText
+    )} counter=${JSON.stringify(verified.counterText || "未读到")}`
+  );
+  if (!bjhDescOk(verified.rawText, wantNorm)) {
+    throw createBjhDeterministicError(
+      `百家号作品描述被页面改写且无法纠正（确定性失败，不再重试）：当前="${
+        verified.normText
+      }"，期望="${wantNorm}"，计数器="${verified.counterText || "未读到"}"`,
+      "BJH_DESC_REWRITTEN"
+    );
+  }
+  return {
+    ok: true,
+    text: verified.normText,
+    counterText: verified.counterText || rewritten.counterText,
+  };
 }
 
 export default async function (page, data, window, event) {
   // 发布模式下一旦派发过点击，后续任何异常都无法排除已发出 → 外层不得整体重试（宁漏勿重）
   let bjhClickDispatched = false;
   const text = buildPlatformVideoTextDetailed("百家号", data.data || {});
-  const wantTitle = text.title || "";
+  const wantDesc = text.description || text.ksFillText || text.title || "";
   const bjhRuleAdjustments = mergeRuleAdjustments(
     data.ruleAdjustments || (data.data && data.data.ruleAdjustments),
     text.adjustments
   );
   const bjhAdjSummary = formatRuleAdjustmentsSummary(bjhRuleAdjustments);
-  const fileStem = path.basename(
-    String(data.filePath || ""),
-    path.extname(String(data.filePath || ""))
-  );
   const isDraftMode =
     data.publishMode === "draft" || data.publishToDraft === true;
   // 使用try-catch包装所有可能出错的操作
@@ -471,6 +912,8 @@ export default async function (page, data, window, event) {
     // 不抛出错误，继续执行后续步骤
   }
 
+  // 表单填写（作品描述 + 创作声明）与提交统一纳入顶层失败上报，
+  // 确保描述写入/校验等确定性失败立即带 noRetry:true 中止，不触发外层 5 次重复上传。
   try {
     console.log("[bjh] 等待发布表单就绪...");
     // 上传完成后页面会重渲染，先等"创作声明" input 出现，作为表单完整渲染的信号
@@ -481,12 +924,12 @@ export default async function (page, data, window, event) {
       });
       console.log("[bjh] 发布表单已就绪（声明 input 已出现）");
     } catch (_) {
-      console.warn("[bjh] 等待声明 input 超时，按当前 DOM 继续尝试找标题");
+      console.warn("[bjh] 等待声明 input 超时，按当前 DOM 继续尝试找作品描述框");
     }
     // 再等一拍，避免 transition 过程中 DOM 还在变
     await page.waitForTimeout(800);
 
-    // 打印页面上所有 input / textarea / contenteditable，定位标题输入框真实选择器
+    // 打印页面上所有 input / textarea / contenteditable，便于定位表单真实选择器
     const fieldDump = await page.evaluate(() => {
       const inputs = [...document.querySelectorAll("input")].map((el) => ({
         tag: "input",
@@ -516,7 +959,7 @@ export default async function (page, data, window, event) {
           el.getAttribute("data-placeholder") ||
           el.getAttribute("placeholder") ||
           "",
-        text: (el.textContent || "").slice(0, 30),
+        text: (el.textContent || "").slice(0, 60),
       }));
       return { inputs, textareas, editables };
     });
@@ -524,26 +967,26 @@ export default async function (page, data, window, event) {
     console.log("[bjh] textareas:", JSON.stringify(fieldDump.textareas));
     console.log("[bjh] contenteditable:", JSON.stringify(fieldDump.editables));
 
-    await page.waitForSelector(BJH_TITLE_SELECTOR, { timeout: 20 * 1000 });
-    const titleHandle = await page.$(BJH_TITLE_SELECTOR);
-    if (!titleHandle) throw new Error("未找到标题 contenteditable");
+    try {
+      await page.waitForSelector(BJH_DESC_SELECTOR, { timeout: 20 * 1000 });
+    } catch (_) {
+      throw createBjhDeterministicError(
+        "未找到百家号作品描述 contenteditable 编辑器（确定性失败：页面可能改版，不再重试）",
+        "BJH_DESC_EDITOR_MISSING"
+      );
+    }
 
-    await fillBjhTitle(page, titleHandle, wantTitle);
-    console.log("[bjh] 标题已输入");
-  } catch (err) {
-    console.error("[bjh] 标题处理失败:", err?.message || err);
-  }
+    await fillBjhDescription(page, wantDesc);
+    console.log("[bjh] 作品描述已写入并通过严格校验");
 
-  // 标题/地址填完后立即选择创作声明（必须声明）
-  try {
-    console.log("选择创作声明");
-    await selectBjhCreativeStatement(page, data);
-  } catch (e) {
-    console.warn("百家号创作声明选择未完成:", e?.message || e);
-  }
+    // 作品描述填完后立即选择创作声明（必须声明）
+    try {
+      console.log("选择创作声明");
+      await selectBjhCreativeStatement(page, data);
+    } catch (e) {
+      console.warn("百家号创作声明选择未完成:", e?.message || e);
+    }
 
-  // 点击提交按钮
-  try {
     // 等待 .upload-step-progress  .progress-container.uploading 消失
     // 用 pollPageUntil 替代 waitForSelector，避免 puppeteer 默认 protocolTimeout
     // (约 180s) 在弱网/大文件下把 CDP Runtime.callFunctionOn 提前砍掉。
@@ -576,7 +1019,7 @@ export default async function (page, data, window, event) {
     }
 
     // 基于操作区容器左上角的固定偏移量点击：
-    //   存草稿：left 600px, top 30px
+    //   存草稿：left 500px, top 30px
     //   发布：  left 700px, top 30px
     const opRoot = await page.$(".op-list.op-list-wrap-videoV2");
     const box = opRoot ? await opRoot.boundingBox() : null;
@@ -612,14 +1055,13 @@ export default async function (page, data, window, event) {
     );
     console.log("[bjh] 视频上传进度条已消失，准备点击");
 
-
     // 2026-11-22 线上事故：成功提示图标不是 info-circle 时被当失败，循环连点「发布」，
     // 同一视频被发了 5 次。规则（宁漏勿重）：发布与存草稿都只点一次，点过之后任何失败
     // 都不在本窗口重点、也不让外层重开窗口（catch 里带 noRetry），交用户核对后手动补发。
     const urlBefore = readPageUrl(page);
-    // 视频解析完成后百家号可能把文件名回填进标题：先纠正标题，再等旧提示消失，
-    // 最后只读复核；若等待期间又被回填，纠正后再等一次提示消失，确保点击后读到的是本次结果。
-    await ensureBjhTitle(page, wantTitle, fileStem);
+    // 视频解析完成后百家号可能把文件名回填进作品描述：先终检并清空重写，再等旧提示消失，
+    // 最后只读复核；若等待期间又被回填，清空重写后再等一次提示消失，确保点击前内容完全一致。
+    await ensureBjhDescription(page, wantDesc);
     const waitToastHidden = () =>
       page
         .waitForSelector(".cheetah-message.cheetah-message-top", {
@@ -629,19 +1071,37 @@ export default async function (page, data, window, event) {
         .then(() => true)
         .catch(() => false);
     let staleToastBefore = !(await waitToastHidden());
-    const titleHandleNow = await page.$(BJH_TITLE_SELECTOR).catch(() => null);
-    const titleNow = titleHandleNow
-      ? normBjhTitle(await titleHandleNow.evaluate((el) => el.textContent || "").catch(() => ""))
-      : "";
-    if (!bjhTitleOk(titleNow, normBjhTitle(wantTitle), fileStem) && normBjhTitle(wantTitle)) {
-      console.warn(`[bjh] 等待提示期间标题变为「${titleNow}」，重新纠正`);
-      await ensureBjhTitle(page, wantTitle, fileStem);
+    const descSnapNow = await readBjhDescSnapshot(page).catch(() => ({
+      found: false,
+      rawText: "",
+      normText: "",
+      counterText: "",
+    }));
+    if (normBjhDesc(wantDesc) && !bjhDescOk(descSnapNow.rawText, wantDesc)) {
+      console.warn(
+        `[bjh][desc] 等待提示期间作品描述变为 ${JSON.stringify(
+          descSnapNow.normText
+        )}（计数器=${JSON.stringify(
+          descSnapNow.counterText || "未读到"
+        )}），重新清空写入`
+      );
+      await ensureBjhDescription(page, wantDesc);
       staleToastBefore = !(await waitToastHidden());
-      // 最后一次等待后只读复核：仍被改写就在点击前中止（未点击，可安全重试）
-      const h2 = await page.$(BJH_TITLE_SELECTOR).catch(() => null);
-      const t2 = h2 ? normBjhTitle(await h2.evaluate((el) => el.textContent || "").catch(() => "")) : "";
-      if (!bjhTitleOk(t2, normBjhTitle(wantTitle), fileStem)) {
-        throw new Error(`百家号标题点击前再次被页面改写（当前="${t2}"），已停止${isDraftMode ? "存草稿" : "发布"}，请检查后重发`);
+      const descSnapFinal = await readBjhDescSnapshot(page).catch(() => ({
+        found: false,
+        rawText: "",
+        normText: "",
+        counterText: "",
+      }));
+      if (!bjhDescOk(descSnapFinal.rawText, wantDesc)) {
+        throw createBjhDeterministicError(
+          `百家号作品描述点击前再次被页面改写（确定性失败，不再重试）：当前="${
+            descSnapFinal.normText
+          }"，期望="${normBjhDesc(wantDesc)}"，计数器="${
+            descSnapFinal.counterText || "未读到"
+          }"，已停止${isDraftMode ? "存草稿" : "发布"}`,
+          "BJH_DESC_REWRITTEN_BEFORE_CLICK"
+        );
       }
     }
     if (staleToastBefore) console.warn("[bjh] 点击前旧提示未消失，点击后读到的提示可能是残留");
@@ -716,6 +1176,7 @@ export default async function (page, data, window, event) {
     });
   } catch (err) {
     const failMessage = err?.message || "上传失败";
+    const noRetry = bjhClickDispatched || isBjhNoRetryError(err);
     await replyPublishFailure({
       page,
       data,
@@ -724,10 +1185,10 @@ export default async function (page, data, window, event) {
       message: failMessage,
       closeWindow: false,
       extraPayload:
-        // 发布/存草稿一旦派发过点击，任何失败（含「请添加横版封面」等校验提示）都不整体重试：
-        // 提示可能是残留/误读，无法证明未发出。宁可报失败让用户手动补发，也不重复发布或重复存稿。
-        bjhClickDispatched ? { noRetry: true } : {},
+        // 1) 发布/存草稿一旦派发过点击，任何失败（含「请添加横版封面」等校验提示）都不整体重试（宁漏勿重）；
+        // 2) 作品描述写入/校验等确定性失败同样标记 noRetry，避免外层 5 次重复上传视频。
+        noRetry ? { noRetry: true } : {},
     });
-    console.error("点击提交按钮失败:", err);
+    console.error("百家号发布失败:", err);
   }
 }
