@@ -78,7 +78,7 @@ function createMockWin() {
 }
 
 async function run() {
-  assert.strictEqual(pkg.version, "0.15.0-fork.1");
+  assert.strictEqual(pkg.version, "0.15.2-fork.1");
   assert.match(pkg.version, /-fork\./);
 
   await build({
@@ -171,7 +171,7 @@ async function run() {
       return {
         hasUpdate: false,
         forkBuild: true,
-        currentVersion: "0.15.0-fork.1",
+        currentVersion: "0.15.2-fork.1",
       };
     }
     return undefined;
@@ -219,13 +219,13 @@ async function run() {
 
     // 2. fork 版本下：FORK_BUILD 为 true，不发请求且拒绝下载
     assert.strictEqual(forkChecker.FORK_BUILD, true);
-    assert.strictEqual(forkChecker.version, "0.15.0-fork.1");
+    assert.strictEqual(forkChecker.version, "0.15.2-fork.1");
 
     const forkCheckRes = await forkChecker.checkForUpdate();
     assert.deepStrictEqual(forkCheckRes, {
       hasUpdate: false,
       forkBuild: true,
-      currentVersion: "0.15.0-fork.1",
+      currentVersion: "0.15.2-fork.1",
     });
     assert.strictEqual(getRequestCount(), 0);
 

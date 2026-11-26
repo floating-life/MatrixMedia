@@ -117,6 +117,10 @@ MCP Server 按以下顺序寻找 MatrixMedia：环境变量 `MATRIXMEDIA_BIN`（
 | `aiChapters`        | 否   | 布尔值；AI 自动章节开关（仅 `dy` / `ks` / `xhs` 生效，其他平台忽略；未传时按发布设置默认开启；透传 `--ai-chapters` / `--no-ai-chapters`；不支持或重试后失败不中止发布，回执附带「`章节：已开启/不支持/失败`」） |
 | `originalStatement` | 否   | 布尔值；原创声明开关（仅 `xhs` / `sph` 生效，其他平台忽略；与 `creativeStatement` 独立并存；未传时按发布设置默认开启；透传 `--original` / `--no-original`；开启时失败或无原创资格中止本条发布） |
 | `sphProductId`      | 否   | 视频号商品上架编号（推荐） |
+| `dyProductUrl`      | 否   | 抖音商品挂车（**完整商品链接**；还须配合 `shortTitle` 商品短标题 ≤10 字） |
+| `dyLink`            | 否   | 抖音链接对象（`type` 支持 `none` / `product`） |
+| `ksProductName`     | 否   | 快手商品挂车（**货架中已存在的商品完整名称**，不是商品 ID） |
+| `ksLink`            | 否   | 快手链接对象（`type` 支持 `none` / `product`） |
 | `sphDramaId`        | 否   | 视频号小程序短剧挂载（**短剧名称**，如 `泳陷错恋`）                          |
 | `sphSeriesId`       | 否   | 视频号剧集挂载（**剧集名称**，视频号原生剧集）                          |
 | `sphLink`           | 否   | 视频号链接对象（`type` 支持 `none` / `product` / `mini_drama` / `sph_series`）；与 `sphProductId` / `sphDramaId` / `sphSeriesId` 同时传时优先快捷字段 |

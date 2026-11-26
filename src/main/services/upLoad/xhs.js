@@ -154,10 +154,9 @@ export const XHS_ORIGINAL_STATEMENT_SELECTORS = Object.freeze({
     ".d-modal",
     ".d-dialog",
     "[role='dialog']",
-    "[class*='modal']",
-    "[class*='dialog']",
+    "[aria-modal='true']",
   ],
-  dialogKeywords: ["原创", "原创声明", "声明原创", "原创保护", "协议", "条款", "须知"],
+  dialogKeywords: ["原创声明", "声明原创", "原创保护", "原创"],
   ignoreDialogPatterns: ["将此次编辑保留"],
   agreementSelectors: [
     ".d-checkbox",
@@ -172,9 +171,12 @@ export const XHS_ORIGINAL_STATEMENT_SELECTORS = Object.freeze({
     "声明原创",
     "同意并声明",
     "开启原创",
+    "我已阅读并同意",
     "确定",
     "确认",
   ],
+  disabledWaitTimeoutMs: 30 * 1000,
+  disabledPollIntervalMs: 500,
   noQualificationPatterns: [
     "无原创资格",
     "暂无原创资格",
@@ -196,14 +198,17 @@ export const XHS_ORIGINAL_STATEMENT_SELECTORS = Object.freeze({
     "发布",
     "发表",
     "立即发布",
+    "立即发表",
     "定时发布",
     "存草稿",
     "保存草稿",
     "暂存离开",
     "保存",
+    "提交",
     "取消",
     "取消发布",
     "确认发布",
+    "确认发表",
   ],
   dispatchMouseEvents: true,
   diagSelectors: [
@@ -746,22 +751,8 @@ export default async function (page, data, window, event) {
   const wantAiChapters = isAiChaptersRequested(data);
 
   try {
-    // 原创声明（默认开启；关闭时不触碰页面；开启时失败或无资格中止本条发布，绝不点击发布/暂存离开）
-    if (wantOriginal) {
-      originalStatementResult = await applyXhsOriginalStatement(page, {
-        data,
-        window,
-      });
-      // 与内容类型声明统一复核，确保互不覆盖且无残留弹窗
-      await verifyXhsDeclarations(page, {
-        creativeStatement: data.data && data.data.creativeStatement,
-        originalStatement: true,
-        data,
-        window,
-      });
-    }
-
-    // 等视频上传完成：新版小红书在 .video-plugin-title-action 出现 "重新上传" 文案表示上传完成。
+    // 先等视频上传/转码完成（与视频号一致），避免转码中原创入口置灰被误判为无原创资格。
+    // 新版小红书在 .video-plugin-title-action 出现 "重新上传" 文案表示上传完成。
     // 老版兼容：找任何带 src 的 <video>。超时 2 分钟，到点不抛错继续。
     try {
       await pollPageUntil(
@@ -786,6 +777,22 @@ export default async function (page, data, window, event) {
       console.log("[xhs] 视频上传完成（重新上传按钮已出现）");
     } catch (_) {
       console.log("[xhs] 视频上传等待超时，继续走发布流程");
+    }
+
+    // 原创声明（视频上传/转码完成后执行；入口置灰时先等待最多 30s 变可用再判无资格；
+    // 默认开启；关闭时不触碰页面；开启时失败或无资格中止本条发布，绝不点击发布/暂存离开）
+    if (wantOriginal) {
+      originalStatementResult = await applyXhsOriginalStatement(page, {
+        data,
+        window,
+      });
+      // 与内容类型声明统一复核，确保互不覆盖且无残留弹窗
+      await verifyXhsDeclarations(page, {
+        creativeStatement: data.data && data.data.creativeStatement,
+        originalStatement: true,
+        data,
+        window,
+      });
     }
 
     // AI 自动章节（视频上传就绪后处理；默认开启，关闭时不触碰页面；不支持/失败告警继续）

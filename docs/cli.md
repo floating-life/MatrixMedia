@@ -122,6 +122,12 @@ matrixmedia.exe cli publish -p dy --phone 13800138000 -f C:\video.mp4 -t "标题
 | `--sph-series-id` | 视频号剧集挂载快捷参数（**剧集名称**，视频号原生剧集）；其他平台忽略                           |
 | `--sph-link-type`          | 视频号链接类型，支持 `none` / `product` / `mini_drama` / `sph_series`（也接受 `短剧` / `drama` / `剧集` / `series` 等别名）；其他平台忽略                  |
 | `--sph-link-value`         | 视频号链接值：商品编号，或短剧 / 剧集**名称**；只传该参数时默认按商品上架                                 |
+| `--dy-product-url`         | 抖音商品挂车快捷参数（**完整商品链接**）。等价于 `--dy-link-type product --dy-link-value <url>`；**还需 `--short-title` 商品短标题（≤10 字）**，抖音挂车硬性要求。其他平台忽略 |
+| `--dy-link-type`           | 抖音链接类型：`none` / `product` |
+| `--dy-link-value`          | 抖音链接值：商品链接 URL |
+| `--ks-product-name`        | 快手商品挂车快捷参数（**货架中已存在的商品完整名称**，不是商品 ID——发布页按名称搜索）。等价于 `--ks-link-type product --ks-link-value <名称>`。其他平台忽略 |
+| `--ks-link-type`           | 快手链接类型：`none` / `product` |
+| `--ks-link-value`          | 快手链接值：货架商品完整名称 |
 | `--allow-duplicate`        | 允许重复发布；默认同平台+同账号+清洗归一后同标题在 7 天内已有成功/进行中记录时拒绝并返回退出码 `6`（`status: "duplicate"`，message 含上次时间），显式传本参数才放行 |
 | `--no-throttle`            | 绕过发布节流与错峰排期；默认与 GUI / HTTP 共用主进程持久化节流配置（同账号最小间隔 抖音 6h/其余 4h、每日上限 3 条、允许时段 06:00–23:30 UTC+8、平台相对首发延迟默认 0 / 百家号可设 10h），超限时自动转为定时任务并返回 `status: "scheduled"`、`publishAt` 与原因（显式 `--publish-at` 同样只顺延不提前），传 `--no-throttle` 可跳过 |
 | `--cs` / `--creative-statement` | 创作声明（`none` / `ai_generated` / `fiction` / `marketing` / `personal_opinion` / `repost` / `self_shot` / `self_made_no_repost`）；省略时套用发布设置里的默认声明（出厂默认 `ai_generated`，平台不支持时回退 `none`），JSON 输出会返回最终生效的 `creativeStatement` |

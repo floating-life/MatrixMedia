@@ -395,7 +395,12 @@ module.exports = {
   WAIT_SELECTOR_APPEAR_MS: 50,
   WAIT_UPLOAD_PROCESSING_MS: 50,
   CLI_PUBLISH_TIMEOUT_MS: 5000,
-  pollPageUntil: async function() { return true; },
+  pollPageUntil: async function(page, fn, timeoutMs) {
+    if (typeof global.__s18OnPollPageUntil === "function") {
+      return await global.__s18OnPollPageUntil(page, fn, timeoutMs);
+    }
+    return true;
+  },
 };
 `
 );
@@ -1168,6 +1173,279 @@ module.exports = {
     assert.strictEqual(x3Replies[0].status, true);
     assert.ok(!x3Replies[0].message.includes("章节："));
   })();
+
+  // 5h. A.1 安全回归：原创确认按钮精确匹配、含「发布」「发表」一律排除、且走提交守卫
+  await quiet(async () => {
+    // 5h-1a. 小红书弹窗内仅有「确认发布」「立即发表」「同意并发布」等含发布/发表按钮 → 绝不得点击，中止发布
+    const body1 = new FakeElement("body");
+    const row1 = body1.appendChild(new FakeElement("div", { attrs: { class: "original-row" } }));
+    const cb1 = row1.appendChild(new FakeElement("label", { attrs: { class: "d-checkbox" }, text: "原创声明" }));
+    cb1.appendChild(new FakeElement("input", { attrs: { type: "checkbox" }, checked: false }));
+    let btnConfirmPub = null;
+    let btnImmediatePub = null;
+    let btnAriaPub = null;
+    let btnAgreePub = null;
+    cb1._onClick = () => {
+      const modal = body1.appendChild(new FakeElement("div", { attrs: { class: "d-modal", role: "dialog" } }));
+      modal.appendChild(new FakeElement("div", { text: "原创声明提示：请核对说明" }));
+      btnConfirmPub = modal.appendChild(new FakeElement("button", { attrs: { class: "d-button" }, text: "确认发布" }));
+      btnImmediatePub = modal.appendChild(new FakeElement("button", { attrs: { class: "d-button" }, text: "立即发表" }));
+      btnAriaPub = modal.appendChild(new FakeElement("button", { attrs: { class: "d-button", "aria-label": "确认发布" }, text: "确认" }));
+      btnAgreePub = modal.appendChild(new FakeElement("button", { attrs: { class: "d-button" }, text: "确定并发布" }));
+    };
+    const page1 = createFakePage(body1);
+    await assert.rejects(
+      xhsMod.applyXhsOriginalStatement(page1, { data: { pt: "小红书" }, timeouts: fastTimeouts }),
+      /原创声明设置失败/
+    );
+    assert.strictEqual(btnConfirmPub.clickCount, 0, "「确认发布」按钮绝不得被选中或点击");
+    assert.strictEqual(btnImmediatePub.clickCount, 0, "「立即发表」按钮绝不得被选中或点击");
+    assert.strictEqual(btnAriaPub.clickCount, 0, "aria-label 含「发布」的按钮绝不得被选中或点击");
+    assert.strictEqual(btnAgreePub.clickCount, 0, "「确定并发布」按钮绝不得被选中或点击");
+
+    // 5h-1b. 弹窗同时含「确认发布」与「我已阅读并同意」→ 跳过「确认发布」，精确命中「我已阅读并同意」
+    const body2 = new FakeElement("body");
+    const row2 = body2.appendChild(new FakeElement("div", { attrs: { class: "original-row" } }));
+    const cb2 = row2.appendChild(new FakeElement("label", { attrs: { class: "d-checkbox" }, text: "原创声明" }));
+    const inp2 = cb2.appendChild(new FakeElement("input", { attrs: { type: "checkbox" }, checked: false }));
+    let btnPubTrap = null;
+    let btnAgreeOk = null;
+    cb2._onClick = () => {
+      const modal = body2.appendChild(new FakeElement("div", { attrs: { class: "d-modal", role: "dialog" } }));
+      modal.appendChild(new FakeElement("div", { text: "原创声明确认：请阅读协议" }));
+      btnPubTrap = modal.appendChild(new FakeElement("button", { attrs: { class: "d-button" }, text: "确认发布" }));
+      btnAgreeOk = modal.appendChild(new FakeElement("button", { attrs: { class: "d-button" }, text: "我已阅读并同意" }));
+      btnAgreeOk._onClick = () => {
+        inp2.checked = true;
+        body2.removeChild(modal);
+      };
+    };
+    const page2 = createFakePage(body2);
+    const res2 = await xhsMod.applyXhsOriginalStatement(page2, { data: { pt: "小红书" }, timeouts: fastTimeouts });
+    assert.strictEqual(res2.status, "enabled");
+    assert.strictEqual(btnPubTrap.clickCount, 0, "存在「确认发布」时绝不得点击它");
+    assert.strictEqual(btnAgreeOk.clickCount, 1, "应精确命中「我已阅读并同意」");
+
+    // 5h-2. 视频号弹窗含「确认发表」「发布原创」与「确定」→ 排除发表/发布按钮，仅点击「确定」；且提交选择器守卫不绕过
+    const { body: body3, shadow: shadow3 } = createSphShadowBody();
+    const wrap3 = shadow3.appendChild(new FakeElement("div", { attrs: { class: "declare-original-checkbox" } }));
+    const lb3 = wrap3.appendChild(new FakeElement("label", { attrs: { class: "ant-checkbox-wrapper" }, text: "声明原创" }));
+    const inp3 = lb3.appendChild(new FakeElement("input", { attrs: { type: "checkbox" }, checked: false }));
+    let sphPubTrap1 = null;
+    let sphPubTrap2 = null;
+    let sphRealConfirm = null;
+    lb3._onClick = () => {
+      const dlg = shadow3.appendChild(new FakeElement("div", { attrs: { class: "declare-original-dialog" } }));
+      const inner = dlg.appendChild(new FakeElement("div", { attrs: { class: "weui-desktop-dialog" } }));
+      inner.appendChild(new FakeElement("div", { text: "声明原创确认" }));
+      sphPubTrap1 = inner.appendChild(new FakeElement("button", { attrs: { class: "weui-desktop-btn_primary" }, text: "确认发表" }));
+      sphPubTrap2 = inner.appendChild(new FakeElement("button", { attrs: { class: "weui-desktop-btn_primary" }, text: "发布原创" }));
+      sphRealConfirm = inner.appendChild(new FakeElement("button", { attrs: { class: "weui-desktop-btn_primary" }, text: "确定" }));
+      sphRealConfirm._onClick = () => {
+        inp3.checked = true;
+        shadow3.removeChild(dlg);
+      };
+    };
+    const page3 = createFakePage(body3);
+    const res3 = await sphMod.applySphOriginalStatement(page3, { data: { pt: "视频号" }, timeouts: fastTimeouts });
+    assert.strictEqual(res3.status, "enabled");
+    assert.strictEqual(sphPubTrap1.clickCount, 0, "视频号「确认发表」绝不得被点击");
+    assert.strictEqual(sphPubTrap2.clickCount, 0, "视频号「发布原创」绝不得被点击");
+    assert.strictEqual(sphRealConfirm.clickCount, 1);
+
+    // 5h-3. 包裹主表单发布按钮的广义容器（含 xhs-publish-btn）不得被误认作原创弹窗
+    const body4 = new FakeElement("body");
+    const fakeWideWrap = body4.appendChild(new FakeElement("div", { attrs: { class: "page-modal", role: "dialog" } }));
+    fakeWideWrap.appendChild(new FakeElement("div", { text: "原创声明" }));
+    const wideConfirmBtn = fakeWideWrap.appendChild(new FakeElement("button", { text: "确定" }));
+    fakeWideWrap.appendChild(new FakeElement("xhs-publish-btn", { attrs: { "submit-disabled": "false" } }));
+    const page4 = createFakePage(body4);
+    await assert.rejects(
+      xhsMod.applyXhsOriginalStatement(page4, { data: { pt: "小红书" }, timeouts: fastTimeouts }),
+      /原创声明设置失败/
+    );
+    assert.strictEqual(wideConfirmBtn.clickCount, 0, "含主发布按钮的容器不得被当作原创弹窗点击");
+  })();
+
+  // 5i. A.2 回归：小红书等待视频上传/转码完成后再做原创声明 + 入口置灰等待最多 30s 再判无资格
+  await quiet(async () => {
+    assert.strictEqual(
+      xhsMod.XHS_ORIGINAL_STATEMENT_SELECTORS.disabledWaitTimeoutMs,
+      30 * 1000,
+      "小红书原创入口置灰默认等待上限应为 30s"
+    );
+
+    // 5i-1. 端到端顺序校验：上传等待必须先于原创声明执行；上传期间置灰、上传完成后可用则成功发布
+    const events = [];
+    const body = new FakeElement("body");
+    body.appendChild(new FakeElement("input", { attrs: { class: "upload-input", type: "file" } }));
+    const titleBox = body.appendChild(new FakeElement("div", { attrs: { class: "publish-page-content-base" } }));
+    const editC = titleBox.appendChild(new FakeElement("div", { attrs: { class: "edit-container" } }));
+    const dIn = editC.appendChild(new FakeElement("div", { attrs: { class: "d-input" } }));
+    dIn.appendChild(new FakeElement("input", { attrs: { class: "d-text" } }));
+    body.appendChild(new FakeElement("div", { attrs: { class: "tiptap ProseMirror" }, text: "正文" }));
+    const origRow = body.appendChild(new FakeElement("div", { attrs: { class: "original-row" } }));
+    const origCb = origRow.appendChild(
+      new FakeElement("label", {
+        attrs: { class: "d-checkbox d-checkbox-disabled" },
+        text: "原创声明",
+        disabled: true,
+      })
+    );
+    const origInp = origCb.appendChild(
+      new FakeElement("input", { attrs: { type: "checkbox" }, checked: false, disabled: true })
+    );
+    origCb._onClick = () => {
+      events.push("original_clicked");
+      origInp.checked = true;
+    };
+    body.appendChild(new FakeElement("xhs-publish-btn", { attrs: { "submit-disabled": "false" } }));
+    const page = createFakePage(body);
+    global.__s18OnPollPageUntil = async (_p, expr) => {
+      if (String(expr || "").includes("重新上传")) {
+        events.push("upload_wait_done");
+        // 模拟上传/转码完成后原创入口解除置灰
+        origCb.disabled = false;
+        origCb.className = "d-checkbox";
+        origInp.disabled = false;
+      }
+      return true;
+    };
+    try {
+      const replies = [];
+      await xhsMod.default(
+        page,
+        {
+          pt: "小红书",
+          filePath: "fixture.mp4",
+          data: { title: "测试", description: "正文", tags: [], aiChapters: false, originalStatement: true },
+        },
+        {},
+        { reply: (_ch, p) => replies.push(p) }
+      );
+      assert.deepStrictEqual(
+        events,
+        ["upload_wait_done", "original_clicked"],
+        "小红书必须先完成上传等待，再执行原创声明"
+      );
+      assert.strictEqual(origInp.checked, true);
+      assert.strictEqual(replies[0].status, true);
+      assert.strictEqual(replies[0].originalStatementStatus, "enabled");
+    } finally {
+      global.__s18OnPollPageUntil = null;
+    }
+
+    // 5i-2. 入口初始置灰（无明确无资格文案）→ 轮询等待变可用后成功勾选，不误判无资格
+    const bodyWaitOk = new FakeElement("body");
+    const rowOk = bodyWaitOk.appendChild(new FakeElement("div", { attrs: { class: "original-row" } }));
+    const cbOk = rowOk.appendChild(
+      new FakeElement("label", { attrs: { class: "d-checkbox d-checkbox-disabled" }, text: "原创声明", disabled: true })
+    );
+    const inpOk = cbOk.appendChild(new FakeElement("input", { attrs: { type: "checkbox" }, checked: false, disabled: true }));
+    cbOk._onClick = () => { inpOk.checked = true; };
+    const pageOk = createFakePage(bodyWaitOk);
+    let waitCallsOk = 0;
+    pageOk.waitForTimeout = async () => {
+      waitCallsOk += 1;
+      if (waitCallsOk === 2) {
+        cbOk.disabled = false;
+        cbOk.className = "d-checkbox";
+        inpOk.disabled = false;
+      }
+    };
+    const waitRes = await xhsMod.applyXhsOriginalStatement(pageOk, {
+      data: { pt: "小红书" },
+      timeouts: { ...fastTimeouts, disabledWaitTimeoutMs: 200, disabledPollIntervalMs: 10 },
+    });
+    assert.strictEqual(waitRes.status, "enabled");
+    assert.strictEqual(inpOk.checked, true);
+    assert.ok(waitCallsOk >= 2, `应先轮询等待置灰解除，实际等待 ${waitCallsOk} 轮`);
+
+    // 5i-3. 入口持续置灰直至超时 → 等待满轮次后再判无原创资格并中止
+    const bodyWaitFail = new FakeElement("body");
+    const rowFail = bodyWaitFail.appendChild(new FakeElement("div", { attrs: { class: "original-row" } }));
+    const cbFail = rowFail.appendChild(
+      new FakeElement("label", { attrs: { class: "d-checkbox d-checkbox-disabled" }, text: "原创声明", disabled: true })
+    );
+    cbFail.appendChild(new FakeElement("input", { attrs: { type: "checkbox" }, checked: false, disabled: true }));
+    const pageFail = createFakePage(bodyWaitFail);
+    let waitCallsFail = 0;
+    pageFail.waitForTimeout = async () => { waitCallsFail += 1; };
+    await assert.rejects(
+      xhsMod.applyXhsOriginalStatement(pageFail, {
+        data: { pt: "小红书" },
+        timeouts: { ...fastTimeouts, disabledWaitTimeoutMs: 50, disabledPollIntervalMs: 10 },
+      }),
+      (err) => {
+        assert.ok(err.message.includes("账号无原创资格，可在发布设置关闭原创声明"), err.message);
+        assert.strictEqual(err.noOriginalQualification, true);
+        return true;
+      }
+    );
+    assert.ok(waitCallsFail >= 3, `置灰超时前应先等待多轮，实际 ${waitCallsFail} 轮`);
+    assert.strictEqual(cbFail.clickCount, 0);
+
+    // 5i-4. 已勾选且锁定（checked=true & disabled=true，无无资格文案）→ 视为已开启短路，不误判无资格
+    const bodyLocked = new FakeElement("body");
+    const rowLocked = bodyLocked.appendChild(new FakeElement("div", { attrs: { class: "original-row" } }));
+    const cbLocked = rowLocked.appendChild(
+      new FakeElement("label", { attrs: { class: "d-checkbox d-checkbox-disabled" }, text: "原创声明", disabled: true })
+    );
+    cbLocked.appendChild(new FakeElement("input", { attrs: { type: "checkbox" }, checked: true, disabled: true }));
+    const pageLocked = createFakePage(bodyLocked);
+    const lockedRes = await xhsMod.applyXhsOriginalStatement(pageLocked, {
+      data: { pt: "小红书" },
+      timeouts: { ...fastTimeouts, disabledWaitTimeoutMs: 50, disabledPollIntervalMs: 10 },
+    });
+    assert.strictEqual(lockedRes.status, "enabled");
+    assert.strictEqual(lockedRes.alreadyEnabled, true);
+    assert.strictEqual(cbLocked.clickCount, 0);
+  })();
+
+  // 5j. 上游商品挂车入参与 S17 分平台文案、S18 AI章节/原创声明并存不覆盖
+  {
+    const dyCombo = parsePublishArgsMod.parsePublishArgs([
+      "-p", "dy", "--phone", "13800138000", "-f", "/tmp/a.mp4", "-t", "默认标题",
+      "--title-by-platform", JSON.stringify({ dy: "抖音专属标题" }),
+      "--desc-by-platform", JSON.stringify({ dy: "抖音专属简介" }),
+      "--short-title", "好物水杯",
+      "--dy-product-url", "https://haohuo.jinritemai.com/views/product/detail?id=123",
+      "--no-ai-chapters",
+    ]);
+    assert.strictEqual(dyCombo.ok, true, dyCombo.error);
+    assert.strictEqual(dyCombo.value.title, "抖音专属标题");
+    assert.strictEqual(dyCombo.value.description, "抖音专属简介");
+    assert.strictEqual(dyCombo.value.aiChapters, false);
+    assert.strictEqual(dyCombo.value.publishOptions.link.type, "product");
+    assert.strictEqual(dyCombo.value.publishOptions.link.shortTitle, "好物水杯");
+
+    const httpMultiCombo = parsePublishArgsMod.parseMultiPublishRequest({
+      file: "/tmp/a.mp4",
+      title: "通用标题",
+      phone: "13800138000",
+      shortTitle: "好物水杯",
+      titleByPlatform: { dy: "抖音覆盖标题", ks: "快手覆盖标题" },
+      descByPlatform: { ks: "快手覆盖简介" },
+      dyProductUrl: "https://haohuo.jinritemai.com/views/product/detail?id=555",
+      ksProductName: "货架完整商品名",
+      platforms: [
+        { platform: "dy", aiChapters: true },
+        { platform: "ks", aiChapters: false },
+        { platform: "xhs", originalStatement: true },
+      ],
+    });
+    assert.strictEqual(httpMultiCombo.ok, true, httpMultiCombo.error);
+    const map = Object.fromEntries(httpMultiCombo.value.map((v) => [v.platform, v]));
+    assert.strictEqual(map["抖音"].title, "抖音覆盖标题");
+    assert.strictEqual(map["抖音"].aiChapters, true);
+    assert.strictEqual(map["抖音"].publishOptions.link.type, "product");
+    assert.strictEqual(map["快手"].title, "快手覆盖标题");
+    assert.strictEqual(map["快手"].description, "快手覆盖简介");
+    assert.strictEqual(map["快手"].aiChapters, false);
+    assert.strictEqual(map["快手"].publishOptions.link.value, "货架完整商品名");
+    assert.strictEqual(map["小红书"].originalStatement, true);
+    assert.strictEqual(map["小红书"].publishOptions.link, undefined);
+  }
 
   // ================================================================
   // 6. 历史 CSV 独立列与 GUI Vue 模板编译校验

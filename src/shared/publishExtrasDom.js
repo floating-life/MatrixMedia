@@ -762,9 +762,12 @@ export function runOriginalStatementDomAction(payload) {
   var dialogSelectors = Array.isArray(cfg.dialogSelectors)
     ? cfg.dialogSelectors
     : [];
+  var originalDialogSelectors = Array.isArray(cfg.originalDialogSelectors)
+    ? cfg.originalDialogSelectors
+    : [];
   var dialogKeywords = Array.isArray(cfg.dialogKeywords)
     ? cfg.dialogKeywords
-    : ["原创", "声明原创", "原创声明", "协议", "条款"];
+    : ["原创声明", "声明原创", "原创"];
   var ignoreDialogPatterns = Array.isArray(cfg.ignoreDialogPatterns)
     ? cfg.ignoreDialogPatterns
     : ["将此次编辑保留"];
@@ -779,7 +782,15 @@ export function runOriginalStatementDomAction(payload) {
     : ["button.weui-desktop-btn_primary", "button", "[role='button']"];
   var confirmButtonTexts = Array.isArray(cfg.confirmButtonTexts)
     ? cfg.confirmButtonTexts
-    : ["声明原创", "确认声明", "同意并声明", "开启原创", "确定", "确认"];
+    : [
+        "声明原创",
+        "确认声明",
+        "同意并声明",
+        "开启原创",
+        "我已阅读并同意",
+        "确定",
+        "确认",
+      ];
   var noQualificationPatterns = Array.isArray(cfg.noQualificationPatterns)
     ? cfg.noQualificationPatterns
     : [
@@ -807,14 +818,17 @@ export function runOriginalStatementDomAction(payload) {
         "发布",
         "发表",
         "立即发布",
+        "立即发表",
         "定时发布",
         "存草稿",
         "保存草稿",
         "暂存离开",
         "保存",
+        "提交",
         "取消",
         "取消发布",
         "确认发布",
+        "确认发表",
       ];
   var dispatchMouseEvents = Boolean(cfg.dispatchMouseEvents);
 
@@ -936,8 +950,39 @@ export function runOriginalStatementDomAction(payload) {
     return false;
   };
 
-  var getSubmitRejectionReason = function (el) {
+  var hasPublishVerb = function (text) {
+    var s = norm(text);
+    if (!s) return false;
+    return s.indexOf("发布") !== -1 || s.indexOf("发表") !== -1;
+  };
+
+  var isButtonLike = function (node) {
+    if (!node || node.nodeType !== 1) return false;
+    var tag = String(node.tagName || "").toUpperCase();
+    if (tag === "BUTTON") return true;
+    if (tag === "INPUT") {
+      var tp = String(
+        (typeof node.getAttribute === "function" && node.getAttribute("type")) ||
+          node.type ||
+          ""
+      ).toLowerCase();
+      if (tp === "button" || tp === "submit" || tp === "reset") return true;
+    }
+    if (typeof node.getAttribute === "function") {
+      if (String(node.getAttribute("role") || "").toLowerCase() === "button") {
+        return true;
+      }
+    }
+    var cls = getClass(node);
+    if (/\b(d-button|weui-desktop-btn|ant-btn|semi-button)\b/.test(cls)) {
+      return true;
+    }
+    return false;
+  };
+
+  var getSubmitRejectionReason = function (el, guardOpts) {
     if (!el) return "empty_target";
+    var rejectPublishVerb = Boolean(guardOpts && guardOpts.rejectPublishVerb);
     var node = el;
     for (var depth = 0; node && depth <= 8; depth++) {
       if (
@@ -950,9 +995,44 @@ export function runOriginalStatementDomAction(payload) {
         if (matchesAnySelector(node, submitSelectors)) {
           return "submit_selector_depth_" + depth;
         }
+        var tag = String(node.tagName || "").toUpperCase();
+        if (
+          (tag === "BUTTON" || tag === "INPUT") &&
+          typeof node.getAttribute === "function"
+        ) {
+          var tp = String(node.getAttribute("type") || "")
+            .trim()
+            .toLowerCase();
+          if (tp === "submit" || tp === "reset") {
+            return "submit_control_depth_" + depth;
+          }
+        }
         var tNorm = norm(getText(node));
         if (tNorm && submitTextSet[tNorm]) {
           return "submit_text_depth_" + depth;
+        }
+        var al =
+          typeof node.getAttribute === "function"
+            ? norm(node.getAttribute("aria-label"))
+            : "";
+        if (al && submitTextSet[al]) {
+          return "submit_aria_depth_" + depth;
+        }
+        var tl =
+          typeof node.getAttribute === "function"
+            ? norm(node.getAttribute("title"))
+            : "";
+        if (tl && submitTextSet[tl]) {
+          return "submit_title_depth_" + depth;
+        }
+        // 任何按钮类控件（或确认点击）含「发布」「发表」一律拒绝，绝不误触发布按钮
+        if (
+          (depth === 0 && (rejectPublishVerb || isButtonLike(node))) ||
+          (depth <= 3 && isButtonLike(node))
+        ) {
+          if (hasPublishVerb(tNorm) || hasPublishVerb(al) || hasPublishVerb(tl)) {
+            return "publish_verb_depth_" + depth;
+          }
         }
       }
       if (node === root) break;
@@ -1075,12 +1155,10 @@ export function runOriginalStatementDomAction(payload) {
     return { checked: false, source: "default" };
   };
 
-  var performClick = function (el, skipSubmitGuard) {
+  var performClick = function (el, guardOpts) {
     if (!el) return { ok: false, reason: "missing_el" };
-    if (!skipSubmitGuard) {
-      var rej = getSubmitRejectionReason(el);
-      if (rej) return { ok: false, submitRejected: true, rejectReason: rej };
-    }
+    var rej = getSubmitRejectionReason(el, guardOpts);
+    if (rej) return { ok: false, submitRejected: true, rejectReason: rej };
     if (typeof el.scrollIntoView === "function") {
       try {
         el.scrollIntoView({ block: "center", inline: "center" });
@@ -1151,10 +1229,24 @@ export function runOriginalStatementDomAction(payload) {
     for (var i = 0; i < dialogs.length; i++) {
       var dlg = dialogs[i];
       if (!isVisible(dlg)) continue;
+      // 排除包裹主表单发布/草稿按钮的大容器，避免把页面容器误认作原创弹窗
+      var containsSubmit = false;
+      if (typeof dlg.querySelector === "function") {
+        for (var ssi = 0; ssi < submitSelectors.length; ssi++) {
+          try {
+            if (dlg.querySelector(submitSelectors[ssi])) {
+              containsSubmit = true;
+              break;
+            }
+          } catch (_) {}
+        }
+      }
+      if (containsSubmit) continue;
       var text = clean(getText(dlg));
       if (!text) continue;
       if (matchesAnyKeyword(text, ignoreDialogPatterns)) continue;
       if (
+        matchesAnySelector(dlg, originalDialogSelectors) ||
         matchesAnyKeyword(text, dialogKeywords) ||
         matchesAnyKeyword(text, noQualificationPatterns)
       ) {
@@ -1195,6 +1287,7 @@ export function runOriginalStatementDomAction(payload) {
           found: true,
           dialogOpen: true,
           noQualification: true,
+          explicitNoQualification: true,
           noQualificationText: activeDialog.text.slice(0, 120),
           checked: false,
         };
@@ -1207,6 +1300,7 @@ export function runOriginalStatementDomAction(payload) {
         found: true,
         dialogOpen: Boolean(activeDialog),
         noQualification: true,
+        explicitNoQualification: true,
         noQualificationText: toastNoQual,
         checked: false,
       };
@@ -1232,10 +1326,11 @@ export function runOriginalStatementDomAction(payload) {
         checked: pState.checked,
         stateSource: pState.source,
         disabled: pDis,
-        noQualification: pDis || Boolean(pNoQual),
+        noQualification: Boolean(pNoQual) || (pDis && !pState.checked),
+        explicitNoQualification: Boolean(pNoQual),
         noQualificationText: pNoQual
           ? pCtx.slice(0, 120)
-          : pDis
+          : pDis && !pState.checked
           ? "原创声明入口置灰不可点击"
           : "",
         dialogOpen: Boolean(activeDialog),
@@ -1266,10 +1361,11 @@ export function runOriginalStatementDomAction(payload) {
         checked: tState.checked,
         stateSource: tState.source,
         disabled: tDis,
-        noQualification: tDis || Boolean(tNoQual),
+        noQualification: Boolean(tNoQual) || (tDis && !tState.checked),
+        explicitNoQualification: Boolean(tNoQual),
         noQualificationText: tNoQual
           ? ctx.slice(0, 120)
-          : tDis
+          : tDis && !tState.checked
           ? "原创声明开关置灰不可用"
           : "",
         dialogOpen: Boolean(activeDialog),
@@ -1293,6 +1389,7 @@ export function runOriginalStatementDomAction(payload) {
         return {
           found: false,
           noQualification: true,
+          explicitNoQualification: true,
           noQualificationText: cText.slice(0, 120),
           dialogOpen: Boolean(activeDialog),
           reason: "container_no_qualification",
@@ -1315,6 +1412,7 @@ export function runOriginalStatementDomAction(payload) {
           return {
             found: false,
             noQualification: true,
+            explicitNoQualification: true,
             noQualificationText: bText.slice(0, 120),
             dialogOpen: Boolean(activeDialog),
             reason: "text_no_qualification",
@@ -1358,7 +1456,7 @@ export function runOriginalStatementDomAction(payload) {
       ? root.querySelector('[data-mm-orig-click="' + token + '"]')
       : null;
     if (!clickEl) return { ok: false, reason: "entry_missing" };
-    return performClick(clickEl, false);
+    return performClick(clickEl);
   }
 
   if (action === "handle_dialog") {
@@ -1403,7 +1501,7 @@ export function runOriginalStatementDomAction(payload) {
         ) {
           continue;
         }
-        var pClick = performClick(ag, true);
+        var pClick = performClick(ag);
         if (pClick && pClick.ok) {
           if (token && typeof ag.setAttribute === "function") {
             ag.setAttribute("data-mm-orig-agreed", token);
@@ -1414,7 +1512,7 @@ export function runOriginalStatementDomAction(payload) {
       } else {
         var agState = readCheckedState(ag, agInp);
         if (!agState.checked) {
-          var aClick = performClick(ag, true);
+          var aClick = performClick(ag);
           if (aClick && aClick.ok) {
             agreementClicked = true;
             break;
@@ -1429,27 +1527,54 @@ export function runOriginalStatementDomAction(payload) {
     var btns = queryList(dlg, confirmButtonSelectors);
     for (var cti = 0; cti < confirmButtonTexts.length && !confirmClicked; cti++) {
       var wanted = norm(confirmButtonTexts[cti]);
+      if (!wanted || hasPublishVerb(wanted)) continue;
       for (var bi = 0; bi < btns.length; bi++) {
         var btn = btns[bi];
         if (!isVisible(btn)) continue;
         var bNorm = norm(getText(btn));
         if (!bNorm) continue;
-        if (bNorm === "取消" || bNorm === "关闭" || bNorm === "暂不声明") {
+        var bAria =
+          typeof btn.getAttribute === "function"
+            ? norm(btn.getAttribute("aria-label"))
+            : "";
+        var bTitle =
+          typeof btn.getAttribute === "function"
+            ? norm(btn.getAttribute("title"))
+            : "";
+        // 任何含「发布」「发表」的按钮一律排除，绝不可能点到发布按钮
+        if (
+          hasPublishVerb(bNorm) ||
+          hasPublishVerb(bAria) ||
+          hasPublishVerb(bTitle)
+        ) {
           continue;
         }
-        if (bNorm === wanted || bNorm.indexOf(wanted) !== -1) {
-          if (isDisabledControl(btn, null)) {
-            confirmDisabled = true;
-            confirmText = bNorm;
-            continue;
-          }
-          // 弹窗内确定按钮（如「声明原创」「确定」）允许跳过主表单提交守卫
-          var cClick = performClick(btn, true);
-          if (cClick && cClick.ok) {
-            confirmClicked = true;
-            confirmText = bNorm;
-            break;
-          }
+        if (
+          bNorm === "取消" ||
+          bNorm === "关闭" ||
+          bNorm === "暂不声明" ||
+          bNorm === "暂存离开" ||
+          bNorm === "存草稿" ||
+          bNorm === "保存草稿"
+        ) {
+          continue;
+        }
+        // 仅允许原创弹窗内确认类按钮完整文案精确匹配（禁止子串匹配）
+        if (bNorm !== wanted) continue;
+        // 必须通过现有提交守卫/拒绝名单，禁止跳过
+        if (getSubmitRejectionReason(btn, { rejectPublishVerb: true })) {
+          continue;
+        }
+        if (isDisabledControl(btn, null)) {
+          confirmDisabled = true;
+          confirmText = bNorm;
+          continue;
+        }
+        var cClick = performClick(btn, { rejectPublishVerb: true });
+        if (cClick && cClick.ok) {
+          confirmClicked = true;
+          confirmText = bNorm;
+          break;
         }
       }
     }
@@ -1474,6 +1599,7 @@ export function runOriginalStatementDomAction(payload) {
         checked: false,
         dialogOpen: Boolean(rbDlg),
         noQualification: true,
+        explicitNoQualification: true,
         noQualificationText: rbToast,
       };
     }
@@ -1483,6 +1609,7 @@ export function runOriginalStatementDomAction(payload) {
         checked: false,
         dialogOpen: true,
         noQualification: true,
+        explicitNoQualification: true,
         noQualificationText: rbDlg.text.slice(0, 120),
       };
     }
@@ -1501,7 +1628,8 @@ export function runOriginalStatementDomAction(payload) {
         stateSource: st.source,
         disabled: dis,
         dialogOpen: Boolean(rbDlg),
-        noQualification: dis || Boolean(nq),
+        noQualification: Boolean(nq) || (dis && !st.checked),
+        explicitNoQualification: Boolean(nq),
         noQualificationText: nq ? ctx.slice(0, 120) : "",
       };
     }
@@ -1936,6 +2064,18 @@ export async function executeOriginalStatementFlow(
       : 2500;
   const pollIntervalMs =
     timeouts.pollIntervalMs !== undefined ? timeouts.pollIntervalMs : 250;
+  const disabledWaitTimeoutMs =
+    timeouts.disabledWaitTimeoutMs !== undefined
+      ? timeouts.disabledWaitTimeoutMs
+      : cfg && cfg.disabledWaitTimeoutMs !== undefined
+      ? cfg.disabledWaitTimeoutMs
+      : 0;
+  const disabledPollIntervalMs =
+    timeouts.disabledPollIntervalMs !== undefined
+      ? timeouts.disabledPollIntervalMs
+      : cfg && cfg.disabledPollIntervalMs !== undefined
+      ? cfg.disabledPollIntervalMs
+      : 500;
   const token = `mm_orig_${Date.now()}_${Math.random()
     .toString(36)
     .slice(2, 8)}`;
@@ -1952,11 +2092,77 @@ export async function executeOriginalStatementFlow(
   });
 
   try {
-    const inspected = await page.evaluate(runOriginalStatementDomAction, {
+    let inspected = await page.evaluate(runOriginalStatementDomAction, {
       action: "inspect",
       token,
       cfg,
     });
+
+    // 入口仅置灰且无明确「无原创资格」文案时（如转码/校验尚未落定），先等待最多 disabledWaitTimeoutMs 变可用再判无资格
+    if (
+      inspected &&
+      inspected.found &&
+      inspected.disabled &&
+      !inspected.checked &&
+      !inspected.explicitNoQualification &&
+      disabledWaitTimeoutMs > 0
+    ) {
+      console.log(
+        `[${platformTag}][original] 原创声明入口当前置灰，等待最多 ${Math.round(
+          disabledWaitTimeoutMs / 1000
+        )}s 变可用...`
+      );
+      const waitDeadline = Date.now() + Math.max(0, disabledWaitTimeoutMs);
+      const stepMs = Math.max(1, disabledPollIntervalMs);
+      const maxPolls = Math.max(1, Math.ceil(disabledWaitTimeoutMs / stepMs));
+      let polls = 0;
+      while (polls < maxPolls && Date.now() < waitDeadline) {
+        await waitExtrasMs(page, stepMs);
+        polls += 1;
+        inspected = await page.evaluate(runOriginalStatementDomAction, {
+          action: "inspect",
+          token,
+          cfg,
+        });
+        if (
+          !inspected ||
+          !inspected.found ||
+          inspected.explicitNoQualification ||
+          !inspected.disabled ||
+          (inspected.checked === true && !inspected.dialogOpen)
+        ) {
+          break;
+        }
+      }
+      if (
+        inspected &&
+        inspected.found &&
+        !inspected.disabled &&
+        !inspected.noQualification
+      ) {
+        console.log(
+          `[${platformTag}][original] 原创声明入口已恢复可用（等待 ${polls} 轮），继续声明原创`
+        );
+      }
+    }
+
+    if (
+      inspected &&
+      inspected.found &&
+      inspected.checked === true &&
+      !inspected.dialogOpen &&
+      !inspected.explicitNoQualification
+    ) {
+      console.log(
+        `[${platformTag}][original] 原创声明已处于勾选状态（策略=${
+          inspected.strategy || ""
+        }，来源=${inspected.stateSource || ""}），无需重复点击`
+      );
+      return {
+        status: ORIGINAL_STATEMENT_STATUS.ENABLED,
+        alreadyEnabled: true,
+      };
+    }
 
     if (inspected && inspected.noQualification) {
       await dumpExtrasDiagnostics(page, diagPayload("no-qualification"));
@@ -1973,18 +2179,6 @@ export async function executeOriginalStatementFlow(
         "定位入口",
         (inspected && inspected.reason) || "未找到原创声明入口"
       );
-    }
-
-    if (inspected.checked === true && !inspected.dialogOpen) {
-      console.log(
-        `[${platformTag}][original] 原创声明已处于勾选状态（策略=${
-          inspected.strategy || ""
-        }，来源=${inspected.stateSource || ""}），无需重复点击`
-      );
-      return {
-        status: ORIGINAL_STATEMENT_STATUS.ENABLED,
-        alreadyEnabled: true,
-      };
     }
 
     if (!inspected.checked) {

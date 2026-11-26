@@ -152,6 +152,8 @@ export const KNOWN_PUBLISH_VALUE_FLAGS = new Set([
   "--creative-statement", "--cs",
   "--collection", "--sph-link-type", "--sph-link-value",
   "--sph-product-id", "--sph-drama-id", "--sph-series-id",
+  "--dy-link-type", "--dy-link-value", "--dy-product-url",
+  "--ks-link-type", "--ks-link-value", "--ks-product-name",
 ]);
 
 /**
@@ -205,6 +207,10 @@ export function parsePublishArgs(subArgv) {
     collection: "",
     sphLinkType: null,
     sphLinkValue: null,
+    dyLinkType: null,
+    dyLinkValue: null,
+    ksLinkType: null,
+    ksLinkValue: null,
     publishOptions: {},
   };
 
@@ -212,6 +218,12 @@ export function parsePublishArgs(subArgv) {
     "--sph-product-id": "商品编号",
     "--sph-drama-id": "短剧名称",
     "--sph-series-id": "剧集名称",
+    "--dy-product-url": "商品链接",
+    "--dy-link-type": "链接类型",
+    "--dy-link-value": "商品链接",
+    "--ks-product-name": "货架商品完整名称",
+    "--ks-link-type": "链接类型",
+    "--ks-link-value": "货架商品完整名称",
     "--collection": "合集名称",
   };
   // 正文类取值参数（-t/--title、--description/--desc、--short-title、--tags/--bq、--bt2、--name/--book-name）：
@@ -427,6 +439,40 @@ export function parsePublishArgs(subArgv) {
       out.sphLinkType = VIDEO_LINK_TYPES.SPH_SERIES;
       out.sphLinkValue = v.value;
       i += 1;
+    } else if (a === "--dy-link-type") {
+      const v = consumeStrictOptionValue(a, i);
+      if (!v.ok) return v;
+      out.dyLinkType = v.value;
+      i += 1;
+    } else if (a === "--dy-link-value") {
+      const v = consumeStrictOptionValue(a, i);
+      if (!v.ok) return v;
+      out.dyLinkValue = v.value;
+      i += 1;
+    } else if (a === "--dy-product-url") {
+      const v = consumeStrictOptionValue(a, i);
+      if (!v.ok) return v;
+      // 抖音商品挂车快捷参数：等价于 --dy-link-type product --dy-link-value <商品链接>
+      out.dyLinkType = VIDEO_LINK_TYPES.PRODUCT;
+      out.dyLinkValue = v.value;
+      i += 1;
+    } else if (a === "--ks-link-type") {
+      const v = consumeStrictOptionValue(a, i);
+      if (!v.ok) return v;
+      out.ksLinkType = v.value;
+      i += 1;
+    } else if (a === "--ks-link-value") {
+      const v = consumeStrictOptionValue(a, i);
+      if (!v.ok) return v;
+      out.ksLinkValue = v.value;
+      i += 1;
+    } else if (a === "--ks-product-name") {
+      const v = consumeStrictOptionValue(a, i);
+      if (!v.ok) return v;
+      // 快手商品挂车快捷参数：等价于 --ks-link-type product --ks-link-value <货架商品完整名称>
+      out.ksLinkType = VIDEO_LINK_TYPES.PRODUCT;
+      out.ksLinkValue = v.value;
+      i += 1;
     }
   }
 
@@ -541,6 +587,75 @@ export function parsePublishArgs(subArgv) {
   } else {
     out.sphLinkType = null;
     out.sphLinkValue = null;
+  }
+
+  // 抖音 / 快手商品挂车：与视频号同一套 publishOptions.link 契约，
+  // 具体挂载实现见 upLoad/dy.js::attachDyProductLink 与 upLoad/ks.js::attachKsProductLink。
+  // 参数误传给其他平台时直接忽略（与视频号一致）。
+  const resolveProductLinkArgs = (platformName, ptKey, typeVal, valueVal, hint) => {
+    const hasType = typeVal != null && String(typeVal).trim() !== "";
+    const hasValue = valueVal != null && String(valueVal).trim() !== "";
+    if (!hasType && !hasValue) return null;
+    // 只传内容时默认按商品挂车
+    const rawType = hasType ? typeVal : VIDEO_LINK_TYPES.PRODUCT;
+    const typeAliases = {
+      none: VIDEO_LINK_TYPES.NONE,
+      无: VIDEO_LINK_TYPES.NONE,
+      product: VIDEO_LINK_TYPES.PRODUCT,
+      商品: VIDEO_LINK_TYPES.PRODUCT,
+    };
+    const linkType = typeAliases[String(rawType).trim().toLowerCase()];
+    if (!linkType) {
+      return { error: `--${ptKey}-link-type 当前仅支持 none 或 product` };
+    }
+    if (linkType === VIDEO_LINK_TYPES.PRODUCT && !hasValue) {
+      return { error: `${platformName}商品挂车必须提供 ${hint}` };
+    }
+    if (linkType === VIDEO_LINK_TYPES.NONE && hasValue) {
+      return { error: `--${ptKey}-link-type none 不应同时提供内容` };
+    }
+    // 抖音商品挂车要求商品短标题（平台硬性要求，≤10 字），由 --short-title 提供。
+    const built = buildVideoLinkOption(platformName, linkType, valueVal, {
+      shortTitle: out.shortTitle,
+    });
+    if (!built.ok) {
+      // 抖音缺短标题时给出可操作的补参提示，而不是平台原文案
+      if (
+        platformName === "抖音" &&
+        linkType === VIDEO_LINK_TYPES.PRODUCT &&
+        /短标题/.test(String(built.error || ""))
+      ) {
+        return {
+          error: `抖音商品挂车需要商品短标题（不超过 10 字），请同时提供 --short-title <短标题>`,
+        };
+      }
+      return { error: built.error };
+    }
+    return { link: built.value };
+  };
+
+  if (out.platform === "抖音") {
+    const r = resolveProductLinkArgs(
+      "抖音", "dy", out.dyLinkType, out.dyLinkValue,
+      "--dy-product-url 或 --dy-link-value <商品链接>"
+    );
+    if (r && r.error) return { ok: false, error: r.error };
+    if (r && r.link) out.publishOptions = { ...out.publishOptions, link: r.link };
+  } else {
+    out.dyLinkType = null;
+    out.dyLinkValue = null;
+  }
+
+  if (out.platform === "快手") {
+    const r = resolveProductLinkArgs(
+      "快手", "ks", out.ksLinkType, out.ksLinkValue,
+      "--ks-product-name 或 --ks-link-value <货架商品完整名称>"
+    );
+    if (r && r.error) return { ok: false, error: r.error };
+    if (r && r.link) out.publishOptions = { ...out.publishOptions, link: r.link };
+  } else {
+    out.ksLinkType = null;
+    out.ksLinkValue = null;
   }
 
   if (!out.file && !out.dir) {
@@ -836,6 +951,53 @@ export function publishBodyToArgv(body) {
     argv.push(explicitOriginal.value ? "--original" : "--no-original");
   }
 
+  // 抖音 / 快手商品挂车：与视频号同构，支持平台专属字段与 platformOptions.<pt>.link 两种写法。
+  const pushProductLink = (ptKey, ptAliases, extraKeys, quickFlag) => {
+    let platLink = null;
+    if (body.platformOptions && typeof body.platformOptions === "object") {
+      for (const k of [ptKey, ...ptAliases]) {
+        if (body.platformOptions[k] && body.platformOptions[k].link) {
+          platLink = body.platformOptions[k].link;
+          break;
+        }
+      }
+    }
+    const link =
+      (body[`${ptKey}Link`] && typeof body[`${ptKey}Link`] === "object"
+        ? body[`${ptKey}Link`]
+        : null) || platLink;
+    // 快捷字段（dyProductUrl / ksProductName）
+    const quick = pickBodyValue(body, extraKeys);
+    const quickStr = quick == null ? "" : String(quick).trim();
+    if (quickStr) {
+      argv.push(quickFlag, quickStr);
+      return;
+    }
+    if (!link || typeof link !== "object") return;
+    const type = link.type == null ? "" : String(link.type).trim();
+    const value = link.value == null ? "" : String(link.value).trim();
+    // 显式给 type+value 时按原样透传（以便校验 none+value 或非法 type）；只给 value 时默认按商品挂车
+    if (type && value) {
+      argv.push(`--${ptKey}-link-type`, type, `--${ptKey}-link-value`, value);
+    } else if (value) {
+      argv.push(quickFlag, value);
+    } else if (type) {
+      argv.push(`--${ptKey}-link-type`, type);
+    }
+  };
+  pushProductLink(
+    "dy",
+    ["抖音"],
+    ["dyProductUrl", "dy-product-url", "dyProductLinkUrl"],
+    "--dy-product-url"
+  );
+  pushProductLink(
+    "ks",
+    ["快手"],
+    ["ksProductName", "ks-product-name", "ksProductLinkName"],
+    "--ks-product-name"
+  );
+
   return argv;
 }
 
@@ -1066,6 +1228,14 @@ const SHARED_PUBLISH_BODY_KEYS = [
   "sphSeriesId",
   "sph-series-id",
   "seriesId",
+  "dyLink",
+  "dyProductUrl",
+  "dy-product-url",
+  "dyProductLinkUrl",
+  "ksLink",
+  "ksProductName",
+  "ks-product-name",
+  "ksProductLinkName",
 ];
 
 function extractSharedPublishBody(body) {
@@ -1620,6 +1790,14 @@ export function publishHelpText() {
       --sph-series-id <name>  视频号挂载剧集（视频号原生剧集，区别于小程序短剧）。同样传「名称」而非编号。
       --sph-link-type <type>  视频号链接类型：none | product | mini_drama | sph_series（也接受 drama / 短剧 / series / 剧集）；传给其他平台时忽略
       --sph-link-value <v>    视频号链接值：商品编号，或短剧/剧集名称；只传该参数时默认按商品上架
+      --dy-product-url <url>  抖音商品挂车（快捷参数，等价于 --dy-link-type product --dy-link-value <url>）。
+                                必须粘贴完整商品链接；抖音商品挂车还需 --short-title 商品短标题（≤10 字）。
+      --dy-link-type <t>      抖音链接类型：none | product
+      --dy-link-value <v>     抖音链接值：商品链接 URL
+      --ks-product-name <n>   快手商品挂车（快捷参数）。值为「货架中已存在的商品完整名称」，
+                                不是商品 ID（发布页按名称搜索）。等价于 --ks-link-type product --ks-link-value <名称>
+      --ks-link-type <t>      快手链接类型：none | product
+      --ks-link-value <v>     快手链接值：货架商品完整名称
   -h, --help            显示帮助
 
 退出码 (单文件): 0 成功, 1 异常, 2 参数错误, 3 任务失败（上传未成功）, 4 已转存草稿需检查, 6 近7天重复发布拦截

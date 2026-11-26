@@ -140,6 +140,10 @@
 | `collection`         | 否     | 发布时选择的合集名称字符串（如 `"民间故事"`；仅抖音 / 快手 / 视频号生效，按去空白后完全匹配；留空不选，其他平台忽略）。找不到入口、找不到同名合集或回读不符时中止本平台发布、截图留证且不重试 |
 | `collections`        | 否     | 按平台覆盖合集名称，key 用 code 或中文名，如 `{ "dy": "抖音合集", "ks": "" }`（显式传 `""` 可取消该平台的全局合集） |
 | `sphProductId`       | 否     | 视频号商品上架快捷字段（商品编号）；仅视频号生效，等价于 `platformOptions.sph.link.type=product` |
+| `dyProductUrl`       | 否     | 抖音商品挂车快捷字段（**完整商品链接**）；仅抖音生效，等价于 `platformOptions.dy.link.type=product`。抖音挂车**还需 `shortTitle` 商品短标题（≤10 字）** |
+| `dyLink`             | 否     | 抖音链接对象 `{ type: "product", value: "<商品链接>" }`；仅抖音生效 |
+| `ksProductName`      | 否     | 快手商品挂车快捷字段（**货架中已存在的商品完整名称**，不是商品 ID）；仅快手生效，等价于 `platformOptions.ks.link.type=product` |
+| `ksLink`             | 否     | 快手链接对象 `{ type: "product", value: "<货架商品完整名称>" }`；仅快手生效 |
 | `sphDramaId` | 否 | 视频号小程序短剧挂载快捷字段（**短剧名称**，如 `泳陷错恋`）；仅视频号生效，等价于 `platformOptions.sph.link.type=mini_drama`                                         |
 | `sphSeriesId` | 否 | 视频号剧集挂载快捷字段（**剧集名称**，视频号原生剧集）；仅视频号生效，等价于 `platformOptions.sph.link.type=sph_series`                                         |
 | `sphLink`            | 否     | 视频号链接对象，如 `{ "type": "product", "value": "商品编号" }`、`{ "type": "mini_drama", "value": "短剧名称" }` 或 `{ "type": "sph_series", "value": "剧集名称" }`；与三个快捷字段同时传时优先快捷字段                           |
