@@ -21,6 +21,8 @@ const {
   accountLoginFlagNameOf,
   buildCompatPhone,
   normalizeAccountRecordFields,
+  resolveRecordGroup,
+  resolveRecordAccountName,
 } = require("../src/shared/accountIdentity.js");
 const {
   buildGroupOrderMap,
@@ -106,5 +108,207 @@ assert.deepStrictEqual(orderMap, { 宠物: 0, 喵呼: 1 });
 assert.strictEqual(recordGroupOf(null), "");
 assert.strictEqual(recordAccountKeyOf(undefined), "");
 assert.strictEqual(buildAccountPartitionOf({}, "抖音"), "persist:抖音");
+
+/* ── resolveRecordGroup / resolveRecordAccountName（S20） ── */
+const currentAccounts = [
+  {
+    id: "acc-dy",
+    pt: "抖音",
+    group: "人间善恶录",
+    phone: "人间善恶录-赛博张师傅",
+    accountName: "赛博张师傅",
+    accountKey: "赛博张师傅",
+  },
+  {
+    id: "acc-ks",
+    pt: "快手",
+    group: "人间善恶录",
+    phone: "人间善恶录-赛博张师傅",
+    accountName: "赛博张师傅",
+    accountKey: "赛博张师傅",
+  },
+  {
+    id: "acc-bjh",
+    pt: "百家号",
+    group: "人间善恶录",
+    phone: "人间善恶录",
+    accountName: "人间善恶录",
+    accountKey: "人间善恶录",
+  },
+  {
+    id: "acc-sblsj",
+    pt: "抖音",
+    group: "赛博老司机",
+    phone: "赛博老司机",
+    accountName: "赛博老司机",
+    accountKey: "赛博老司机",
+  },
+];
+
+// 1. 改名前旧记录（仍记录旧分组名赛博张师傅）命中当前账号 → 返回新分组名
+assert.strictEqual(
+  resolveRecordGroup(
+    {
+      pt: "抖音",
+      phone: "赛博张师傅",
+      group: "赛博张师傅",
+      accountKey: "赛博张师傅",
+      partition: "persist:赛博张师傅抖音",
+    },
+    currentAccounts
+  ),
+  "人间善恶录"
+);
+// 极早期旧记录（缺 group / accountKey / partition，仅 phone + pt）→ 仍命中新分组名
+assert.strictEqual(
+  resolveRecordGroup({ pt: "快手", phone: "赛博张师傅" }, currentAccounts),
+  "人间善恶录"
+);
+// 缺 partition / pt 时按 accountKey 兜底命中当前账号
+assert.strictEqual(
+  resolveRecordGroup(
+    { phone: "赛博张师傅", accountKey: "赛博张师傅" },
+    currentAccounts
+  ),
+  "人间善恶录"
+);
+// 改名后记录与同组不同 accountKey 的百家号均解析到同一分组名
+assert.strictEqual(
+  resolveRecordGroup(
+    {
+      pt: "抖音",
+      phone: "人间善恶录-赛博张师傅",
+      group: "人间善恶录",
+      accountKey: "赛博张师傅",
+      partition: "persist:赛博张师傅抖音",
+    },
+    currentAccounts
+  ),
+  "人间善恶录"
+);
+assert.strictEqual(
+  resolveRecordGroup(
+    {
+      pt: "百家号",
+      phone: "人间善恶录",
+      group: "人间善恶录",
+      accountKey: "人间善恶录",
+      partition: "persist:人间善恶录百家号",
+    },
+    currentAccounts
+  ),
+  "人间善恶录"
+);
+
+// 2. 账号已删 → 回退 recordGroupOf（group 优先，再回退 phone "-" 前缀）
+assert.strictEqual(
+  resolveRecordGroup(
+    {
+      pt: "抖音",
+      phone: "老分组-已删号",
+      group: "历史分组",
+      accountKey: "已删号",
+      partition: "persist:已删号抖音",
+    },
+    currentAccounts
+  ),
+  "历史分组"
+);
+assert.strictEqual(
+  resolveRecordGroup(
+    {
+      pt: "抖音",
+      phone: "已删组-小号",
+      partition: "persist:已删组抖音",
+    },
+    currentAccounts
+  ),
+  "已删组"
+);
+assert.strictEqual(
+  resolveRecordGroup({ pt: "抖音", phone: "纯旧组" }, currentAccounts),
+  "纯旧组"
+);
+// 已删账号带明确 partition，即使 phone 前缀与现存其他账号撞名也不误命中
+assert.strictEqual(
+  resolveRecordGroup(
+    {
+      pt: "抖音",
+      phone: "赛博老司机-已删二号",
+      partition: "persist:已删二号抖音",
+    },
+    currentAccounts
+  ),
+  "赛博老司机"
+);
+assert.strictEqual(
+  resolveRecordGroup(
+    {
+      pt: "抖音",
+      phone: "赛博张师傅-已删分身",
+      partition: "persist:已删分身抖音",
+    },
+    currentAccounts
+  ),
+  "赛博张师傅"
+);
+// 平台不匹配不误命中（当前列表无该 accountKey 的哔哩哔哩账号）
+assert.strictEqual(
+  resolveRecordGroup(
+    {
+      pt: "哔哩哔哩",
+      phone: "旧组",
+      group: "旧组",
+      accountKey: "赛博张师傅",
+      partition: "persist:赛博张师傅哔哩哔哩",
+    },
+    currentAccounts
+  ),
+  "旧组"
+);
+
+// 3. 跨分组共享登录态账号：保留记录原本所属的有效分组
+const sharedAccounts = [
+  { pt: "抖音", group: "A组", phone: "A组-旺财", accountName: "旺财", accountKey: "旺财" },
+  { pt: "抖音", group: "B组", phone: "B组-旺财", accountName: "旺财", accountKey: "旺财" },
+];
+assert.strictEqual(
+  resolveRecordGroup(
+    { pt: "抖音", group: "B组", phone: "B组-旺财", accountKey: "旺财", partition: "persist:旺财抖音" },
+    sharedAccounts
+  ),
+  "B组"
+);
+
+// 4. 容忍 accountTree 结构与空/字符串入参
+assert.strictEqual(
+  resolveRecordGroup(
+    { pt: "抖音", phone: "赛博张师傅", partition: "persist:赛博张师傅抖音" },
+    {
+      人间善恶录: {
+        children: [{ meta: currentAccounts[0] }],
+      },
+    }
+  ),
+  "人间善恶录"
+);
+assert.strictEqual(resolveRecordGroup(null, currentAccounts), "");
+assert.strictEqual(resolveRecordGroup("旧组-备注", currentAccounts), "旧组");
+
+// 5. resolveRecordAccountName
+assert.strictEqual(
+  resolveRecordAccountName(
+    { pt: "抖音", phone: "赛博张师傅", partition: "persist:赛博张师傅抖音" },
+    currentAccounts
+  ),
+  "赛博张师傅"
+);
+assert.strictEqual(
+  resolveRecordAccountName(
+    { pt: "抖音", phone: "已删组-老号", partition: "persist:老号抖音" },
+    currentAccounts
+  ),
+  "老号"
+);
 
 console.log("test-account-identity: 全部通过");
