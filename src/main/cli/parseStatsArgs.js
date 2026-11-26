@@ -32,7 +32,7 @@ function readValue(args, i, flag) {
 }
 
 function parseStatsExportArgs(args) {
-  const out = { action: "export", out: null, from: null, to: null, json: false };
+  const out = { action: "export", out: null, from: null, to: null, group: null, json: false };
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === "--out" || a === "-o") {
@@ -64,12 +64,23 @@ function parseStatsExportArgs(args) {
       const val = a.slice("--to=".length).trim();
       if (!val) return { ok: false, error: "--to 需要 YYYY-MM-DD 日期" };
       out.to = val;
+    } else if (a === "--group") {
+      const v = readValue(args, i, a);
+      if (!v.ok) return v;
+      const val = String(v.value).trim();
+      if (!val) return { ok: false, error: "--group 需要一个非空分组名" };
+      out.group = val;
+      i = v.next;
+    } else if (typeof a === "string" && a.startsWith("--group=")) {
+      const val = a.slice("--group=".length).trim();
+      if (!val) return { ok: false, error: "--group 需要一个非空分组名" };
+      out.group = val;
     } else if (a === "--json") {
       out.json = true;
     } else {
       return {
         ok: false,
-        error: `未知参数: ${a}（可用: --out、--from、--to、--json）`,
+        error: `未知参数: ${a}（可用: --out、--from、--to、--group、--json）`,
       };
     }
   }
@@ -145,22 +156,24 @@ export function parseStatsArgs(subArgv, action) {
 export function statsHelpText(cmd) {
   if (cmd === "stats-export" || cmd === "export") {
     return `
-用法: <应用> cli stats-export --out <路径.xlsx> [--from YYYY-MM-DD] [--to YYYY-MM-DD]
+用法: <应用> cli stats-export --out <路径.xlsx> [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--group <分组名>]
 
-将本地作品日明细、跨平台汇总、平台日汇总与账号日快照导出为 Excel（.xlsx）
+将本地作品日明细、跨平台汇总、平台日汇总、账号日快照与规则分析导出为 Excel（.xlsx）
 
 选项:
   -o, --out <路径>      输出 .xlsx 文件路径（必填，须以 .xlsx 结尾）
       --from <日期>     起始日期（含），YYYY-MM-DD，默认结束日期往前 29 天
       --to <日期>       结束日期（含），YYYY-MM-DD，默认最新有数据日期
+      --group <分组名>  可选，仅导出指定分组（所有工作表均按该分组过滤）
       --json            以 JSON 输出（默认即 JSON，便于脚本消费）
   -h, --help            显示本帮助
 
-退出码: 0 成功, 1 异常, 2 参数错误, 3 业务失败（如单表超过 200000 行）
+退出码: 0 成功, 1 异常, 2 参数错误（含未知分组）, 3 业务失败（如单表超过 200000 行）
 
 示例:
   matrixmedia cli stats-export --out ./stats.xlsx
   matrixmedia cli stats-export --out ./stats.xlsx --from 2026-11-01 --to 2026-11-30
+  matrixmedia cli stats-export --out ./stats.xlsx --group 赛博老司机
 `.trim();
   }
   const usage = {

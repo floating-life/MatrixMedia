@@ -26,6 +26,7 @@ export async function runStatsCli({
   out,
   from,
   to,
+  group,
   maxRows,
   deps,
 }) {
@@ -44,6 +45,7 @@ export async function runStatsCli({
       const buildOpts = {
         from: from || undefined,
         to: to || undefined,
+        group: group || undefined,
       };
       if (maxRows !== undefined) buildOpts.maxRows = maxRows;
       const data = statsExport.buildStatsWorkbookData(buildOpts, deps);
@@ -57,18 +59,24 @@ export async function runStatsCli({
         out: outPath,
         from: data.from,
         to: data.to,
+        ...(data.group ? { group: data.group } : {}),
         counts: data.counts,
       });
       return 0;
     } catch (err) {
       const message = (err && err.message) || String(err);
       const exitCode =
-        err && err.code === statsExport.ROW_LIMIT_EXCEEDED_CODE ? 3 : 1;
+        err && err.code === statsExport.UNKNOWN_GROUP_CODE
+          ? 2
+          : err && err.code === statsExport.ROW_LIMIT_EXCEEDED_CODE
+          ? 3
+          : 1;
       print({
         success: false,
         out: outPath,
         from: from || null,
         to: to || null,
+        ...(group ? { group } : {}),
         error: message,
       });
       return exitCode;

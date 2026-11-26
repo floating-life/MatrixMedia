@@ -571,7 +571,19 @@ async function main() {
 
     // 2.3 默认范围导出（自动定位最新数据日 2026-11-14，往前 29 天 2026-10-16）
     const wbData = buildStatsWorkbookData({ now: dayTs("2026-11-19") });
-    assert.deepStrictEqual(wbData.sheetOrder, SHEET_NAMES);
+    const expectedFullSheetOrder = [
+      "作品日明细",
+      "作品时段明细",
+      "作品跨平台汇总",
+      "平台日汇总",
+      "账号日快照",
+      "分析",
+      "分析-A组",
+      "分析-B组",
+      "字段说明",
+      "导出信息",
+    ];
+    assert.deepStrictEqual(wbData.sheetOrder, expectedFullSheetOrder);
     assert.strictEqual(wbData.to, "2026-11-14", "默认 to 应取最新有数据日");
     assert.strictEqual(wbData.from, "2026-10-16", "默认 from 应为 to 往前 29 天");
     assert.strictEqual(wbData.counts.accounts, 4);
@@ -652,6 +664,7 @@ async function main() {
     assert.deepStrictEqual(s2[0], [
       "内容ID",
       "标题",
+      "分组",
       "素材文件",
       "首发日期",
       "覆盖平台数",
@@ -678,37 +691,41 @@ async function main() {
     ]);
     const dish1Row = s2.slice(1).find((r) => r[0] === "file:/videos/dish1.mp4");
     assert.ok(dish1Row, "跨平台汇总应含 dish1");
-    assert.strictEqual(dish1Row[2], "/videos/dish1.mp4");
-    assert.strictEqual(dish1Row[3], "2026-11-09");
-    assert.strictEqual(dish1Row[4], 2, "覆盖平台数应为 2");
-    assert.strictEqual(dish1Row[5], "title", "dish1 含 link+title，簇内最弱方式应为 title");
-    assert.strictEqual(dish1Row[6], 500 + 700, "总播放 = DY1(500) + KS1(700)");
-    assert.strictEqual(dish1Row[7], 60 + 55);
-    assert.strictEqual(dish1Row[8], 12 + 11);
-    assert.strictEqual(dish1Row[9], 8, "总分享仅抖音有值 8");
-    assert.strictEqual(dish1Row[10], null, "总收藏两平台全空应为空单元格");
-    assert.strictEqual(dish1Row[11], 10, "总涨粉仅抖音有值 10");
-    assert.strictEqual(dish1Row[12], 500, "抖音·A组·播放");
-    assert.strictEqual(dish1Row[13], 60, "抖音·A组·点赞");
-    assert.strictEqual(dish1Row[14], 12, "抖音·A组·评论");
-    assert.strictEqual(dish1Row[15], null, "抖音·B组 无此作品应为空");
-    assert.strictEqual(dish1Row[18], 700, "快手·A组·播放");
-    assert.strictEqual(dish1Row[19], 55, "快手·A组·点赞");
-    assert.strictEqual(dish1Row[20], 11, "快手·A组·评论");
+    assert.strictEqual(dish1Row[2], "A组");
+    assert.strictEqual(dish1Row[3], "/videos/dish1.mp4");
+    assert.strictEqual(dish1Row[4], "2026-11-09");
+    assert.strictEqual(dish1Row[5], 2, "覆盖平台数应为 2");
+    assert.strictEqual(dish1Row[6], "title", "dish1 含 link+title，簇内最弱方式应为 title");
+    assert.strictEqual(dish1Row[7], 500 + 700, "总播放 = DY1(500) + KS1(700)");
+    assert.strictEqual(dish1Row[8], 60 + 55);
+    assert.strictEqual(dish1Row[9], 12 + 11);
+    assert.strictEqual(dish1Row[10], 8, "总分享仅抖音有值 8");
+    assert.strictEqual(dish1Row[11], null, "总收藏两平台全空应为空单元格");
+    assert.strictEqual(dish1Row[12], 10, "总涨粉仅抖音有值 10");
+    assert.strictEqual(dish1Row[13], 500, "抖音·A组·播放");
+    assert.strictEqual(dish1Row[14], 60, "抖音·A组·点赞");
+    assert.strictEqual(dish1Row[15], 12, "抖音·A组·评论");
+    assert.strictEqual(dish1Row[16], null, "抖音·B组 无此作品应为空");
+    assert.strictEqual(dish1Row[19], 700, "快手·A组·播放");
+    assert.strictEqual(dish1Row[20], 55, "快手·A组·点赞");
+    assert.strictEqual(dish1Row[21], 11, "快手·A组·评论");
     assert.strictEqual(
-      dish1Row[24],
+      dish1Row[25],
       "https://www.douyin.com/video/1001\nhttps://www.kuaishou.com/short-video/ks1",
       "多条作品链接应用换行连接"
     );
     const b1Row = s2.slice(1).find((r) => r[0] === "file:/videos/b1.mp4");
     assert.strictEqual(b1Row[1], "'-测试视频", "跨平台汇总标题应同样防公式注入");
-    assert.strictEqual(b1Row[5], "link", "b1 仅直链匹配应标 link");
+    assert.strictEqual(b1Row[2], "B组");
+    assert.strictEqual(b1Row[6], "link", "b1 仅直链匹配应标 link");
     const unlinkedDy2 = s2.slice(1).find((r) => r[0] === "unlinked:抖音:DY2");
     assert.strictEqual(unlinkedDy2[1], "'+123 独立视频");
-    assert.strictEqual(unlinkedDy2[5], null, "未关联行匹配方式应为空");
+    assert.strictEqual(unlinkedDy2[2], "A组");
+    assert.strictEqual(unlinkedDy2[6], null, "未关联行匹配方式应为空");
     const unlinkedKs2 = s2.slice(1).find((r) => r[0] === "unlinked:快手:KS2");
     assert.strictEqual(unlinkedKs2[1], "'@用户 独立视频");
-    assert.strictEqual(unlinkedKs2[5], null);
+    assert.strictEqual(unlinkedKs2[2], "B组");
+    assert.strictEqual(unlinkedKs2[6], null);
 
     // 验证 Sheet 3：平台日汇总
     const s3 = wbData.sheets["平台日汇总"];
@@ -721,6 +738,7 @@ async function main() {
     assert.deepStrictEqual(pDy10, [
       "2026-11-10",
       "抖音",
+      "A组、B组",
       3,
       null,
       null,
@@ -735,6 +753,7 @@ async function main() {
     assert.deepStrictEqual(pDy11, [
       "2026-11-11",
       "抖音",
+      "A组、B组",
       3,
       310,
       23,
@@ -749,6 +768,7 @@ async function main() {
     assert.deepStrictEqual(pKs11, [
       "2026-11-11",
       "快手",
+      "A组、B组",
       2,
       120,
       10,
@@ -863,11 +883,20 @@ async function main() {
       );
     }
 
-    // 验证 Sheet 5：分析（在字段说明前，首块为文字小结，其后长表数值为 number）
+    // 验证 Sheet 5：分析（在字段说明前，后接分分组分析 sheet，首块为文字小结，其后长表数值为 number）
+    assert.ok(
+      wbData.sheetOrder.indexOf("分析") < wbData.sheetOrder.indexOf("字段说明"),
+      "分析 sheet 必须在字段说明之前"
+    );
     assert.strictEqual(
-      wbData.sheetOrder.indexOf("分析"),
+      wbData.sheetOrder.indexOf("分析-A组"),
+      wbData.sheetOrder.indexOf("分析") + 1,
+      "分分组分析 sheet 应紧随全局分析 sheet"
+    );
+    assert.strictEqual(
+      wbData.sheetOrder.indexOf("分析-B组"),
       wbData.sheetOrder.indexOf("字段说明") - 1,
-      "分析 sheet 必须紧挨在字段说明之前"
+      "最后一个分分组分析 sheet 应紧挨字段说明之前"
     );
     const sAnalysis = wbData.sheets["分析"];
     assert.strictEqual(sAnalysis[0][0], "文字小结", "分析 sheet 首块应为文字小结");
@@ -894,9 +923,9 @@ async function main() {
     assert.ok(fs.existsSync(outXlsx), "应写出 .xlsx 文件");
 
     const readWb = xlsx.readFile(outXlsx);
-    assert.deepStrictEqual(readWb.SheetNames, SHEET_NAMES, "读回 sheet 名与顺序必须精确匹配");
+    assert.deepStrictEqual(readWb.SheetNames, expectedFullSheetOrder, "读回 sheet 名与顺序必须精确匹配");
 
-    for (const sheetName of SHEET_NAMES) {
+    for (const sheetName of expectedFullSheetOrder) {
       const ws = readWb.Sheets[sheetName];
       assert.ok(ws, `读回缺少 sheet: ${sheetName}`);
       assert.strictEqual(ws["!merges"], undefined, `${sheetName} 不得合并单元格`);
@@ -946,9 +975,8 @@ async function main() {
     assert.ok(checkedDy1D2 && checkedKs2D2, "读回校验应命中目标行");
 
     // 读回检查 Sheet「分析」存在、顺序在字段说明前、数值单元格为 number 类型
-    assert.strictEqual(
-      readWb.SheetNames.indexOf("分析"),
-      readWb.SheetNames.indexOf("字段说明") - 1,
+    assert.ok(
+      readWb.SheetNames.indexOf("分析") < readWb.SheetNames.indexOf("字段说明"),
       "读回 xlsx 中「分析」sheet 必须在「字段说明」之前"
     );
     const wsAnalysis = readWb.Sheets["分析"];
@@ -1007,7 +1035,7 @@ async function main() {
       .slice(1)
       .find((r) => r[0] === "file:/videos/dish1.mp4");
     assert.strictEqual(
-      fDish1[6],
+      fDish1[7],
       260 + 420,
       "跨平台汇总应截至 to=11-11（不泄漏 11-14 数据）"
     );
@@ -1188,7 +1216,7 @@ async function main() {
       saveDialogCalls[saveDialogCalls.length - 1].opts.defaultPath,
       path.join(docsDir, buildDefaultExportFileName("", ""))
     );
-    assert.deepStrictEqual(xlsx.readFile(ipcOutFile).SheetNames, SHEET_NAMES);
+    assert.deepStrictEqual(xlsx.readFile(ipcOutFile).SheetNames, expectedFullSheetOrder);
 
     const trailingSpacePath = path.join(tmpRoot, "trailing-space.xlsx ");
     mockDialogResult = { canceled: false, filePath: trailingSpacePath };
@@ -1448,14 +1476,15 @@ async function main() {
       const dupS3 = dupWb.sheets["平台日汇总"].slice(1);
       const dupD10 = dupS3.find((r) => r[0] === "2026-11-10" && r[1] === "抖音");
       const dupD11 = dupS3.find((r) => r[0] === "2026-11-11" && r[1] === "抖音");
-      assert.strictEqual(dupD10[2], 2, "Day1 有数据作品数应去重为 2（而非 4）");
-      assert.strictEqual(dupD11[2], 2, "Day2 有数据作品数应去重为 2（而非 4）");
+      assert.strictEqual(dupD10[2], "A组");
+      assert.strictEqual(dupD10[3], 2, "Day1 有数据作品数应去重为 2（而非 4）");
+      assert.strictEqual(dupD11[3], 2, "Day2 有数据作品数应去重为 2（而非 4）");
       assert.strictEqual(
-        dupD11[3],
+        dupD11[4],
         20 + 20,
         "Day2 播放日增合计应取 A组 观测（20+20=40），不得重复累加 B组"
       );
-      assert.strictEqual(dupD11[4], 2 + 1, "Day2 点赞日增合计应取 A组 观测（2+1=3）");
+      assert.strictEqual(dupD11[5], 2 + 1, "Day2 点赞日增合计应取 A组 观测（2+1=3）");
 
       // 导出信息作品数/未关联作品数沿用跨平台汇总去重与关联口径：
       // DY_DUP 已由 A组 关联，不计入未关联；DY_UNL 去重计 1 个未关联
@@ -1859,6 +1888,7 @@ async function main() {
         out: "report.xlsx",
         from: "2026-11-10",
         to: "2026-11-14",
+        group: null,
         json: false,
       },
     });
@@ -2003,7 +2033,7 @@ async function main() {
       probeOk.stderr.some((l) => l.includes("[account-migration]")),
       "CLI 模式迁移诊断日志应输出到 stderr"
     );
-    assert.deepStrictEqual(xlsx.readFile(cliOutFile).SheetNames, SHEET_NAMES);
+    assert.deepStrictEqual(xlsx.readFile(cliOutFile).SheetNames, expectedFullSheetOrder);
 
     // 大写 .XLSX 后缀 → exit 0
     const cliUpperOut = path.join(tmpRoot, "CLI-UPPER.XLSX");
@@ -2199,8 +2229,9 @@ async function main() {
       const s6Sum = s6Wb.sheets["作品跨平台汇总"].slice(1);
       const sumHsr = s6Sum.find((r) => r[0] === "file:/videos/s6_hsr.mp4");
       const sumMan = s6Sum.find((r) => r[0] === "manual:s6merge");
-      assert.strictEqual(sumHsr[5], "fuzzy", "含 link+fuzzy 的簇汇总匹配方式应取最弱 fuzzy");
-      assert.strictEqual(sumMan[5], "manual", "含手动矫正的簇汇总匹配方式应标 manual");
+      assert.strictEqual(sumHsr[2], "S6组");
+      assert.strictEqual(sumHsr[6], "fuzzy", "含 link+fuzzy 的簇汇总匹配方式应取最弱 fuzzy");
+      assert.strictEqual(sumMan[6], "manual", "含手动矫正的簇汇总匹配方式应标 manual");
 
       const s6File = path.join(tmpRoot, "s6-new-cols.xlsx");
       writeStatsXlsx(s6Wb, s6File);
@@ -2338,8 +2369,9 @@ async function main() {
       const onlyAS2 = onlyAWb.sheets["作品跨平台汇总"].slice(1);
       const crossTargetRow = onlyAS2.find((r) => r[0] === "file:/videos/b_shared_target.mp4");
       assert.ok(crossTargetRow, "S6-fix#10: 只导出 A 组汇总应保留被 A 组手工引用的跨组内容行");
-      assert.strictEqual(crossTargetRow[5], "manual");
-      assert.strictEqual(crossTargetRow[6], 500);
+      assert.strictEqual(crossTargetRow[2], "A组");
+      assert.strictEqual(crossTargetRow[6], "manual");
+      assert.strictEqual(crossTargetRow[7], 500);
       assert.strictEqual(
         onlyAS2.some((r) => r[0] === "file:/videos/b_unrelated.mp4"),
         false,
@@ -3140,7 +3172,17 @@ async function main() {
       const s9Xlsx = path.join(tmpRoot, "s9-intraday.xlsx");
       writeStatsXlsx(wbS9, s9Xlsx);
       const readS9Wb = xlsx.readFile(s9Xlsx);
-      assert.deepStrictEqual(readS9Wb.SheetNames, SHEET_NAMES);
+      assert.deepStrictEqual(readS9Wb.SheetNames, [
+        "作品日明细",
+        "作品时段明细",
+        "作品跨平台汇总",
+        "平台日汇总",
+        "账号日快照",
+        "分析",
+        "分析-G1",
+        "字段说明",
+        "导出信息",
+      ]);
       const wsIntra = readS9Wb.Sheets["作品时段明细"];
       assert.strictEqual(wsIntra["A2"].v, "2026-11-20");
       assert.strictEqual(wsIntra["B2"].v, "08:00");

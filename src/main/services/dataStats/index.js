@@ -50,6 +50,7 @@ const {
   isContentRowDeleted,
 } = require("./contentLink");
 const {
+  UNKNOWN_GROUP_CODE,
   validateExportDateRange,
   assertExportRangeNotAllFuture,
   buildDefaultExportFileName,
@@ -73,6 +74,16 @@ function isLinkOverridesReadErr(err) {
     return true;
   }
   return Boolean(err && typeof err === "object" && err.isLinkOverridesReadError === true);
+}
+
+function buildStatsErrorExtras(err) {
+  if (isLinkOverridesReadErr(err)) {
+    return { errorCode: "LINK_OVERRIDES_READ_ERROR", detail: (err && err.message) || "" };
+  }
+  if (err && typeof err === "object" && err.code === UNKNOWN_GROUP_CODE) {
+    return { errorCode: UNKNOWN_GROUP_CODE };
+  }
+  return {};
 }
 
 const VALID_TRIGGERS = new Set(["auto", "manual"]);
@@ -1139,8 +1150,19 @@ function sanitizeChartFileName(rawName, fallback = "图表") {
   return cleaned;
 }
 
-function buildChartImageFileName(rawName, dateStr) {
-  const safe = sanitizeChartFileName(rawName, "图表");
+function buildChartImageFileName(rawName, dateStr, rawGroup) {
+  const safeGroup =
+    typeof rawGroup === "string" && rawGroup.trim()
+      ? sanitizeChartFileName(rawGroup.trim(), "")
+      : "";
+  const rawBase = typeof rawName === "string" ? rawName.trim() : "";
+  const combined =
+    safeGroup && rawBase
+      ? rawBase === safeGroup || rawBase.startsWith(`${safeGroup}-`)
+        ? rawBase
+        : `${safeGroup}-${rawBase}`
+      : rawBase || safeGroup || "图表";
+  const safe = sanitizeChartFileName(combined, "图表");
   const hasDate = /\d{4}-\d{2}-\d{2}/.test(safe);
   const stem = hasDate || !dateStr ? safe : `${safe}-${dateStr}`;
   return `${stem}.png`;
@@ -1618,8 +1640,16 @@ function registerDataStatsIpc(options = {}) {
         return { rows: [], deletedRows: [], date: "", error: "查询参数无效" };
       }
       await Promise.all([overrideWriteChain, groupSettingsWriteChain]);
-      const date = args && args.date !== undefined ? args.date : undefined;
-      return buildContentSummaryData({ date }, exportDeps);
+      const payload = args || {};
+      const date = payload.date !== undefined ? payload.date : undefined;
+      return buildContentSummaryData(
+        {
+          date,
+          ...(payload.group !== undefined ? { group: payload.group } : {}),
+          ...(payload.groups !== undefined ? { groups: payload.groups } : {}),
+        },
+        exportDeps
+      );
     } catch (err) {
       const isOvReadErr = isLinkOverridesReadErr(err);
       return {
@@ -1629,9 +1659,7 @@ function registerDataStatsIpc(options = {}) {
         error: isOvReadErr
           ? LINK_OVERRIDES_READ_ERROR_MESSAGE
           : (err && err.message) || "读取作品汇总失败",
-        ...(isOvReadErr
-          ? { errorCode: "LINK_OVERRIDES_READ_ERROR", detail: (err && err.message) || "" }
-          : {}),
+        ...buildStatsErrorExtras(err),
       };
     }
   });
@@ -1654,6 +1682,7 @@ function registerDataStatsIpc(options = {}) {
           contentKey,
           from: args.from !== undefined ? args.from : undefined,
           to: args.to !== undefined ? args.to : undefined,
+          group: args.group !== undefined ? args.group : undefined,
           groups: args.groups,
         },
         exportDeps
@@ -1666,9 +1695,7 @@ function registerDataStatsIpc(options = {}) {
         error: isOvReadErr
           ? LINK_OVERRIDES_READ_ERROR_MESSAGE
           : (err && err.message) || "读取作品趋势失败",
-        ...(isOvReadErr
-          ? { errorCode: "LINK_OVERRIDES_READ_ERROR", detail: (err && err.message) || "" }
-          : {}),
+        ...buildStatsErrorExtras(err),
       };
     }
   });
@@ -1691,6 +1718,7 @@ function registerDataStatsIpc(options = {}) {
           contentKey,
           days: args.days !== undefined ? args.days : undefined,
           to: args.to !== undefined ? args.to : undefined,
+          group: args.group !== undefined ? args.group : undefined,
           groups: args.groups,
         },
         exportDeps
@@ -1703,9 +1731,7 @@ function registerDataStatsIpc(options = {}) {
         error: isOvReadErr
           ? LINK_OVERRIDES_READ_ERROR_MESSAGE
           : (err && err.message) || "读取作品分时段趋势失败",
-        ...(isOvReadErr
-          ? { errorCode: "LINK_OVERRIDES_READ_ERROR", detail: (err && err.message) || "" }
-          : {}),
+        ...buildStatsErrorExtras(err),
       };
     }
   });
@@ -1722,7 +1748,9 @@ function registerDataStatsIpc(options = {}) {
       const payload = args || {};
       const period = payload.period !== undefined ? payload.period : 30;
       const to = payload.to !== undefined ? payload.to : undefined;
-      const data = buildStatsAnalysisData({ period, to }, exportDeps);
+      const group = payload.group !== undefined ? payload.group : undefined;
+      const groups = payload.groups !== undefined ? payload.groups : undefined;
+      const data = buildStatsAnalysisData({ period, to, group, groups }, exportDeps);
       return { ok: true, ...data };
     } catch (err) {
       const isOvReadErr = isLinkOverridesReadErr(err);
@@ -1731,9 +1759,7 @@ function registerDataStatsIpc(options = {}) {
         error: isOvReadErr
           ? LINK_OVERRIDES_READ_ERROR_MESSAGE
           : (err && err.message) || "读取数据分析失败",
-        ...(isOvReadErr
-          ? { errorCode: "LINK_OVERRIDES_READ_ERROR", detail: (err && err.message) || "" }
-          : {}),
+        ...buildStatsErrorExtras(err),
       };
     }
   });
@@ -1755,7 +1781,7 @@ function registerDataStatsIpc(options = {}) {
         typeof args.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(args.date.trim())
           ? args.date.trim()
           : getTodayStr(exportNow);
-      const defaultName = buildChartImageFileName(args.name, dateStr);
+      const defaultName = buildChartImageFileName(args.name, dateStr, args.group);
 
       const { BrowserWindow, dialog, app } = electron;
       const win =
@@ -1813,6 +1839,10 @@ function registerDataStatsIpc(options = {}) {
         typeof args.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(args.date.trim())
           ? args.date.trim()
           : getTodayStr(exportNow);
+      const safeGroup =
+        typeof args.group === "string" && args.group.trim()
+          ? sanitizeChartFileName(args.group.trim(), "")
+          : "";
 
       const prepared = [];
       const usedNames = new Set();
@@ -1822,7 +1852,11 @@ function registerDataStatsIpc(options = {}) {
           throw new Error(`第 ${i + 1} 张图表参数无效`);
         }
         const buf = decodePngDataUrl(item.dataUrl);
-        let fileName = buildChartImageFileName(item.name || `图表-${i + 1}`, dateStr);
+        let fileName = buildChartImageFileName(
+          item.name || `图表-${i + 1}`,
+          dateStr,
+          safeGroup
+        );
         if (usedNames.has(fileName.toLowerCase())) {
           const stem = fileName.slice(0, -4);
           let seq = 2;
@@ -1857,7 +1891,9 @@ function registerDataStatsIpc(options = {}) {
       const parentDir = path.resolve(result.filePaths[0]);
       const periodLabel = formatChartBatchPeriodLabel(args.period);
       const hms = formatUtc8Hms(exportNow);
-      const subDirName = `MatrixMedia-图表-${periodLabel}-${dateStr}-${hms}`;
+      const subDirName = safeGroup
+        ? `MatrixMedia-图表-${safeGroup}-${periodLabel}-${dateStr}-${hms}`
+        : `MatrixMedia-图表-${periodLabel}-${dateStr}-${hms}`;
       const targetDir = createUniqueBatchExportDir(parentDir, subDirName);
       const files = [];
       for (const item of prepared) {
@@ -2226,6 +2262,13 @@ function registerDataStatsIpc(options = {}) {
         return { ok: false, message: "导出参数无效" };
       }
       const payload = args || {};
+      let validGroup = "";
+      if (payload.group !== undefined && payload.group !== null && payload.group !== "") {
+        if (typeof payload.group !== "string" || !payload.group.trim()) {
+          return { ok: false, message: "分组名称 group 需为非空字符串" };
+        }
+        validGroup = payload.group.trim();
+      }
       // 纯参数校验（不读任何数据）：日期非法、from > to 或所选日期都在未来时直接拒绝，不弹保存框
       const { from: validFrom, to: validTo } = validateExportDateRange(
         payload.from,
@@ -2247,7 +2290,7 @@ function registerDataStatsIpc(options = {}) {
       if (!win) return { ok: false, message: "窗口已关闭" };
 
       // 先弹保存对话框，用户取消则不读任何数据
-      const defaultName = buildDefaultExportFileName(effectiveFrom, effectiveTo);
+      const defaultName = buildDefaultExportFileName(effectiveFrom, effectiveTo, validGroup);
       const result = await dialog.showSaveDialog(win, {
         title: "导出作品数据 Excel",
         defaultPath: path.join(app.getPath("documents"), defaultName),
@@ -2260,6 +2303,7 @@ function registerDataStatsIpc(options = {}) {
       const buildOpts = {
         from: validFrom || undefined,
         to: validTo || undefined,
+        group: validGroup || undefined,
         groups: payload.groups,
       };
       if (exportMaxRows !== undefined) buildOpts.maxRows = exportMaxRows;
@@ -2277,6 +2321,7 @@ function registerDataStatsIpc(options = {}) {
         filePath: result.filePath,
         from: data.from,
         to: data.to,
+        ...(data.group ? { group: data.group } : {}),
         counts: data.counts,
       };
     } catch (err) {
@@ -2284,12 +2329,11 @@ function registerDataStatsIpc(options = {}) {
       const msg = isOvReadErr
         ? LINK_OVERRIDES_READ_ERROR_MESSAGE
         : (err && err.message) || "导出失败";
+      const extras = buildStatsErrorExtras(err);
       return {
         ok: false,
         message: msg,
-        ...(isOvReadErr
-          ? { error: msg, errorCode: "LINK_OVERRIDES_READ_ERROR", detail: (err && err.message) || "" }
-          : {}),
+        ...(Object.keys(extras).length ? { error: msg, ...extras } : {}),
       };
     }
   });

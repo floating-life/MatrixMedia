@@ -917,8 +917,9 @@ async function main() {
 
       const mergedRowXlsx = s2Rows.find((r) => r[0] === mergeRes.contentKey);
       assert.ok(mergedRowXlsx);
-      assert.strictEqual(mergedRowXlsx[5], "manual", "作品跨平台汇总匹配方式列应为 manual");
-      assert.strictEqual(mergedRowXlsx[6], 550);
+      assert.strictEqual(mergedRowXlsx[2], "主组");
+      assert.strictEqual(mergedRowXlsx[6], "manual", "作品跨平台汇总匹配方式列应为 manual");
+      assert.strictEqual(mergedRowXlsx[7], 550);
 
       // 操作 2：clear W_FUZZY 的 detach → 恢复模糊匹配 fuzzy(0.95)
       const clearRes = await clearOverride(localEv, { workKey: "主组|抖音|W_FUZZY" });
@@ -935,7 +936,7 @@ async function main() {
       assert.strictEqual(s1Restored[4], "fuzzy");
       assert.strictEqual(s1Restored[5], 0.95);
       const s2Restored = wb.sheets["作品跨平台汇总"].slice(1).find((r) => r[0] === "file:/videos/dish_hsr.mp4");
-      assert.strictEqual(s2Restored[5], "fuzzy");
+      assert.strictEqual(s2Restored[6], "fuzzy");
 
       // 3e. S6-fix#4 端到端：确认 auto 簇单条写入 contents 表，拆出另一条后已确认成员保留；
       //     stats:apply-link-overrides 一次原子写盘，批内有非法 op 时整批回滚不写盘
@@ -1092,7 +1093,7 @@ async function main() {
         .slice(1)
         .find((r) => r[0] === race1.contentKey);
       assert.ok(dailyOnlyS2);
-      assert.strictEqual(dailyOnlyS2[6], 333);
+      assert.strictEqual(dailyOnlyS2[7], 333);
 
       // 3g. S6-r3#1 + #2 + #9 + #11 端到端回归测试
       {

@@ -818,66 +818,6 @@
           </template>
         </el-dialog>
         <el-dialog
-          :title="contentTrendDialogTitle"
-          :visible.sync="contentTrendVisible"
-          width="820px"
-          append-to-body
-          @opened="onContentTrendDialogOpened"
-          @closed="resetContentTrendDialog"
-        >
-          <div class="trend-dialog-head">
-            <div class="trend-dialog-controls">
-              <el-radio-group
-                v-model="contentTrendMode"
-                size="mini"
-                @change="onContentTrendModeChange"
-              >
-                <el-radio-button label="daily">按天</el-radio-button>
-                <el-radio-button label="intraday">按时段</el-radio-button>
-              </el-radio-group>
-              <el-radio-group
-                v-if="contentTrendMode === 'intraday'"
-                v-model="contentIntradayDays"
-                size="mini"
-                @change="loadContentIntraday"
-              >
-                <el-radio-button :label="1">近1天</el-radio-button>
-                <el-radio-button :label="3">近3天</el-radio-button>
-                <el-radio-button :label="7">近7天</el-radio-button>
-              </el-radio-group>
-              <span class="trend-dialog-tip">
-                <template v-if="activeContentTrendData && activeContentTrendData.from && activeContentTrendData.to">
-                  区间：{{ activeContentTrendData.from }} ~ {{ activeContentTrendData.to }}
-                </template>
-                <template v-if="activeContentTrendData && activeContentTrendData.date">
-                  · 截至 {{ activeContentTrendData.date }}
-                </template>
-                <template v-else-if="contentSummaryDate">
-                  截至 {{ contentSummaryDate }}
-                </template>
-              </span>
-            </div>
-            <el-button
-              type="text"
-              size="mini"
-              icon="el-icon-download"
-              :disabled="loadingContentTrend || isChartOptionEmpty(contentTrendOption)"
-              @click="saveChartImage('chartContentTrend', (contentTrendMode === 'intraday' ? '作品分时段-' : '作品趋势-') + (contentTrendRow && contentTrendRow.title ? contentTrendRow.title : '内容'), contentTrendChartDate)"
-            >
-              保存图片
-            </el-button>
-          </div>
-          <stats-chart
-            ref="chartContentTrend"
-            :option="contentTrendOption"
-            :loading="loadingContentTrend"
-            height="360px"
-          />
-          <template #footer>
-            <el-button size="small" @click="contentTrendVisible = false">关闭</el-button>
-          </template>
-        </el-dialog>
-        <el-dialog
           :title="`已删除内容（${deletedContentRows.length}）`"
           :visible.sync="deletedDialogVisible"
           width="780px"
@@ -952,6 +892,21 @@
           <div class="platform-card analysis-toolbar-card">
             <div class="analysis-toolbar">
               <div class="analysis-controls">
+                <el-select
+                  v-model="analysisGroup"
+                  size="mini"
+                  class="analysis-group-select"
+                  placeholder="选择分组"
+                  @change="onAnalysisGroupChange"
+                >
+                  <el-option label="全部" value="all" />
+                  <el-option
+                    v-for="g in analysisGroupOptions"
+                    :key="g"
+                    :label="g"
+                    :value="g"
+                  />
+                </el-select>
                 <el-radio-group
                   v-model="analysisPeriod"
                   size="mini"
@@ -1009,7 +964,17 @@
             <!-- 7. 文字小结（置顶） -->
             <div class="platform-card analysis-summary-card">
               <div class="card-head">
-                <span class="card-title">分析小结</span>
+                <span class="card-title">
+                  分析小结
+                  <el-tag
+                    v-if="activeAnalysisGroup"
+                    size="mini"
+                    type="primary"
+                    class="inline-tag"
+                  >
+                    {{ activeAnalysisGroup }}
+                  </el-tag>
+                </span>
                 <span class="card-tip">纯规则计算 · 与 Excel「分析」sheet 同口径</span>
               </div>
               <ul class="analysis-summary-list">
@@ -1436,6 +1401,19 @@
                     </span>
                   </template>
                 </el-table-column>
+                <el-table-column label="操作" width="68" align="center">
+                  <template #default="{ row }">
+                    <el-button
+                      v-if="row.contentKey"
+                      type="text"
+                      size="mini"
+                      @click.stop="openContentTrend(row, { group: activeAnalysisGroup, to: analysisChartDate })"
+                    >
+                      趋势
+                    </el-button>
+                    <span v-else class="num muted">-</span>
+                  </template>
+                </el-table-column>
                 <template #empty>
                   <span class="card-empty-inline">暂无符合条件的作品排行数据</span>
                 </template>
@@ -1469,6 +1447,19 @@
                     <span class="num">
                       {{ row.ratio != null ? row.ratio + "x" : "极高(它端0)" }}
                     </span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="操作" width="68" align="center">
+                  <template #default="{ row }">
+                    <el-button
+                      v-if="row.contentKey"
+                      type="text"
+                      size="mini"
+                      @click.stop="openContentTrend(row, { group: activeAnalysisGroup, to: analysisChartDate })"
+                    >
+                      趋势
+                    </el-button>
+                    <span v-else class="num muted">-</span>
                   </template>
                 </el-table-column>
                 <template #empty>
@@ -1657,6 +1648,19 @@
                     <span :class="{ muted: !row.classificationBasis }">
                       {{ row.classificationBasis || "-" }}
                     </span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="操作" width="68" align="center">
+                  <template #default="{ row }">
+                    <el-button
+                      v-if="row.contentKey"
+                      type="text"
+                      size="mini"
+                      @click.stop="openContentTrend(row, { group: activeAnalysisGroup, to: analysisChartDate })"
+                    >
+                      趋势
+                    </el-button>
+                    <span v-else class="num muted">-</span>
                   </template>
                 </el-table-column>
                 <template #empty>
@@ -1992,6 +1996,73 @@
         </div>
       </el-tab-pane>
     </el-tabs>
+    <el-dialog
+      :title="contentTrendDialogTitle"
+      :visible.sync="contentTrendVisible"
+      width="820px"
+      append-to-body
+      @opened="onContentTrendDialogOpened"
+      @closed="resetContentTrendDialog"
+    >
+      <div class="trend-dialog-head">
+        <div class="trend-dialog-controls">
+          <el-tag
+            v-if="contentTrendGroup"
+            size="mini"
+            type="primary"
+          >
+            {{ contentTrendGroup }}
+          </el-tag>
+          <el-radio-group
+            v-model="contentTrendMode"
+            size="mini"
+            @change="onContentTrendModeChange"
+          >
+            <el-radio-button label="daily">按天</el-radio-button>
+            <el-radio-button label="intraday">按时段</el-radio-button>
+          </el-radio-group>
+          <el-radio-group
+            v-if="contentTrendMode === 'intraday'"
+            v-model="contentIntradayDays"
+            size="mini"
+            @change="loadContentIntraday"
+          >
+            <el-radio-button :label="1">近1天</el-radio-button>
+            <el-radio-button :label="3">近3天</el-radio-button>
+            <el-radio-button :label="7">近7天</el-radio-button>
+          </el-radio-group>
+          <span class="trend-dialog-tip">
+            <template v-if="activeContentTrendData && activeContentTrendData.from && activeContentTrendData.to">
+              区间：{{ activeContentTrendData.from }} ~ {{ activeContentTrendData.to }}
+            </template>
+            <template v-if="activeContentTrendData && activeContentTrendData.date">
+              · 截至 {{ activeContentTrendData.date }}
+            </template>
+            <template v-else-if="contentTrendTo || contentSummaryDate">
+              截至 {{ contentTrendTo || contentSummaryDate }}
+            </template>
+          </span>
+        </div>
+        <el-button
+          type="text"
+          size="mini"
+          icon="el-icon-download"
+          :disabled="loadingContentTrend || isChartOptionEmpty(contentTrendOption)"
+          @click="saveChartImage('chartContentTrend', (contentTrendMode === 'intraday' ? '作品分时段-' : '作品趋势-') + (contentTrendRow && contentTrendRow.title ? contentTrendRow.title : '内容'), contentTrendChartDate)"
+        >
+          保存图片
+        </el-button>
+      </div>
+      <stats-chart
+        ref="chartContentTrend"
+        :option="contentTrendOption"
+        :loading="loadingContentTrend"
+        height="360px"
+      />
+      <template #footer>
+        <el-button size="small" @click="contentTrendVisible = false">关闭</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -2003,6 +2074,7 @@ import GroupStatsTable from "./components/GroupStatsTable.vue";
 import CollectLogDialog from "./components/CollectLogDialog.vue";
 import StatsChart from "@/components/StatsChart.vue";
 import { dailyToRows } from "./statsUtils";
+import { compareGroups } from "../../../shared/accountGroupOrder.js";
 import {
   OVERVIEW_METRIC_OPTIONS,
   isEmptyChartOption,
@@ -2035,6 +2107,8 @@ import {
 
 const UNSTABLE_RECORD_KEY_RE = /^record:(?:.*:)?pos:\d+$/;
 const INTERVAL_HOURS_FALLBACK = [1, 2, 3, 4, 6];
+const ANALYSIS_GROUP_STORAGE_KEY = "stats:analysisGroup";
+const STATS_EXCLUDED_PLATFORMS = new Set(["番茄视频", "掘金"]);
 const PLATFORM_ORDER = [
   "抖音",
   "视频号",
@@ -2044,6 +2118,63 @@ const PLATFORM_ORDER = [
   "百家号",
   "头条",
 ];
+
+function readStoredAnalysisGroup() {
+  try {
+    if (typeof localStorage === "undefined" || !localStorage) return null;
+    const raw = localStorage.getItem(ANALYSIS_GROUP_STORAGE_KEY);
+    if (typeof raw !== "string") return null;
+    const trimmed = raw.trim();
+    return trimmed ? trimmed : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function writeStoredAnalysisGroup(value) {
+  try {
+    if (typeof localStorage === "undefined" || !localStorage) return;
+    localStorage.setItem(ANALYSIS_GROUP_STORAGE_KEY, String(value || "all"));
+  } catch (_) {}
+}
+
+function readAccountTreeGroupMeta() {
+  const treeGroups = [];
+  const orderMap = Object.create(null);
+  let tree = null;
+  try {
+    if (typeof localStorage === "undefined" || !localStorage) {
+      return { treeGroups, orderMap };
+    }
+    const raw = localStorage.getItem("accountTree");
+    if (!raw) return { treeGroups, orderMap };
+    tree = JSON.parse(raw);
+  } catch (_) {
+    return { treeGroups, orderMap };
+  }
+  if (!tree || typeof tree !== "object" || Array.isArray(tree)) {
+    return { treeGroups, orderMap };
+  }
+  const seen = new Set();
+  for (const [phone, node] of Object.entries(tree)) {
+    const g = typeof phone === "string" ? phone.trim() : "";
+    if (!g) continue;
+    const order = node && node.meta ? node.meta.groupOrder : null;
+    if (orderMap[g] === undefined) {
+      orderMap[g] = order;
+    }
+    const children = node && Array.isArray(node.children) ? node.children : [];
+    const hasStatsPlatform = children.some((c) => {
+      const pt = c && ((c.meta && c.meta.pt) || c.path);
+      return pt && !STATS_EXCLUDED_PLATFORMS.has(pt);
+    });
+    if (hasStatsPlatform && !seen.has(g)) {
+      seen.add(g);
+      treeGroups.push(g);
+    }
+  }
+  return { treeGroups, orderMap };
+}
 
 function normalizeAutoCollectView(raw) {
   const s = raw && typeof raw === "object" ? raw : {};
@@ -2089,6 +2220,7 @@ export default {
   name: "DataStatsAll",
   components: { StatsOverview, PlatformBarChart, GroupStatsTable, CollectLogDialog, StatsChart },
   data() {
+    const storedAnalysisGroup = readStoredAnalysisGroup();
     return {
       activeTab: "overview",
       overview: { daily: {}, accounts: [] },
@@ -2112,11 +2244,16 @@ export default {
       reassignTargetKey: "",
       contentTrendVisible: false,
       contentTrendRow: null,
+      contentTrendGroup: "",
+      contentTrendTo: "",
       contentTrendMode: "daily",
       contentIntradayDays: 3,
       contentTrendData: null,
       contentIntradayData: null,
       loadingContentTrend: false,
+      analysisGroup: storedAnalysisGroup || "all",
+      analysisGroupTouched: storedAnalysisGroup !== null,
+      accountTreeVersion: 0,
       analysisPeriod: 30,
       analysisTo: "",
       analysisDatePickerOptions: {
@@ -2157,7 +2294,27 @@ export default {
     accounts() {
       return this.overview.accounts || [];
     },
+    accountTreeGroupMeta() {
+      void this.accountTreeVersion;
+      void this.accounts;
+      return readAccountTreeGroupMeta();
+    },
+    analysisGroupOptions() {
+      const { treeGroups, orderMap } = this.accountTreeGroupMeta;
+      const set = new Set(treeGroups);
+      for (const acc of this.accounts) {
+        const g = acc && typeof acc.group === "string" ? acc.group.trim() : "";
+        if (g) set.add(g);
+      }
+      return [...set].sort((a, b) => compareGroups(a, orderMap[a], b, orderMap[b]));
+    },
+    activeAnalysisGroup() {
+      const cur = typeof this.analysisGroup === "string" ? this.analysisGroup.trim() : "";
+      if (!cur || cur === "all") return "";
+      return cur;
+    },
     statsGroupNames() {
+      const { orderMap } = this.accountTreeGroupMeta;
       const set = new Set();
       for (const acc of this.accounts) {
         const g = acc && typeof acc.group === "string" ? acc.group.trim() : "";
@@ -2170,7 +2327,7 @@ export default {
         const trimmed = typeof g === "string" ? g.trim() : "";
         if (trimmed) set.add(trimmed);
       }
-      return [...set].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+      return [...set].sort((a, b) => compareGroups(a, orderMap[a], b, orderMap[b]));
     },
     // 平台分布：各平台下所有分组账号的最新快照求和
     platformRows() {
@@ -2253,6 +2410,12 @@ export default {
     analysisSummaryText() {
       const s = this.analysisData && this.analysisData.summary;
       return s && typeof s.text === "string" ? s.text : this.analysisSummaryLines.join("\n");
+    },
+    analysisSummaryCopyText() {
+      const base = this.analysisSummaryText;
+      if (!base) return "";
+      const groupName = this.activeAnalysisGroup;
+      return groupName ? `【${groupName}】\n${base}` : base;
     },
     analysisOverviewMetricRows() {
       const ov = this.analysisData && this.analysisData.overview;
@@ -2396,6 +2559,7 @@ export default {
       const cur = this.activeContentTrendData;
       return (
         (cur && (cur.date || cur.to)) ||
+        this.contentTrendTo ||
         this.contentSummaryDate ||
         ""
       );
@@ -2473,7 +2637,9 @@ export default {
         (cur && cur.title) ||
         (this.contentTrendRow && this.contentTrendRow.title) ||
         "作品播放趋势";
-      return `播放趋势 · ${title}`;
+      return this.contentTrendGroup
+        ? `播放趋势 · ${this.contentTrendGroup} · ${title}`
+        : `播放趋势 · ${title}`;
     },
   },
   watch: {
@@ -2481,6 +2647,7 @@ export default {
       if (val === "works") {
         this.loadContentSummary();
       } else if (val === "analysis") {
+        this.reconcileAnalysisGroupSelection();
         this.loadAnalysis();
         if (typeof this.$nextTick === "function") {
           this.$nextTick(() => this.resizeAnalysisCharts());
@@ -2501,6 +2668,7 @@ export default {
   },
   created() {
     this._mainRetentionDays = null;
+    this.reconcileAnalysisGroupSelection();
     this.syncAutoSettingsFromMain();
     this.loadGroupSettings();
     this.refresh();
@@ -2535,10 +2703,18 @@ export default {
       view.retentionDays = this._mainRetentionDays;
     }
     this.autoCollect = view;
+    this.accountTreeVersion = (this.accountTreeVersion || 0) + 1;
+    const prevGroup = this.analysisGroup;
+    this.reconcileAnalysisGroupSelection();
     this.syncAutoSettingsFromMain();
     this.loadGroupSettings();
-    if (this.activeTab === "analysis" && typeof this.$nextTick === "function") {
-      this.$nextTick(() => this.resizeAnalysisCharts());
+    if (this.activeTab === "analysis") {
+      if (this.analysisGroup !== prevGroup) {
+        this.loadAnalysis();
+      }
+      if (typeof this.$nextTick === "function") {
+        this.$nextTick(() => this.resizeAnalysisCharts());
+      }
     }
   },
   beforeDestroy() {
@@ -2665,8 +2841,32 @@ export default {
     clearGroupStartDate(group) {
       return this.onGroupStartDateChange(group, "");
     },
+    reconcileAnalysisGroupSelection() {
+      const options = this.analysisGroupOptions;
+      if (!Array.isArray(options) || options.length === 0) return;
+      const current = typeof this.analysisGroup === "string" ? this.analysisGroup.trim() : "";
+      if (!this.analysisGroupTouched) {
+        this.analysisGroup = options[0];
+        return;
+      }
+      if (current && current !== "all" && !options.includes(current)) {
+        this.analysisGroup = options[0];
+        writeStoredAnalysisGroup(options[0]);
+      }
+    },
+    async onAnalysisGroupChange(val) {
+      const next = typeof val === "string" && val.trim() ? val.trim() : "all";
+      this.analysisGroup = next;
+      this.analysisGroupTouched = true;
+      writeStoredAnalysisGroup(next);
+      this.fansSelectedAccounts = [];
+      this.newWorks24hPlatform = "all";
+      await this.loadAnalysis();
+    },
     async refresh() {
+      this.accountTreeVersion = (this.accountTreeVersion || 0) + 1;
       this.overview = await getOverviewStats();
+      this.reconcileAnalysisGroupSelection();
       await this.loadGroupSettings();
       if (this.activeTab === "works") {
         await this.loadContentSummary();
@@ -2680,6 +2880,7 @@ export default {
       try {
         const payload = { period: this.analysisPeriod };
         if (this.analysisTo) payload.to = this.analysisTo;
+        if (this.activeAnalysisGroup) payload.group = this.activeAnalysisGroup;
         const res = await ipcRenderer.invoke("stats:get-analysis", payload);
         if (reqId !== this._analysisReqId) return;
         if (!res || res.ok === false || res.error) {
@@ -2759,13 +2960,24 @@ export default {
         return;
       }
       try {
+        const chartGroup =
+          refName === "chartContentTrend"
+            ? this.contentTrendGroup
+            : this.activeAnalysisGroup;
+        const baseName = chartName || "图表";
+        const finalName =
+          chartGroup && !baseName.startsWith(`${chartGroup}-`) && baseName !== chartGroup
+            ? `${chartGroup}-${baseName}`
+            : baseName;
         const payload = {
           dataUrl,
-          name: chartName || "图表",
+          name: finalName,
         };
+        if (chartGroup) payload.group = chartGroup;
         const fallbackDate =
           refName === "chartContentTrend"
             ? (this.contentTrendData && (this.contentTrendData.date || this.contentTrendData.to)) ||
+              this.contentTrendTo ||
               this.contentSummaryDate ||
               ""
             : (this.analysisData && this.analysisData.to) || "";
@@ -2789,13 +3001,17 @@ export default {
     async exportAllCharts() {
       if (this.exportingAllCharts) return;
       this.resizeAnalysisCharts();
+      const groupName = this.activeAnalysisGroup;
       const items = [];
       for (const spec of this.getAnalysisChartSpecs()) {
         const comp = this.$refs && this.$refs[spec.ref];
         if (!comp || typeof comp.getDataURL !== "function") continue;
         const dataUrl = comp.getDataURL();
         if (dataUrl) {
-          items.push({ name: spec.name, dataUrl });
+          items.push({
+            name: groupName ? `${groupName}-${spec.name}` : spec.name,
+            dataUrl,
+          });
         }
       }
       if (!items.length) {
@@ -2805,6 +3021,9 @@ export default {
       this.exportingAllCharts = true;
       try {
         const payload = { items };
+        if (groupName) {
+          payload.group = groupName;
+        }
         if (this.analysisData && this.analysisData.to) {
           payload.date = this.analysisData.to;
         }
@@ -2827,12 +3046,17 @@ export default {
         this.exportingAllCharts = false;
       }
     },
-    async openContentTrend(row) {
+    async openContentTrend(row, options = {}) {
       if (!row || !row.contentKey) return;
+      const opts = options && typeof options === "object" ? options : {};
       this.contentTrendRow = {
         contentKey: row.contentKey,
         title: row.title || "(无标题)",
       };
+      this.contentTrendGroup =
+        typeof opts.group === "string" ? opts.group.trim() : "";
+      this.contentTrendTo =
+        typeof opts.to === "string" ? opts.to.trim() : "";
       this.contentTrendMode = "daily";
       this.contentTrendData = null;
       this.contentIntradayData = null;
@@ -2846,7 +3070,9 @@ export default {
       this.loadingContentTrend = true;
       try {
         const payload = { contentKey: row.contentKey };
-        if (this.contentSummaryDate) payload.to = this.contentSummaryDate;
+        const targetTo = this.contentTrendTo || this.contentSummaryDate;
+        if (targetTo) payload.to = targetTo;
+        if (this.contentTrendGroup) payload.group = this.contentTrendGroup;
         const res = await ipcRenderer.invoke("stats:get-content-trend", payload);
         if (reqId !== this._contentTrendReqId) return;
         if (!res || res.ok === false || res.error) {
@@ -2884,7 +3110,9 @@ export default {
           contentKey: row.contentKey,
           days: this.contentIntradayDays,
         };
-        if (this.contentSummaryDate) payload.to = this.contentSummaryDate;
+        const targetTo = this.contentTrendTo || this.contentSummaryDate;
+        if (targetTo) payload.to = targetTo;
+        if (this.contentTrendGroup) payload.group = this.contentTrendGroup;
         const res = await ipcRenderer.invoke("stats:get-content-intraday", payload);
         if (reqId !== this._contentTrendReqId) return;
         if (!res || res.ok === false || res.error) {
@@ -2935,6 +3163,8 @@ export default {
     resetContentTrendDialog() {
       this._contentTrendReqId = (this._contentTrendReqId || 0) + 1;
       this.contentTrendRow = null;
+      this.contentTrendGroup = "";
+      this.contentTrendTo = "";
       this.contentTrendMode = "daily";
       this.contentIntradayDays = 3;
       this.contentTrendData = null;
@@ -2942,7 +3172,7 @@ export default {
       this.loadingContentTrend = false;
     },
     async copyAnalysisSummary() {
-      const text = this.analysisSummaryText;
+      const text = this.analysisSummaryCopyText;
       if (!text) return;
       try {
         if (clipboard && typeof clipboard.writeText === "function") {
@@ -3986,6 +4216,10 @@ export default {
   align-items: center;
   flex-wrap: wrap;
   gap: 10px;
+}
+
+.analysis-group-select {
+  width: 150px;
 }
 
 .analysis-date-picker {
