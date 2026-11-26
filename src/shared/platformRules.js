@@ -477,6 +477,7 @@ export function createAppliedRuleSnapshot(ruled) {
     shortTitle: String(ruled.shortTitle || ""),
     tags: Array.isArray(ruled.tags) ? ruled.tags.slice() : [],
     tagsText: String(ruled.tagsText || ""),
+    ...(ruled.descOverrideApplied === true ? { descOverrideApplied: true } : {}),
   };
 }
 
@@ -525,6 +526,66 @@ export function resolvePlatformOverrideValue(rawMap, platform, kind = "title") {
   if (!canonical) return "";
   const normalized = normalizePlatformTextMap(rawMap, kind);
   return normalized[canonical] || "";
+}
+
+/**
+ * 仅提取指定平台相关的分平台文本覆盖项（无覆盖时返回 undefined，避免空对象污染记录）。
+ *
+ * @param {Record<string, unknown>|null|undefined} rawMap
+ * @param {string} platform
+ * @param {"title"|"description"} [kind]
+ * @returns {Record<string, string>|undefined}
+ */
+export function pickPlatformTextMapForPlatform(rawMap, platform, kind = "title") {
+  const canonical = resolvePlatformRuleKey(platform);
+  if (!canonical) return undefined;
+  const val = resolvePlatformOverrideValue(rawMap, canonical, kind);
+  return val ? { [canonical]: val } : undefined;
+}
+
+/**
+ * 构造持久化到发布记录（定时/节流/即时）的分平台映射与规则快照补丁：
+ * - titleByPlatform / descByPlatform：仅保留本平台相关项，未覆盖时不写入；
+ * - descOverrideApplied：百家号简介覆盖生效时写入 true；
+ * - platformRulesApplied：规则处理快照（由 createAppliedRuleSnapshot 生成）。
+ *
+ * @param {string} platform
+ * @param {{
+ *   titleByPlatform?: Record<string, unknown>|null,
+ *   descByPlatform?: Record<string, unknown>|null,
+ *   ruled?: object|null,
+ *   platformRulesApplied?: object|null,
+ *   descOverrideApplied?: boolean,
+ * }} [options]
+ * @returns {object}
+ */
+export function buildPlatformRulesPersistencePatch(platform, options = {}) {
+  const titleMap = pickPlatformTextMapForPlatform(
+    options && options.titleByPlatform,
+    platform,
+    "title"
+  );
+  const descMap = pickPlatformTextMapForPlatform(
+    options && options.descByPlatform,
+    platform,
+    "description"
+  );
+  const snap =
+    (options &&
+      options.platformRulesApplied &&
+      typeof options.platformRulesApplied === "object" &&
+      options.platformRulesApplied) ||
+    (options && options.ruled ? createAppliedRuleSnapshot(options.ruled) : null);
+  const descOverrideApplied =
+    Boolean(options && options.descOverrideApplied === true) ||
+    Boolean(options && options.ruled && options.ruled.descOverrideApplied === true) ||
+    Boolean(snap && snap.descOverrideApplied === true);
+  return {
+    ...(titleMap ? { titleByPlatform: titleMap } : {}),
+    ...(descMap ? { descByPlatform: descMap } : {}),
+    ...(descOverrideApplied ? { descOverrideApplied: true } : {}),
+    ...(snap ? { platformRulesApplied: snap } : {}),
+  };
 }
 
 function collapseText(t) {

@@ -68,6 +68,7 @@ import { ensureAccountRecordsMigrated } from "../services/accountMigration.js";
 import { normalizeVideoMetadata } from "../../shared/videoMetadata.js";
 import {
   applyPlatformPublishRules,
+  buildPlatformRulesPersistencePatch,
   createAppliedRuleSnapshot,
   formatRuleAdjustmentsSummary,
   mergeRuleAdjustments,
@@ -654,6 +655,17 @@ async function runBatchDirPublish(v, cfg) {
     const bt1 = ruled.title;
     const rowRuleAdjustments = ruled.adjustments || [];
     const rowRuleSummary = ruled.summary || "";
+    const rowPlatformRulesApplied = createAppliedRuleSnapshot(ruled);
+    const rowDescOverrideApplied = ruled.descOverrideApplied === true;
+    const rowRulePersistencePatch = buildPlatformRulesPersistencePatch(
+      v.platform,
+      {
+        titleByPlatform: effectiveTitleByPlatform,
+        descByPlatform: effectiveDescByPlatform,
+        ruled,
+        platformRulesApplied: rowPlatformRulesApplied,
+      }
+    );
     const rowRulePatch =
       rowRuleAdjustments.length > 0
         ? {
@@ -829,12 +841,14 @@ async function runBatchDirPublish(v, cfg) {
       shortTitle: metadata.shortTitle,
       tags: metadata.tags,
       ...metadata.legacy,
+      ...rowRulePersistencePatch,
       creativeStatement: cs,
       ...rowExtrasPatch,
       ...(rowReservationId ? { throttleReservationId: rowReservationId } : {}),
       coverPath,
       ...(coverPathH ? { coverPathH } : {}),
       ...rowRulePatch,
+      noDownload: v.noDownload === true,
       filePath: resolvedFile,
       useragent: cfg.useragent,
       phone: derivePhoneForRecord(v),
@@ -1094,7 +1108,10 @@ async function runBatchDirPublish(v, cfg) {
         ...rowExtrasPatch,
         coverPath,
         coverPathH,
-        ...(ruled ? { platformRulesApplied: createAppliedRuleSnapshot(ruled) } : {}),
+        ...(rowPlatformRulesApplied
+          ? { platformRulesApplied: rowPlatformRulesApplied }
+          : {}),
+        ...(rowDescOverrideApplied ? { descOverrideApplied: true } : {}),
         ...rowRulePatch,
       },
       ...rowRulePatch,

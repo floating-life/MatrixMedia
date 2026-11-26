@@ -1924,11 +1924,948 @@ async function testS17Round3FourEntriesAndDedupe() {
   }
 }
 
+/* ------------------------------------------------------------------ *
+ * 5. S17 返修第 4 轮：开启节流（无 --no-throttle）下定时/节流到点重建
+ *    覆盖：
+ *    - CLI 目录批量第 2 条（默认 4h 节流自动转定时）到点重建与第 1 条即时发布一致
+ *    - 显式 --publish-at（CLI / publishVideo 空标题 / HTTP）开启节流下到点重建
+ *    - GUI 定时（目录批量 submitDirBatchPublish & 单条 doSubmitBatchPublish）到点重建
+ *    - Grok 4 组样例（标题空/「济公断案」 × 25/57 字百家号简介 + 话题「民间故事」）均不含文件名且查重标题不变
+ *    - S17/S18 新字段（coverPathH 横封面 / aiChapters 章节 / originalStatement 原创）到点仍生效 + 完结状态回写
+ *    - 旧定时记录回归（无映射/无快照/无新字段行为不变）
+ *    - Grok P3：GUI 重发恢复 descByPlatform + HTTP 多平台子目标继承顶层 descByPlatform
+ * ------------------------------------------------------------------ */
+async function testS17Round4ThrottledScheduledRebuild() {
+  const publishDedupe = require(path.join(root, "src/shared/publishDedupe.js"));
+  const publishExtras = bundle("src/shared/publishExtras.js", "publishExtras-r4.cjs");
+  const textSanitize = bundle("src/shared/textSanitize.js", "textSanitize-r4.cjs");
+  const videoLink = bundle("src/shared/videoLink.js", "videoLink-r4.cjs");
+  const accountIdentity = bundle("src/shared/accountIdentity.js", "accountIdentity-r4.cjs");
+  const sharedThrottle = require(path.join(root, "src/shared/publishThrottle.js"));
+
+  const STEM_1 = "济公J03-首条即时参照-v1";
+  const STEM_2 = "济公J04-豆腐坊泼脏水-审看版-v1";
+  const DESC_25 = "这场戏的看点是掌柜往豆腐缸里泼脏水，济公当众拆穿。";
+  const DESC_57 =
+    "这场戏的看点是掌柜往豆腐缸里泼脏水，济公当众拆穿。街坊邻居全都围过来拍手叫好，黑心掌柜灰溜溜低头认错，再不敢作恶。";
+  const TAG = "民间故事";
+  const SHORT_TITLE = "济公断案";
+  const EXPECT_25 = `${DESC_25} #${TAG}`;
+  const EXPECT_57 = applyPlatformPublishRules("百家号", {
+    title: "",
+    descByPlatform: { bjh: DESC_57 },
+    tags: [TAG],
+  }).combinedDescription;
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-s17-r4-"));
+  const videoDir = path.join(tmpDir, "videos");
+  fs.mkdirSync(videoDir, { recursive: true });
+  const videoFile1 = path.join(videoDir, `${STEM_1}.mp4`);
+  const videoFile2 = path.join(videoDir, `${STEM_2}.mp4`);
+  const coverV = path.join(videoDir, "cover-v.jpg");
+  const coverH = path.join(videoDir, "cover-h.jpg");
+  fs.writeFileSync(videoFile1, "fake-video-1");
+  fs.writeFileSync(videoFile2, "fake-video-2");
+  fs.writeFileSync(coverV, Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x01]));
+  fs.writeFileSync(coverH, Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x02]));
+
+  // 开启节流（enabled: true，保留默认 百家号 4h / 抖音 6h 间隔，仅将允许时段设为全天确保测试不受执行时点影响）
+  function resetThrottleStorage() {
+    const settingsPath = path.join(tmpDir, "publish-throttle-settings.json");
+    const ledgerPath = path.join(tmpDir, "publish-throttle-ledger.json");
+    const lockPath = `${ledgerPath}.lock`;
+    try {
+      fs.rmSync(ledgerPath, { force: true });
+      fs.rmSync(lockPath, { force: true });
+    } catch (_) {}
+    const defaults = sharedThrottle.createDefaultPublishThrottleSettings();
+    fs.writeFileSync(
+      settingsPath,
+      JSON.stringify(
+        {
+          ...defaults,
+          enabled: true,
+          allowedWindow: { start: "00:00", end: "23:59" },
+        },
+        null,
+        2
+      )
+    );
+  }
+
+  let idSeq = 1;
+  const state = {
+    pushDataByDate: {},
+    capturedTasks: [],
+    nextDoneExtra: null,
+    reset() {
+      this.pushDataByDate = {};
+      this.capturedTasks = [];
+      this.nextDoneExtra = null;
+      idSeq = 1;
+      resetThrottleStorage();
+    },
+    allRecords() {
+      const out = [];
+      for (const d of Object.keys(this.pushDataByDate)) {
+        for (const rec of this.pushDataByDate[d]) out.push(rec);
+      }
+      return out;
+    },
+    changeData({ fileName, type, item }) {
+      if (fileName === "pushData") {
+        if (type === "get") {
+          const copy = {};
+          for (const d of Object.keys(this.pushDataByDate)) {
+            copy[d] = this.pushDataByDate[d].map((r) => ({ ...r }));
+          }
+          return { success: true, data: copy };
+        }
+        if (type === "add") {
+          const date = (item && item.date) || new Date().toISOString().slice(0, 10);
+          if (!this.pushDataByDate[date]) this.pushDataByDate[date] = [];
+          const rec = {
+            ...item,
+            date,
+            id: item && item.id != null ? item.id : `r4-rec-${idSeq++}`,
+          };
+          this.pushDataByDate[date].push(rec);
+          return {
+            success: true,
+            data: this.pushDataByDate[date].map((r) => ({ ...r })),
+          };
+        }
+        if (type === "update") {
+          const date = item && item.date;
+          const list = (date && this.pushDataByDate[date]) || [];
+          const idx = list.findIndex((r) => String(r.id) === String(item.id));
+          if (idx >= 0) {
+            list[idx] = { ...list[idx], ...item };
+          }
+          return { success: true, data: list.map((r) => ({ ...r })) };
+        }
+        if (type === "delete") {
+          const date = item && item.date;
+          const list = (date && this.pushDataByDate[date]) || [];
+          const idx = list.findIndex((r) => String(r.id) === String(item.id));
+          if (idx >= 0) list.splice(idx, 1);
+          return { success: true, data: list.map((r) => ({ ...r })) };
+        }
+      }
+      return { success: true, data: {} };
+    },
+  };
+  global.__MM_S17_R4_STATE__ = state;
+
+  const utilsStub = path.join(tmpDir, "utilsStub.js");
+  const pupStub = path.join(tmpDir, "pupStub.js");
+  const guardStub = path.join(tmpDir, "guardStub.js");
+  const alertStub = path.join(tmpDir, "alertStub.js");
+
+  fs.writeFileSync(
+    utilsStub,
+    `module.exports = {
+      changeData: (req) => global.__MM_S17_R4_STATE__.changeData(req),
+    };`
+  );
+  fs.writeFileSync(
+    pupStub,
+    `export function registerPublishDedupeBypass() {}
+     export function runPuppeteerTask(payload, transport, onFinish) {
+       global.__MM_S17_R4_STATE__.capturedTasks.push(payload);
+       const extra = global.__MM_S17_R4_STATE__.nextDoneExtra || {};
+       setImmediate(() => {
+         transport.reply("puppeteerFile-done", {
+           taskId: payload.taskId,
+           status: true,
+           message: "上传成功",
+           ...extra,
+         });
+         if (typeof onFinish === "function") onFinish();
+       });
+     }`
+  );
+  fs.writeFileSync(guardStub, `module.exports = { isTrustedLocalRequest: () => true };`);
+  fs.writeFileSync(alertStub, `module.exports = { handleAccountCollectOutcome: () => ({ ok: true }) };`);
+
+  const cliBundle = path.join(tmpDir, "cliIndexR4.cjs");
+  const schedBundle = path.join(tmpDir, "schedR4.cjs");
+  const pvBundle = path.join(tmpDir, "pvR4.cjs");
+  const routesBundle = path.join(tmpDir, "routesR4.cjs");
+
+  const commonExternal = [
+    "electron",
+    "xlsx",
+    "express",
+    "puppeteer-core",
+    "puppeteer-extra",
+    "puppeteer-extra-plugin-stealth",
+    "puppeteer-in-electron",
+  ];
+  const makeStubPlugin = (name) => ({
+    name,
+    setup(b) {
+      b.onResolve({ filter: /^\.\.\/utils$/ }, () => ({ path: utilsStub }));
+      b.onResolve({ filter: /server\/utils(\.js)?$/ }, () => ({ path: utilsStub }));
+      b.onResolve({ filter: /^\.\.\/requestGuard$/ }, () => ({ path: guardStub }));
+      b.onResolve({ filter: /(?:^|\/)puppeteerFile(\.js)?$/ }, () => ({ path: pupStub }));
+      b.onResolve({ filter: /services\/dataStats\/collectAlert\.js$/ }, () => ({ path: alertStub }));
+    },
+  });
+
+  await Promise.all([
+    build({
+      entryPoints: [path.join(root, "src/main/cli/index.js")],
+      outfile: cliBundle,
+      bundle: true,
+      platform: "node",
+      format: "cjs",
+      external: commonExternal,
+      plugins: [makeStubPlugin("stub-cli-r4")],
+    }),
+    build({
+      entryPoints: [path.join(root, "src/main/services/scheduledPublish.js")],
+      outfile: schedBundle,
+      bundle: true,
+      platform: "node",
+      format: "cjs",
+      external: commonExternal,
+      plugins: [makeStubPlugin("stub-sched-r4")],
+    }),
+    build({
+      entryPoints: [path.join(root, "src/main/services/publishVideo.js")],
+      outfile: pvBundle,
+      bundle: true,
+      platform: "node",
+      format: "cjs",
+      external: commonExternal,
+      plugins: [makeStubPlugin("stub-pv-r4")],
+    }),
+    build({
+      entryPoints: [path.join(root, "src/main/server/routes/index.js")],
+      outfile: routesBundle,
+      bundle: true,
+      platform: "node",
+      format: "cjs",
+      external: commonExternal,
+      plugins: [makeStubPlugin("stub-routes-r4")],
+    }),
+  ]);
+
+  const expressMod = require("express");
+  const origLoad = Module._load;
+  Module._load = function (request, parent, isMain) {
+    if (request === "express") return expressMod;
+    if (request === "xlsx") return xlsx;
+    if (request === "puppeteer-extra") {
+      return { addExtra: () => ({ use: () => {}, connect: () => {} }) };
+    }
+    if (request === "puppeteer-extra-plugin-stealth") return () => ({});
+    if (request.startsWith("puppeteer")) return { use: () => {}, connect: () => {} };
+    if (request === "electron") {
+      return {
+        ipcMain: { on: () => {}, handle: () => {} },
+        app: {
+          getPath: () => tmpDir,
+          getVersion: () => "0.14.9-test",
+          on: () => {},
+          once: () => {},
+          commandLine: { getSwitchValue: () => "" },
+        },
+        BrowserWindow: function () {},
+        dialog: {},
+      };
+    }
+    return origLoad.apply(this, arguments);
+  };
+
+  function writeXlsx(fileName, rows) {
+    const p = path.join(tmpDir, fileName);
+    const wb = xlsx.utils.book_new();
+    const ws = xlsx.utils.json_to_sheet(rows);
+    xlsx.utils.book_append_sheet(wb, ws, "Sheet1");
+    xlsx.writeFile(wb, p);
+    return p;
+  }
+
+  function extractBjhPageDesc(taskData) {
+    const text = videoMetadata.buildPlatformVideoTextDetailed("百家号", taskData || {});
+    return text.description || text.ksFillText || text.title || "";
+  }
+
+  async function waitForCapturedCount(schedMod, targetCount, dueAtMs) {
+    schedMod.stopScheduledPublishScheduler();
+    schedMod.refreshScheduledPublishScheduler(dueAtMs);
+    const deadline = Date.now() + 2000;
+    while (state.capturedTasks.length < targetCount && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 15));
+    }
+    schedMod.stopScheduledPublishScheduler();
+  }
+
+  // 构建真实 LocalVideoPublish.vue 组件实例（可真跑 submitDirBatchPublish & doSubmitBatchPublish 定时写盘）
+  function createGuiRunner(writtenScheduledRecords, immediatePayloads) {
+    const lvpSrc = fs.readFileSync(
+      path.join(root, "src/renderer/components/LocalVideoPublish.vue"),
+      "utf8"
+    );
+    const sfc = compiler.parseComponent(lvpSrc);
+    const importedNames = [
+      ...sfc.script.content.matchAll(
+        /^import\s+([\s\S]*?)\s+from\s+["'][^"']+["'];/gm
+      ),
+    ].flatMap((m) =>
+      m[1]
+        .replace(/[{}]/g, "")
+        .split(",")
+        .map((x) => x.trim().split(/\s+as\s+/).pop())
+        .filter(Boolean)
+    );
+    const stubs = Object.fromEntries(importedNames.map((n) => [n, () => {}]));
+    const ctx = vm.createContext({
+      ...stubs,
+      ...videoLink,
+      ...videoMetadata,
+      ...platformRules,
+      ...accountIdentity,
+      ...textSanitize,
+      ...publishExtras,
+      parsePublishAtUtc8: sharedThrottle.parsePublishAtUtc8,
+      require,
+      moment: () => ({ format: () => "2026-11-26" }),
+      applyXhsConservativePublishOptions: (p) => p,
+      isXhsPlatform: (pt) => String(pt || "").includes("小红书"),
+      getXhsPlatformStaggerDelayMs: () => 0,
+      resolveEffectivePublishMode: (isDraft, node) => ({
+        publishMode: isDraft || (node && node.defaultPublishToDraft) ? "draft" : "publish",
+        publishToDraft: Boolean(isDraft || (node && node.defaultPublishToDraft)),
+      }),
+      resolveCreativeStatementForPlatform: (cs) => cs || "none",
+      ptConfig: {
+        百家号: { useragent: "ua-bjh", listIndex: "https://bjh/list", upload: "https://bjh/upload" },
+        抖音: { useragent: "ua-dy", listIndex: "https://dy/list", upload: "https://dy/upload" },
+        视频号: { useragent: "ua-sph", listIndex: "https://sph/list", upload: "https://sph/upload" },
+        小红书: { useragent: "ua-xhs", listIndex: "https://xhs/list", upload: "https://xhs/upload" },
+      },
+      ipcRenderer: {
+        send(ch, payload) {
+          if (ch === "puppeteerFile") immediatePayloads.push(payload);
+        },
+        async invoke(ch, arg) {
+          if (ch === "publish-throttle:create-scheduled") {
+            const rec = { ...arg.item, id: `gui-sched-${writtenScheduledRecords.length + 1}` };
+            writtenScheduledRecords.push(rec);
+            return { ok: true, id: rec.id };
+          }
+          if (ch === "publish:check-duplicate") return { duplicates: [] };
+          return { ok: true };
+        },
+      },
+      dataRequest: async ({ type, item }) => {
+        if (type === "add") {
+          return { success: true, data: [{ ...item, id: "gui-imm-1" }] };
+        }
+        return { success: true, data: [] };
+      },
+    });
+    const script = sfc.script.content
+      .replace(/^import[\s\S]*?from\s+["'][^"']+["'];\s*$/gm, "")
+      .replace("export default", "globalThis.component =");
+    vm.runInContext(script, ctx);
+    const comp = ctx.component;
+    const gui = {
+      ...comp.data(),
+      $set: (o, k, v) => {
+        o[k] = v;
+      },
+      $delete: (o, k) => {
+        delete o[k];
+      },
+      $message: { warning: () => {}, error: () => {}, info: () => {}, success: () => {} },
+      $nextTick: () => {},
+      $emit: () => {},
+    };
+    for (const [k, fn] of Object.entries(comp.methods)) {
+      gui[k] = fn.bind(gui);
+    }
+    gui.getPlatformStatement = () => "ai_generated";
+    gui.loadPublishThrottleDefaults = async () => "ai_generated";
+    gui.confirmDuplicatePublishTargets = async () => ({ proceed: true, allowDuplicate: false });
+    return gui;
+  }
+
+  try {
+    const cliMod = require(cliBundle);
+    const schedMod = require(schedBundle);
+    const pvMod = require(pvBundle);
+    const router = require(routesBundle);
+    const httpPublishHandler = router.stack.find(
+      (l) => l.route && l.route.path === "/publish" && l.route.methods.post
+    ).route.stack[0].handle;
+
+    const runCli = async (args) => {
+      const out = [];
+      const err = [];
+      const origLog = console.log;
+      const origErr = console.error;
+      console.log = (...a) => out.push(a.join(" "));
+      console.error = (...a) => err.push(a.join(" "));
+      try {
+        const code = await cliMod.runCliMain(["node", ".", "cli", "publish", ...args]);
+        return { code, out, err };
+      } finally {
+        console.log = origLog;
+        console.error = origErr;
+      }
+    };
+
+    const runHttp = async (body) => {
+      let statusCode = 200;
+      let payload = null;
+      const req = { method: "POST", body, headers: { origin: "http://localhost:30088" } };
+      const res = {
+        status(c) {
+          statusCode = c;
+          return this;
+        },
+        json(obj) {
+          payload = obj;
+          return this;
+        },
+      };
+      await httpPublishHandler(req, res);
+      return { statusCode, payload };
+    };
+
+    const grokCases = [
+      {
+        name: "标题空 + 25字百家号简介 + 话题民间故事",
+        title: "",
+        bjhDesc: DESC_25,
+        expectDesc: EXPECT_25,
+        expectDedupeTitle: STEM_2,
+      },
+      {
+        name: "标题空 + 57字百家号简介 + 话题民间故事",
+        title: "",
+        bjhDesc: DESC_57,
+        expectDesc: EXPECT_57,
+        expectDedupeTitle: STEM_2,
+      },
+      {
+        name: "短标题济公断案 + 25字百家号简介 + 话题民间故事",
+        title: SHORT_TITLE,
+        bjhDesc: DESC_25,
+        expectDesc: EXPECT_25,
+        expectDedupeTitle: SHORT_TITLE,
+      },
+      {
+        name: "短标题济公断案 + 57字百家号简介 + 话题民间故事",
+        title: SHORT_TITLE,
+        bjhDesc: DESC_57,
+        expectDesc: EXPECT_57,
+        expectDedupeTitle: SHORT_TITLE,
+      },
+    ];
+
+    const futureAtMs = Date.now() + 2 * 3600 * 1000;
+    const futureAtText = sharedThrottle.formatUtc8DateTime(futureAtMs);
+
+    for (let idx = 0; idx < grokCases.length; idx++) {
+      const sc = grokCases[idx];
+      const tagCtx = `[S17-R4][${sc.name}]`;
+
+      // ================================================================
+      // 路径 1：CLI 目录批量第 2 条（开启节流，不传 --no-throttle！）
+      // 第 1 条即时发布，第 2 条触发默认 4h 节流自动转定时 → 到点重建并派发
+      // ================================================================
+      state.reset();
+      const batchCfg = writeXlsx(`r4-throttled-${idx}.xlsx`, [
+        {
+          文件名: `${STEM_1}.mp4`,
+          标题: sc.title ? `${sc.title}第一条` : "",
+          简介: "",
+          标签: TAG,
+          百家号简介: sc.bjhDesc,
+        },
+        {
+          文件名: `${STEM_2}.mp4`,
+          标题: sc.title,
+          简介: "",
+          标签: TAG,
+          百家号简介: sc.bjhDesc,
+        },
+      ]);
+      const dirRes = await runCli([
+        "-p",
+        "bjh",
+        "--phone",
+        "A组",
+        "--dir",
+        videoDir,
+        "--config",
+        batchCfg,
+      ]);
+      assert.strictEqual(dirRes.code, 0, `${tagCtx} 开启节流 CLI 目录批量应成功，err=${dirRes.err.join(";")}`);
+      assert.strictEqual(state.capturedTasks.length, 1, `${tagCtx} 第 1 条应即时发布，第 2 条应被 4h 节流转定时`);
+      const allBatchRecs = state.allRecords();
+      assert.strictEqual(allBatchRecs.length, 2, `${tagCtx} 应写入 2 条记录（1 即时 + 1 节流定时）`);
+      const row1Task = state.capturedTasks[0];
+      const row2SchedRec = allBatchRecs.find((r) => r.scheduledTask === true && r.publishStatus === "scheduled");
+      assert.ok(row2SchedRec, `${tagCtx} 第 2 条必须落盘为定时任务`);
+      assert.strictEqual(row2SchedRec.selectedFile, `${STEM_2}.mp4`);
+      assert.deepStrictEqual(row2SchedRec.descByPlatform, { 百家号: sc.bjhDesc }, `${tagCtx} 定时记录应持久化本平台 descByPlatform`);
+      assert.strictEqual(row2SchedRec.descOverrideApplied, true);
+      assert.ok(row2SchedRec.platformRulesApplied, `${tagCtx} 定时记录应持久化规则快照`);
+      // 查重标题不变
+      assert.strictEqual(
+        publishDedupe.extractCandidateTitle(row2SchedRec),
+        sc.expectDedupeTitle,
+        `${tagCtx} 第 2 条定时记录查重标题必须保持 ${sc.expectDedupeTitle}`
+      );
+      // 模拟到点经 scheduledPublish 真实派发（重建 payload → runPuppeteerTask）
+      const row1Desc = extractBjhPageDesc(row1Task.data);
+      const row2RebuiltDirect = schedMod.buildTaskPayloadFromRecord(row2SchedRec);
+      assert.strictEqual(extractBjhPageDesc(row2RebuiltDirect.data), sc.expectDesc);
+      await waitForCapturedCount(schedMod, 2, Number(row2SchedRec.scheduledPublishAt) + 1000);
+      assert.strictEqual(state.capturedTasks.length, 2, `${tagCtx} 第 2 条到点后应成功派发`);
+      const row2DispatchedDesc = extractBjhPageDesc(state.capturedTasks[1].data);
+      assert.strictEqual(row2DispatchedDesc, row1Desc, `${tagCtx} 第 2 条到点重建结果必须与第 1 条即时发布完全一致`);
+      assert.strictEqual(row2DispatchedDesc, sc.expectDesc);
+      assert.ok(!row2DispatchedDesc.includes(STEM_2), `${tagCtx} 第 2 条到点重建绝不能包含文件名`);
+      // 用真 DOM bjhHandler 跑一遍重建后的 taskPayload，确认写入编辑器的就是期望描述
+      {
+        const env = createFakeBjhEnv({
+          initialText: STEM_2,
+          hasBubble: false,
+          afterClickToast: { type: "check-circle", text: "发布成功" },
+        });
+        await bjhMod.default(env.page, state.capturedTasks[1], null, { reply() {} });
+        assert.strictEqual(env.editor.textContent, sc.expectDesc, `${tagCtx} 百家号编辑器最终写入文本必须一致且不含文件名`);
+      }
+
+      // ================================================================
+      // 路径 2：显式 --publish-at（开启节流，不传 --no-throttle！）
+      // 覆盖单条 CLI、publishVideo 空标题直调、HTTP 显式定时
+      // ================================================================
+      state.reset();
+      const singleReqTitle = sc.title || STEM_2;
+      const pubAtCliRes = await runCli([
+        "-p",
+        "bjh",
+        "--phone",
+        "A组",
+        "-f",
+        videoFile2,
+        "-t",
+        singleReqTitle,
+        "--desc-by-platform",
+        JSON.stringify({ bjh: sc.bjhDesc, dy: "无关抖音简介" }),
+        "--tags",
+        TAG,
+        "--publish-at",
+        futureAtText,
+      ]);
+      assert.strictEqual(pubAtCliRes.code, 0, `${tagCtx} 显式 --publish-at CLI 应成功，err=${pubAtCliRes.err.join(";")}`);
+      assert.strictEqual(state.capturedTasks.length, 0, "显式定时创建时不应立即上传");
+      const pubAtRec = state.allRecords()[0];
+      assert.strictEqual(pubAtRec.scheduledTask, true);
+      assert.deepStrictEqual(pubAtRec.descByPlatform, { 百家号: sc.bjhDesc }, "定时记录仅持久化本平台项，不含 dy");
+      assert.strictEqual(publishDedupe.extractCandidateTitle(pubAtRec), sc.expectDedupeTitle);
+      await waitForCapturedCount(schedMod, 1, Number(pubAtRec.scheduledPublishAt) + 1000);
+      assert.strictEqual(state.capturedTasks.length, 1);
+      const pubAtDesc = extractBjhPageDesc(state.capturedTasks[0].data);
+      assert.strictEqual(pubAtDesc, sc.expectDesc, `${tagCtx} 显式 --publish-at 到点重建不符`);
+      assert.ok(!pubAtDesc.includes(STEM_2), `${tagCtx} 显式 --publish-at 到点绝不能含文件名`);
+
+      // 空标题样例同步验证 publishVideo.runSingleFilePublish 直接定时入参
+      if (!sc.title) {
+        state.reset();
+        const pvSchedRes = await pvMod.runSingleFilePublish({
+          platform: "百家号",
+          phone: "A组",
+          partition: "persist:A组百家号",
+          file: videoFile2,
+          title: "",
+          description: "",
+          descByPlatform: { bjh: sc.bjhDesc },
+          tags: [TAG],
+          publishAt: futureAtText,
+          scheduledPublishAtMs: futureAtMs,
+        });
+        assert.strictEqual(pvSchedRes.exitCode, 0);
+        assert.strictEqual(pvSchedRes.scheduled, true);
+        const pvRec = state.allRecords()[0];
+        assert.strictEqual(publishDedupe.extractCandidateTitle(pvRec), STEM_2);
+        const pvRebuilt = schedMod.buildTaskPayloadFromRecord(pvRec);
+        assert.strictEqual(extractBjhPageDesc(pvRebuilt.data), sc.expectDesc);
+        assert.ok(!extractBjhPageDesc(pvRebuilt.data).includes(STEM_2));
+      }
+
+      // ================================================================
+      // 路径 3：GUI 定时（目录批量 submitDirBatchPublish & 单条 doSubmitBatchPublish）
+      // 模拟开启节流排期 → 落盘定时记录 → 到点由 scheduledPublish 重建
+      // ================================================================
+      {
+        const guiScheduledRecs = [];
+        const guiImmediatePayloads = [];
+        const gui = createGuiRunner(guiScheduledRecs, guiImmediatePayloads);
+        const bjhTreeNode = {
+          id: "node-bjh-1",
+          pt: "百家号",
+          phone: "A组",
+          accountKey: "A组",
+          url: "https://bjh/upload",
+        };
+        gui.$refs = { tree: { getCheckedNodes: () => [bjhTreeNode] } };
+        gui.dirPath = videoDir;
+        gui.dirBatchFiles = [
+          {
+            fileName: `${STEM_1}.mp4`,
+            resolvedPath: videoFile1,
+            title: sc.title ? `${sc.title}第一条` : "",
+            description: "",
+            shortTitle: "",
+            tags: TAG,
+            titleByPlatform: {},
+            descByPlatform: { 百家号: sc.bjhDesc, 抖音: "抖音无关简介" },
+          },
+          {
+            fileName: `${STEM_2}.mp4`,
+            resolvedPath: videoFile2,
+            title: sc.title,
+            description: "",
+            shortTitle: "",
+            tags: TAG,
+            titleByPlatform: {},
+            descByPlatform: { 百家号: sc.bjhDesc, 抖音: "抖音无关简介" },
+          },
+        ];
+        // 开启节流：第 1 条立即，第 2 条顺延 +4h 定时
+        gui.confirmThrottlePublishPlan = async (entries) => ({
+          proceed: true,
+          noThrottle: false,
+          itemsByKey: new Map([
+            [entries[0].key, { scheduled: false, throttled: false, reservationId: "res-1" }],
+            [
+              entries[1].key,
+              {
+                scheduled: true,
+                throttled: true,
+                plannedAtMs: futureAtMs,
+                publishAt: futureAtText,
+                reason: "距上一条不足 4 小时，已顺延",
+                reservationId: "res-2",
+              },
+            ],
+          ]),
+          reservationIds: ["res-1", "res-2"],
+        });
+
+        await gui.submitDirBatchPublish("publish");
+        assert.strictEqual(guiImmediatePayloads.length, 1, `${tagCtx} GUI 目录批量第 1 条应即时提交`);
+        assert.strictEqual(guiScheduledRecs.length, 1, `${tagCtx} GUI 目录批量第 2 条应走节流写定时记录`);
+        const guiRow2Rec = guiScheduledRecs[0];
+        assert.deepStrictEqual({ ...guiRow2Rec.descByPlatform }, { 百家号: sc.bjhDesc }, "GUI 定时记录仅存本平台 descByPlatform");
+        assert.strictEqual(guiRow2Rec.descOverrideApplied, true);
+        assert.ok(guiRow2Rec.platformRulesApplied);
+        assert.strictEqual(publishDedupe.extractCandidateTitle(guiRow2Rec), sc.expectDedupeTitle);
+        const guiRow1Desc = extractBjhPageDesc(guiImmediatePayloads[0].data);
+        const guiRow2Rebuilt = schedMod.buildTaskPayloadFromRecord(guiRow2Rec);
+        const guiRow2Desc = extractBjhPageDesc(guiRow2Rebuilt.data);
+        assert.strictEqual(guiRow2Desc, guiRow1Desc, `${tagCtx} GUI 目录批量定时到点重建必须与即时一致`);
+        assert.strictEqual(guiRow2Desc, sc.expectDesc);
+        assert.ok(!guiRow2Desc.includes(STEM_2), `${tagCtx} GUI 目录批量定时到点绝不能含文件名`);
+
+        // GUI 单条显式定时（经 openRepublish 恢复 descByPlatform 后再定时发布）
+        const guiSingleSched = [];
+        const guiSingleImm = [];
+        const guiSingle = createGuiRunner(guiSingleSched, guiSingleImm);
+        guiSingle.loadAccounts = () => {};
+        guiSingle.$refs = { tree: { getCheckedNodes: () => [bjhTreeNode], setCheckedKeys: () => {} } };
+        guiSingle.openRepublish({
+          filePath: videoFile2,
+          textOtherName: STEM_2,
+          form: {
+            title: STEM_2,
+            bt1: sc.title,
+            description: "",
+            tags: TAG,
+            descByPlatform: { bjh: sc.bjhDesc },
+          },
+          records: [],
+          failedTargets: [],
+        });
+        assert.deepStrictEqual({ ...guiSingle.form.descByPlatform }, { 百家号: sc.bjhDesc });
+        guiSingle.scheduledPublish = true;
+        guiSingle.publishAt = futureAtText;
+        guiSingle.confirmThrottlePublishPlan = async (entries) => ({
+          proceed: true,
+          noThrottle: false,
+          itemsByKey: new Map([
+            [
+              entries[0].key,
+              {
+                scheduled: true,
+                throttled: false,
+                plannedAtMs: futureAtMs,
+                publishAt: futureAtText,
+                reason: "",
+                reservationId: "res-single",
+              },
+            ],
+          ]),
+          reservationIds: ["res-single"],
+        });
+        await guiSingle.doSubmitBatchPublish("publish");
+        assert.strictEqual(guiSingleSched.length, 1, `${tagCtx} GUI 单条定时应写入 1 条记录`);
+        assert.deepStrictEqual({ ...guiSingleSched[0].descByPlatform }, { 百家号: sc.bjhDesc });
+        assert.strictEqual(publishDedupe.extractCandidateTitle(guiSingleSched[0]), sc.expectDedupeTitle);
+        const guiSingleRebuilt = schedMod.buildTaskPayloadFromRecord(guiSingleSched[0]);
+        assert.strictEqual(extractBjhPageDesc(guiSingleRebuilt.data), sc.expectDesc);
+        assert.ok(!extractBjhPageDesc(guiSingleRebuilt.data).includes(STEM_2));
+      }
+    }
+
+    // ================================================================
+    // 5b. S17/S18 新字段（横版封面 coverPathH、AI 章节 aiChapters、原创声明 originalStatement）
+    //     在开启节流的 CLI 显式定时、CLI 目录批量第 2 条、GUI 定时三条路径到点仍生效 + 完结状态回写
+    // ================================================================
+    {
+      // (1) CLI 显式 --publish-at（抖音：横封面 + AI 章节；视频号：横封面 + 原创声明）
+      state.reset();
+      const dySchedCli = await runCli([
+        "-p",
+        "dy",
+        "--phone",
+        "A组",
+        "-f",
+        videoFile2,
+        "-t",
+        "抖音定时新字段",
+        "--cover",
+        coverV,
+        "--cover-h",
+        coverH,
+        "--ai-chapters",
+        "--publish-at",
+        futureAtText,
+      ]);
+      assert.strictEqual(dySchedCli.code, 0, dySchedCli.err.join(";"));
+      const dyRec = state.allRecords()[0];
+      assert.strictEqual(dyRec.coverPathH, coverH);
+      assert.strictEqual(dyRec.aiChapters, true);
+      state.nextDoneExtra = { aiChaptersStatus: "enabled", aiChaptersReceipt: "章节：已开启" };
+      await waitForCapturedCount(schedMod, 1, Number(dyRec.scheduledPublishAt) + 1000);
+      const dyTask = state.capturedTasks[0];
+      assert.strictEqual(dyTask.data.coverPathH, coverH);
+      assert.strictEqual(dyTask.publishOptions.coverPathH, coverH);
+      assert.strictEqual(dyTask.data.aiChapters, true);
+      assert.strictEqual(publishExtras.isAiChaptersRequested(dyTask), true);
+      await new Promise((r) => setTimeout(r, 30));
+      assert.strictEqual(state.allRecords()[0].aiChaptersStatus, "enabled");
+      assert.ok(String(state.allRecords()[0].lastPublishMessage || "").includes("章节：已开启"));
+
+      state.reset();
+      const sphSchedCli = await runCli([
+        "-p",
+        "sph",
+        "--phone",
+        "A组",
+        "-f",
+        videoFile2,
+        "-t",
+        "视频号定时新字段",
+        "--cover",
+        coverV,
+        "--cover-h",
+        coverH,
+        "--original",
+        "--publish-at",
+        futureAtText,
+      ]);
+      assert.strictEqual(sphSchedCli.code, 0, sphSchedCli.err.join(";"));
+      const sphRec = state.allRecords()[0];
+      assert.strictEqual(sphRec.coverPathH, coverH);
+      assert.strictEqual(sphRec.originalStatement, true);
+      state.nextDoneExtra = { originalStatementStatus: "enabled" };
+      await waitForCapturedCount(schedMod, 1, Number(sphRec.scheduledPublishAt) + 1000);
+      const sphTask = state.capturedTasks[0];
+      assert.strictEqual(sphTask.data.coverPathH, coverH);
+      assert.strictEqual(sphTask.publishOptions.coverPathH, coverH);
+      assert.strictEqual(sphTask.data.originalStatement, true);
+      assert.strictEqual(publishExtras.isOriginalStatementRequested(sphTask), true);
+      await new Promise((r) => setTimeout(r, 30));
+      assert.strictEqual(state.allRecords()[0].originalStatementStatus, "enabled");
+
+      // (2) CLI 目录批量第 2 条（开启节流，小红书：AI 章节=否 + 原创声明=是）
+      state.reset();
+      const xhsCfg = writeXlsx("r4-xhs-extras.xlsx", [
+        { 文件名: `${STEM_1}.mp4`, 标题: "小红书第一条", AI章节: "是", 原创声明: "是" },
+        { 文件名: `${STEM_2}.mp4`, 标题: "小红书第二条", AI章节: "否", 原创声明: "是" },
+      ]);
+      const xhsBatchRes = await runCli([
+        "-p",
+        "xhs",
+        "--phone",
+        "A组",
+        "--dir",
+        videoDir,
+        "--config",
+        xhsCfg,
+      ]);
+      assert.strictEqual(xhsBatchRes.code, 0, xhsBatchRes.err.join(";"));
+      const xhsRow2Rec = state.allRecords().find((r) => r.scheduledTask === true);
+      assert.ok(xhsRow2Rec, "小红书第 2 条应被 4h 节流转定时");
+      assert.strictEqual(xhsRow2Rec.aiChapters, false);
+      assert.strictEqual(xhsRow2Rec.originalStatement, true);
+      const xhsRow2Task = schedMod.buildTaskPayloadFromRecord(xhsRow2Rec);
+      assert.strictEqual(xhsRow2Task.data.aiChapters, false);
+      assert.strictEqual(xhsRow2Task.data.originalStatement, true);
+      assert.strictEqual(publishExtras.isAiChaptersRequested(xhsRow2Task), false);
+      assert.strictEqual(publishExtras.isOriginalStatementRequested(xhsRow2Task), true);
+
+      // (3) GUI 定时（目录批量带横版封面 + AI 章节 + 原创声明）→ 到点重建仍生效
+      const guiExtrasSched = [];
+      const guiExtrasImm = [];
+      const guiExtras = createGuiRunner(guiExtrasSched, guiExtrasImm);
+      const dyNode = { id: "g-dy", pt: "抖音", phone: "A组", accountKey: "A组", url: "https://dy/upload" };
+      const sphNode = { id: "g-sph", pt: "视频号", phone: "A组", accountKey: "A组", url: "https://sph/upload" };
+      guiExtras.$refs = { tree: { getCheckedNodes: () => [dyNode, sphNode] } };
+      guiExtras.dirPath = videoDir;
+      guiExtras.dirBatchFiles = [
+        {
+          fileName: `${STEM_2}.mp4`,
+          resolvedPath: videoFile2,
+          title: "GUI定时新字段",
+          description: "简介",
+          shortTitle: "六个字短标题",
+          tags: TAG,
+          coverResolved: coverV,
+          coverHResolved: coverH,
+          aiChapters: true,
+          originalStatement: true,
+          titleByPlatform: { 抖音: "抖音专属定时标题" },
+          descByPlatform: {},
+        },
+      ];
+      guiExtras.confirmThrottlePublishPlan = async (entries) => ({
+        proceed: true,
+        noThrottle: false,
+        itemsByKey: new Map(
+          entries.map((e) => [
+            e.key,
+            {
+              scheduled: true,
+              throttled: true,
+              plannedAtMs: futureAtMs,
+              publishAt: futureAtText,
+              reason: "定时测试",
+              reservationId: `res-${e.key}`,
+            },
+          ])
+        ),
+        reservationIds: entries.map((e) => `res-${e.key}`),
+      });
+      await guiExtras.submitDirBatchPublish("publish");
+      assert.strictEqual(guiExtrasSched.length, 2);
+      const guiDyRec = guiExtrasSched.find((r) => r.pt === "抖音");
+      const guiSphRec = guiExtrasSched.find((r) => r.pt === "视频号");
+      assert.strictEqual(guiDyRec.coverPathH, coverH);
+      assert.strictEqual(guiDyRec.aiChapters, true);
+      assert.deepStrictEqual({ ...guiDyRec.titleByPlatform }, { 抖音: "抖音专属定时标题" });
+      assert.strictEqual(guiSphRec.coverPathH, coverH);
+      assert.strictEqual(guiSphRec.originalStatement, true);
+      assert.strictEqual(guiSphRec.titleByPlatform, undefined, "视频号定时记录不应带上抖音的 titleByPlatform");
+      const guiDyRebuilt = schedMod.buildTaskPayloadFromRecord(guiDyRec);
+      const guiSphRebuilt = schedMod.buildTaskPayloadFromRecord(guiSphRec);
+      assert.strictEqual(guiDyRebuilt.data.coverPathH, coverH);
+      assert.strictEqual(guiDyRebuilt.data.aiChapters, true);
+      assert.strictEqual(guiDyRebuilt.data.title, "抖音专属定时标题");
+      assert.strictEqual(guiSphRebuilt.data.coverPathH, coverH);
+      assert.strictEqual(guiSphRebuilt.data.originalStatement, true);
+    }
+
+    // ================================================================
+    // 5c. HTTP 多平台（开启节流 + 子目标未带映射继承顶层 descByPlatform）到点重建
+    // ================================================================
+    {
+      state.reset();
+      const httpSched = await runHttp({
+        file: videoFile2,
+        phone: "A组",
+        title: SHORT_TITLE,
+        descByPlatform: { bjh: DESC_25 },
+        tags: TAG,
+        publishAt: futureAtText,
+        platforms: [{ platform: "bjh", description: "子目标通用简介" }],
+      });
+      assert.strictEqual(httpSched.statusCode, 200);
+      assert.strictEqual(httpSched.payload.exitCode, 0, JSON.stringify(httpSched.payload));
+      assert.strictEqual(httpSched.payload.scheduled, true);
+      const httpRec = state.allRecords()[0];
+      assert.deepStrictEqual(httpRec.descByPlatform, { 百家号: DESC_25 });
+      assert.strictEqual(publishDedupe.extractCandidateTitle(httpRec), SHORT_TITLE);
+      const httpRebuilt = schedMod.buildTaskPayloadFromRecord(httpRec);
+      assert.strictEqual(extractBjhPageDesc(httpRebuilt.data), EXPECT_25);
+      assert.ok(!extractBjhPageDesc(httpRebuilt.data).includes(SHORT_TITLE));
+    }
+
+    // ================================================================
+    // 5d. 旧定时记录回归：无分平台映射/无规则快照/无 S18 字段时行为完全不变
+    // ================================================================
+    {
+      const legacyRecord = {
+        id: "legacy-1",
+        date: "2026-11-20",
+        scheduledTask: true,
+        publishStatus: "scheduled",
+        scheduledPublishAt: futureAtMs,
+        textType: "local",
+        pt: "百家号",
+        phone: "A组",
+        partition: "persist:A组百家号",
+        bookName: SHORT_TITLE,
+        textOtherName: STEM_2,
+        selectedFile: `${STEM_2}.mp4`,
+        bt: SHORT_TITLE,
+        title: SHORT_TITLE,
+        description: DESC_25,
+        tags: [TAG],
+        filePath: videoFile2,
+      };
+      const legacyPayload = schedMod.buildTaskPayloadFromRecord(legacyRecord);
+      assert.strictEqual(legacyPayload.data.platformRulesApplied, undefined);
+      assert.strictEqual(legacyPayload.data.descOverrideApplied, undefined);
+      assert.strictEqual(legacyPayload.data.coverPathH, undefined);
+      assert.strictEqual(legacyPayload.data.aiChapters, undefined);
+      assert.strictEqual(legacyPayload.data.originalStatement, undefined);
+      assert.strictEqual(
+        extractBjhPageDesc(legacyPayload.data),
+        `${SHORT_TITLE}，${DESC_25} #${TAG}`,
+        "旧记录无分平台映射时仍按「标题，简介」组装"
+      );
+    }
+
+    console.log(
+      "✓ 5. S17 返修第 4 轮：开启节流下 CLI目录批量第2条/显式--publish-at/GUI定时到点重建 + 新字段生效 + 旧记录回归 + P3 通过"
+    );
+  } finally {
+    delete global.__MM_S17_R4_STATE__;
+    Module._load = origLoad;
+    for (const p of [cliBundle, schedBundle, pvBundle, routesBundle]) {
+      delete require.cache[p];
+    }
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
 (async () => {
   testBjhDescriptionAssembly();
   testBjhExactEquality();
   await testBjhDomClearWriteAndNoRetry();
   await testS17Round3FourEntriesAndDedupe();
+  await testS17Round4ThrottledScheduledRebuild();
   console.log("\ntest-bjh-description: 全部断言通过");
 })().catch((err) => {
   console.error(err);

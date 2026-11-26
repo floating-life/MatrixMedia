@@ -1269,29 +1269,56 @@ function mergePublishBody(shared, target) {
     ...target,
     ...(Object.keys(platformOptions).length > 0 ? { platformOptions } : {}),
   };
-  // 多平台目标子对象显式传了 title/description 且自身未传分平台映射时，
-  // 不让顶层 shared.titleByPlatform / descByPlatform 反向覆盖 target 的显式值
+  // 多平台目标子对象显式传了 title 且自身未传分平台标题映射时，
+  // 不让顶层 shared.titleByPlatform 反向覆盖 target 的显式标题；
+  // 子目标传了自身映射时清掉顶层其他别名键防止被遮蔽；
+  // descByPlatform 则在子目标未带映射时继承顶层 descByPlatform（确保百家号等分平台简介覆盖不丢失）。
   const targetHasDirectTitle =
     (target.title != null && String(target.title).trim() !== "") ||
     (target.t != null && String(target.t).trim() !== "");
   const targetHasTitleMap =
     target.titleByPlatform !== undefined ||
     target["title-by-platform"] !== undefined;
-  if (targetHasDirectTitle && !targetHasTitleMap) {
+  if (targetHasTitleMap) {
+    if (target.titleByPlatform === undefined) delete merged.titleByPlatform;
+    if (target["title-by-platform"] === undefined) {
+      delete merged["title-by-platform"];
+    }
+  } else if (targetHasDirectTitle) {
     delete merged.titleByPlatform;
     delete merged["title-by-platform"];
   }
-  const targetHasDirectDesc =
-    (target.description != null && String(target.description).trim() !== "") ||
-    (target.desc != null && String(target.desc).trim() !== "");
   const targetHasDescMap =
     target.descByPlatform !== undefined ||
     target["desc-by-platform"] !== undefined ||
     target.descriptionByPlatform !== undefined;
-  if (targetHasDirectDesc && !targetHasDescMap) {
-    delete merged.descByPlatform;
-    delete merged["desc-by-platform"];
-    delete merged.descriptionByPlatform;
+  if (targetHasDescMap) {
+    if (target.descByPlatform === undefined) delete merged.descByPlatform;
+    if (target["desc-by-platform"] === undefined) {
+      delete merged["desc-by-platform"];
+    }
+    if (target.descriptionByPlatform === undefined) {
+      delete merged.descriptionByPlatform;
+    }
+  } else {
+    if (
+      merged.descByPlatform === undefined &&
+      shared.descByPlatform !== undefined
+    ) {
+      merged.descByPlatform = shared.descByPlatform;
+    }
+    if (
+      merged["desc-by-platform"] === undefined &&
+      shared["desc-by-platform"] !== undefined
+    ) {
+      merged["desc-by-platform"] = shared["desc-by-platform"];
+    }
+    if (
+      merged.descriptionByPlatform === undefined &&
+      shared.descriptionByPlatform !== undefined
+    ) {
+      merged.descriptionByPlatform = shared.descriptionByPlatform;
+    }
   }
   return merged;
 }

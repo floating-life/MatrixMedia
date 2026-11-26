@@ -42,6 +42,7 @@ import { resolvePublishCompletion } from "../../shared/publishResult.js";
 import { normalizeVideoMetadata } from "../../shared/videoMetadata.js";
 import {
   applyPlatformPublishRules,
+  buildPlatformRulesPersistencePatch,
   createAppliedRuleSnapshot,
   formatRuleAdjustmentsSummary,
   mergeRuleAdjustments,
@@ -215,6 +216,16 @@ export async function runSingleFilePublish(
   const ruleAdjustments = ruled.adjustments || [];
   const ruleAdjustmentsSummary = ruled.summary || "";
   const platformRulesApplied = createAppliedRuleSnapshot(ruled);
+  const descOverrideApplied = ruled.descOverrideApplied === true;
+  const platformRulesPersistencePatch = buildPlatformRulesPersistencePatch(
+    v.platform,
+    {
+      titleByPlatform: v.titleByPlatform,
+      descByPlatform: v.descByPlatform,
+      ruled,
+      platformRulesApplied,
+    }
+  );
   const bookName = (v.bookName && String(v.bookName).trim()) || stem;
 
   // 封面文件在组装参数时就校验（存在性 / 视频号 jpg|png），失败早于视频下载与上传
@@ -268,6 +279,8 @@ export async function runSingleFilePublish(
         ruleAdjustments,
         ruleAdjustmentsSummary,
         platformRulesApplied,
+        descOverrideApplied,
+        platformRulesPersistencePatch,
       },
       options
     );
@@ -290,6 +303,8 @@ async function runSingleFilePublishInner(
     ruleAdjustments = [],
     ruleAdjustmentsSummary = "",
     platformRulesApplied = null,
+    descOverrideApplied = false,
+    platformRulesPersistencePatch = {},
   },
   options = {}
 ) {
@@ -434,6 +449,7 @@ async function runSingleFilePublishInner(
       coverPathH,
       noDownload: v.noDownload === true,
       ...(platformRulesApplied ? { platformRulesApplied } : {}),
+      ...(descOverrideApplied ? { descOverrideApplied: true } : {}),
       ...ruleAdjustmentsPatch,
     },
     ...ruleAdjustmentsPatch,
@@ -469,6 +485,7 @@ async function runSingleFilePublishInner(
     shortTitle: metadata.shortTitle,
     tags: metadata.tags,
     ...metadata.legacy,
+    ...platformRulesPersistencePatch,
     creativeStatement: normalizeCreativeStatement(finalCreativeStatement),
     ...extrasPatch,
     ...(throttleReason ? { throttleReason } : {}),

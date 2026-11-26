@@ -2,7 +2,9 @@
 
 const path = require("path");
 const fs = require("fs");
+const os = require("os");
 const assert = require("assert");
+const Module = require("module");
 const { buildSync } = require("esbuild");
 
 const root = path.join(__dirname, "..");
@@ -11,6 +13,7 @@ fs.mkdirSync(outDir, { recursive: true });
 
 const schedulerBundle = path.join(outDir, "scheduledPublish.cjs");
 const publishArgsBundle = path.join(outDir, "parsePublishArgs.cjs");
+const videoMetadataBundle = path.join(outDir, "videoMetadata-sched.cjs");
 
 buildSync({
   entryPoints: [path.join(root, "src/main/services/scheduledPublish.js")],
@@ -35,6 +38,28 @@ buildSync({
   outfile: publishArgsBundle,
 });
 
+buildSync({
+  entryPoints: [path.join(root, "src/shared/videoMetadata.js")],
+  bundle: true,
+  platform: "node",
+  format: "cjs",
+  outfile: videoMetadataBundle,
+});
+
+const tmpElectronUserData = fs.mkdtempSync(
+  path.join(os.tmpdir(), "mm-sched-test-")
+);
+const origModuleLoad = Module._load;
+Module._load = function (request, parent, isMain) {
+  if (request === "electron") {
+    return {
+      ipcMain: { on: () => {}, handle: () => {} },
+      app: { getPath: () => tmpElectronUserData },
+    };
+  }
+  return origModuleLoad.apply(this, arguments);
+};
+
 const {
   parsePublishAt,
   createScheduledRecord,
@@ -42,6 +67,9 @@ const {
   buildTaskPayloadFromRecord,
 } = require(schedulerBundle);
 const { parsePublishArgs, publishHelpText } = require(publishArgsBundle);
+const { buildPlatformVideoTextDetailed } = require(videoMetadataBundle);
+Module._load = origModuleLoad;
+fs.rmSync(tmpElectronUserData, { recursive: true, force: true });
 
 const fixedNow = new Date("2026-05-05T08:00:00+08:00").getTime();
 
@@ -299,11 +327,114 @@ const fixedNow = new Date("2026-05-05T08:00:00+08:00").getTime();
   assert.strictEqual(r.ok, true);
   assert.strictEqual(r.value.platform, "小红书");
   assert.strictEqual(r.value.partition, "persist:13800138000小红书");
-  assert.strictEqual(r.value.bq, "减脂 健身");
+  assert.strictEqual(r.value.bq, "减脂,健身");
+  assert.deepStrictEqual(r.value.tags, ["减脂", "健身"]);
 })();
 
 (() => {
   assert.ok(publishHelpText().includes("--publish-at"));
+})();
+
+// S17 返修第 4 轮：定时记录持久化分平台映射（仅本平台项）+ S17/S18 新字段 + 到点重建 + 旧记录回归
+(() => {
+  const bjhDesc = "这场戏的看点是掌柜往豆腐缸里泼脏水，济公当众拆穿。";
+  const scheduled = createScheduledRecord(
+    {
+      textType: "local",
+      pt: "百家号",
+      bookName: "济公J04-豆腐坊泼脏水-审看版-v1",
+      textOtherName: "济公J04-豆腐坊泼脏水-审看版-v1",
+      bt: "济公断案",
+      title: "济公断案",
+      description: bjhDesc,
+      tags: ["民间故事"],
+      titleByPlatform: { dy: "抖音无关标题", bjh: "百家号专属标题" },
+      descByPlatform: { dy: "抖音无关简介", bjh: bjhDesc },
+      descOverrideApplied: true,
+      filePath: "/tmp/济公J04-豆腐坊泼脏水-审看版-v1.mp4",
+    },
+    "2026-05-05 20:30:00",
+    fixedNow
+  );
+  // 仅持久化本平台项，不泄漏其他平台覆盖
+  assert.deepStrictEqual(scheduled.titleByPlatform, { 百家号: "百家号专属标题" });
+  assert.deepStrictEqual(scheduled.descByPlatform, { 百家号: bjhDesc });
+  const rebuilt = buildTaskPayloadFromRecord(scheduled);
+  assert.strictEqual(rebuilt.data.descOverrideApplied, true);
+  assert.ok(rebuilt.data.platformRulesApplied);
+  const bjhText = buildPlatformVideoTextDetailed("百家号", rebuilt.data);
+  assert.strictEqual(bjhText.description, `${bjhDesc} #民间故事`);
+  assert.ok(!bjhText.description.includes("济公J04"));
+  assert.ok(!bjhText.description.includes("济公断案"));
+
+  // S17/S18 新字段：横版封面 coverPathH、aiChapters、originalStatement 到点回传（含显式 false 与跨平台过滤）
+  const dyRebuilt = buildTaskPayloadFromRecord({
+    textType: "local",
+    pt: "抖音",
+    bt: "测试抖音",
+    description: "简介",
+    tags: ["测试"],
+    coverPath: "/tmp/v.jpg",
+    coverPathH: "/tmp/h.jpg",
+    aiChapters: true,
+    originalStatement: true, // 抖音不支持原创声明，应忽略
+    filePath: "/tmp/v.mp4",
+  });
+  assert.strictEqual(dyRebuilt.data.coverPathH, "/tmp/h.jpg");
+  assert.strictEqual(dyRebuilt.publishOptions.coverPathH, "/tmp/h.jpg");
+  assert.strictEqual(dyRebuilt.data.aiChapters, true);
+  assert.strictEqual(dyRebuilt.publishOptions.aiChapters, true);
+  assert.strictEqual(dyRebuilt.data.originalStatement, undefined);
+
+  const sphRebuilt = buildTaskPayloadFromRecord({
+    textType: "local",
+    pt: "视频号",
+    bt: "测试视频号",
+    description: "简介",
+    coverPath: "/tmp/v.jpg",
+    coverPathH: "/tmp/h-sph.jpg",
+    originalStatement: true,
+    aiChapters: true, // 视频号不支持 AI 章节，应忽略
+    filePath: "/tmp/v.mp4",
+  });
+  assert.strictEqual(sphRebuilt.data.coverPathH, "/tmp/h-sph.jpg");
+  assert.strictEqual(sphRebuilt.publishOptions.coverPathH, "/tmp/h-sph.jpg");
+  assert.strictEqual(sphRebuilt.data.originalStatement, true);
+  assert.strictEqual(sphRebuilt.publishOptions.originalStatement, true);
+  assert.strictEqual(sphRebuilt.data.aiChapters, undefined);
+
+  const xhsFalseRebuilt = buildTaskPayloadFromRecord({
+    textType: "local",
+    pt: "小红书",
+    bt: "测试小红书",
+    description: "简介",
+    aiChapters: false,
+    originalStatement: false,
+    filePath: "/tmp/v.mp4",
+  });
+  assert.strictEqual(xhsFalseRebuilt.data.aiChapters, false);
+  assert.strictEqual(xhsFalseRebuilt.data.originalStatement, false);
+  assert.strictEqual(xhsFalseRebuilt.publishOptions.aiChapters, false);
+  assert.strictEqual(xhsFalseRebuilt.publishOptions.originalStatement, false);
+
+  // 旧记录回归：无新字段时不污染 data / publishOptions，百家号仍按「标题，简介」组装
+  const legacyBjh = buildTaskPayloadFromRecord({
+    textType: "local",
+    pt: "百家号",
+    bt: "旧标题",
+    description: "旧简介内容",
+    tags: ["旧标签"],
+    filePath: "/tmp/old.mp4",
+  });
+  assert.strictEqual(legacyBjh.data.platformRulesApplied, undefined);
+  assert.strictEqual(legacyBjh.data.descOverrideApplied, undefined);
+  assert.strictEqual(legacyBjh.data.coverPathH, undefined);
+  assert.strictEqual(legacyBjh.data.aiChapters, undefined);
+  assert.strictEqual(legacyBjh.data.originalStatement, undefined);
+  assert.strictEqual(
+    buildPlatformVideoTextDetailed("百家号", legacyBjh.data).description,
+    "旧标题，旧简介内容 #旧标签"
+  );
 })();
 
 console.log("test:scheduled-publish 全部通过");

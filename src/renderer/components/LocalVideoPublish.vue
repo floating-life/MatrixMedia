@@ -1060,6 +1060,7 @@ import { normalizeVideoMetadata } from "../../shared/videoMetadata.js";
 import {
   PLATFORM_RULES,
   applyPlatformPublishRules,
+  buildPlatformRulesPersistencePatch,
   createAppliedRuleSnapshot,
   getPlatformRule,
   normalizePlatformTextMap,
@@ -1161,6 +1162,73 @@ function safeCreateAppliedRuleSnapshot(ruled) {
     if (snap && typeof snap === "object") return snap;
   }
   return null;
+}
+
+function safeBuildPlatformRulesPersistencePatch(pt, options = {}) {
+  if (typeof buildPlatformRulesPersistencePatch === "function") {
+    const patch = buildPlatformRulesPersistencePatch(pt, options);
+    if (patch && typeof patch === "object") return patch;
+  }
+  const canonical = safeResolvePlatformRuleKey(pt);
+  const titleMap = safeNormalizePlatformTextMap(
+    options && options.titleByPlatform,
+    "title"
+  );
+  const descMap = safeNormalizePlatformTextMap(
+    options && options.descByPlatform,
+    "description"
+  );
+  const snap =
+    (options &&
+      options.platformRulesApplied &&
+      typeof options.platformRulesApplied === "object" &&
+      options.platformRulesApplied) ||
+    safeCreateAppliedRuleSnapshot(options && options.ruled);
+  const descOverrideApplied =
+    Boolean(options && options.descOverrideApplied === true) ||
+    Boolean(options && options.ruled && options.ruled.descOverrideApplied === true) ||
+    Boolean(snap && snap.descOverrideApplied === true);
+  return {
+    ...(canonical && titleMap[canonical]
+      ? { titleByPlatform: { [canonical]: titleMap[canonical] } }
+      : {}),
+    ...(canonical && descMap[canonical]
+      ? { descByPlatform: { [canonical]: descMap[canonical] } }
+      : {}),
+    ...(descOverrideApplied ? { descOverrideApplied: true } : {}),
+    ...(snap ? { platformRulesApplied: snap } : {}),
+  };
+}
+
+function resolveRepublishPlatformTextMap(
+  formMap,
+  records = [],
+  field = "descByPlatform",
+  kind = "description"
+) {
+  const fromRecords = {};
+  if (Array.isArray(records)) {
+    for (const rec of records) {
+      if (!rec || typeof rec !== "object") continue;
+      const pt = safeResolvePlatformRuleKey(rec.pt || rec.platform || "");
+      if (rec[field] && typeof rec[field] === "object") {
+        Object.assign(fromRecords, safeNormalizePlatformTextMap(rec[field], kind));
+      } else if (
+        field === "descByPlatform" &&
+        pt === "百家号" &&
+        (rec.descOverrideApplied === true ||
+          (rec.platformRulesApplied &&
+            rec.platformRulesApplied.descOverrideApplied === true))
+      ) {
+        const descVal = String(rec.description || rec.bdText || "").trim();
+        if (descVal && !fromRecords[pt]) {
+          fromRecords[pt] = descVal;
+        }
+      }
+    }
+  }
+  const fromForm = safeNormalizePlatformTextMap(formMap, kind);
+  return { ...fromRecords, ...fromForm };
 }
 
 function fileBaseName(p) {
@@ -1338,6 +1406,8 @@ export default {
         shortTitle: "",
         // 分平台覆盖标题（key 为规范平台中文名，如 抖音 / 百家号 / 小红书 / 头条 / 哔哩哔哩 / 快手）
         titleByPlatform: {},
+        // 分平台覆盖简介（重发恢复与规则透传共用）
+        descByPlatform: {},
         // 自定义封面图片绝对路径（竖版 3:4；发布第一步选图；重发时从历史记录带入）
         coverPath: "",
         // 横版封面绝对路径（4:3，仅抖音 / 视频号生效；留空时有竖封面则自动生成）
@@ -1406,11 +1476,14 @@ export default {
       const tags = Array.isArray(this.bqTags) ? this.bqTags : [];
       const titleByPlatform =
         (this.form && this.form.titleByPlatform) || {};
+      const descByPlatform =
+        (this.form && this.form.descByPlatform) || {};
       if (
         !title &&
         !description &&
         tags.length === 0 &&
-        Object.keys(titleByPlatform).length === 0
+        Object.keys(titleByPlatform).length === 0 &&
+        Object.keys(descByPlatform).length === 0
       ) {
         return [];
       }
@@ -1420,6 +1493,7 @@ export default {
         shortTitle: (this.form && this.form.shortTitle) || "",
         tags,
         titleByPlatform,
+        descByPlatform,
       });
     },
     checkedPlatformRuleWarnings() {
@@ -1458,6 +1532,7 @@ export default {
         shortTitle: (this.form && this.form.shortTitle) || "",
         tags: Array.isArray(this.bqTags) ? this.bqTags : [],
         titleByPlatform: (this.form && this.form.titleByPlatform) || {},
+        descByPlatform: (this.form && this.form.descByPlatform) || {},
       }).map((w) => ({
         ...w,
         key: w.platform,
@@ -1838,6 +1913,7 @@ export default {
         description: "",
         shortTitle: "",
         titleByPlatform: {},
+        descByPlatform: {},
         coverPath: "",
         coverPathH: "",
         noDownload: false,
@@ -1890,7 +1966,18 @@ export default {
         bt1: (form.bt1 || "").trim(),
         description: (form.description || form.bdText || "").trim(),
         shortTitle: (form.shortTitle || form.bt2Filled || "").trim(),
-        titleByPlatform: safeNormalizePlatformTextMap(form.titleByPlatform, "title"),
+        titleByPlatform: resolveRepublishPlatformTextMap(
+          form.titleByPlatform,
+          payload.records,
+          "titleByPlatform",
+          "title"
+        ),
+        descByPlatform: resolveRepublishPlatformTextMap(
+          form.descByPlatform,
+          payload.records,
+          "descByPlatform",
+          "description"
+        ),
         coverPath: (form.coverPath || "").trim(),
         coverPathH: (form.coverPathH || "").trim(),
         noDownload: form.noDownload === true,
@@ -1999,6 +2086,10 @@ export default {
         this.form.titleByPlatform,
         "title"
       );
+      const descByPlatform = safeNormalizePlatformTextMap(
+        this.form.descByPlatform,
+        "description"
+      );
       const coverPathH = (this.form.coverPathH || "").trim();
       const metadata = normalizeVideoMetadata({
         title: bt1,
@@ -2021,6 +2112,7 @@ export default {
           coverPath: (this.form.coverPath || "").trim(),
           ...(coverPathH ? { coverPathH } : {}),
           ...(Object.keys(titleByPlatform).length > 0 ? { titleByPlatform } : {}),
+          ...(Object.keys(descByPlatform).length > 0 ? { descByPlatform } : {}),
           noDownload: this.form.noDownload === true,
         },
       };
@@ -2449,7 +2541,10 @@ export default {
         (baseData && baseData.titleByPlatform) ||
         (this.form && this.form.titleByPlatform) ||
         {};
-      const descByPlatform = (baseData && baseData.descByPlatform) || {};
+      const descByPlatform =
+        (baseData && baseData.descByPlatform) ||
+        (this.form && this.form.descByPlatform) ||
+        {};
       const hasTitle = Boolean(
         (baseData.title != null && String(baseData.title).trim()) ||
           (baseData.bt1 != null && String(baseData.bt1).trim())
@@ -2545,6 +2640,9 @@ export default {
           ...meta.legacy,
           bq: nextBq,
           ...(appliedSnapshot ? { platformRulesApplied: appliedSnapshot } : {}),
+          ...(ruled.descOverrideApplied === true
+            ? { descOverrideApplied: true }
+            : {}),
           ...(ruled.adjusted
             ? {
                 ruleAdjustments: ruled.adjustments,
@@ -3279,6 +3377,7 @@ export default {
         description: "",
         shortTitle: "",
         titleByPlatform: {},
+        descByPlatform: {},
         coverPath: "",
         coverPathH: "",
         noDownload: false,
@@ -3588,6 +3687,19 @@ export default {
           ? this.closeWindow
           : true;
         const video = this.buildPlatformVideoPayload(p, baseVideo);
+        const singleRulePersistPatch = safeBuildPlatformRulesPersistencePatch(
+          p.pt,
+          {
+            titleByPlatform:
+              (baseVideo.data && baseVideo.data.titleByPlatform) ||
+              (this.form && this.form.titleByPlatform),
+            descByPlatform:
+              (baseVideo.data && baseVideo.data.descByPlatform) ||
+              (this.form && this.form.descByPlatform),
+            platformRulesApplied: video.data.platformRulesApplied,
+            descOverrideApplied: video.data.descOverrideApplied === true,
+          }
+        );
         const effectiveMode = resolveEffectivePublishMode(isDraftMode, p);
         const planItem = throttleDecision.itemsByKey.get(`single:${idx}:${p.id}`);
         const itemReservationId =
@@ -3625,6 +3737,7 @@ export default {
                 bt2Filled: video.data.bt2Filled,
                 bdText: video.data.bdText,
                 bq: video.data.bq,
+                ...singleRulePersistPatch,
                 creativeStatement: video.data.creativeStatement,
                 ...buildPlatformExtrasPatch(p.pt, video.data),
                 noDownload: video.data.noDownload === true,
@@ -3704,6 +3817,7 @@ export default {
                 bt2Filled: video.data.bt2Filled,
                 bdText: video.data.bdText,
                 bq: video.data.bq,
+                ...singleRulePersistPatch,
                 creativeStatement: video.data.creativeStatement,
                 ...buildPlatformExtrasPatch(p.pt, video.data),
                 noDownload: video.data.noDownload === true,
@@ -3753,6 +3867,7 @@ export default {
                 bt2Filled: video.data.bt2Filled,
                 bdText: video.data.bdText,
                 bq: video.data.bq,
+                ...singleRulePersistPatch,
                 creativeStatement: video.data.creativeStatement,
                 ...buildPlatformExtrasPatch(p.pt, video.data),
                 noDownload: video.data.noDownload === true,
@@ -4355,6 +4470,15 @@ export default {
           const dirRuleSummary =
             dirRuled && dirRuled.adjusted ? dirRuled.summary : "";
           const dirAppliedSnapshot = safeCreateAppliedRuleSnapshot(dirRuled);
+          const dirRulePersistPatch = safeBuildPlatformRulesPersistencePatch(
+            p.pt,
+            {
+              titleByPlatform: fileRow.titleByPlatform,
+              descByPlatform: fileRow.descByPlatform,
+              ruled: dirRuled,
+              platformRulesApplied: dirAppliedSnapshot,
+            }
+          );
 
           // Format bq for this platform
           const hashtagPlatforms = new Set(["视频号", "抖音", "快手"]);
@@ -4420,6 +4544,7 @@ export default {
                   tags: metadata.tags,
                   ...metadata.legacy,
                   bq,
+                  ...dirRulePersistPatch,
                   creativeStatement,
                   ...dirExtrasPatch,
                   coverPath: fileRow.coverResolved || "",
@@ -4489,6 +4614,7 @@ export default {
                 tags: metadata.tags,
                 ...metadata.legacy,
                 bq,
+                ...dirRulePersistPatch,
                 creativeStatement,
                 ...dirExtrasPatch,
                 coverPath: fileRow.coverResolved || "",
@@ -4599,6 +4725,9 @@ export default {
               ...(dirCoverPathH ? { coverPathH: dirCoverPathH } : {}),
               ...(dirAppliedSnapshot
                 ? { platformRulesApplied: dirAppliedSnapshot }
+                : {}),
+              ...(dirRuled && dirRuled.descOverrideApplied === true
+                ? { descOverrideApplied: true }
                 : {}),
               ...(dirRuleAdjustments.length > 0
                 ? {

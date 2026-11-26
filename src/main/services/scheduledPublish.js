@@ -8,7 +8,25 @@ import { runPuppeteerTask } from "./puppeteerFile";
 import { changeData } from "../server/utils";
 import { normalizeCreativeStatement } from "../../shared/creativeStatement.js";
 import { isRemotePublishFile, resolvePublishFile } from "./resolvePublishFile";
-import { normalizeVideoRecordMetadata } from "../../shared/videoMetadata.js";
+import {
+  normalizeVideoRecordMetadata,
+  matchAppliedRuleSnapshot,
+} from "../../shared/videoMetadata.js";
+import {
+  applyPlatformPublishRules,
+  createAppliedRuleSnapshot,
+  formatRuleAdjustmentsSummary,
+  mergeRuleAdjustments,
+  pickPlatformTextMapForPlatform,
+  resolvePlatformRuleKey,
+} from "../../shared/platformRules.js";
+import {
+  buildPlatformExtrasPatch,
+  readTaskAiChapters,
+  readTaskOriginalStatement,
+  formatAiChaptersReceipt,
+  appendPublishReceiptNote,
+} from "../../shared/publishExtras.js";
 import { scheduledKey } from "./scheduledDedupe.js";
 import { resolvePublishCompletion } from "../../shared/publishResult.js";
 import {
@@ -93,8 +111,29 @@ export function createScheduledRecord(
     (options && options.throttleReservationId) ||
     recordItem.throttleReservationId ||
     null;
+  const normalizedRecord = { ...recordItem };
+  if (recordItem && recordItem.pt) {
+    if (recordItem.titleByPlatform !== undefined) {
+      const scopedTitle = pickPlatformTextMapForPlatform(
+        recordItem.titleByPlatform,
+        recordItem.pt,
+        "title"
+      );
+      if (scopedTitle) normalizedRecord.titleByPlatform = scopedTitle;
+      else delete normalizedRecord.titleByPlatform;
+    }
+    if (recordItem.descByPlatform !== undefined) {
+      const scopedDesc = pickPlatformTextMapForPlatform(
+        recordItem.descByPlatform,
+        recordItem.pt,
+        "description"
+      );
+      if (scopedDesc) normalizedRecord.descByPlatform = scopedDesc;
+      else delete normalizedRecord.descByPlatform;
+    }
+  }
   return {
-    ...recordItem,
+    ...normalizedRecord,
     ...(allowDuplicate ? { allowDuplicate: true } : {}),
     ...(throttleReason ? { throttleReason } : {}),
     ...(throttleReservationId ? { throttleReservationId } : {}),
@@ -198,6 +237,125 @@ export function buildTaskPayloadFromRecord(record) {
     };
   }
   const metadata = normalizeVideoRecordMetadata(record);
+  const canonicalPt =
+    resolvePlatformRuleKey(record.pt) || String(record.pt || "").trim();
+  const scopedTitleByPlatform = pickPlatformTextMapForPlatform(
+    record.titleByPlatform,
+    canonicalPt,
+    "title"
+  );
+  const scopedDescByPlatform = pickPlatformTextMapForPlatform(
+    record.descByPlatform,
+    canonicalPt,
+    "description"
+  );
+  const savedSnapshot =
+    record.platformRulesApplied &&
+    typeof record.platformRulesApplied === "object"
+      ? record.platformRulesApplied
+      : null;
+  const hasDescOverrideFlag =
+    record.descOverrideApplied === true ||
+    Boolean(savedSnapshot && savedSnapshot.descOverrideApplied === true);
+  const savedRuleAdjustments = Array.isArray(record.ruleAdjustments)
+    ? record.ruleAdjustments
+    : [];
+
+  let effectiveMetadata = metadata;
+  let appliedSnapshot = null;
+  let effectiveDescOverrideApplied = false;
+  let effectiveRuleAdjustments = savedRuleAdjustments;
+
+  const matchedSavedSnapshot = savedSnapshot
+    ? matchAppliedRuleSnapshot(
+        canonicalPt,
+        {
+          title: metadata.title,
+          description: metadata.description,
+          shortTitle: metadata.shortTitle,
+          tags: metadata.tags,
+          ...metadata.legacy,
+          platformRulesApplied: savedSnapshot,
+        },
+        { ignoreOverrideMaps: true }
+      )
+    : null;
+
+  if (matchedSavedSnapshot && !scopedTitleByPlatform && !scopedDescByPlatform) {
+    appliedSnapshot = {
+      ...savedSnapshot,
+      ...(hasDescOverrideFlag ? { descOverrideApplied: true } : {}),
+    };
+    effectiveDescOverrideApplied = hasDescOverrideFlag;
+  } else if (
+    scopedTitleByPlatform ||
+    scopedDescByPlatform ||
+    hasDescOverrideFlag
+  ) {
+    const ruled = applyPlatformPublishRules(
+      canonicalPt,
+      {
+        title: metadata.title,
+        description: metadata.description,
+        shortTitle: metadata.shortTitle,
+        tags: metadata.tags,
+        titleByPlatform: scopedTitleByPlatform,
+        descByPlatform: scopedDescByPlatform,
+        descOverrideApplied: hasDescOverrideFlag,
+      },
+      { log: !matchedSavedSnapshot }
+    );
+    effectiveMetadata = {
+      title: ruled.title,
+      description: ruled.bodyDescription,
+      shortTitle: ruled.shortTitle,
+      tags: ruled.tags,
+      legacy: {
+        bt1: ruled.title,
+        bt2: ruled.bodyDescription,
+        bt2Filled: ruled.shortTitle,
+        bdText: ruled.bodyDescription,
+        bq: ruled.tagsText,
+      },
+    };
+    appliedSnapshot = createAppliedRuleSnapshot(ruled);
+    effectiveDescOverrideApplied = ruled.descOverrideApplied === true;
+    effectiveRuleAdjustments = mergeRuleAdjustments(
+      savedRuleAdjustments,
+      ruled.adjustments
+    );
+  }
+
+  const coverPathH = String(
+    record.coverPathH ||
+      (record.publishOptions && record.publishOptions.coverPathH) ||
+      ""
+  ).trim();
+  const extrasPatch = buildPlatformExtrasPatch(record.pt, {
+    aiChapters: readTaskAiChapters(record),
+    originalStatement: readTaskOriginalStatement(record),
+  });
+  const effectivePublishOptions =
+    record.publishOptions && typeof record.publishOptions === "object"
+      ? { ...record.publishOptions }
+      : {};
+  if (coverPathH) {
+    effectivePublishOptions.coverPathH = coverPathH;
+  }
+  Object.assign(effectivePublishOptions, extrasPatch);
+  const effectiveRuleSummary =
+    effectiveRuleAdjustments.length > 0
+      ? String(record.ruleAdjustmentsSummary || "").trim() ||
+        formatRuleAdjustmentsSummary(effectiveRuleAdjustments)
+      : "";
+  const ruleAdjustmentsPatch =
+    effectiveRuleAdjustments.length > 0
+      ? {
+          ruleAdjustments: effectiveRuleAdjustments,
+          ruleAdjustmentsSummary: effectiveRuleSummary,
+        }
+      : {};
+
   return {
     taskId: Date.now() + Math.random(),
     ...recordIdPatch,
@@ -208,18 +366,24 @@ export function buildTaskPayloadFromRecord(record) {
     textType: record.textType || "local",
     data: {
       textOtherName: record.textOtherName || "",
-      title: metadata.title,
-      description: metadata.description,
-      shortTitle: metadata.shortTitle,
-      tags: metadata.tags,
-      ...metadata.legacy,
+      title: effectiveMetadata.title,
+      description: effectiveMetadata.description,
+      shortTitle: effectiveMetadata.shortTitle,
+      tags: effectiveMetadata.tags,
+      ...effectiveMetadata.legacy,
       creativeStatement: normalizeCreativeStatement(record.creativeStatement),
+      ...extrasPatch,
       // 定时视频发布透传封面（dy/ks/sph 读 data.data.coverPath，
       // 缺失会静默跳过自定义封面；文章分支一直有传，视频分支上游漏了）
       coverPath: record.coverPath || "",
+      ...(coverPathH ? { coverPathH } : {}),
       // 快手禁下载红线参数：定时触发时从记录字段回传（GUI 勾选/CLI --no-download 落档）
       noDownload: record.noDownload === true,
+      ...(appliedSnapshot ? { platformRulesApplied: appliedSnapshot } : {}),
+      ...(effectiveDescOverrideApplied ? { descOverrideApplied: true } : {}),
+      ...ruleAdjustmentsPatch,
     },
+    ...ruleAdjustmentsPatch,
     textOtherName: record.textOtherName || "",
     selectedFile: record.selectedFile || path.basename(record.filePath || ""),
     url: record.uploadUrl || cfg.upload || record.url,
@@ -228,7 +392,7 @@ export function buildTaskPayloadFromRecord(record) {
     publishMode: record.publishMode || "publish",
     publishToDraft:
       record.publishMode === "draft" || record.publishToDraft === true,
-    publishOptions: record.publishOptions || {},
+    publishOptions: effectivePublishOptions,
     closeWindowAfterPublish: true,
     useragent: record.useragent || cfg.useragent,
     partition: record.partition,
@@ -429,6 +593,31 @@ async function finishScheduledRecord(record, payload, dispatchKey) {
   const isFailure =
     completion.recordStatus === "failed" ||
     completion.recordStatus === "login_required";
+  const mergedAdj = mergeRuleAdjustments(
+    record && record.ruleAdjustments,
+    payload && payload.ruleAdjustments
+  );
+  const mergedSummary = formatRuleAdjustmentsSummary(mergedAdj);
+  const aiChaptersStatus =
+    payload && typeof payload.aiChaptersStatus === "string"
+      ? payload.aiChaptersStatus
+      : "";
+  const originalStatementStatus =
+    payload && typeof payload.originalStatementStatus === "string"
+      ? payload.originalStatementStatus
+      : "";
+  const chaptersReceipt =
+    (payload &&
+      typeof payload.aiChaptersReceipt === "string" &&
+      payload.aiChaptersReceipt) ||
+    formatAiChaptersReceipt(aiChaptersStatus);
+  const msgWithChapters = chaptersReceipt
+    ? appendPublishReceiptNote(completion.message, chaptersReceipt)
+    : completion.message;
+  const finalMessage =
+    mergedSummary && !String(msgWithChapters || "").includes(mergedSummary)
+      ? `${msgWithChapters}（规则调整：${mergedSummary}）`
+      : msgWithChapters;
   const patch = {
     publishMode: completion.savedAsDraft ? "draft" : record.publishMode || "publish",
     publishToDraft: completion.savedAsDraft,
@@ -437,7 +626,15 @@ async function finishScheduledRecord(record, payload, dispatchKey) {
     publishFailCount: isFailure ? 1 : 0,
     publishAbnormalCount: completion.publishAbnormal ? 1 : 0,
     ...(isPositive ? {} : { failScreenshot }),
-    lastPublishMessage: completion.message,
+    ...(aiChaptersStatus ? { aiChaptersStatus } : {}),
+    ...(originalStatementStatus ? { originalStatementStatus } : {}),
+    ...(mergedAdj.length > 0
+      ? {
+          ruleAdjustments: mergedAdj,
+          ruleAdjustmentsSummary: mergedSummary,
+        }
+      : {}),
+    lastPublishMessage: finalMessage,
     lastPublishAt: nowMs,
   };
   const writeRes = updateRecord(record, patch);

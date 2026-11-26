@@ -97,15 +97,20 @@ function hasNonEmptyOverrideMap(rawMap) {
  * 只有当平台一致、未新增分平台覆盖映射、且当前 title/description/shortTitle/tags 与快照完全吻合时才直接复用；
  * 否则回退到 applyPlatformPublishRules 正常执行（其本身同样严格幂等）。
  */
-function matchAppliedRuleSnapshot(platform, metadata) {
+export function matchAppliedRuleSnapshot(
+  platform,
+  metadata,
+  { ignoreOverrideMaps = false } = {}
+) {
   const snap = metadata && metadata.platformRulesApplied;
   if (!snap || typeof snap !== "object") return null;
   const canonical =
     resolvePlatformRuleKey(platform) || String(platform || "").trim();
   if (!canonical || snap.platform !== canonical) return null;
   if (
-    hasNonEmptyOverrideMap(metadata.titleByPlatform) ||
-    hasNonEmptyOverrideMap(metadata.descByPlatform)
+    !ignoreOverrideMaps &&
+    (hasNonEmptyOverrideMap(metadata.titleByPlatform) ||
+      hasNonEmptyOverrideMap(metadata.descByPlatform))
   ) {
     return null;
   }
@@ -146,6 +151,7 @@ function matchAppliedRuleSnapshot(platform, metadata) {
     shortTitle: snap.shortTitle,
     tags: snapTags.slice(),
     tagsText: snap.tagsText,
+    ...(snap.descOverrideApplied === true ? { descOverrideApplied: true } : {}),
     adjusted: false,
     adjustments: [],
     summary: "",
@@ -168,6 +174,7 @@ export function buildPlatformVideoTextDetailed(platform, metadata = {}) {
       tags: metadata.tags ?? metadata.bq,
       titleByPlatform: metadata.titleByPlatform,
       descByPlatform: metadata.descByPlatform,
+      descOverrideApplied: metadata.descOverrideApplied === true,
     },
     { log: true }
   );

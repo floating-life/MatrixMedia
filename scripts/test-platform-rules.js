@@ -991,6 +991,49 @@ function testCliAndHttpArgs() {
   });
   assert.strictEqual(httpBadMap.ok, false);
 
+  // 4d. S17 返修第 4 轮（Grok P3）：多平台子目标未带 descByPlatform 时继承顶层 descByPlatform
+  const httpInheritDescMap = parsePublish.parseMultiPublishRequest({
+    file: "/tmp/v.mp4",
+    phone: "13800138000",
+    title: "济公断案",
+    description: "顶层通用简介",
+    descByPlatform: {
+      bjh: "这场戏的看点是掌柜往豆腐缸里泼脏水，济公当众拆穿。",
+      ks: "顶层快手专属简介",
+    },
+    tags: "民间故事",
+    platforms: [
+      { platform: "bjh", description: "子目标通用简介" }, // 未带 descByPlatform → 继承顶层 descByPlatform.bjh
+      { platform: "dy", description: "子目标抖音直接简介" }, // 顶层无 dy 项 → 保留子目标 description
+      {
+        platform: "ks",
+        description: "子目标快手通用简介",
+        "desc-by-platform": { ks: "子目标快手映射覆盖" },
+      }, // 子目标显式带映射 → 以子目标映射为准
+    ],
+  });
+  assert.strictEqual(httpInheritDescMap.ok, true, httpInheritDescMap.error);
+  const [inhBjh, inhDy, inhKs] = httpInheritDescMap.value;
+  assert.strictEqual(
+    inhBjh.descByPlatform["百家号"],
+    "这场戏的看点是掌柜往豆腐缸里泼脏水，济公当众拆穿。",
+    "多平台子目标未带 descByPlatform 时必须继承顶层 descByPlatform"
+  );
+  const inhBjhRuled = platformRules.applyPlatformPublishRules(inhBjh.platform, inhBjh);
+  assert.strictEqual(
+    inhBjhRuled.combinedDescription,
+    "这场戏的看点是掌柜往豆腐缸里泼脏水，济公当众拆穿。 #民间故事"
+  );
+  assert.strictEqual(inhBjhRuled.title, "济公断案");
+  assert.strictEqual(
+    platformRules.applyPlatformPublishRules(inhDy.platform, inhDy).bodyDescription,
+    "子目标抖音直接简介"
+  );
+  assert.strictEqual(
+    platformRules.applyPlatformPublishRules(inhKs.platform, inhKs).bodyDescription,
+    "子目标快手映射覆盖"
+  );
+
   console.log("✓ 4. CLI & HTTP 参数解析与覆盖优先级通过");
 }
 
@@ -1181,6 +1224,52 @@ function testGuiLocalVideoPublish() {
   const dyWithH = state.buildPlatformVideoPayload(dyNode, state.buildVideoPayload());
   assert.strictEqual(dyWithH.data.coverPathH, "/tmp/my-h-cover.jpg");
   assert.strictEqual(dyWithH.publishOptions.coverPathH, "/tmp/my-h-cover.jpg");
+
+  // S17 返修第 4 轮（Grok P3）：GUI openRepublish 恢复 descByPlatform（form & records 两种来源）
+  const bjhDesc25 = "这场戏的看点是掌柜往豆腐缸里泼脏水，济公当众拆穿。";
+  state.loadAccounts = () => {};
+  state.openRepublish({
+    filePath: "/tmp/济公J04-豆腐坊泼脏水-审看版-v1.mp4",
+    form: {
+      title: "济公J04-豆腐坊泼脏水-审看版-v1",
+      bt1: "济公断案",
+      description: "",
+      tags: "民间故事",
+      descByPlatform: { bjh: bjhDesc25 },
+    },
+    records: [],
+    failedTargets: [],
+  });
+  assert.deepStrictEqual({ ...state.form.descByPlatform }, { 百家号: bjhDesc25 });
+  const repubBaseFromForm = state.buildVideoPayload();
+  assert.deepStrictEqual({ ...repubBaseFromForm.data.descByPlatform }, { 百家号: bjhDesc25 });
+  const repubBjhPayload = state.buildPlatformVideoPayload(bjhNode, repubBaseFromForm);
+  assert.strictEqual(repubBjhPayload.data.descOverrideApplied, true);
+  assert.strictEqual(
+    repubBjhPayload.data.platformRulesApplied.combinedDescription,
+    `${bjhDesc25} #民间故事`
+  );
+  assert.strictEqual(repubBjhPayload.data.title, "济公断案");
+
+  // 从历史 records 恢复 descByPlatform（无需 form 传映射）
+  state.openRepublish({
+    filePath: "/tmp/济公J04-豆腐坊泼脏水-审看版-v1.mp4",
+    form: {
+      title: "济公J04-豆腐坊泼脏水-审看版-v1",
+      bt1: "济公断案",
+      description: bjhDesc25,
+      tags: "民间故事",
+    },
+    records: [
+      {
+        pt: "百家号",
+        phone: "13800138000",
+        descByPlatform: { 百家号: bjhDesc25 },
+      },
+    ],
+    failedTargets: [],
+  });
+  assert.deepStrictEqual({ ...state.form.descByPlatform }, { 百家号: bjhDesc25 });
 
   console.log("✓ 6. GUI LocalVideoPublish.vue 模板编译、覆盖标题、横封面与预检提示通过");
 }
