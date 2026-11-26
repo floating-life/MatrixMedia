@@ -44,13 +44,37 @@
           >
         </div>
       </div>
+      <div class="toolbar-filter">
+        <span class="toolbar-label">分组筛选</span>
+        <el-select
+          v-model="selectedGroup"
+          size="small"
+          class="group-filter-select"
+          placeholder="全部分组"
+          @change="onGroupFilterChange"
+        >
+          <el-option label="全部" value="all" />
+          <el-option
+            v-for="group in groupFilterOptions"
+            :key="group"
+            :label="group"
+            :value="group"
+          />
+        </el-select>
+      </div>
     </div>
 
     <LocalVideoPublish ref="localPublishRef" @published="loadRecords" />
     <LocalArticlePublish ref="articlePublishRef" @published="loadRecords" />
 
     <div class="info-box">
-      <template v-for="(item, index) in dataList">
+      <div
+        v-if="selectedGroup !== 'all' && !hasVisibleRecords"
+        class="section-card el-card is-never-shadow empty-filter-card"
+      >
+        分组「{{ selectedGroup }}」暂无发布记录
+      </div>
+      <template v-for="(item, index) in filteredDataList">
         <el-card
           v-if="item && item.length"
           :key="index"
@@ -63,7 +87,11 @@
           </div>
           <el-table :data="item" border style="width: 100%">
             <el-table-column prop="bt" label="标题" min-width="180" />
-            <el-table-column prop="phone" label="发布分组" min-width="120" />
+            <el-table-column prop="displayGroup" label="发布分组" min-width="120">
+              <template slot-scope="scope">
+                <span>{{ getRowDisplayGroup(scope.row) }}</span>
+              </template>
+            </el-table-column>
             <el-table-column label="发布进度" min-width="320">
               <template slot-scope="scope">
                 <div
@@ -71,7 +99,14 @@
                   :key="si"
                   class="progress-row"
                 >
-                  <span class="pt-name">{{ sub.pt }}</span>
+                  <span class="pt-name"
+                    >{{ sub.pt
+                    }}<span
+                      v-if="getSubAccountLabel(scope.row, sub)"
+                      class="pt-account-name"
+                      >（{{ getSubAccountLabel(scope.row, sub) }}）</span
+                    ></span
+                  >
                   <div class="progress-detail">
                     <span class="progress-count"
                       >重发 {{ normalizeCount(sub.republishCount) }} 次</span
@@ -249,7 +284,14 @@ import {
   buildAccountPartitionOf,
   recordAccountKeyOf,
   recordGroupOf,
+  resolveRecordGroup,
+  resolveRecordAccountName,
 } from "../../../shared/accountIdentity.js";
+import {
+  buildGroupOrderMap,
+  compareGroups,
+  normalizeGroupOrder,
+} from "../../../shared/accountGroupOrder.js";
 import { buildPublishHistoryCsv } from "../../../shared/publishHistoryCsv.js";
 import {
   getCreativeStatementShortLabel,
@@ -260,6 +302,39 @@ import {
   readTaskAiChapters,
   readTaskOriginalStatement,
 } from "../../../shared/publishExtras.js";
+
+const VIDEO_MANAGER_GROUP_STORAGE_KEY = "videoManager:selectedGroup";
+
+function readStoredSelectedGroup() {
+  try {
+    if (typeof localStorage === "undefined" || !localStorage) return "all";
+    const raw = localStorage.getItem(VIDEO_MANAGER_GROUP_STORAGE_KEY);
+    if (typeof raw !== "string") return "all";
+    const trimmed = raw.trim();
+    return trimmed || "all";
+  } catch (_) {
+    return "all";
+  }
+}
+
+function writeStoredSelectedGroup(value) {
+  try {
+    if (typeof localStorage === "undefined" || !localStorage) return;
+    localStorage.setItem(
+      VIDEO_MANAGER_GROUP_STORAGE_KEY,
+      String(value || "all")
+    );
+  } catch (_) {}
+}
+
+function subAccountIdentityKey(item) {
+  if (!item || typeof item !== "object") return "";
+  const pt = String(item.pt || "").trim();
+  const partition = String(item.partition || "").trim();
+  if (partition) return partition;
+  if (pt) return buildAccountPartitionOf(item, pt);
+  return recordAccountKeyOf(item) || String(item.phone || "").trim();
+}
 
 function readRecordDySyncToutiao(record) {
   if (!record || typeof record !== "object") return undefined;
@@ -332,6 +407,10 @@ export default {
       statusCalss: ".video-card-zQ02ng",
       ptConfig,
       dataList: {},
+      selectedGroup: readStoredSelectedGroup(),
+      currentAccounts: [],
+      groupOrderMap: {},
+      accountsLoaded: false,
       exportingHistory: false,
       publishSettingsVisible: false,
       taskHandlers: new Map(),
@@ -345,6 +424,17 @@ export default {
       screenshotError: "",
       screenshotPath: "",
     };
+  },
+  computed: {
+    groupFilterOptions() {
+      return this.getGroupFilterOptions();
+    },
+    filteredDataList() {
+      return this.getFilteredDataList();
+    },
+    hasVisibleRecords() {
+      return Object.keys(this.filteredDataList).length > 0;
+    },
   },
   mounted() {
     this._onPuppeteerDone = (event, data) => {
@@ -368,7 +458,11 @@ export default {
   methods: {
     async exportHistory() {
       if (this.exportingHistory) return;
-      const { csv, recordCount } = buildPublishHistoryCsv(this.dataList);
+      const exportSource =
+        typeof this.getFilteredDataList === "function"
+          ? this.getFilteredDataList()
+          : this.dataList;
+      const { csv, recordCount } = buildPublishHistoryCsv(exportSource);
       if (!recordCount) {
         this.$message.info("当前没有可导出的发布记录");
         return;
@@ -390,10 +484,10 @@ export default {
     copy: copyToClipboard,
     getStatusRowKey(row) {
       if (!row) return "";
-      // 账号身份按登录主键 accountKey（回退历史 phone "-" 前缀）
+      // 合并卡按解析后的分组名隔离加载态，无 displayGroup 时回退登录主键
       return [
         row.textOtherName || "",
-        recordAccountKeyOf(row),
+        row.displayGroup || recordAccountKeyOf(row),
         row.selectedFile || "",
       ].join("-");
     },
@@ -1120,16 +1214,251 @@ export default {
       this.$refs.articlePublishRef.open();
     },
 
-    loadRecords() {
-      dataRequest({
-        type: "get",
-        fileName: "pushData",
-      }).then((r) => {
-        this.initDataFiltered(r.data || {});
-      });
+    loadAccountsFromStorage() {
+      try {
+        if (typeof localStorage === "undefined" || !localStorage) {
+          return { accounts: [], groupOrderMap: {} };
+        }
+        const raw = localStorage.getItem("accountTree");
+        if (!raw) return { accounts: [], groupOrderMap: {} };
+        const tree = JSON.parse(raw);
+        if (!tree || typeof tree !== "object" || Array.isArray(tree)) {
+          return { accounts: [], groupOrderMap: {} };
+        }
+        const accounts = [];
+        const groupOrderMap = {};
+        for (const [groupKey, node] of Object.entries(tree)) {
+          const g = String(groupKey || "").trim();
+          if (g && groupOrderMap[g] === undefined) {
+            const rawOrder = node && node.meta ? node.meta.groupOrder : null;
+            groupOrderMap[g] = normalizeGroupOrder(rawOrder);
+          }
+          const children =
+            node && Array.isArray(node.children) ? node.children : [];
+          for (const child of children) {
+            if (!child || typeof child !== "object") continue;
+            const meta =
+              child.meta && typeof child.meta === "object" ? child.meta : child;
+            const group = recordGroupOf(meta) || g;
+            accounts.push(group && !meta.group ? { ...meta, group } : meta);
+          }
+        }
+        return { accounts, groupOrderMap };
+      } catch (_) {
+        return { accounts: [], groupOrderMap: {} };
+      }
     },
 
-    initDataFiltered(data) {
+    extractAccountsFromRaw(rawAccountData) {
+      const accounts = [];
+      if (
+        !rawAccountData ||
+        typeof rawAccountData !== "object" ||
+        Array.isArray(rawAccountData)
+      ) {
+        return { accounts, groupOrderMap: {} };
+      }
+      const groupOrderMap = buildGroupOrderMap(rawAccountData);
+      for (const dateKey of Object.keys(rawAccountData)) {
+        const list = rawAccountData[dateKey];
+        if (!Array.isArray(list)) continue;
+        for (const item of list) {
+          if (!item || typeof item !== "object") continue;
+          if (!item.phone && !item.group && !item.accountKey) continue;
+          accounts.push(item);
+        }
+      }
+      return { accounts, groupOrderMap };
+    },
+
+    getEffectiveAccounts() {
+      if (this.accountsLoaded) {
+        return Array.isArray(this.currentAccounts) ? this.currentAccounts : [];
+      }
+      if (Array.isArray(this.currentAccounts) && this.currentAccounts.length > 0) {
+        return this.currentAccounts;
+      }
+      return this.loadAccountsFromStorage().accounts;
+    },
+
+    getEffectiveGroupOrderMap() {
+      if (this.accountsLoaded) {
+        return this.groupOrderMap && typeof this.groupOrderMap === "object"
+          ? this.groupOrderMap
+          : {};
+      }
+      if (
+        this.groupOrderMap &&
+        typeof this.groupOrderMap === "object" &&
+        Object.keys(this.groupOrderMap).length > 0
+      ) {
+        return this.groupOrderMap;
+      }
+      return this.loadAccountsFromStorage().groupOrderMap;
+    },
+
+    getRowDisplayGroup(row) {
+      if (!row || typeof row !== "object") return "";
+      return String(row.displayGroup || recordGroupOf(row) || row.phone || "");
+    },
+
+    getGroupFilterOptions() {
+      const accounts = this.getEffectiveAccounts();
+      const orderMap = this.getEffectiveGroupOrderMap();
+      const set = new Set();
+      for (const acc of accounts) {
+        const g = recordGroupOf(acc);
+        if (g) set.add(g);
+      }
+      if (set.size === 0) {
+        const all = this.dataList || {};
+        for (const rows of Object.values(all)) {
+          if (!Array.isArray(rows)) continue;
+          for (const row of rows) {
+            const g = this.getRowDisplayGroup(row);
+            if (g) set.add(g);
+          }
+        }
+      }
+      return [...set].sort((a, b) =>
+        compareGroups(a, orderMap[a], b, orderMap[b])
+      );
+    },
+
+    getFilteredDataList() {
+      const all = this.dataList || {};
+      const selected = String(this.selectedGroup || "all").trim();
+      if (!selected || selected === "all") return all;
+      const result = {};
+      for (const dateKey of Object.keys(all)) {
+        const rows = Array.isArray(all[dateKey]) ? all[dateKey] : [];
+        const matched = rows.filter(
+          (row) => this.getRowDisplayGroup(row) === selected
+        );
+        if (matched.length > 0) {
+          result[dateKey] = matched;
+        }
+      }
+      return result;
+    },
+
+    onGroupFilterChange(value) {
+      const next = String(value || "all").trim() || "all";
+      this.selectedGroup = next;
+      writeStoredSelectedGroup(next);
+    },
+
+    reconcileSelectedGroup() {
+      const cur = String(this.selectedGroup || "all").trim();
+      if (!cur || cur === "all") return;
+      const options = this.getGroupFilterOptions();
+      if ((this.accountsLoaded || options.length > 0) && !options.includes(cur)) {
+        this.selectedGroup = "all";
+        writeStoredSelectedGroup("all");
+      }
+    },
+
+    hasMultiAccountForSub(row, sub) {
+      if (!sub || !sub.pt) return false;
+      const pt = String(sub.pt).trim();
+      const details = (row && Array.isArray(row.showAlltype) && row.showAlltype) || [];
+      const rowAccountSet = new Set();
+      for (const item of details) {
+        if (!item || String(item.pt || "").trim() !== pt) continue;
+        const idKey = subAccountIdentityKey(item);
+        if (idKey) rowAccountSet.add(idKey);
+      }
+      if (rowAccountSet.size > 1) return true;
+
+      const rowGroup = this.getRowDisplayGroup(row);
+      if (!rowGroup) return false;
+      const accounts = this.getEffectiveAccounts();
+      const groupAccountSet = new Set();
+      for (const acc of accounts) {
+        if (!acc || String(acc.pt || "").trim() !== pt) continue;
+        if (recordGroupOf(acc) !== rowGroup) continue;
+        const idKey = subAccountIdentityKey(acc);
+        if (idKey) groupAccountSet.add(idKey);
+      }
+      return groupAccountSet.size > 1;
+    },
+
+    getSubAccountLabel(row, sub) {
+      if (!this.hasMultiAccountForSub(row, sub)) return "";
+      return (
+        resolveRecordAccountName(sub, this.getEffectiveAccounts()) ||
+        recordAccountKeyOf(sub) ||
+        ""
+      );
+    },
+
+    buildLocalCardMergeKey(row, resolvedGroup) {
+      return [
+        this.recordValue(row && row.textOtherName),
+        this.recordValue(row && row.textType),
+        this.recordValue(resolvedGroup),
+        this.recordValue(row && row.selectedFile),
+      ].join("\u0001");
+    },
+
+    buildArticleCardMergeKey(row, resolvedGroup) {
+      return [
+        this.recordValue(row && row.textOtherName),
+        this.recordValue(row && row.textType),
+        this.recordValue(resolvedGroup),
+        this.recordValue(row && row.selectedFile),
+        this.getArticleField(row, "content"),
+        this.getArticleField(row, "articleFilePath"),
+        this.getArticleField(row, "coverPath"),
+        this.getArticleField(row, "category"),
+        this.getArticleTags(row),
+        this.getArticleField(row, "summary"),
+      ].join("\u0001");
+    },
+
+    async loadRecords() {
+      const seq = (this._loadSeq || 0) + 1;
+      this._loadSeq = seq;
+      const [pushRes, accRes] = await Promise.all([
+        dataRequest({
+          type: "get",
+          fileName: "pushData",
+        }).catch(() => ({ data: {} })),
+        dataRequest({
+          type: "get",
+          fileName: "account",
+          item: { page: 1, pageSize: 10000 },
+        }).catch(() => null),
+      ]);
+      if (seq !== this._loadSeq) return;
+      if (
+        accRes &&
+        accRes.success !== false &&
+        accRes.data &&
+        typeof accRes.data === "object" &&
+        !Array.isArray(accRes.data)
+      ) {
+        const { accounts, groupOrderMap } = this.extractAccountsFromRaw(
+          accRes.data
+        );
+        this.currentAccounts = accounts;
+        this.groupOrderMap = groupOrderMap;
+        this.accountsLoaded = true;
+      } else {
+        const fallback = this.loadAccountsFromStorage();
+        this.currentAccounts = fallback.accounts;
+        this.groupOrderMap = fallback.groupOrderMap;
+        this.accountsLoaded = fallback.accounts.length > 0;
+      }
+      this.initDataFiltered((pushRes && pushRes.data) || {});
+      this.reconcileSelectedGroup();
+    },
+
+    initDataFiltered(data, accountsOverride) {
+      const accounts =
+        accountsOverride !== undefined
+          ? accountsOverride
+          : this.getEffectiveAccounts();
       const tempObj = {};
       this.dataList = {};
       for (const key in data) {
@@ -1137,18 +1466,16 @@ export default {
         const list = data[key] || [];
         list.forEach((row) => {
           if (!["local", "article"].includes(row.textType)) return;
+          const resolvedGroup = resolveRecordGroup(row, accounts);
           const mergeKey =
             row.textType === "article"
-              ? this.buildArticleMergeKey(row)
-              : row.textOtherName +
-                "-" +
-                row.textType +
-                this.getRecordPhone(row) +
-                row.selectedFile;
+              ? this.buildArticleCardMergeKey(row, resolvedGroup)
+              : this.buildLocalCardMergeKey(row, resolvedGroup);
           if (!tempData[mergeKey]) {
             const copyRow = this.fillPublishStats(
               JSON.parse(JSON.stringify(row))
             );
+            copyRow.displayGroup = resolvedGroup;
             copyRow.showAlltype = [
               this.fillPublishStats(JSON.parse(JSON.stringify(row))),
             ];
@@ -1202,8 +1529,26 @@ export default {
         if (warnings.length > 0 && this.$message) {
           this.$message.warning(warnings.join("；"));
         }
-        this.dataList[dateKey].splice(idx, 1);
-        if (this.dataList[dateKey].length === 0) {
+        const dayRows = this.dataList[dateKey];
+        if (!Array.isArray(dayRows)) return;
+        let realIdx = dayRows.indexOf(item);
+        if (realIdx < 0 && idx >= 0 && idx < dayRows.length && dayRows[idx] === item) {
+          realIdx = idx;
+        }
+        if (realIdx < 0) {
+          const deletedIds = new Set(
+            (item.showAlltype || []).map((v) => v && v.id).filter(Boolean)
+          );
+          if (deletedIds.size > 0) {
+            realIdx = dayRows.findIndex((row) =>
+              (row.showAlltype || []).some((v) => v && deletedIds.has(v.id))
+            );
+          }
+        }
+        if (realIdx >= 0) {
+          dayRows.splice(realIdx, 1);
+        }
+        if (dayRows.length === 0) {
           this.$delete(this.dataList, dateKey);
         }
       });
@@ -1243,6 +1588,30 @@ export default {
   font-size: 13px;
   color: #909399;
   margin-right: 4px;
+}
+
+.toolbar-filter {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid $borderColor;
+}
+
+.group-filter-select {
+  width: 200px;
+}
+
+.empty-filter-card {
+  padding: 28px 20px;
+  text-align: center;
+  font-size: 13px;
+  color: #909399;
+  background: $cardBg;
+  border: 1px solid $borderColor;
+  border-radius: 4px;
 }
 
 .info-box {
@@ -1341,6 +1710,11 @@ export default {
   cursor: pointer;
   width: 60%;
   word-break: break-all;
+}
+
+.pt-account-name {
+  font-size: 12px;
+  color: #606266;
 }
 
 .fail {

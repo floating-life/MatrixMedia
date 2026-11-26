@@ -25,7 +25,10 @@
  * phone "-" 前缀行为，因此旧数据与旧调用方零迁移即可正确工作。
  */
 
-import { accountSessionKey } from "./accountPartition.js";
+import {
+  accountSessionKey,
+  canonicalAccountPartition,
+} from "./accountPartition.js";
 
 /**
  * 历史 phone 规则的登录主键（"-" 前缀）。
@@ -175,4 +178,165 @@ export function normalizeAccountRecordFields(record) {
     changed = true;
   }
   return changed;
+}
+
+function normalizeAccountsForLookup(accounts) {
+  if (!accounts) return [];
+  if (Array.isArray(accounts)) {
+    return accounts.filter((item) => item && typeof item === "object");
+  }
+  if (typeof accounts !== "object") return [];
+  const list = [];
+  for (const [key, val] of Object.entries(accounts)) {
+    if (Array.isArray(val)) {
+      for (const item of val) {
+        if (item && typeof item === "object") list.push(item);
+      }
+    } else if (val && typeof val === "object" && Array.isArray(val.children)) {
+      for (const child of val.children) {
+        if (!child || typeof child !== "object") continue;
+        const meta =
+          child.meta && typeof child.meta === "object" ? child.meta : child;
+        if (!recordGroupOf(meta) && key) {
+          list.push({ ...meta, group: key });
+        } else {
+          list.push(meta);
+        }
+      }
+    }
+  }
+  return list;
+}
+
+function extractAccountKeyFromPartition(partition, pt) {
+  const raw = String(partition || "").trim();
+  if (!raw) return "";
+  const canonical = canonicalAccountPartition(raw, pt);
+  let body = canonical.startsWith("persist:")
+    ? canonical.slice("persist:".length)
+    : canonical;
+  const suffix = String(pt || "").trim();
+  if (suffix && body.endsWith(suffix)) {
+    body = body.slice(0, body.length - suffix.length);
+  }
+  return sanitizeAccountKey(body);
+}
+
+function getRecordPlatform(record) {
+  if (!record || typeof record !== "object") return "";
+  return String(record.pt || record.platform || "").trim();
+}
+
+function getLookupAccountKey(record) {
+  if (!record || typeof record !== "object") return "";
+  const explicitKey = sanitizeAccountKey(record.accountKey);
+  if (explicitKey) return explicitKey;
+  const rawPartition = String(record.partition || "").trim();
+  const pt = getRecordPlatform(record);
+  if (rawPartition && pt) {
+    const derived = extractAccountKeyFromPartition(rawPartition, pt);
+    if (derived) return derived;
+  }
+  return recordAccountKeyOf(record);
+}
+
+function getLookupPartition(record) {
+  if (!record || typeof record !== "object") return "";
+  const pt = getRecordPlatform(record);
+  const rawPartition = String(record.partition || "").trim();
+  if (rawPartition) {
+    return pt ? canonicalAccountPartition(rawPartition, pt) : rawPartition;
+  }
+  if (pt) {
+    const key = getLookupAccountKey(record);
+    return key ? "persist:" + key + pt : "";
+  }
+  return "";
+}
+
+function findMatchedAccounts(record, accounts) {
+  if (!record || typeof record !== "object") return [];
+  const list = normalizeAccountsForLookup(accounts);
+  if (list.length === 0) return [];
+
+  const recPt = getRecordPlatform(record);
+  const recPartition = getLookupPartition(record);
+  const recKey = getLookupAccountKey(record);
+
+  // 1. 优先按 partition 精确匹配（含由 accountKey + pt 推导的标准分区）
+  if (recPartition) {
+    const byPartition = list.filter((acc) => {
+      const accPt = getRecordPlatform(acc);
+      if (recPt && accPt && recPt !== accPt) return false;
+      const accPartition = getLookupPartition(acc);
+      return Boolean(accPartition && accPartition === recPartition);
+    });
+    if (byPartition.length > 0) return byPartition;
+  }
+
+  // 2. 次选按 accountKey 匹配（双方均有平台字段时须同平台，缺平台字段时兜底）
+  if (recKey) {
+    const byKey = list.filter((acc) => {
+      const accPt = getRecordPlatform(acc);
+      if (recPt && accPt && recPt !== accPt) return false;
+      const accKey = getLookupAccountKey(acc);
+      return Boolean(accKey && accKey === recKey);
+    });
+    if (byKey.length > 0) return byKey;
+  }
+
+  return [];
+}
+
+/**
+ * 解析发布记录 / 账号记录当前所属的分组名。
+ * 优先按记录的 partition / accountKey 在当前账号列表中匹配账号，取其当前分组名
+ * （保证分组改名前的历史记录也能显示改名后的新分组名）；找不到账号时回退
+ * recordGroupOf(record)（group 字段，再回退 phone "-" 前缀）。
+ * @param {object|string} record 发布记录或账号记录
+ * @param {Array<object>|object} [accounts] 当前账号列表（或账号树 / 按日期映射）
+ * @returns {string}
+ */
+export function resolveRecordGroup(record, accounts) {
+  if (!record) return "";
+  const fallbackGroup = recordGroupOf(record);
+  if (typeof record !== "object") return fallbackGroup;
+
+  const matches = findMatchedAccounts(record, accounts);
+  if (matches.length === 0) return fallbackGroup;
+
+  const groups = [];
+  for (const acc of matches) {
+    const g = recordGroupOf(acc);
+    if (g && !groups.includes(g)) groups.push(g);
+  }
+  if (groups.length === 0) return fallbackGroup;
+  if (groups.length === 1) return groups[0];
+  // 同一平台账号跨分组共享登录态时，若记录原分组仍在当前归属中则保留原分组
+  if (fallbackGroup && groups.includes(fallbackGroup)) return fallbackGroup;
+  return groups[0];
+}
+
+/**
+ * 解析记录对应的账号显示名。
+ * 优先匹配当前账号列表中的账号名，未命中时回退记录自身的 recordAccountNameOf / accountKey。
+ * @param {object|string} record 发布记录或账号记录
+ * @param {Array<object>|object} [accounts] 当前账号列表
+ * @returns {string}
+ */
+export function resolveRecordAccountName(record, accounts) {
+  if (!record) return "";
+  if (typeof record !== "object") return recordAccountNameOf(record);
+
+  const fallbackGroup = recordGroupOf(record);
+  const matches = findMatchedAccounts(record, accounts);
+  if (matches.length > 0) {
+    const preferred =
+      (fallbackGroup &&
+        matches.find((acc) => recordGroupOf(acc) === fallbackGroup)) ||
+      matches[0];
+    const name = recordAccountNameOf(preferred);
+    if (name) return name;
+  }
+  return recordAccountNameOf(record) || recordAccountKeyOf(record);
 }
