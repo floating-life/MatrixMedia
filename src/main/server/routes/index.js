@@ -2,7 +2,10 @@ var express = require("express");
 var path = require("path");
 const { changeData } = require("../utils");
 const { isTrustedLocalRequest } = require("../requestGuard");
-const { sanitizePublishPayloadObject } = require("../../../shared/textSanitize.js");
+const {
+  sanitizePublishPayloadObject,
+  sanitizeTitle,
+} = require("../../../shared/textSanitize.js");
 const {
   DUPLICATE_EXIT_CODE,
   findRecentDuplicatePublish,
@@ -235,13 +238,16 @@ router.post("/publish", async function (req, res) {
         requestDraftMode: Boolean(target.draft),
       });
       const isDraft = Boolean(effectiveMode.publishToDraft);
-      const rawCandTitle = target.title || fileStemForDedupe(target.file);
+      const fallbackCandTitle =
+        sanitizeTitle(target.bookName) || fileStemForDedupe(target.file);
       const candTitle =
         applyPlatformPublishRules(target.platform, {
-          title: rawCandTitle,
+          title: sanitizeTitle(target.title),
           description: target.description || "",
           tags: target.tags || target.bq || "",
-        }).title || rawCandTitle;
+          titleByPlatform: target.titleByPlatform,
+          descByPlatform: target.descByPlatform,
+        }).title || fallbackCandTitle;
       const targetAllowDup = Boolean(rootAllowDuplicate || target.allowDuplicate === true);
       if (targetAllowDup) {
         target.allowDuplicate = true;
@@ -385,13 +391,16 @@ router.post("/publish", async function (req, res) {
           requestDraftMode: Boolean(t.draft),
         });
         const isDraft = Boolean(effectiveMode.publishToDraft);
-        const rawCandTitle = t.title || fileStemForDedupe(t.file);
+        const fallbackCandTitle =
+          sanitizeTitle(t.bookName) || fileStemForDedupe(t.file);
         const candTitle =
           applyPlatformPublishRules(t.platform, {
-            title: rawCandTitle,
+            title: sanitizeTitle(t.title),
             description: t.description || "",
             tags: t.tags || t.bq || "",
-          }).title || rawCandTitle;
+            titleByPlatform: t.titleByPlatform,
+            descByPlatform: t.descByPlatform,
+          }).title || fallbackCandTitle;
         const allowDup = Boolean(t.allowDuplicate);
         if (allowDup) {
           t.allowDuplicate = true;

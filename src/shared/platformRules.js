@@ -712,6 +712,12 @@ export function applyPlatformPublishRules(platform, input = {}, options = {}) {
     canonical,
     "description"
   );
+  const hasBjhDescOverride =
+    canonical === "百家号" &&
+    (Boolean(overrideDesc) ||
+      Boolean(input && input.descOverrideApplied === true));
+  const effectiveOverrideDesc =
+    overrideDesc || (hasBjhDescOverride ? baseDesc : "");
   let description = overrideDesc || baseDesc;
 
   const shortTitle =
@@ -782,32 +788,32 @@ export function applyPlatformPublishRules(platform, input = {}, options = {}) {
     const descLimit = rule.descMax;
     const formatTagsStr = (list) => list.map((t) => `#${t}`).join(" ");
 
-    if (overrideDesc) {
-      const extracted = extractInlineHashtags(overrideDesc);
+    if (hasBjhDescOverride) {
+      const extracted = extractInlineHashtags(effectiveOverrideDesc);
       const inlineSet = new Set(extracted.inlineTags);
       const allTagNames = dedupeTagList([extracted.inlineTags, keptTags]);
       const extraTagsNatural = allTagNames.filter((t) => !inlineSet.has(t));
       const extraTagsNaturalStr = formatTagsStr(extraTagsNatural);
-      const naturalCombined = [overrideDesc, extraTagsNaturalStr]
+      const naturalCombined = [effectiveOverrideDesc, extraTagsNaturalStr]
         .filter(Boolean)
         .join(" ");
 
       if (descLimit == null || countChars(naturalCombined) <= descLimit) {
-        bodyDescription = overrideDesc;
+        bodyDescription = effectiveOverrideDesc;
         keptTags = allTagNames;
         combinedDescription = naturalCombined;
-      } else if (countChars(overrideDesc) <= descLimit) {
+      } else if (countChars(effectiveOverrideDesc) <= descLimit) {
         // 覆盖简介本身 ≤ 50：完整保留覆盖简介，仅追加 50 字内放得下的外部话题
-        const remaining = overrideDesc
-          ? Math.max(0, descLimit - countChars(overrideDesc) - 1)
+        const remaining = effectiveOverrideDesc
+          ? Math.max(0, descLimit - countChars(effectiveOverrideDesc) - 1)
           : descLimit;
         const { kept: keptExtra, droppedByLength } = selectTagsWithinBudget(
           extraTagsNatural,
           { tagMax: rule.tagMax, maxTagsBudget: remaining }
         );
-        bodyDescription = overrideDesc;
+        bodyDescription = effectiveOverrideDesc;
         keptTags = dedupeTagList([extracted.inlineTags, keptExtra]);
-        combinedDescription = [overrideDesc, formatTagsStr(keptExtra)]
+        combinedDescription = [effectiveOverrideDesc, formatTagsStr(keptExtra)]
           .filter(Boolean)
           .join(" ");
         if (droppedByLength.length > 0) {
@@ -861,16 +867,16 @@ export function applyPlatformPublishRules(platform, input = {}, options = {}) {
               field: "description",
               action: "truncate",
               limit: descLimit,
-              originalLength: countChars(overrideDesc),
+              originalLength: countChars(effectiveOverrideDesc),
               finalLength: countChars(combinedDescription),
-              originalPreview: previewText(overrideDesc, 18),
+              originalPreview: previewText(effectiveOverrideDesc, 18),
               finalPreview: previewText(combinedDescription, 18),
             })
           );
         }
       }
-      // 同步 title 为覆盖正文，保证发布记录真实反映覆盖描述，且二次调用严格幂等
-      title = bodyDescription ? sanitizeTitle(bodyDescription) : "";
+      // 发布记录/账本标题保持用户标题（分平台标题覆盖 > 通用标题 > 现有回退），
+      // 作品描述只作为写入页面文本，绝不覆盖 title，确保各入口 7 天查重与账本一致
       ksFillText = combinedDescription;
     } else if (descLimit != null && title && countChars(title) > descLimit) {
       // 标题自身超 50：只截标题（不拼通用简介正文），剩余空间放得下的话题才保留
@@ -1455,6 +1461,7 @@ export function applyPlatformPublishRules(platform, input = {}, options = {}) {
     shortTitle,
     tags: keptTags,
     tagsText,
+    ...(hasBjhDescOverride ? { descOverrideApplied: true } : {}),
     adjusted: adjustments.length > 0,
     adjustments,
     summary,

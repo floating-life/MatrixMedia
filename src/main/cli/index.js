@@ -511,24 +511,41 @@ async function runBatchDirPublish(v, cfg) {
     }
 
     const stem = fileStem(resolvedFile);
-    const rawBt1 =
-      resolvePlatformOverrideValue(row.titleByPlatform, v.platform, "title") ||
-      (row.title && row.title.trim()) ||
-      resolvePlatformOverrideValue(v.titleByPlatform, v.platform, "title") ||
-      stem;
-    const rawDesc =
-      resolvePlatformOverrideValue(
-        row.descByPlatform,
-        v.platform,
-        "description"
-      ) ||
-      row.description ||
-      resolvePlatformOverrideValue(
-        v.descByPlatform,
-        v.platform,
-        "description"
-      ) ||
-      "";
+    const rowTitleText = row.title && row.title.trim();
+    const rowTitleOverride = resolvePlatformOverrideValue(
+      row.titleByPlatform,
+      v.platform,
+      "title"
+    );
+    const cliTitleOverride = resolvePlatformOverrideValue(
+      v.titleByPlatform,
+      v.platform,
+      "title"
+    );
+    const effectiveTitleByPlatform = rowTitleOverride
+      ? { [v.platform]: rowTitleOverride }
+      : !rowTitleText && cliTitleOverride
+      ? { [v.platform]: cliTitleOverride }
+      : undefined;
+    const baseBt1 = rowTitleText || stem;
+    const rawBt1 = rowTitleOverride || rowTitleText || cliTitleOverride || stem;
+
+    const rowDescText = row.description || "";
+    const rowDescOverride = resolvePlatformOverrideValue(
+      row.descByPlatform,
+      v.platform,
+      "description"
+    );
+    const cliDescOverride = resolvePlatformOverrideValue(
+      v.descByPlatform,
+      v.platform,
+      "description"
+    );
+    const effectiveDescByPlatform = rowDescOverride
+      ? { [v.platform]: rowDescOverride }
+      : !String(rowDescText).trim() && cliDescOverride
+      ? { [v.platform]: cliDescOverride }
+      : undefined;
     const bookName = stem;
 
     // 封面：显式 --cover 全局覆盖 xlsx 封面列；行内相对路径相对视频目录解析。
@@ -625,10 +642,12 @@ async function runBatchDirPublish(v, cfg) {
     const ruled = applyPlatformPublishRules(
       v.platform,
       {
-        title: rawBt1,
-        description: rawDesc,
+        title: baseBt1,
+        description: rowDescText,
         shortTitle: row.shortTitle,
         tags: tagList,
+        titleByPlatform: effectiveTitleByPlatform,
+        descByPlatform: effectiveDescByPlatform,
       },
       { log: true }
     );
@@ -1534,13 +1553,15 @@ export async function runCliMain(argv = process.argv) {
           });
     const singleExtrasPatch = buildPlatformExtrasPatch(v.platform, singleExtras);
     Object.assign(v, singleExtrasPatch);
-    const rawCandTitle = sanitizeTitle(v.title) || fileStem(v.file);
+    const fallbackCandTitle = sanitizeTitle(v.bookName) || fileStem(v.file);
     const candTitle =
       applyPlatformPublishRules(v.platform, {
-        title: rawCandTitle,
+        title: sanitizeTitle(v.title),
         description: v.description || "",
         tags: v.tags || v.bq || "",
-      }).title || rawCandTitle;
+        titleByPlatform: v.titleByPlatform,
+        descByPlatform: v.descByPlatform,
+      }).title || fallbackCandTitle;
     const pushRecords = readPushDataRecordsForCli();
 
     // 显式 --publish-at 先按 UTC+8 做格式与未来时间校验
