@@ -898,6 +898,20 @@ export default {
           ...(typeof readTaskOriginalStatement(record) === "boolean"
             ? { originalStatement: readTaskOriginalStatement(record) }
             : {}),
+          // 透传分平台标题/简介覆盖，避免重发时百家号作品描述被「标题，简介」重拼
+          ...(record.titleByPlatform && typeof record.titleByPlatform === "object"
+            ? { titleByPlatform: record.titleByPlatform }
+            : {}),
+          ...(record.descByPlatform && typeof record.descByPlatform === "object"
+            ? { descByPlatform: record.descByPlatform }
+            : {}),
+          ...(record.descOverrideApplied === true
+            ? { descOverrideApplied: true }
+            : {}),
+          ...(record.platformRulesApplied &&
+          typeof record.platformRulesApplied === "object"
+            ? { platformRulesApplied: record.platformRulesApplied }
+            : {}),
           publishAttemptCount: Number(record.publishAttemptCount) || 1,
           republishCount: Number(record.republishCount),
         })),
