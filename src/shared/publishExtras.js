@@ -320,6 +320,15 @@ export function isAiChaptersRequested(task) {
 
 /** 仅当显式开启（=== true）时返回 true；关闭（false）或未传入时返回 false（不触碰页面） */
 export function isOriginalStatementRequested(task) {
+  // 2026-11-27 用户定：原创声明功能整体关闭（视频号无资格/弹窗阻断上传，改为手机端手动勾选）。
+  // 仅测试或将来需要时以环境变量 MM_ENABLE_ORIGINAL_STATEMENT=1 重新打开。
+  if (
+    typeof process === "undefined" ||
+    !process.env ||
+    process.env.MM_ENABLE_ORIGINAL_STATEMENT !== "1"
+  ) {
+    return false;
+  }
   return readTaskOriginalStatement(task) === true;
 }
 

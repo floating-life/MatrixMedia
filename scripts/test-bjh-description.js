@@ -1,4 +1,5 @@
 "use strict";
+process.env.MM_ENABLE_ORIGINAL_STATEMENT = "1"; // 原创声明功能默认关闭，测试显式打开以覆盖原逻辑
 
 /**
  * S17 返修第 2 轮单测：百家号新版只有「作品描述」（上限 50 字）

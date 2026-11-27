@@ -1,4 +1,5 @@
 "use strict";
+process.env.MM_ENABLE_ORIGINAL_STATEMENT = "1"; // 原创声明功能默认关闭，测试显式打开以覆盖原逻辑
 
 /**
  * S18 综合单测：发布时 AI 自动章节（抖音/快手/小红书）+ 原创声明（小红书/视频号）

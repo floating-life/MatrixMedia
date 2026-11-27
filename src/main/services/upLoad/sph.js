@@ -148,7 +148,7 @@ export const SPH_ORIGINAL_STATEMENT_SELECTORS = Object.freeze({
     ".declare-original-dialog",
   ],
   dialogKeywords: ["声明原创", "原创声明", "原创权益", "原创"],
-  ignoreDialogPatterns: ["将此次编辑保留", "编辑封面", "更换封面"],
+  ignoreDialogPatterns: ["将此次编辑保留", "编辑封面", "更换封面", "个人主页卡片"],
   agreementSelectors: [
     ".weui-desktop-dialog__bd .protocol-text",
     ".protocol-text",
@@ -264,6 +264,38 @@ export async function closeSphOriginalDialog(page) {
     return false;
   } catch (e) {
     console.warn("[sph][original] 关闭原创弹窗异常:", (e && e.message) || e);
+    return false;
+  }
+}
+
+/**
+ * 关闭视频号封面相关弹窗（编辑封面 / 编辑个人主页卡片 / 更换封面），点「取消」或右上角关闭，不点「确认」。
+ * @returns {Promise<boolean>} 无可见封面弹窗返回 true
+ */
+export async function closeSphCoverDialogs(page) {
+  const probe =
+    "(function(act){" +
+    "var app=document.querySelector('wujie-app.wujie_iframe');var root=app&&app.shadowRoot;if(!root)return 0;" +
+    "function vis(el){var r=el.getBoundingClientRect();var s=getComputedStyle(el);return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden';}" +
+    "var open=Array.prototype.filter.call(root.querySelectorAll('.weui-desktop-dialog'),function(d){return vis(d)&&/编辑封面|个人主页卡片|更换封面|上传封面/.test(d.textContent||'');});" +
+    "if(act!=='close')return open.length;" +
+    "open.forEach(function(d){var btn=null;var bs=d.querySelectorAll('button,.weui-desktop-btn,[role=button]');" +
+    "for(var i=0;i<bs.length;i++){if(String(bs[i].textContent||'').replace(/\\s+/g,'')==='取消'&&vis(bs[i])){btn=bs[i];break;}}" +
+    "if(!btn)btn=d.querySelector('.weui-desktop-dialog__close-btn,[class*=close-btn],[class*=dialog__close]');" +
+    "if(btn)btn.click();});return open.length;})";
+  try {
+    if (!(await page.evaluate(`${probe}('count')`))) return true;
+    for (let i = 0; i < 3; i++) {
+      await page.evaluate(`${probe}('close')`).catch(() => 0);
+      await new Promise((r) => setTimeout(r, 800));
+      if (!(await page.evaluate(`${probe}('count')`))) return true;
+      await page.keyboard.press("Escape").catch(() => {});
+      await new Promise((r) => setTimeout(r, 800));
+      if (!(await page.evaluate(`${probe}('count')`))) return true;
+    }
+    return false;
+  } catch (e) {
+    console.warn("[sph] 关闭封面弹窗异常:", (e && e.message) || e);
     return false;
   }
 }
@@ -392,7 +424,7 @@ async function uploadSphCustomCover(page, coverPath) {
       for (const d of root.querySelectorAll(".weui-desktop-dialog")) {
         const t = (d.textContent || "").replace(/\s+/g, "");
         const r = d.getBoundingClientRect();
-        if (t.includes("编辑封面") && r.width > 0) return true;
+        if (/编辑封面|个人主页卡片|更换封面/.test(t) && r.width > 0) return true;
       }
       return false;
     },
@@ -408,7 +440,7 @@ async function uploadSphCustomCover(page, coverPath) {
     if (!root) return false;
     const dlg = [...root.querySelectorAll(".weui-desktop-dialog")].find(
       (d) =>
-        (d.textContent || "").includes("编辑封面") &&
+        /编辑封面|个人主页卡片|更换封面/.test(d.textContent || "") &&
         d.getBoundingClientRect().width > 0
     );
     if (!dlg) return false;
@@ -454,7 +486,7 @@ async function uploadSphCustomCover(page, coverPath) {
     if (!root) return { ok: false, reason: "no-shadow" };
     const dlg = [...root.querySelectorAll(".weui-desktop-dialog")].find(
       (d) =>
-        (d.textContent || "").includes("编辑封面") &&
+        /编辑封面|个人主页卡片|更换封面/.test(d.textContent || "") &&
         d.getBoundingClientRect().width > 0
     );
     if (!dlg) return { ok: false, reason: "no-dialog" };
@@ -485,7 +517,7 @@ async function uploadSphCustomCover(page, coverPath) {
     const img = root.querySelector(".cover-img-vertical");
     const dlg = [...root.querySelectorAll(".weui-desktop-dialog")].find(
       (d) =>
-        (d.textContent || "").includes("编辑封面") &&
+        /编辑封面|个人主页卡片|更换封面/.test(d.textContent || "") &&
         d.getBoundingClientRect().width > 0
     );
     return { src: img ? img.src : "", dialogOpen: !!dlg };
@@ -538,7 +570,7 @@ export const SPH_HORIZONTAL_COVER_SELECTORS = Object.freeze({
   slotTextKeywords: ["4:3", "4：3", "横封面", "横版封面", "横屏封面", "朋友圈"],
   // 封面编辑弹窗
   dialogSelector: ".weui-desktop-dialog",
-  dialogKeywords: ["编辑封面", "更换封面", "上传封面"],
+  dialogKeywords: ["编辑封面", "更换封面", "上传封面", "个人主页卡片"],
   // 弹窗内上传封面入口文案
   uploadTabTexts: ["上传封面", "本地上传"],
   // 文件输入框
@@ -1341,7 +1373,21 @@ export default async function (page, data, window, event, onFinish) {
       (data.data && data.data.coverPathH) ||
       (data.publishOptions && data.publishOptions.coverPathH) ||
       "";
+    // 2026-11-27 真机：封面弹窗改名「编辑个人主页卡片」导致超时、整条视频号发不出。
+    // 封面改为尽力而为：失败则关掉封面弹窗、用平台默认封面继续发布；弹窗关不掉才中止。
     if (rawCoverPath || rawCoverPathH) {
+      try {
+        await applySphCovers();
+      } catch (coverErr) {
+        console.warn(
+          "[sph] ⚠️ 封面设置失败，改用平台默认封面继续发布：",
+          (coverErr && coverErr.message) || coverErr
+        );
+        const closed = await closeSphCoverDialogs(page);
+        if (!closed) throw coverErr;
+      }
+    }
+    async function applySphCovers() {
       const dualCovers =
         typeof coverCompat.resolveDualCoversForUpload === "function"
           ? await coverCompat.resolveDualCoversForUpload({
