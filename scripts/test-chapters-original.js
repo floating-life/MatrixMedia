@@ -997,7 +997,7 @@ module.exports = {
     assert.strictEqual(s1.pubBtn.clickCount, 1);
     assert.strictEqual(replies1[0].status, true);
 
-    // Case 2: originalStatement=true 且无原创资格 → 中止发布，绝不点击发表或保存草稿，报错文案精准
+    // Case 2（2026-11-27 改）: originalStatement=true 且无原创资格 → 跳过原创声明、照常发表
     const s2 = makeSphFullPage({ allowOriginal: false, noQual: true });
     const replies2 = [];
     await sphMod.default(
@@ -1010,14 +1010,9 @@ module.exports = {
       {},
       { reply: (_ch, p) => replies2.push(p) }
     );
-    assert.strictEqual(s2.pubBtn.clickCount, 0, "无原创资格绝不能点击发表");
-    assert.strictEqual(s2.draftBtn.clickCount, 0, "无原创资格绝不能点击保存草稿");
-    assert.strictEqual(replies2[0].status, false);
-    assert.ok(
-      replies2[0].message.includes("账号无原创资格，可在发布设置关闭原创声明"),
-      replies2[0].message
-    );
-    assert.strictEqual(replies2[0].originalStatementStatus, "no_qualification");
+    assert.strictEqual(s2.pubBtn.clickCount, 1, "无原创资格应跳过原创声明并照常发表");
+    assert.strictEqual(replies2[0].status, true, JSON.stringify(replies2[0]));
+    assert.notStrictEqual(replies2[0].originalStatementStatus, "enabled");
 
     // Case 3: originalStatement=true 且与 creativeStatement 并存 → 两者同时选中并联合复核通过
     const s3 = makeSphFullPage({ allowOriginal: true, noQual: false });

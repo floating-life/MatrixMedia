@@ -233,6 +233,41 @@ export async function applySphOriginalStatement(
  * 统一复核视频号「视频标注（creativeStatement）」与「原创声明（originalStatement）」：
  * 确保二者互不覆盖、确认弹窗已完全关闭；若视频标注被重置则补选一次并复核原创仍在勾选态。
  */
+/**
+ * 关闭视频号「声明原创」弹窗（无资格时用），关闭后回读确认无残留弹窗。
+ * @returns {Promise<boolean>} 弹窗已不存在返回 true
+ */
+export async function closeSphOriginalDialog(page) {
+  const probe =
+    "(function(act){" +
+    "var app=document.querySelector('wujie-app.wujie_iframe');" +
+    "var roots=[document];if(app&&app.shadowRoot)roots.push(app.shadowRoot);" +
+    "function vis(el){if(!el)return false;var r=el.getBoundingClientRect();var s=getComputedStyle(el);return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden';}" +
+    "var open=[];roots.forEach(function(rt){rt.querySelectorAll('.declare-original-dialog').forEach(function(d){if(vis(d))open.push(d);});});" +
+    "if(act!=='close')return open.length;" +
+    "open.forEach(function(d){" +
+    "var btn=d.querySelector('.weui-desktop-dialog__close-btn,[class*=close-btn],[class*=dialog__close]');" +
+    "if(!btn){var bs=d.querySelectorAll('button,[role=button]');for(var i=0;i<bs.length;i++){var t=String(bs[i].textContent||'').replace(/\\s+/g,'');if(/^(取消|关闭|我知道了|知道了|暂不声明|暂不)$/.test(t)){btn=bs[i];break;}}}" +
+    "if(btn)btn.click();});" +
+    "return open.length;})";
+  try {
+    const before = await page.evaluate(`${probe}('count')`);
+    if (!before) return true;
+    for (let i = 0; i < 3; i++) {
+      await page.evaluate(`${probe}('close')`).catch(() => 0);
+      await new Promise((r) => setTimeout(r, 600));
+      if (!(await page.evaluate(`${probe}('count')`))) return true;
+      await page.keyboard.press("Escape").catch(() => {});
+      await new Promise((r) => setTimeout(r, 600));
+      if (!(await page.evaluate(`${probe}('count')`))) return true;
+    }
+    return false;
+  } catch (e) {
+    console.warn("[sph][original] 关闭原创弹窗异常:", (e && e.message) || e);
+    return false;
+  }
+}
+
 export async function verifySphDeclarations(
   page,
   { creativeStatement, originalStatement, data, window } = {}
@@ -1269,13 +1304,28 @@ export default async function (page, data, window, event, onFinish) {
     // 原创声明（默认开启；关闭时不触碰页面；开启时失败或无资格中止本条发布，不点发表/保存草稿）
     let originalStatementResult = null;
     if (isOriginalStatementRequested(data)) {
-      originalStatementResult = await applySphOriginalStatement(page, {
-        data,
-        window,
-      });
+      let originalSkipped = false;
+      try {
+        originalStatementResult = await applySphOriginalStatement(page, {
+          data,
+          window,
+        });
+      } catch (origErr) {
+        // 2026-11-27 真机：视频号原创声明对未加入创作分成计划的账号显示「暂无权限」（功能对该号不可用）。
+        // 无资格时降级为跳过原创声明、照常发布；仅在弹窗确实关掉后才继续，关不掉仍中止。
+        if (!(origErr && origErr.noOriginalQualification)) throw origErr;
+        const closed = await closeSphOriginalDialog(page);
+        if (!closed) throw origErr;
+        console.warn(
+          "[sph][original] 账号无原创资格/功能不可用，已跳过原创声明，继续发布：",
+          origErr.message
+        );
+        originalStatementResult = { status: "unavailable", skipped: true };
+        originalSkipped = true;
+      }
       await verifySphDeclarations(page, {
         creativeStatement: data.data && data.data.creativeStatement,
-        originalStatement: true,
+        originalStatement: !originalSkipped,
         data,
         window,
       });
